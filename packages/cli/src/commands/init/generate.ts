@@ -147,7 +147,7 @@ export async function generate_settings(path_overrides?: Partial<PathConfig>): P
       Stop: [
         {
           hook: "memory_extraction",
-          command: "echo 'TODO: memory extraction hook'",
+          command: "curl -s -X POST http://localhost:7749/hooks/stop -H 'Content-Type: application/json' -d '{\"session_id\": \"'\"$CLAUDE_SESSION_ID\"'\", \"working_dir\": \"'\"$(pwd)\"'\"}' || true",
         },
       ],
     },

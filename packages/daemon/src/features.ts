@@ -13,6 +13,7 @@ import type { TaskQueue } from "./queue.js";
 import type { SessionResult } from "./session.js";
 import * as actions from "./actions.js";
 import { save_features, load_features } from "./persistence.js";
+import { extract_session_learnings } from "./hooks.js";
 
 // ── Phase configuration ──
 
@@ -311,6 +312,15 @@ export class FeatureManager extends EventEmitter {
 
     console.log(
       `[features] Agent completed for ${feature_id} (phase: ${feature.phase})`,
+    );
+
+    // Extract session learnings to daily log (best-effort, non-blocking)
+    void extract_session_learnings(
+      feature.entity,
+      feature_id,
+      feature.activeArchetype ?? feature.phase,
+      result.session_id,
+      this.config,
     );
 
     // Auto-advance if no approval gate

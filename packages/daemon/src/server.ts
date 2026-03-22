@@ -112,6 +112,29 @@ const handle_webhook_sentry: RouteHandler = async (req, res) => {
   json_response(res, 200, { ok: true });
 };
 
+// ── Hook endpoints ──
+
+const handle_stop_hook: RouteHandler = async (req, res, ctx) => {
+  const body = await read_body(req);
+  console.log("[hooks] Stop hook triggered:", body.slice(0, 200));
+
+  try {
+    const data = JSON.parse(body) as { session_id?: string; working_dir?: string };
+    if (data.session_id) {
+      // Find which feature this session belongs to and log it
+      const features = ctx.features.list_features();
+      const feature = features.find((f) => f.lastSessionId === data.session_id);
+      if (feature) {
+        console.log(`[hooks] Session ${data.session_id.slice(0, 8)} was for feature ${feature.id}`);
+      }
+    }
+  } catch {
+    // Best effort
+  }
+
+  json_response(res, 200, { ok: true });
+};
+
 // ── Task routes ──
 
 const handle_submit_task: RouteHandler = async (req, res, ctx) => {
@@ -308,6 +331,7 @@ const routes: Route[] = [
   { method: "POST", pattern: /^\/features\/[a-z0-9-]+\/approve$/, handler: handle_approve_feature },
   { method: "POST", pattern: /^\/webhooks\/github$/, handler: handle_webhook_github },
   { method: "POST", pattern: /^\/webhooks\/sentry$/, handler: handle_webhook_sentry },
+  { method: "POST", pattern: /^\/hooks\/stop$/, handler: handle_stop_hook },
 ];
 
 function route_request(

@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import * as p from "@clack/prompts";
 import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import {
   type PathConfig,
   entity_dir,
@@ -204,7 +205,7 @@ entity_command
     await write_yaml(config_path, entity_config);
     spin.stop(`Config: ${config_path}`);
 
-    // Create empty MEMORY.md
+    // Create MEMORY.md
     const mem_path = entity_memory_path(path_overrides, entity_id);
     const { writeFile } = await import("node:fs/promises");
     await writeFile(
@@ -212,6 +213,60 @@ entity_command
       `# ${entity_name} — Memory\n\n_Curated project knowledge. Updated by agents, reviewed periodically._\n`,
       "utf-8",
     );
+
+    // Create context/ files
+    const ctx_dir = entity_context_dir(path_overrides, entity_id);
+    await writeFile(
+      join(ctx_dir, "decisions.md"),
+      `# ${entity_name} — Decision Log\n\n_Append-only. Record significant decisions with rationale._\n`,
+      "utf-8",
+    );
+    await writeFile(
+      join(ctx_dir, "gotchas.md"),
+      `# ${entity_name} — Known Gotchas\n\n_Issues, workarounds, and things to watch out for._\n`,
+      "utf-8",
+    );
+
+    // Create entity CLAUDE.md template (to be placed in repo root)
+    const entity_claude_md = [
+      `# ${entity_name}`,
+      ``,
+      `_Project context for Claude Code agents. This file is auto-loaded by Claude Code._`,
+      ``,
+      `## Project`,
+      ``,
+      `- **Entity:** ${entity_id}`,
+      `- **Description:** ${description || "TODO: Add project description"}`,
+      `- **Repo:** ${repo_url}`,
+      ``,
+      `## Tech Stack`,
+      ``,
+      `TODO: Document the tech stack (languages, frameworks, databases, etc.)`,
+      ``,
+      `## Build & Run`,
+      ``,
+      `\`\`\`bash`,
+      `# TODO: Add build/run/test commands`,
+      `\`\`\``,
+      ``,
+      `## Memory`,
+      ``,
+      `- **MEMORY.md:** ${mem_path}`,
+      `- **Daily logs:** ${entity_daily_dir(path_overrides, entity_id)}/`,
+      `- **Context docs:** ${ctx_dir}/`,
+      ``,
+      `Read MEMORY.md at the start of every session for accumulated project knowledge.`,
+      `Check daily logs for recent session context.`,
+      `Read context/decisions.md and context/gotchas.md for architectural context.`,
+      ``,
+      `## Conventions`,
+      ``,
+      `_Document any project-specific conventions that differ from global DNA here._`,
+      ``,
+    ].join("\n");
+
+    const claude_md_output = join(entity_dir(path_overrides, entity_id), "CLAUDE.md.template");
+    await writeFile(claude_md_output, entity_claude_md, "utf-8");
 
     // Summary
     p.note(
