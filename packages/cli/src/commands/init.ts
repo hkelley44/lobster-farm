@@ -168,9 +168,25 @@ export const init_command = new Command("init")
     if (op.cli_installed && !op.token_configured && !non_interactive) {
       p.log.info(
         "1Password service account token not set.\n" +
-          "Create one at https://my.1password.com → Developer → Service Accounts\n" +
-          "Then add to ~/.zshrc: export OP_SERVICE_ACCOUNT_TOKEN=\"your-token\"",
+          "Create one at https://my.1password.com → Developer → Service Accounts",
       );
+
+      const op_token = await p.password({
+        message: "1Password service account token (or press Enter to skip):",
+      });
+      if (p.isCancel(op_token)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+      if (op_token && op_token.trim()) {
+        // Write to .zshrc for persistence
+        const { appendFile } = await import("node:fs/promises");
+        const home = process.env["HOME"] ?? "";
+        await appendFile(`${home}/.zshrc`, `\nexport OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"\n`);
+        // Set for current process
+        process.env["OP_SERVICE_ACCOUNT_TOKEN"] = op_token.trim();
+        op.token_configured = true;
+        op.status = "op CLI installed, service account token configured";
+        p.log.success("1Password token saved to ~/.zshrc");
+      }
     }
 
     // ── Step 7: macOS Full Disk Access ──
