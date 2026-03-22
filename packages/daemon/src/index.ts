@@ -56,11 +56,6 @@ async function main(): Promise<void> {
       set_discord_bot(discord);
       await discord.connect(bot_token);
       discord_connected = true;
-
-      // Scaffold global Discord structure if needed
-      if (config.discord?.server_id) {
-        await discord.scaffold_server();
-      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[discord] Failed to connect: ${msg}`);
