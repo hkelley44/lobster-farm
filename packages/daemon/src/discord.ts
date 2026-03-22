@@ -865,43 +865,49 @@ export class DiscordBot extends EventEmitter {
   }
 
   private async handle_commander_message(message: Message): Promise<void> {
-    const { ask_commander, execute_action } = await import("./commander.js");
+    const { run_commander } = await import("./commander.js");
 
-    // Show typing indicator
+    // Show typing indicator (refresh every 8s since Claude Code takes a while)
+    let typing = true;
+    const typing_interval = setInterval(() => {
+      if (typing) {
+        message.channel.sendTyping().catch(() => {});
+      }
+    }, 8000);
     try { await message.channel.sendTyping(); } catch { /* ignore */ }
 
-    const result = await ask_commander(
-      message.content,
-      this.config,
-      this.registry,
-      this._features!,
-      this._queue!,
-    );
-
-    // Execute any actions
-    const action_results: string[] = [];
-    for (const action of result.actions) {
-      const action_result = await execute_action(
-        action,
+    try {
+      const response = await run_commander(
+        message.content,
+        this.config,
         this.registry,
         this._features!,
-        this,
+        this._queue!,
       );
-      action_results.push(action_result);
-    }
 
-    // Build response
-    let full_response = result.response;
-    if (action_results.length > 0) {
-      full_response += "\n\n" + action_results.join("\n");
-    }
+      typing = false;
+      clearInterval(typing_interval);
 
-    // Discord has a 2000 char limit
-    if (full_response.length > 1900) {
-      full_response = full_response.slice(0, 1900) + "\n\n_(truncated)_";
-    }
+      // Discord has a 2000 char limit — split if needed
+      if (response.length <= 1900) {
+        await this.send_as_agent(message.channelId, response, "system");
+      } else {
+        // Split into chunks
+        const chunks = response.match(/[\s\S]{1,1900}/g) ?? [response.slice(0, 1900)];
+        for (const chunk of chunks) {
+          await this.send_as_agent(message.channelId, chunk, "system");
+        }
+      }
 
-    await this.send_as_agent(message.channelId, full_response, "system");
+      // Reload entities in case Commander created/modified any
+      await this.registry.load_all();
+      this.build_channel_map();
+    } catch (err) {
+      typing = false;
+      clearInterval(typing_interval);
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.reply(message, `Commander error: ${msg}`);
+    }
   }
 
   private async reply(message: Message, content: string): Promise<void> {
