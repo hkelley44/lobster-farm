@@ -80,6 +80,8 @@ function resolve_agent_name(
       return agents.builder.name.toLowerCase();
     case "operator":
       return agents.operator.name.toLowerCase();
+    case "commander":
+      return agents.commander.name.toLowerCase();
     case "reviewer":
       return "reviewer";
   }

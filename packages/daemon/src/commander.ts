@@ -57,9 +57,10 @@ export async function run_commander(
 
   try {
     const result = await new Promise<string>((resolve, reject) => {
+      const agent_name = config.agents.commander.name.toLowerCase();
       const proc = spawn(claude_bin, [
         "-p",
-        "--agent", "commander",
+        "--agent", agent_name,
         "--model", "claude-opus-4-6",
         "--permission-mode", "bypassPermissions",
         "--append-system-prompt-file", context_file,

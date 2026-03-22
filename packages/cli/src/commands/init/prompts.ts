@@ -18,20 +18,21 @@ export async function prompt_user_name(): Promise<string> {
   return name.trim();
 }
 
-/** Prompt for agent names for the four configurable archetypes. */
+/** Prompt for agent names for the configurable archetypes. */
 export async function prompt_agent_names(): Promise<
-  Record<"planner" | "designer" | "builder" | "operator", string>
+  Record<"planner" | "designer" | "builder" | "operator" | "commander", string>
 > {
   p.note(
     "Your agents need names. Each role has a default — press Enter to keep it.",
     "Agent Names",
   );
 
-  const roles: Array<"planner" | "designer" | "builder" | "operator"> = [
+  const roles: Array<"planner" | "designer" | "builder" | "operator" | "commander"> = [
     "planner",
     "designer",
     "builder",
     "operator",
+    "commander",
   ];
 
   const result: Record<string, string> = {};
@@ -50,7 +51,7 @@ export async function prompt_agent_names(): Promise<
     result[role] = name.trim() || defaults.default_name;
   }
 
-  return result as Record<"planner" | "designer" | "builder" | "operator", string>;
+  return result as Record<"planner" | "designer" | "builder" | "operator" | "commander", string>;
 }
 
 export interface DiscordSetup {

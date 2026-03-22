@@ -22,12 +22,14 @@ export const TemplateVariablesSchema = z.object({
   DESIGNER_NAME: z.string().default("Pearl"),
   BUILDER_NAME: z.string().default("Bob"),
   OPERATOR_NAME: z.string().default("Ray"),
+  COMMANDER_NAME: z.string().default("Pat"),
 
   // Agent names (lowercase — used in agent file frontmatter `name:` field)
   PLANNER_NAME_LOWER: z.string().default("gary"),
   DESIGNER_NAME_LOWER: z.string().default("pearl"),
   BUILDER_NAME_LOWER: z.string().default("bob"),
   OPERATOR_NAME_LOWER: z.string().default("ray"),
+  COMMANDER_NAME_LOWER: z.string().default("pat"),
 
   // Paths
   PROJECTS_DIR: z.string().default("~/projects"),

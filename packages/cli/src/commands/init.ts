@@ -66,7 +66,7 @@ export const init_command = new Command("init")
 
     // ── Step 2: Agent names ──
     const agent_names = non_interactive
-      ? { planner: "Gary", designer: "Pearl", builder: "Bob", operator: "Ray" }
+      ? { planner: "Gary", designer: "Pearl", builder: "Bob", operator: "Ray", commander: "Pat" }
       : await prompt_agent_names();
 
     // ── Step 3: Machine detection ──
@@ -322,10 +322,12 @@ export const init_command = new Command("init")
       DESIGNER_NAME: agent_names.designer,
       BUILDER_NAME: agent_names.builder,
       OPERATOR_NAME: agent_names.operator,
+      COMMANDER_NAME: agent_names.commander,
       PLANNER_NAME_LOWER: agent_names.planner.toLowerCase(),
       DESIGNER_NAME_LOWER: agent_names.designer.toLowerCase(),
       BUILDER_NAME_LOWER: agent_names.builder.toLowerCase(),
       OPERATOR_NAME_LOWER: agent_names.operator.toLowerCase(),
+      COMMANDER_NAME_LOWER: agent_names.commander.toLowerCase(),
       PROJECTS_DIR: projects_dir,
       GITHUB_USERNAME: github.username,
       GITHUB_ORG: "",
@@ -346,6 +348,7 @@ export const init_command = new Command("init")
         designer: { name: agent_names.designer },
         builder: { name: agent_names.builder },
         operator: { name: agent_names.operator },
+        commander: { name: agent_names.commander },
       },
     };
 
@@ -382,7 +385,7 @@ export const init_command = new Command("init")
     const summary_lines = [
       `Config:     ${config_path}`,
       `Settings:   ${settings_path}`,
-      `Agents:     ${agent_names.planner} (planner), ${agent_names.designer} (designer), ${agent_names.builder} (builder), ${agent_names.operator} (operator)`,
+      `Agents:     ${agent_names.planner} (planner), ${agent_names.designer} (designer), ${agent_names.builder} (builder), ${agent_names.operator} (operator), ${agent_names.commander} (commander)`,
       `Projects:   ${projects_dir}`,
       `Machine:    ${machine.name}`,
       `Sudo:       ${sudo.status}`,

@@ -60,6 +60,7 @@ export const LobsterFarmConfigSchema = z.object({
     designer: AgentNameSchema.default({ name: "Pearl" }),
     builder: AgentNameSchema.default({ name: "Bob" }),
     operator: AgentNameSchema.default({ name: "Ray" }),
+    commander: AgentNameSchema.default({ name: "Pat" }),
   }).default({}),
 });
 

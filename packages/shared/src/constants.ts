@@ -44,6 +44,13 @@ export const DEFAULT_ARCHETYPES: Record<ArchetypeRole, ArchetypeDefaults> = {
     primary_dna: "operator-dna",
     additional_dna: [],
   },
+  commander: {
+    default_name: "Pat",
+    model: "opus",
+    think: "high",
+    primary_dna: "commander-dna",
+    additional_dna: [],
+  },
 } as const;
 
 /** Valid phase transitions. Keys are current phase, values are allowed next phases. */

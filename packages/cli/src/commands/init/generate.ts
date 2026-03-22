@@ -53,6 +53,7 @@ const AGENT_TEMPLATE_MAP: Record<string, string> = {
   designer: "designer.md",
   builder: "builder.md",
   operator: "operator.md",
+  commander: "commander.md",
 };
 
 /**
@@ -101,12 +102,6 @@ export async function generate_config_files(
   const reviewer_out = join(agents_dir(path_overrides), "reviewer.md");
   await write_resolved(reviewer_template, reviewer_out, vars);
   created.push(reviewer_out);
-
-  // ── Commander agent (not renamed — always "commander") ──
-  const commander_template = join(config_dir, "claude", "agents", "commander.md");
-  const commander_out = join(agents_dir(path_overrides), "commander.md");
-  await write_resolved(commander_template, commander_out, vars);
-  created.push(commander_out);
 
   // ── Skills: copy all skill directories ──
   const skills_src = join(config_dir, "claude", "skills");

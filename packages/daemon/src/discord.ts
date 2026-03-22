@@ -186,6 +186,7 @@ export class DiscordBot extends EventEmitter {
       designer: agents.designer.name,
       builder: agents.builder.name,
       operator: agents.operator.name,
+      commander: agents.commander.name,
       reviewer: "Reviewer",
     };
 
