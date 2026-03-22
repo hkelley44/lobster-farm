@@ -81,15 +81,24 @@ export const init_command = new Command("init")
     spin.stop(`Claude Code: ${claude.status}`);
 
     if (!claude.installed && !non_interactive) {
-      p.log.warning(
-        "Claude Code CLI is required for LobsterFarm to function.\n" +
-          "Install it from: https://docs.anthropic.com/en/docs/claude-code\n" +
-          "Then re-run this setup.",
-      );
-      const proceed = await p.confirm({ message: "Continue setup anyway?" });
-      if (p.isCancel(proceed) || !proceed) {
-        p.cancel("Install Claude Code first, then re-run `lobsterfarm init`.");
-        process.exit(0);
+      const install_it = await p.confirm({
+        message: "Claude Code is required but not installed. Install it now?",
+        initialValue: true,
+      });
+      if (p.isCancel(install_it)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+      if (install_it) {
+        spin.start("Installing Claude Code...");
+        const { exec_command } = await import("../lib/process.js");
+        const result = await exec_command("npm install -g @anthropic-ai/claude-code");
+        if (result.exitCode === 0) {
+          spin.stop("Claude Code installed successfully");
+        } else {
+          spin.stop("Claude Code installation failed");
+          p.log.warning(`Install manually: npm install -g @anthropic-ai/claude-code\n${result.stderr}`);
+        }
+      } else {
+        p.log.warning("Continuing without Claude Code. Install it before starting the daemon.");
       }
     }
 
