@@ -108,14 +108,13 @@ export async function prompt_discord(): Promise<DiscordSetup | undefined> {
   };
 }
 
-/** Prompt for GitHub configuration. */
+/** Prompt for default GitHub account. */
 export async function prompt_github(): Promise<{
   username: string;
-  org: string;
 }> {
   const username = await p.text({
-    message: "GitHub username (default):",
-    placeholder: "e.g. jax",
+    message: "Default GitHub account (used for all entities unless overridden):",
+    placeholder: "e.g. spacelobsterfarm",
     defaultValue: "",
   });
   if (p.isCancel(username)) {
@@ -123,19 +122,8 @@ export async function prompt_github(): Promise<{
     process.exit(0);
   }
 
-  const org = await p.text({
-    message: "GitHub organization (default):",
-    placeholder: "e.g. my-org",
-    defaultValue: "",
-  });
-  if (p.isCancel(org)) {
-    p.cancel("Setup cancelled.");
-    process.exit(0);
-  }
-
   return {
     username: (username ?? "").trim(),
-    org: (org ?? "").trim(),
   };
 }
 

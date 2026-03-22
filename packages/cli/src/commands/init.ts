@@ -172,7 +172,7 @@ export const init_command = new Command("init")
 
     // ── Step 7-9: Prompts (skipped in non-interactive mode) ──
     const discord_setup = non_interactive ? undefined : await prompt_discord();
-    const github = non_interactive ? { username: "", org: "" } : await prompt_github();
+    const github = non_interactive ? { username: "" } : await prompt_github();
     const projects_dir = non_interactive
       ? (path_overrides?.projects_dir ?? "~/projects")
       : await prompt_projects_dir();
@@ -202,7 +202,7 @@ export const init_command = new Command("init")
       OPERATOR_NAME_LOWER: agent_names.operator.toLowerCase(),
       PROJECTS_DIR: projects_dir,
       GITHUB_USERNAME: github.username,
-      GITHUB_ORG: github.org,
+      GITHUB_ORG: "",
     });
 
     // ── Build LobsterFarmConfig ──
@@ -268,7 +268,7 @@ export const init_command = new Command("init")
     }
 
     if (github.username) {
-      summary_lines.push(`GitHub:     ${github.username}${github.org ? ` (org: ${github.org})` : ""}`);
+      summary_lines.push(`GitHub:     ${github.username}`);
     }
 
     p.note(summary_lines.join("\n"), "Setup Complete");
