@@ -7,7 +7,7 @@ import {
   type TemplateVariables,
   type PathConfig,
 } from "@lobster-farm/shared";
-import { detect_machine, check_sudo, check_onepassword } from "./init/detect.js";
+import { detect_machine, check_sudo, check_onepassword, check_claude_code } from "./init/detect.js";
 import {
   prompt_user_name,
   prompt_agent_names,
@@ -75,12 +75,30 @@ export const init_command = new Command("init")
     const machine = detect_machine();
     spin.stop(`Machine: ${machine.name} (${machine.hardware})`);
 
-    // ── Step 4: Sudo check ──
+    // ── Step 4: Claude Code check ──
+    spin.start("Checking Claude Code...");
+    const claude = await check_claude_code();
+    spin.stop(`Claude Code: ${claude.status}`);
+
+    if (!claude.installed && !non_interactive) {
+      p.log.warning(
+        "Claude Code CLI is required for LobsterFarm to function.\n" +
+          "Install it from: https://docs.anthropic.com/en/docs/claude-code\n" +
+          "Then re-run this setup.",
+      );
+      const proceed = await p.confirm({ message: "Continue setup anyway?" });
+      if (p.isCancel(proceed) || !proceed) {
+        p.cancel("Install Claude Code first, then re-run `lobsterfarm init`.");
+        process.exit(0);
+      }
+    }
+
+    // ── Step 5: Sudo check ──
     spin.start("Checking sudo access...");
     const sudo = await check_sudo();
     spin.stop(`Sudo: ${sudo.status}`);
 
-    // ── Step 5: 1Password check ──
+    // ── Step 6: 1Password check ──
     spin.start("Checking 1Password CLI...");
     const op = await check_onepassword();
     spin.stop(`1Password: ${op.status}`);

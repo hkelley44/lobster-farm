@@ -6,9 +6,11 @@ import type {
   LobsterFarmConfig,
   ModelTier,
 } from "@lobster-farm/shared";
+import { readdir } from "node:fs/promises";
 import {
   entity_memory_path,
   entity_daily_dir,
+  entity_context_dir,
   entity_dir,
 } from "@lobster-farm/shared";
 import { build_model_flags } from "./models.js";
@@ -24,6 +26,8 @@ export interface SessionSpawnOptions {
   worktree_path: string;
   prompt: string;
   interactive: boolean;
+  /** If set, resume this prior session instead of starting fresh. */
+  resume_session_id?: string;
 }
 
 export interface ActiveSession {
@@ -83,13 +87,34 @@ function resolve_agent_name(
 
 // ── Build entity context for --append-system-prompt ──
 
-function build_entity_context(
+async function find_recent_daily_logs(
+  entity_id: string,
+  config: LobsterFarmConfig,
+  max_count: number = 5,
+): Promise<string[]> {
+  const daily_path = entity_daily_dir(config.paths, entity_id);
+  try {
+    const entries = await readdir(daily_path);
+    // Filter for .md files, sort descending (most recent first)
+    const logs = entries
+      .filter((e) => e.endsWith(".md"))
+      .sort()
+      .reverse()
+      .slice(0, max_count);
+    return logs.map((f) => `${daily_path}/${f}`);
+  } catch {
+    return [];
+  }
+}
+
+async function build_entity_context(
   entity_id: string,
   feature_id: string,
   config: LobsterFarmConfig,
-): string {
+): Promise<string> {
   const mem_path = entity_memory_path(config.paths, entity_id);
-  const daily_path = entity_daily_dir(config.paths, entity_id);
+  const ctx_path = entity_context_dir(config.paths, entity_id);
+  const recent_logs = await find_recent_daily_logs(entity_id, config);
 
   const lines = [
     `## Entity Context (injected by LobsterFarm daemon)`,
@@ -97,11 +122,28 @@ function build_entity_context(
     `Entity: ${entity_id}`,
     `Feature: ${feature_id}`,
     ``,
-    `Read the entity's MEMORY.md at: ${mem_path}`,
-    `Check daily logs at: ${daily_path}`,
+    `### Session Startup`,
+    `1. Read the entity's MEMORY.md at: ${mem_path}`,
+    `2. Read context files at: ${ctx_path}/ (architecture.md, decisions.md, gotchas.md if they exist)`,
+  ];
+
+  if (recent_logs.length > 0) {
+    lines.push(`3. Check recent daily logs:`);
+    for (const log of recent_logs) {
+      lines.push(`   - ${log}`);
+    }
+  }
+
+  lines.push(
+    ``,
+    `### Memory Rules`,
+    `- Write session learnings and progress to today's daily log`,
+    `- Update MEMORY.md when you make decisions future sessions need to know`,
+    `- Update context/decisions.md for significant architectural or design decisions`,
+    `- Update context/gotchas.md for known issues or workarounds discovered`,
     ``,
     `When you finish your work, commit and push your changes.`,
-  ];
+  );
 
   return lines.join("\n");
 }
@@ -126,10 +168,11 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
   }
 
   /** Build the full CLI arguments for spawning a claude session. */
-  build_command(options: SessionSpawnOptions): { command: string; args: string[] } {
+  async build_command(options: SessionSpawnOptions): Promise<{ command: string; args: string[] }> {
     const command = claude_binary();
     const agent_name = resolve_agent_name(options.archetype, this.config);
-    const session_id = randomUUID();
+    const is_resume = Boolean(options.resume_session_id);
+    const session_id = options.resume_session_id ?? randomUUID();
 
     const args: string[] = [];
 
@@ -144,12 +187,16 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
     // Permissions
     args.push("--permission-mode", "bypassPermissions");
 
-    // Session identity
-    args.push("--session-id", session_id);
+    // Session identity — resume or fresh
+    if (is_resume) {
+      args.push("--resume", session_id);
+    } else {
+      args.push("--session-id", session_id);
+    }
     args.push("-n", `${options.entity_id}-${options.feature_id}`);
 
     // Entity context
-    const entity_context = build_entity_context(
+    const entity_context = await build_entity_context(
       options.entity_id,
       options.feature_id,
       this.config,
@@ -174,7 +221,7 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
       );
     }
 
-    const { command, args } = this.build_command(options);
+    const { command, args } = await this.build_command(options);
     // Extract session_id from the args (we passed it via --session-id)
     const session_id_idx = args.indexOf("--session-id");
     const session_id = args[session_id_idx + 1]!;

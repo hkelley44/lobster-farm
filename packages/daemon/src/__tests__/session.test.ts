@@ -50,11 +50,11 @@ describe("ClaudeSessionManager", () => {
   });
 
   describe("build_command", () => {
-    it("builds correct CLI arguments for autonomous mode", () => {
+    it("builds correct CLI arguments for autonomous mode", async () => {
       const config = make_config();
       const mgr = new ClaudeSessionManager(config);
 
-      const { args } = mgr.build_command({
+      const { args } = await mgr.build_command({
         entity_id: "alpha",
         feature_id: "alpha-42",
         archetype: "builder",
@@ -80,7 +80,7 @@ describe("ClaudeSessionManager", () => {
       expect(args).toContain("Build feature #42");
     });
 
-    it("uses custom agent names from config", () => {
+    it("uses custom agent names from config", async () => {
       const config = make_config({
         agents: {
           planner: { name: "Planny" },
@@ -91,7 +91,7 @@ describe("ClaudeSessionManager", () => {
       });
       const mgr = new ClaudeSessionManager(config);
 
-      const { args: planner_args } = mgr.build_command({
+      const { args: planner_args } = await mgr.build_command({
         entity_id: "alpha",
         feature_id: "alpha-1",
         archetype: "planner",
@@ -105,7 +105,7 @@ describe("ClaudeSessionManager", () => {
       const agent_idx = planner_args.indexOf("--agent");
       expect(planner_args[agent_idx + 1]).toBe("planny");
 
-      const { args: builder_args } = mgr.build_command({
+      const { args: builder_args } = await mgr.build_command({
         entity_id: "alpha",
         feature_id: "alpha-2",
         archetype: "builder",
@@ -120,11 +120,11 @@ describe("ClaudeSessionManager", () => {
       expect(builder_args[builder_agent_idx + 1]).toBe("buildo");
     });
 
-    it("always uses 'reviewer' name for reviewer archetype", () => {
+    it("always uses 'reviewer' name for reviewer archetype", async () => {
       const config = make_config();
       const mgr = new ClaudeSessionManager(config);
 
-      const { args } = mgr.build_command({
+      const { args } = await mgr.build_command({
         entity_id: "alpha",
         feature_id: "alpha-1",
         archetype: "reviewer",

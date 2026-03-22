@@ -163,6 +163,7 @@ export class FeatureManager extends EventEmitter {
       activeArchetype: null,
       activeDna: [],
       sessionId: null,
+      lastSessionId: null,
       blocked: false,
       blockedReason: null,
       approved: false,
@@ -286,10 +287,10 @@ export class FeatureManager extends EventEmitter {
 
   /** Register a session→feature mapping when a session starts. */
   on_session_started(session: { session_id: string; feature_id: string }): void {
-    // Find the feature this session belongs to
     const feature = this.features.get(session.feature_id);
     if (feature) {
       feature.sessionId = session.session_id;
+      feature.lastSessionId = session.session_id;
       this.session_to_feature.set(session.session_id, feature.id);
     }
   }
@@ -406,6 +407,10 @@ export class FeatureManager extends EventEmitter {
     const prompt = resolve_prompt(phase_config.prompt_template, feature);
     const worktree_path = feature.worktreePath ?? expand_home_safe(entity.entity.repo.path);
 
+    // Resume prior session if same archetype is being re-spawned for this feature
+    // (e.g., builder picks up where it left off after being unblocked)
+    const resume_id = feature.lastSessionId ?? undefined;
+
     const task_id = this.queue.submit({
       entity_id: feature.entity,
       feature_id: feature.id,
@@ -416,6 +421,7 @@ export class FeatureManager extends EventEmitter {
       interactive: false,
       priority: feature.priority,
       worktree_path,
+      resume_session_id: resume_id,
     });
 
     feature.activeArchetype = phase_config.archetype;

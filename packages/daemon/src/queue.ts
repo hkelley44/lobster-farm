@@ -19,6 +19,7 @@ export interface TaskSubmission {
   interactive: boolean;
   priority?: Priority;
   worktree_path: string;
+  resume_session_id?: string;
 }
 
 export interface QueuedTask extends TaskSubmission {
@@ -125,6 +126,7 @@ export class TaskQueue {
           prompt: task.prompt,
           interactive: task.interactive,
           worktree_path: task.worktree_path,
+          resume_session_id: task.resume_session_id,
         });
 
         task.session_id = session.session_id;

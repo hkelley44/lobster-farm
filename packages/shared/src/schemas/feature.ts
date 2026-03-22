@@ -16,6 +16,7 @@ export const FeatureStateSchema = z.object({
   activeArchetype: z.string().nullable().default(null),
   activeDna: z.array(z.string()).default([]),
   sessionId: z.string().nullable().default(null),
+  lastSessionId: z.string().nullable().default(null),
   blocked: z.boolean().default(false),
   blockedReason: z.string().nullable().default(null),
   approved: z.boolean().default(false),

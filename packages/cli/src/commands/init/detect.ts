@@ -41,6 +41,29 @@ export interface OnePasswordCheckResult {
 }
 
 /** Check if 1Password CLI is installed and the service account token is set. */
+export interface ClaudeCodeCheckResult {
+  installed: boolean;
+  version: string | null;
+  status: string;
+}
+
+/** Check if Claude Code CLI is installed. */
+export async function check_claude_code(): Promise<ClaudeCodeCheckResult> {
+  const { exitCode, stdout } = await exec_command("claude --version 2>/dev/null");
+  if (exitCode === 0 && stdout.trim()) {
+    return {
+      installed: true,
+      version: stdout.trim(),
+      status: `Claude Code ${stdout.trim()}`,
+    };
+  }
+  return {
+    installed: false,
+    version: null,
+    status: "Claude Code not found — install from https://docs.anthropic.com/en/docs/claude-code",
+  };
+}
+
 export async function check_onepassword(): Promise<OnePasswordCheckResult> {
   const { exitCode: which_exit } = await exec_command("which op");
   const cli_installed = which_exit === 0;
