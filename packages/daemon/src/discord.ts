@@ -880,6 +880,7 @@ export class DiscordBot extends EventEmitter {
     try {
       const response = await run_commander(
         message.content,
+        message.channelId,
         this.config,
         this.registry,
         this._features!,
