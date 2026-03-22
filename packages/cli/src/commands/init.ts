@@ -111,10 +111,64 @@ export const init_command = new Command("init")
     const sudo = await check_sudo();
     spin.stop(`Sudo: ${sudo.status}`);
 
+    if (!sudo.has_passwordless_sudo && !non_interactive) {
+      const setup_sudo = await p.confirm({
+        message: "Set up passwordless sudo? (adds NOPASSWD to sudoers)",
+        initialValue: true,
+      });
+      if (p.isCancel(setup_sudo)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+      if (setup_sudo) {
+        spin.start("Configuring passwordless sudo (may prompt for password)...");
+        const { exec_command } = await import("../lib/process.js");
+        const user = process.env["USER"] ?? "$(whoami)";
+        const result = await exec_command(
+          `echo "${user} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/lobsterfarm > /dev/null`,
+        );
+        if (result.exitCode === 0) {
+          sudo.has_passwordless_sudo = true;
+          sudo.status = "passwordless sudo configured";
+          spin.stop("Passwordless sudo configured");
+        } else {
+          spin.stop("Sudo setup failed — configure manually");
+        }
+      }
+    }
+
     // ── Step 6: 1Password check ──
     spin.start("Checking 1Password CLI...");
     const op = await check_onepassword();
     spin.stop(`1Password: ${op.status}`);
+
+    if (!op.cli_installed && !non_interactive) {
+      const install_op = await p.confirm({
+        message: "Install 1Password CLI? (via Homebrew)",
+        initialValue: true,
+      });
+      if (p.isCancel(install_op)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+      if (install_op) {
+        spin.start("Installing 1Password CLI...");
+        const { exec_command } = await import("../lib/process.js");
+        const result = await exec_command("brew install --cask 1password-cli");
+        if (result.exitCode === 0) {
+          op.cli_installed = true;
+          op.status = "op CLI installed";
+          spin.stop("1Password CLI installed");
+        } else {
+          spin.stop("1Password CLI installation failed");
+          p.log.warning("Install manually: brew install --cask 1password-cli");
+        }
+      }
+    }
+
+    if (op.cli_installed && !op.token_configured && !non_interactive) {
+      p.log.info(
+        "1Password service account token not set.\n" +
+          "Create one at https://my.1password.com → Developer → Service Accounts\n" +
+          "Then add to ~/.zshrc: export OP_SERVICE_ACCOUNT_TOKEN=\"your-token\"",
+      );
+    }
 
     // ── Step 7-9: Prompts (skipped in non-interactive mode) ──
     const discord_setup = non_interactive ? undefined : await prompt_discord();
