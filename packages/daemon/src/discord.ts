@@ -16,6 +16,17 @@ import type {
   ChannelType,
   ArchetypeRole,
 } from "@lobster-farm/shared";
+import {
+  entity_dir,
+  entity_daily_dir,
+  entity_context_dir,
+  entity_files_dir,
+  entity_config_path,
+  entity_memory_path,
+  write_yaml,
+} from "@lobster-farm/shared";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { EntityRegistry } from "./registry.js";
 import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import { route_message, type RouteAction, type RoutedMessage } from "./router.js";
@@ -699,28 +710,121 @@ export class DiscordBot extends EventEmitter {
     const sub = args[0];
 
     if (sub === "entity") {
+      // Usage: !lf scaffold entity <id> <name> [--repo <url>]
       const entity_id = args[1];
-      const entity_name = args.slice(2).join(" ");
-
-      if (!entity_id) {
-        await this.reply(message, "Usage: `!lf scaffold entity <id> <name>`");
+      if (!entity_id || !/^[a-z0-9-]+$/.test(entity_id)) {
+        await this.reply(message, "Usage: `!lf scaffold entity <id> <name>`\nID must be lowercase alphanumeric with hyphens.");
         return;
       }
 
-      const name = entity_name || entity_id;
-      await this.reply(message, `Scaffolding Discord channels for entity **${entity_id}**...`);
-
-      const channels = await this.scaffold_entity(entity_id, name);
-
-      if (channels.length > 0) {
-        const lines = channels.map((c) => `  • #${c.purpose} (${c.type}): \`${c.id}\``);
-        await this.reply(
-          message,
-          `Created ${String(channels.length)} channels for **${entity_id}**:\n${lines.join("\n")}\n\nChannel IDs have been generated. Update the entity config to use them.`,
-        );
-      } else {
-        await this.reply(message, "Failed to scaffold channels. Check bot permissions and server_id in config.");
+      // Check if entity already exists
+      if (this.registry.get(entity_id)) {
+        await this.reply(message, `Entity **${entity_id}** already exists.`);
+        return;
       }
+
+      // Parse remaining args for name and optional --repo
+      const remaining = args.slice(2);
+      let repo_url = "";
+      const name_parts: string[] = [];
+      for (let i = 0; i < remaining.length; i++) {
+        if (remaining[i] === "--repo" && remaining[i + 1]) {
+          repo_url = remaining[i + 1]!;
+          i++;
+        } else {
+          name_parts.push(remaining[i]!);
+        }
+      }
+      const entity_name = name_parts.join(" ") || entity_id;
+
+      await this.reply(message, `Setting up entity **${entity_id}** ("${entity_name}")...`);
+
+      // 1. Create Discord channels
+      const channels = await this.scaffold_entity(entity_id, entity_name);
+
+      // 2. Create directory structure
+      const paths = this.config.paths;
+      const dirs = [
+        entity_dir(paths, entity_id),
+        entity_daily_dir(paths, entity_id),
+        entity_context_dir(paths, entity_id),
+        entity_files_dir(paths, entity_id),
+      ];
+      for (const dir of dirs) {
+        await mkdir(dir, { recursive: true });
+      }
+
+      // 3. Create entity config
+      const entity_config = {
+        entity: {
+          id: entity_id,
+          name: entity_name,
+          description: "",
+          status: "active",
+          repo: {
+            url: repo_url || `git@github.com:org/${entity_id}.git`,
+            path: `~/projects/${entity_id}/${entity_id}`,
+            structure: "monorepo",
+          },
+          accounts: {},
+          channels,
+          agent_mode: "hybrid",
+          models: {},
+          budget: { monthly_warning_pct: 80, monthly_limit: null },
+          memory: {
+            path: entity_dir(paths, entity_id),
+            auto_extract: true,
+          },
+          active_sops: [
+            "feature-lifecycle",
+            "pr-review-merge",
+            "secrets-management",
+            "readme-maintenance",
+          ],
+          secrets: {
+            vault: "1password",
+            vault_name: `entity-${entity_id}`,
+          },
+        },
+      };
+
+      const config_path = entity_config_path(paths, entity_id);
+      await write_yaml(config_path, entity_config);
+
+      // 4. Create MEMORY.md and context files
+      const mem_path = entity_memory_path(paths, entity_id);
+      await writeFile(
+        mem_path,
+        `# ${entity_name} — Memory\n\n_Curated project knowledge. Updated by agents, reviewed periodically._\n`,
+        "utf-8",
+      );
+
+      const ctx_dir = entity_context_dir(paths, entity_id);
+      await writeFile(
+        join(ctx_dir, "decisions.md"),
+        `# ${entity_name} — Decision Log\n\n_Append-only. Record significant decisions with rationale._\n`,
+        "utf-8",
+      );
+      await writeFile(
+        join(ctx_dir, "gotchas.md"),
+        `# ${entity_name} — Known Gotchas\n\n_Issues, workarounds, and things to watch out for._\n`,
+        "utf-8",
+      );
+
+      // 5. Reload entity into registry
+      await this.registry.load_all();
+
+      // 6. Report
+      const channel_lines = channels.map((c) => `  • #${c.purpose} → ${c.type}`);
+      await this.reply(
+        message,
+        `Entity **${entity_id}** fully scaffolded:\n` +
+          `• Config: \`${config_path}\`\n` +
+          `• Memory: \`${mem_path}\`\n` +
+          `• Discord: ${String(channels.length)} channels\n` +
+          channel_lines.join("\n") + "\n\n" +
+          `Ready to use. Try \`!lf plan ${entity_id} "Your first feature"\``,
+      );
     } else if (sub === "server") {
       await this.reply(message, "Scaffolding global Discord structure...");
       const result = await this.scaffold_server();
