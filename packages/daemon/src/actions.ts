@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { rm } from "node:fs/promises";
 import { promisify } from "node:util";
-import type { FeatureState, LobsterFarmConfig, EntityConfig } from "@lobster-farm/shared";
+import type { FeatureState, LobsterFarmConfig, EntityConfig, ChannelType } from "@lobster-farm/shared";
 import { expand_home } from "@lobster-farm/shared";
+import type { DiscordBot } from "./discord.js";
 
 const exec = promisify(execFile);
 
@@ -149,16 +150,30 @@ export async function run_tests(
   }
 }
 
-// ── Notification stubs ──
+// ── Notifications ──
 
-/** Stub: send a notification to a channel. */
+/** Global Discord bot reference, set by the daemon on startup. */
+let _discord: DiscordBot | null = null;
+
+export function set_discord_bot(bot: DiscordBot | null): void {
+  _discord = bot;
+}
+
+/** Send a notification to an entity's Discord channel (or log if not connected). */
 export async function notify(
   channel_type: string,
   message: string,
-  _entity_config?: EntityConfig,
+  entity_config?: EntityConfig,
 ): Promise<void> {
   console.log(`[actions:notify] [${channel_type}] ${message}`);
-  // TODO: Implement when Discord integration is built
+
+  if (_discord && entity_config) {
+    await _discord.send_to_entity(
+      entity_config.entity.id,
+      channel_type as ChannelType,
+      message,
+    );
+  }
 }
 
 /** Stub: assign a work room to a feature. */

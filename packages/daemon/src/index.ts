@@ -4,6 +4,8 @@ import { EntityRegistry } from "./registry.js";
 import { ClaudeSessionManager } from "./session.js";
 import { TaskQueue } from "./queue.js";
 import { FeatureManager } from "./features.js";
+import { DiscordBot, resolve_bot_token } from "./discord.js";
+import { set_discord_bot } from "./actions.js";
 import { start_server } from "./server.js";
 import { write_pid, remove_pid } from "./pid.js";
 
@@ -42,6 +44,29 @@ async function main(): Promise<void> {
     `Session manager ready (max ${String(config.concurrency.max_active_sessions)} concurrent sessions)`,
   );
 
+  // Initialize Discord bot (optional — daemon works without it via HTTP API)
+  const discord = new DiscordBot(config, registry);
+  let discord_connected = false;
+
+  const bot_token = await resolve_bot_token(config);
+  if (bot_token) {
+    try {
+      discord.set_managers(feature_manager, queue);
+      set_discord_bot(discord);
+      await discord.connect(bot_token);
+      discord_connected = true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[discord] Failed to connect: ${msg}`);
+      console.log("[discord] Daemon will continue without Discord. HTTP API still available.");
+    }
+  } else {
+    console.log(
+      "[discord] No bot token found. Set DISCORD_BOT_TOKEN env var or configure 1Password reference.",
+    );
+    console.log("[discord] Daemon will run with HTTP API only.");
+  }
+
   // Start HTTP server
   const server = start_server(registry, config, session_manager, queue, feature_manager);
 
@@ -57,6 +82,11 @@ async function main(): Promise<void> {
     shutting_down = true;
 
     console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+
+    // Disconnect Discord
+    if (discord_connected) {
+      await discord.disconnect();
+    }
 
     // Kill all active sessions
     const active = session_manager.get_active();
