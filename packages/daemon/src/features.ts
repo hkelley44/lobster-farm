@@ -12,6 +12,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { TaskQueue } from "./queue.js";
 import type { SessionResult } from "./session.js";
 import * as actions from "./actions.js";
+import { save_features, load_features } from "./persistence.js";
 
 // ── Phase configuration ──
 
@@ -123,6 +124,22 @@ export class FeatureManager extends EventEmitter {
     super();
   }
 
+  /** Load persisted features from disk. Call on daemon startup. */
+  async load_persisted(): Promise<void> {
+    const saved = await load_features(this.config);
+    for (const feature of saved) {
+      this.features.set(feature.id, feature);
+    }
+    if (saved.length > 0) {
+      console.log(`[features] Restored ${String(saved.length)} features from disk`);
+    }
+  }
+
+  /** Persist all features to disk. Called after every mutation. */
+  private async persist(): Promise<void> {
+    await save_features([...this.features.values()], this.config);
+  }
+
   /** Create a new feature. Starts in the "plan" phase. */
   create_feature(opts: CreateFeatureOptions): FeatureState {
     const entity = this.registry.get(opts.entity_id);
@@ -157,6 +174,7 @@ export class FeatureManager extends EventEmitter {
     };
 
     this.features.set(id, feature);
+    void this.persist();
 
     console.log(
       `[features] Created feature ${id}: "${opts.title}" (phase: plan)`,
@@ -180,6 +198,7 @@ export class FeatureManager extends EventEmitter {
 
     feature.approved = true;
     feature.updatedAt = new Date().toISOString();
+    void this.persist();
 
     console.log(`[features] Phase "${feature.phase}" approved for ${feature_id}`);
     this.emit("feature:approved", feature);
@@ -260,6 +279,7 @@ export class FeatureManager extends EventEmitter {
       }
     }
 
+    void this.persist();
     this.emit("feature:advanced", feature, old_phase);
     return feature;
   }
@@ -286,6 +306,7 @@ export class FeatureManager extends EventEmitter {
     feature.agentDone = true;
     feature.sessionId = null;
     feature.updatedAt = new Date().toISOString();
+    void this.persist();
 
     console.log(
       `[features] Agent completed for ${feature_id} (phase: ${feature.phase})`,
@@ -322,6 +343,7 @@ export class FeatureManager extends EventEmitter {
     feature.blockedReason = error;
     feature.sessionId = null;
     feature.updatedAt = new Date().toISOString();
+    void this.persist();
 
     console.error(`[features] Session failed for ${feature_id}: ${error}`);
     this.emit("feature:blocked", feature, error);
@@ -335,6 +357,7 @@ export class FeatureManager extends EventEmitter {
     feature.blocked = false;
     feature.blockedReason = null;
     feature.updatedAt = new Date().toISOString();
+    void this.persist();
     return feature;
   }
 

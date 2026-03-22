@@ -28,6 +28,7 @@ async function main(): Promise<void> {
   const session_manager = new ClaudeSessionManager(config);
   const queue = new TaskQueue(session_manager, config);
   const feature_manager = new FeatureManager(registry, queue, config);
+  await feature_manager.load_persisted();
 
   // Wire up session events to feature manager
   session_manager.on("session:started", (session) => {
