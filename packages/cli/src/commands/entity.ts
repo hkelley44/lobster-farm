@@ -19,8 +19,13 @@ entity_command
   .command("create")
   .description("Create a new entity (project)")
   .option("--prefix <dir>", "Use a custom prefix directory instead of ~/")
-  .action(async (options: { prefix?: string }) => {
+  .option("--id <id>", "Entity ID (non-interactive)")
+  .option("--name <name>", "Display name (non-interactive)")
+  .option("--repo-url <url>", "Git repo URL (non-interactive)")
+  .option("--non-interactive", "Skip prompts, use provided flags")
+  .action(async (options: { prefix?: string; id?: string; name?: string; repoUrl?: string; nonInteractive?: boolean }) => {
     const prefix = options.prefix;
+    const ni = options.nonInteractive ?? false;
     const path_overrides: Partial<PathConfig> | undefined = prefix
       ? {
           lobsterfarm_dir: `${prefix}/.lobsterfarm`,
@@ -29,9 +34,31 @@ entity_command
         }
       : undefined;
 
+    if (ni && (!options.id || !options.name || !options.repoUrl)) {
+      console.error("Error: --non-interactive requires --id, --name, and --repo-url");
+      process.exit(1);
+    }
+
     p.intro("Create a new LobsterFarm entity");
 
     // Entity ID
+    let entity_id: string;
+    let entity_name: string;
+    let description: string;
+    let repo_url: string;
+    let repo_path: string;
+    let github_org: string;
+    let setup_discord_flag: boolean;
+
+    if (ni) {
+      entity_id = options.id!;
+      entity_name = options.name!;
+      description = "";
+      repo_url = options.repoUrl!;
+      repo_path = `~/projects/${entity_id}/${entity_id}`;
+      github_org = "";
+      setup_discord_flag = false;
+    } else {
     const id_result = await p.text({
       message: "Entity ID (lowercase, hyphens only)",
       placeholder: "my-project",
@@ -42,34 +69,30 @@ entity_command
       },
     });
     if (p.isCancel(id_result)) { p.cancel("Cancelled"); process.exit(0); }
-    const entity_id = id_result;
+    entity_id = id_result;
 
-    // Name
     const name_result = await p.text({
       message: "Display name",
       placeholder: "My Project",
     });
     if (p.isCancel(name_result)) { p.cancel("Cancelled"); process.exit(0); }
-    const entity_name = name_result;
+    entity_name = name_result;
 
-    // Description
     const desc_result = await p.text({
       message: "Description (optional)",
       placeholder: "A brief description of this project",
       defaultValue: "",
     });
     if (p.isCancel(desc_result)) { p.cancel("Cancelled"); process.exit(0); }
-    const description = desc_result;
+    description = desc_result;
 
-    // Repo URL
     const repo_result = await p.text({
       message: "Git repo URL",
       placeholder: "git@github.com:org/repo.git",
     });
     if (p.isCancel(repo_result)) { p.cancel("Cancelled"); process.exit(0); }
-    const repo_url = repo_result;
+    repo_url = repo_result;
 
-    // Repo local path
     const default_path = `~/projects/${entity_id}/${entity_id}`;
     const path_result = await p.text({
       message: "Local repo path",
@@ -77,22 +100,23 @@ entity_command
       defaultValue: default_path,
     });
     if (p.isCancel(path_result)) { p.cancel("Cancelled"); process.exit(0); }
-    const repo_path = path_result;
+    repo_path = path_result;
 
-    // GitHub account
     const github_org_result = await p.text({
       message: "GitHub org/username for this entity (optional)",
       placeholder: "my-org",
       defaultValue: "",
     });
     if (p.isCancel(github_org_result)) { p.cancel("Cancelled"); process.exit(0); }
+    github_org = github_org_result;
 
-    // Discord channels (optional)
-    const setup_discord = await p.confirm({
+    const setup_discord_result = await p.confirm({
       message: "Configure Discord channels for this entity?",
       initialValue: false,
     });
-    if (p.isCancel(setup_discord)) { p.cancel("Cancelled"); process.exit(0); }
+    if (p.isCancel(setup_discord_result)) { p.cancel("Cancelled"); process.exit(0); }
+    setup_discord_flag = setup_discord_result;
+    } // end interactive block
 
     interface DiscordChannel {
       type: string;
@@ -101,7 +125,7 @@ entity_command
     }
     const channels: DiscordChannel[] = [];
 
-    if (setup_discord) {
+    if (setup_discord_flag) {
       const channel_types = [
         { type: "general", purpose: "Entity-level discussion" },
         { type: "work_room", purpose: "Feature workspace 1" },
@@ -136,7 +160,7 @@ entity_command
           structure: "monorepo",
         },
         accounts: {
-          ...(github_org_result ? { github: { org: github_org_result } } : {}),
+          ...(github_org ? { github: { org: github_org } } : {}),
         },
         channels,
         agent_mode: "hybrid",
