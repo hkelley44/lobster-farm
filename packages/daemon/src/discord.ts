@@ -3,10 +3,13 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   Client,
+  ChannelType as DiscordChannelType,
   GatewayIntentBits,
   type TextChannel,
   type Message,
   type Webhook,
+  type Guild,
+  type CategoryChannel,
 } from "discord.js";
 import type {
   LobsterFarmConfig,
@@ -217,6 +220,146 @@ export class DiscordBot extends EventEmitter {
     }
   }
 
+  // ── Server & Entity Scaffolding ──
+
+  /** Get the guild (Discord server) from config. */
+  private async get_guild(): Promise<Guild | null> {
+    const server_id = this.config.discord?.server_id;
+    if (!server_id) {
+      console.log("[discord] No server_id in config — cannot scaffold");
+      return null;
+    }
+    try {
+      return await this.client.guilds.fetch(server_id);
+    } catch (err) {
+      console.error(`[discord] Failed to fetch guild ${server_id}: ${String(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Scaffold the global Discord structure on first connect.
+   * Creates the GLOBAL category with #command-center and #system-status.
+   * Returns the channel IDs created.
+   */
+  async scaffold_server(): Promise<{ command_center?: string; system_status?: string }> {
+    const guild = await this.get_guild();
+    if (!guild) return {};
+
+    const result: { command_center?: string; system_status?: string } = {};
+
+    try {
+      // Find or create GLOBAL category
+      let category = guild.channels.cache.find(
+        (c) => c.name === "GLOBAL" && c.type === DiscordChannelType.GuildCategory,
+      ) as CategoryChannel | undefined;
+
+      if (!category) {
+        category = await guild.channels.create({
+          name: "GLOBAL",
+          type: DiscordChannelType.GuildCategory,
+          reason: "LobsterFarm global channels",
+        });
+        console.log("[discord] Created GLOBAL category");
+      }
+
+      // Create channels under GLOBAL
+      const global_channels = [
+        { name: "command-center", key: "command_center" as const },
+        { name: "system-status", key: "system_status" as const },
+      ];
+
+      for (const ch of global_channels) {
+        let channel = guild.channels.cache.find(
+          (c) => c.name === ch.name && c.parentId === category!.id,
+        );
+
+        if (!channel) {
+          channel = await guild.channels.create({
+            name: ch.name,
+            type: DiscordChannelType.GuildText,
+            parent: category.id,
+            reason: "LobsterFarm global channel",
+          });
+          console.log(`[discord] Created #${ch.name}`);
+        }
+
+        result[ch.key] = channel.id;
+      }
+    } catch (err) {
+      console.error(`[discord] Server scaffold failed: ${String(err)}`);
+    }
+
+    return result;
+  }
+
+  /**
+   * Scaffold Discord channels for a new entity.
+   * Creates a category and standard channels (general, work-rooms, work-log, alerts).
+   * Returns the channel mappings to store in entity config.
+   */
+  async scaffold_entity(
+    entity_id: string,
+    entity_name: string,
+  ): Promise<Array<{ type: string; id: string; purpose: string }>> {
+    const guild = await this.get_guild();
+    if (!guild) return [];
+
+    const channels: Array<{ type: string; id: string; purpose: string }> = [];
+
+    try {
+      // Create entity category
+      const category_name = `${entity_name} [${entity_id}]`;
+      let category = guild.channels.cache.find(
+        (c) => c.name === category_name && c.type === DiscordChannelType.GuildCategory,
+      ) as CategoryChannel | undefined;
+
+      if (!category) {
+        category = await guild.channels.create({
+          name: category_name,
+          type: DiscordChannelType.GuildCategory,
+          reason: `LobsterFarm entity: ${entity_id}`,
+        });
+        console.log(`[discord] Created category "${category_name}"`);
+      }
+
+      // Standard entity channels
+      const entity_channels = [
+        { name: "general", type: "general", purpose: "Entity-level discussion" },
+        { name: "work-room-1", type: "work_room", purpose: "Feature workspace 1" },
+        { name: "work-room-2", type: "work_room", purpose: "Feature workspace 2" },
+        { name: "work-room-3", type: "work_room", purpose: "Feature workspace 3" },
+        { name: "work-log", type: "work_log", purpose: "Agent activity feed" },
+        { name: "alerts", type: "alerts", purpose: "Approvals, blockers, questions" },
+      ];
+
+      for (const ch of entity_channels) {
+        let channel = guild.channels.cache.find(
+          (c) => c.name === ch.name && c.parentId === category!.id,
+        );
+
+        if (!channel) {
+          channel = await guild.channels.create({
+            name: ch.name,
+            type: DiscordChannelType.GuildText,
+            parent: category.id,
+            reason: `LobsterFarm entity: ${entity_id}`,
+          });
+          console.log(`[discord] Created #${ch.name} in ${category_name}`);
+        }
+
+        channels.push({ type: ch.type, id: channel.id, purpose: ch.purpose });
+      }
+
+      // Rebuild channel map to include new channels
+      this.build_channel_map();
+    } catch (err) {
+      console.error(`[discord] Entity scaffold failed for ${entity_id}: ${String(err)}`);
+    }
+
+    return channels;
+  }
+
   /** Rebuild the channel → entity/type index from entity configs. */
   build_channel_map(): void {
     this.channel_map.clear();
@@ -344,6 +487,8 @@ export class DiscordBot extends EventEmitter {
             "• `!lf advance <feature-id>` — advance to next phase\n" +
             "• `!lf status` — daemon status\n" +
             "• `!lf features [entity]` — list features\n" +
+            "• `!lf scaffold server` — create GLOBAL Discord channels\n" +
+            "• `!lf scaffold entity <id> <name>` — create entity Discord channels\n" +
             "• `!lf help` — this message",
         );
         break;
@@ -366,6 +511,10 @@ export class DiscordBot extends EventEmitter {
 
       case "features":
         await this.handle_features_command(args, message);
+        break;
+
+      case "scaffold":
+        await this.handle_scaffold_command(args, routed, message);
         break;
 
       default:
@@ -540,6 +689,49 @@ export class DiscordBot extends EventEmitter {
     });
 
     await this.reply(message, lines.join("\n"));
+  }
+
+  private async handle_scaffold_command(
+    args: string[],
+    routed: RoutedMessage,
+    message: Message,
+  ): Promise<void> {
+    const sub = args[0];
+
+    if (sub === "entity") {
+      const entity_id = args[1];
+      const entity_name = args.slice(2).join(" ");
+
+      if (!entity_id) {
+        await this.reply(message, "Usage: `!lf scaffold entity <id> <name>`");
+        return;
+      }
+
+      const name = entity_name || entity_id;
+      await this.reply(message, `Scaffolding Discord channels for entity **${entity_id}**...`);
+
+      const channels = await this.scaffold_entity(entity_id, name);
+
+      if (channels.length > 0) {
+        const lines = channels.map((c) => `  • #${c.purpose} (${c.type}): \`${c.id}\``);
+        await this.reply(
+          message,
+          `Created ${String(channels.length)} channels for **${entity_id}**:\n${lines.join("\n")}\n\nChannel IDs have been generated. Update the entity config to use them.`,
+        );
+      } else {
+        await this.reply(message, "Failed to scaffold channels. Check bot permissions and server_id in config.");
+      }
+    } else if (sub === "server") {
+      await this.reply(message, "Scaffolding global Discord structure...");
+      const result = await this.scaffold_server();
+      const created = Object.entries(result).filter(([_, v]) => v).length;
+      await this.reply(message, `Global scaffold complete. ${String(created)} channels configured.`);
+    } else {
+      await this.reply(
+        message,
+        "Usage:\n• `!lf scaffold server` — create GLOBAL channels\n• `!lf scaffold entity <id> <name>` — create entity channels",
+      );
+    }
   }
 
   private async reply(message: Message, content: string): Promise<void> {
