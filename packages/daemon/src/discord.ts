@@ -419,8 +419,7 @@ export class DiscordBot extends EventEmitter {
     // Look up channel in entity map
     const entry = this.channel_map.get(message.channelId);
 
-    // If not in entity map, still handle !lf commands from any channel
-    // (including GLOBAL channels like #command-center)
+    // If not in entity map, handle !lf commands OR route to Commander
     if (!entry) {
       if (message.content.trim().startsWith("!lf")) {
         const routed: RoutedMessage = {
@@ -440,6 +439,9 @@ export class DiscordBot extends EventEmitter {
             await this.reply(message, `Error: ${msg}`);
           }
         }
+      } else {
+        // Natural language → Commander (in any unmapped channel, including #command-center)
+        await this.handle_commander_message(message);
       }
       return;
     }
@@ -860,6 +862,46 @@ export class DiscordBot extends EventEmitter {
         "Usage:\n• `!lf scaffold server` — create GLOBAL channels\n• `!lf scaffold entity <id> <name>` — create entity channels",
       );
     }
+  }
+
+  private async handle_commander_message(message: Message): Promise<void> {
+    const { ask_commander, execute_action } = await import("./commander.js");
+
+    // Show typing indicator
+    try { await message.channel.sendTyping(); } catch { /* ignore */ }
+
+    const result = await ask_commander(
+      message.content,
+      this.config,
+      this.registry,
+      this._features!,
+      this._queue!,
+    );
+
+    // Execute any actions
+    const action_results: string[] = [];
+    for (const action of result.actions) {
+      const action_result = await execute_action(
+        action,
+        this.registry,
+        this._features!,
+        this,
+      );
+      action_results.push(action_result);
+    }
+
+    // Build response
+    let full_response = result.response;
+    if (action_results.length > 0) {
+      full_response += "\n\n" + action_results.join("\n");
+    }
+
+    // Discord has a 2000 char limit
+    if (full_response.length > 1900) {
+      full_response = full_response.slice(0, 1900) + "\n\n_(truncated)_";
+    }
+
+    await this.send_as_agent(message.channelId, full_response, "system");
   }
 
   private async reply(message: Message, content: string): Promise<void> {
