@@ -18,6 +18,10 @@ export const FeatureStateSchema = z.object({
   sessionId: z.string().nullable().default(null),
   blocked: z.boolean().default(false),
   blockedReason: z.string().nullable().default(null),
+  approved: z.boolean().default(false),
+  labels: z.array(z.string()).default([]),
+  prNumber: z.number().int().nullable().default(null),
+  agentDone: z.boolean().default(false),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
 });

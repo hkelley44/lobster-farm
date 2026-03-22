@@ -1,15 +1,17 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import type { LobsterFarmConfig, Phase } from "@lobster-farm/shared";
 import { DAEMON_PORT } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import type { TaskQueue, TaskSubmission } from "./queue.js";
+import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 
 interface ServerContext {
   registry: EntityRegistry;
   config: LobsterFarmConfig;
   session_manager: ClaudeSessionManager;
   queue: TaskQueue;
+  features: FeatureManager;
 }
 
 type RouteHandler = (
@@ -186,6 +188,110 @@ function task_summary(task: { id: string; entity_id: string; feature_id: string;
   };
 }
 
+// ── Feature routes ──
+
+const handle_create_feature: RouteHandler = async (req, res, ctx) => {
+  const body = await read_body(req);
+  let opts: CreateFeatureOptions;
+  try {
+    opts = JSON.parse(body) as CreateFeatureOptions;
+  } catch {
+    json_response(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+
+  if (!opts.entity_id || !opts.title || !opts.github_issue) {
+    json_response(res, 400, {
+      error: "Missing required fields: entity_id, title, github_issue",
+    });
+    return;
+  }
+
+  try {
+    const feature = ctx.features.create_feature(opts);
+    json_response(res, 201, feature);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    json_response(res, 400, { error: msg });
+  }
+};
+
+const handle_list_features: RouteHandler = (req, res, ctx) => {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const entity_id = url.searchParams.get("entity_id");
+
+  const features = entity_id
+    ? ctx.features.get_features_by_entity(entity_id)
+    : ctx.features.list_features();
+
+  json_response(res, 200, features);
+};
+
+const handle_get_feature: RouteHandler = (req, res, ctx) => {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const match = url.pathname.match(/^\/features\/([a-z0-9-]+)$/);
+  const feature_id = match?.[1];
+  if (!feature_id) {
+    json_response(res, 400, { error: "Invalid feature ID" });
+    return;
+  }
+
+  const feature = ctx.features.get_feature(feature_id);
+  if (!feature) {
+    json_response(res, 404, { error: `Feature "${feature_id}" not found` });
+    return;
+  }
+
+  json_response(res, 200, feature);
+};
+
+const handle_advance_feature: RouteHandler = async (req, res, ctx) => {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const match = url.pathname.match(/^\/features\/([a-z0-9-]+)\/advance$/);
+  const feature_id = match?.[1];
+  if (!feature_id) {
+    json_response(res, 400, { error: "Invalid feature ID" });
+    return;
+  }
+
+  let target_phase: Phase | undefined;
+  const body = await read_body(req);
+  if (body) {
+    try {
+      const parsed = JSON.parse(body) as { target_phase?: Phase };
+      target_phase = parsed.target_phase;
+    } catch {
+      // No body is fine — auto-determine next phase
+    }
+  }
+
+  try {
+    const feature = await ctx.features.advance_feature(feature_id, target_phase);
+    json_response(res, 200, feature);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    json_response(res, 400, { error: msg });
+  }
+};
+
+const handle_approve_feature: RouteHandler = (_req, res, ctx) => {
+  const url = new URL(_req.url ?? "/", `http://${_req.headers.host ?? "localhost"}`);
+  const match = url.pathname.match(/^\/features\/([a-z0-9-]+)\/approve$/);
+  const feature_id = match?.[1];
+  if (!feature_id) {
+    json_response(res, 400, { error: "Invalid feature ID" });
+    return;
+  }
+
+  try {
+    const feature = ctx.features.approve_phase(feature_id);
+    json_response(res, 200, feature);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    json_response(res, 400, { error: msg });
+  }
+};
+
 // ── Router ──
 
 const routes: Route[] = [
@@ -195,6 +301,11 @@ const routes: Route[] = [
   { method: "POST", pattern: /^\/tasks$/, handler: handle_submit_task },
   { method: "GET", pattern: /^\/tasks$/, handler: handle_list_tasks },
   { method: "DELETE", pattern: /^\/tasks\/[a-f0-9-]+$/, handler: handle_cancel_task },
+  { method: "POST", pattern: /^\/features$/, handler: handle_create_feature },
+  { method: "GET", pattern: /^\/features$/, handler: handle_list_features },
+  { method: "GET", pattern: /^\/features\/[a-z0-9-]+$/, handler: handle_get_feature },
+  { method: "POST", pattern: /^\/features\/[a-z0-9-]+\/advance$/, handler: handle_advance_feature },
+  { method: "POST", pattern: /^\/features\/[a-z0-9-]+\/approve$/, handler: handle_approve_feature },
   { method: "POST", pattern: /^\/webhooks\/github$/, handler: handle_webhook_github },
   { method: "POST", pattern: /^\/webhooks\/sentry$/, handler: handle_webhook_sentry },
 ];
@@ -228,9 +339,10 @@ export function start_server(
   config: LobsterFarmConfig,
   session_manager: ClaudeSessionManager,
   queue: TaskQueue,
+  features: FeatureManager,
   port: number = DAEMON_PORT,
 ): Server {
-  const ctx: ServerContext = { registry, config, session_manager, queue };
+  const ctx: ServerContext = { registry, config, session_manager, queue, features };
 
   const server = createServer((req, res) => {
     route_request(req, res, ctx);

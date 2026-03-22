@@ -3,6 +3,7 @@ import { load_config } from "./config.js";
 import { EntityRegistry } from "./registry.js";
 import { ClaudeSessionManager } from "./session.js";
 import { TaskQueue } from "./queue.js";
+import { FeatureManager } from "./features.js";
 import { start_server } from "./server.js";
 import { write_pid, remove_pid } from "./pid.js";
 
@@ -21,16 +22,28 @@ async function main(): Promise<void> {
       `(${String(registry.get_active().length)} active)`,
   );
 
-  // Initialize session manager + task queue
+  // Initialize session manager + task queue + feature manager
   const session_manager = new ClaudeSessionManager(config);
   const queue = new TaskQueue(session_manager, config);
+  const feature_manager = new FeatureManager(registry, queue, config);
+
+  // Wire up session events to feature manager
+  session_manager.on("session:started", (session) => {
+    feature_manager.on_session_started(session);
+  });
+  session_manager.on("session:completed", (result) => {
+    void feature_manager.on_session_completed(result);
+  });
+  session_manager.on("session:failed", (session_id: string, error: string) => {
+    feature_manager.on_session_failed(session_id, error);
+  });
 
   console.log(
     `Session manager ready (max ${String(config.concurrency.max_active_sessions)} concurrent sessions)`,
   );
 
   // Start HTTP server
-  const server = start_server(registry, config, session_manager, queue);
+  const server = start_server(registry, config, session_manager, queue, feature_manager);
 
   // Write PID file
   await write_pid(config);
