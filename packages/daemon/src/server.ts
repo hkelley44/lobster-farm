@@ -5,6 +5,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import type { TaskQueue, TaskSubmission } from "./queue.js";
 import type { FeatureManager, CreateFeatureOptions } from "./features.js";
+import type { CommanderProcess } from "./commander-process.js";
 
 interface ServerContext {
   registry: EntityRegistry;
@@ -12,6 +13,7 @@ interface ServerContext {
   session_manager: ClaudeSessionManager;
   queue: TaskQueue;
   features: FeatureManager;
+  commander: CommanderProcess | null;
 }
 
 type RouteHandler = (
@@ -70,6 +72,7 @@ const handle_status: RouteHandler = (_req, res, ctx) => {
       })),
     },
     queue: queue_stats,
+    commander: ctx.commander?.health_check() ?? { state: "not_configured" },
   });
 };
 
@@ -364,9 +367,10 @@ export function start_server(
   session_manager: ClaudeSessionManager,
   queue: TaskQueue,
   features: FeatureManager,
+  commander: CommanderProcess | null = null,
   port: number = DAEMON_PORT,
 ): Server {
-  const ctx: ServerContext = { registry, config, session_manager, queue, features };
+  const ctx: ServerContext = { registry, config, session_manager, queue, features, commander };
 
   const server = createServer((req, res) => {
     route_request(req, res, ctx);

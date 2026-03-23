@@ -327,7 +327,7 @@ export const init_command = new Command("init")
     }
 
     // ── Step 8-10: Prompts (skipped in non-interactive mode) ──
-    // Check if Discord token already exists in .env
+    // Check if Discord tokens already exist
     let has_existing_discord_token = false;
     try {
       const { readFile: readF } = await import("node:fs/promises");
@@ -335,6 +335,14 @@ export const init_command = new Command("init")
       const env_content = await readF(`${lf_dir(path_overrides)}/.env`, "utf-8");
       has_existing_discord_token = env_content.includes("DISCORD_BOT_TOKEN");
     } catch { /* no .env yet */ }
+    if (!has_existing_discord_token) {
+      try {
+        const { readFile: readF } = await import("node:fs/promises");
+        const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+        const pat_env = await readF(`${lf_dir(path_overrides)}/channels/pat/.env`, "utf-8");
+        has_existing_discord_token = pat_env.includes("DISCORD_BOT_TOKEN");
+      } catch { /* no pat .env yet */ }
+    }
 
     const discord_setup = non_interactive ? undefined : await prompt_discord(has_existing_discord_token);
     const github = non_interactive ? { username: "" } : await prompt_github();
@@ -407,15 +415,26 @@ export const init_command = new Command("init")
     const files = await generate_config_files(vars, agent_names, path_overrides);
     const settings_path = await generate_settings(path_overrides);
 
-    // Write .env with secrets (bot token)
-    if (discord_setup?.bot_token) {
+    // Write .env with secrets (daemon bot token)
+    if (discord_setup?.daemon_bot_token) {
       const { writeFile, mkdir: mkdirFs } = await import("node:fs/promises");
       const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
       const env_dir = lf_dir(path_overrides);
       await mkdirFs(env_dir, { recursive: true });
       const env_path = `${env_dir}/.env`;
-      await writeFile(env_path, `DISCORD_BOT_TOKEN=${discord_setup.bot_token}\n`, { mode: 0o600 });
+      await writeFile(env_path, `DISCORD_BOT_TOKEN=${discord_setup.daemon_bot_token}\n`, { mode: 0o600 });
       files.push(env_path);
+    }
+
+    // Write Commander (Pat) bot token to channel state dir
+    if (discord_setup?.commander_bot_token) {
+      const { writeFile, mkdir: mkdirFs } = await import("node:fs/promises");
+      const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+      const pat_dir = `${lf_dir(path_overrides)}/channels/pat`;
+      await mkdirFs(pat_dir, { recursive: true, mode: 0o700 });
+      const pat_env_path = `${pat_dir}/.env`;
+      await writeFile(pat_env_path, `DISCORD_BOT_TOKEN=${discord_setup.commander_bot_token}\n`, { mode: 0o600 });
+      files.push(pat_env_path);
     }
 
     spin.stop(`Wrote ${String(files.length + 2)} configuration files`);
@@ -432,7 +451,9 @@ export const init_command = new Command("init")
     ];
 
     if (discord_setup) {
-      summary_lines.push(`Discord:    server ${discord_setup.server_id} (token saved)`);
+      const tokens = [discord_setup.daemon_bot_token ? "daemon" : ""].filter(Boolean);
+      if (discord_setup.commander_bot_token) tokens.push("commander");
+      summary_lines.push(`Discord:    server ${discord_setup.server_id} (${tokens.join(" + ")} token${tokens.length > 1 ? "s" : ""} saved)`);
     }
 
     if (github.username) {

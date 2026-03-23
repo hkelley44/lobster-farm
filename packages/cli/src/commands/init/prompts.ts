@@ -56,14 +56,15 @@ export async function prompt_agent_names(): Promise<
 
 export interface DiscordSetup {
   server_id: string;
-  bot_token: string;
+  daemon_bot_token: string;
+  commander_bot_token?: string;
 }
 
-/** Prompt for Discord setup (optional). Returns server ID + bot token or undefined. */
+/** Prompt for Discord setup (optional). Returns server ID + bot tokens or undefined. */
 export async function prompt_discord(existing_token?: boolean): Promise<DiscordSetup | undefined> {
   if (existing_token) {
     const overwrite = await p.confirm({
-      message: "Discord bot token already configured. Update it?",
+      message: "Discord bot tokens already configured. Update them?",
       initialValue: false,
     });
     if (p.isCancel(overwrite)) { p.cancel("Setup cancelled."); process.exit(0); }
@@ -81,9 +82,14 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
   }
 
   p.note(
-    "You need a Discord bot. Create one at https://discord.com/developers/applications\n" +
-      "Enable Message Content Intent in the Bot tab.\n" +
-      "Copy the bot token and server ID (right-click server → Copy Server ID).",
+    "LobsterFarm uses two Discord bots:\n\n" +
+      "1. Daemon bot — manages entity channels, scaffolding, webhooks.\n" +
+      "   Needs: Manage Server, View Channels, Send Messages, Manage Webhooks.\n\n" +
+      "2. Commander bot — your admin agent (Pat). Reads and replies in #command-center.\n" +
+      "   Needs: View Channels, Send Messages, Read Message History, Attach Files, Add Reactions.\n\n" +
+      "Create both at https://discord.com/developers/applications.\n" +
+      "Enable Message Content Intent in the Bot tab for both.\n" +
+      "Copy the server ID (right-click server → Copy Server ID).",
     "Discord Setup",
   );
 
@@ -100,21 +106,30 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
     process.exit(0);
   }
 
-  const bot_token = await p.password({
-    message: "Discord bot token:",
+  const daemon_token = await p.password({
+    message: "Daemon bot token (server management):",
     validate: (value) => {
-      if (!value.trim()) return "Bot token is required.";
+      if (!value.trim()) return "Daemon bot token is required.";
       return undefined;
     },
   });
-  if (p.isCancel(bot_token)) {
+  if (p.isCancel(daemon_token)) {
+    p.cancel("Setup cancelled.");
+    process.exit(0);
+  }
+
+  const commander_token = await p.password({
+    message: "Commander bot token (Pat — press Enter to skip):",
+  });
+  if (p.isCancel(commander_token)) {
     p.cancel("Setup cancelled.");
     process.exit(0);
   }
 
   return {
     server_id: server_id.trim(),
-    bot_token: bot_token.trim(),
+    daemon_bot_token: daemon_token.trim(),
+    commander_bot_token: commander_token?.trim() || undefined,
   };
 }
 

@@ -8,6 +8,7 @@ import { DiscordBot, resolve_bot_token } from "./discord.js";
 import { set_discord_bot } from "./actions.js";
 import { start_server } from "./server.js";
 import { write_pid, remove_pid } from "./pid.js";
+import { CommanderProcess } from "./commander-process.js";
 
 async function main(): Promise<void> {
   console.log("Starting LobsterFarm daemon...");
@@ -68,8 +69,22 @@ async function main(): Promise<void> {
     console.log("[discord] Daemon will run with HTTP API only.");
   }
 
+  // Initialize Commander (persistent Claude Code session with Discord channel)
+  const commander = new CommanderProcess(config);
+  if (await commander.has_token()) {
+    try {
+      await commander.start();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[commander] Failed to start: ${msg}`);
+    }
+  } else {
+    console.log("[commander] No token configured. Pat will not start.");
+    console.log("[commander] Add token to ~/.lobsterfarm/channels/pat/.env and restart.");
+  }
+
   // Start HTTP server
-  const server = start_server(registry, config, session_manager, queue, feature_manager);
+  const server = start_server(registry, config, session_manager, queue, feature_manager, commander);
 
   // Write PID file
   await write_pid(config);
@@ -83,6 +98,9 @@ async function main(): Promise<void> {
     shutting_down = true;
 
     console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+
+    // Stop Commander
+    await commander.stop();
 
     // Disconnect Discord
     if (discord_connected) {

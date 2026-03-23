@@ -440,10 +440,9 @@ export class DiscordBot extends EventEmitter {
             await this.reply(message, `Error: ${msg}`);
           }
         }
-      } else {
-        // Natural language → Commander (in any unmapped channel, including #command-center)
-        await this.handle_commander_message(message);
       }
+      // Non-command messages in unmapped channels are ignored.
+      // Commander (Pat) handles #command-center via its own Discord bot.
       return;
     }
 
@@ -862,53 +861,6 @@ export class DiscordBot extends EventEmitter {
         message,
         "Usage:\n• `!lf scaffold server` — create GLOBAL channels\n• `!lf scaffold entity <id> <name>` — create entity channels",
       );
-    }
-  }
-
-  private async handle_commander_message(message: Message): Promise<void> {
-    const { run_commander } = await import("./commander.js");
-
-    // Show typing indicator (refresh every 8s since Claude Code takes a while)
-    let typing = true;
-    const typing_interval = setInterval(() => {
-      if (typing) {
-        message.channel.sendTyping().catch(() => {});
-      }
-    }, 8000);
-    try { await message.channel.sendTyping(); } catch { /* ignore */ }
-
-    try {
-      const response = await run_commander(
-        message.content,
-        message.channelId,
-        this.config,
-        this.registry,
-        this._features!,
-        this._queue!,
-      );
-
-      typing = false;
-      clearInterval(typing_interval);
-
-      // Discord has a 2000 char limit — split if needed
-      if (response.length <= 1900) {
-        await this.send_as_agent(message.channelId, response, "commander");
-      } else {
-        // Split into chunks
-        const chunks = response.match(/[\s\S]{1,1900}/g) ?? [response.slice(0, 1900)];
-        for (const chunk of chunks) {
-          await this.send_as_agent(message.channelId, chunk, "commander");
-        }
-      }
-
-      // Reload entities in case Commander created/modified any
-      await this.registry.load_all();
-      this.build_channel_map();
-    } catch (err) {
-      typing = false;
-      clearInterval(typing_interval);
-      const msg = err instanceof Error ? err.message : String(err);
-      await this.reply(message, `Commander error: ${msg}`);
     }
   }
 
