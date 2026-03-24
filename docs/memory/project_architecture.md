@@ -6,9 +6,13 @@ type: project
 
 ## Three Concerns
 
-**Execution:** Actually doing work (writing code, creating designs, reviewing PRs). Claude Code for coding, potentially other tools for other work types.
+**Execution:** Actually doing work. Two engines:
+- **Claude Code** — coding, file ops, git, testing, CLI-based work. The primary engine for software development.
+- **Computer use** — GUI interaction, browser testing, desktop apps, visual verification, non-CLI tools. Substantially important for LobsterFarm — not everything is dev work. Content entities, research, design exploration, QA, and any workflow requiring GUI interaction needs this. Shipped March 2026 in Claude Desktop, available via API with computer use tool.
 
-**Orchestration:** Managing WHAT gets done, by WHOM, in WHAT order. Handoffs, SOPs, progress tracking across entities. Background coordinator.
+The orchestrator must be tool-routing-aware. SOPs and the execution layer should NOT assume Claude Code is the only runtime.
+
+**Orchestration:** Managing WHAT gets done, by WHOM, in WHAT order. Handoffs, SOPs, progress tracking across entities. Background coordinator. Must route to the right execution engine (Claude Code vs computer use vs both).
 
 **Interaction:** How Jax communicates with agents. Terminal, Discord, Telegram. Jax is the front door; orchestrator is background infrastructure.
 
@@ -39,9 +43,21 @@ Both Claude Code and OpenClaw use MCP natively. MCP servers configured once work
 
 ## Tool Routing (Open Design Problem)
 
-Different work types benefit from different tools. Feature implementation and code review need Claude Code. Planning without codebase context can be conversational. Design exploration starts conversational, becomes coded prototype.
+Different work types benefit from different execution engines:
 
-WHO decides which tool handles which task? Options: human decides (simple, bottleneck), orchestrator decides (autonomous, needs routing logic), single platform with mode switching (simplest, depends on Claude Code sufficiency). Answer will likely be a hybrid that evolves.
+| Work Type | Engine | Why |
+|-----------|--------|-----|
+| Feature implementation, code review | Claude Code | Codebase awareness, file ops, git |
+| Planning with codebase context | Claude Code (plan mode) | Reads existing code |
+| Planning without codebase context | Conversational | Pure reasoning |
+| Design exploration | Conversational → Claude Code | Creative start, coded prototype |
+| Visual QA, browser testing | Computer use | Needs to see and interact with GUI |
+| Desktop app automation | Computer use | No CLI/API available |
+| Research | Either | Depends on whether codebase matters |
+
+An agent may need both engines in a single workflow — Bob writes code (Claude Code), then verifies it renders correctly (computer use). Pearl designs a component (Claude Code), then checks it against Figma reference (computer use).
+
+WHO decides which tool handles which task? Options: human decides (simple, bottleneck), orchestrator decides (autonomous, needs routing logic), single platform with mode switching (simplest). Answer will likely be a hybrid that evolves.
 
 ## File Structure
 

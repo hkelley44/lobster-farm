@@ -12,6 +12,18 @@ type: project
 
 **Implication:** Agent Teams can't leverage our archetype system until Anthropic ships profile support for teammates. Our orchestrator handles multi-agent coordination externally for now.
 
+## Claude Computer Use
+
+**What it is:** Claude can interact with GUIs — view screens, click, type, navigate apps. Shipped March 2026 in Claude Desktop (macOS, Windows coming). Available via API with computer use tool and beta header.
+
+**Why it matters for LobsterFarm:** Not everything is dev work. Computer use is the second execution engine alongside Claude Code. Needed for: visual QA and browser testing, desktop app automation, interacting with GUI-only tools (Figma, admin panels), design verification, content workflows, research involving web navigation.
+
+**Current state:** Still maturing — struggles with scrolling, dragging, zooming. ~72.5% success on OSWorld benchmarks with Sonnet 4.6. But improving fast.
+
+**Integration path:** Available in Claude Code Desktop as supplementary capability. Also accessible via Claude API with SDKs (Python, TypeScript). An agent session could use both Claude Code tools AND computer use tools within the same workflow.
+
+**Implication:** The orchestrator and SOP engine must not assume Claude Code is the only execution runtime. Tool routing needs to dispatch to the right engine (or both) per task.
+
 ## OpenClaw
 
 **Strengths:** 25+ messaging channel adapters, multi-agent routing with isolated workspaces, per-agent tool allow/deny, Lobster workflow engine, massive ecosystem (5,400+ skills), MCP support, battle-tested.
