@@ -20,6 +20,8 @@ LobsterFarm is built entirely on Claude Code as sole runtime. New features direc
 
 **Subagents**: Custom profiles, tool restrictions, isolated context windows. Useful for scoped sub-tasks within a session.
 
+**Computer use via `--chrome`**: Full GUI capabilities in CLI sessions. The `computer` tool gives screen control, mouse, keyboard. Plus browser automation: navigate, read pages, fill forms, run JS, inspect console/network. Enables agents to write code AND verify it visually in the same session. Not a separate engine — just more tools in the same Claude Code session.
+
 ## Known Limitations
 
 **Agent Teams cannot use custom agent profiles** — open feature request #24316. Teammates are generic, can't leverage our archetype system. Also broken when launched from custom agent sessions (bug #23506). Until this ships, our orchestrator handles multi-agent coordination externally.

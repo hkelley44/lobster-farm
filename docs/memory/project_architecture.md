@@ -6,11 +6,14 @@ type: project
 
 ## Three Concerns
 
-**Execution:** Actually doing work. Two engines:
-- **Claude Code** — coding, file ops, git, testing, CLI-based work. The primary engine for software development.
-- **Computer use** — GUI interaction, browser testing, desktop apps, visual verification, non-CLI tools. Substantially important for LobsterFarm — not everything is dev work. Content entities, research, design exploration, QA, and any workflow requiring GUI interaction needs this. Shipped March 2026 in Claude Desktop, available via API with computer use tool.
+**Execution:** Claude Code is the single execution engine. With the `--chrome` flag, it has both CLI and GUI capabilities in the same session:
+- **CLI tools** — Bash, file ops, git, testing, MCP servers, web fetch/search
+- **Computer use** — full screen control, mouse, keyboard, screenshots (via `computer` tool)
+- **Browser automation** — navigate, read pages, fill forms, run JS, inspect console/network, manage tabs
 
-The orchestrator must be tool-routing-aware. SOPs and the execution layer should NOT assume Claude Code is the only runtime.
+An agent can write code AND verify it visually AND interact with GUI-only tools — all in one session. No routing between engines needed. The `--chrome` flag enables all GUI tools via the Claude in Chrome MCP server.
+
+Not everything is dev work. Computer use matters for: design verification, QA, content workflows, research, interacting with tools that have no CLI/API.
 
 **Orchestration:** Managing WHAT gets done, by WHOM, in WHAT order. Handoffs, SOPs, progress tracking across entities. Background coordinator. Must route to the right execution engine (Claude Code vs computer use vs both).
 
@@ -43,21 +46,21 @@ Both Claude Code and OpenClaw use MCP natively. MCP servers configured once work
 
 ## Tool Routing (Open Design Problem)
 
-Different work types benefit from different execution engines:
+All work types run through Claude Code. The agent picks the right tools within a single session:
 
-| Work Type | Engine | Why |
-|-----------|--------|-----|
-| Feature implementation, code review | Claude Code | Codebase awareness, file ops, git |
-| Planning with codebase context | Claude Code (plan mode) | Reads existing code |
-| Planning without codebase context | Conversational | Pure reasoning |
-| Design exploration | Conversational → Claude Code | Creative start, coded prototype |
-| Visual QA, browser testing | Computer use | Needs to see and interact with GUI |
-| Desktop app automation | Computer use | No CLI/API available |
-| Research | Either | Depends on whether codebase matters |
+| Work Type | Tools Used |
+|-----------|-----------|
+| Feature implementation, code review | Bash, Read, Write, Edit, Glob, Grep |
+| Planning with codebase context | Read, Grep, Glob (plan mode) |
+| Visual QA, browser testing | computer, navigate, read_page, gif_creator |
+| Design verification against Figma | computer (screenshot + compare) |
+| Desktop app automation | computer, shortcuts_execute |
+| Research | WebSearch, WebFetch, navigate, read_page |
+| Form filling, web interaction | navigate, form_input, javascript_tool |
 
-An agent may need both engines in a single workflow — Bob writes code (Claude Code), then verifies it renders correctly (computer use). Pearl designs a component (Claude Code), then checks it against Figma reference (computer use).
+No routing between engines. The agent decides which tools to use. Bob writes code then verifies it renders correctly — same session. Pearl builds a component then checks it against a design reference — same session.
 
-WHO decides which tool handles which task? Options: human decides (simple, bottleneck), orchestrator decides (autonomous, needs routing logic), single platform with mode switching (simplest). Answer will likely be a hybrid that evolves.
+For daemon-spawned sessions, add `--chrome` to enable GUI capabilities alongside CLI tools.
 
 ## File Structure
 

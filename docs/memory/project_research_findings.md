@@ -12,17 +12,15 @@ type: project
 
 **Implication:** Agent Teams can't leverage our archetype system until Anthropic ships profile support for teammates. Our orchestrator handles multi-agent coordination externally for now.
 
-## Claude Computer Use
+## Claude Computer Use (in Claude Code CLI)
 
-**What it is:** Claude can interact with GUIs — view screens, click, type, navigate apps. Shipped March 2026 in Claude Desktop (macOS, Windows coming). Available via API with computer use tool and beta header.
+**What it is:** Full computer use — screen control, mouse, keyboard, screenshots — available in Claude Code CLI via the `--chrome` flag. Not a separate product. Same session as Bash/Read/Write/Edit.
 
-**Why it matters for LobsterFarm:** Not everything is dev work. Computer use is the second execution engine alongside Claude Code. Needed for: visual QA and browser testing, desktop app automation, interacting with GUI-only tools (Figma, admin panels), design verification, content workflows, research involving web navigation.
+**Tools enabled by `--chrome`:** `computer` (full screen control), `navigate`, `read_page`, `find`, `form_input`, `javascript_tool`, `gif_creator`, `upload_image`, `read_console_messages`, `read_network_requests`, `tabs_create_mcp`, `shortcuts_execute`, and more. All via the Claude in Chrome MCP server.
 
-**Current state:** Still maturing — struggles with scrolling, dragging, zooming. ~72.5% success on OSWorld benchmarks with Sonnet 4.6. But improving fast.
+**Why it matters for LobsterFarm:** Not everything is dev work. Computer use in the same session means agents can write code AND verify it visually AND interact with GUI-only tools. No routing between engines needed.
 
-**Integration path:** Available in Claude Code Desktop as supplementary capability. Also accessible via Claude API with SDKs (Python, TypeScript). An agent session could use both Claude Code tools AND computer use tools within the same workflow.
-
-**Implication:** The orchestrator and SOP engine must not assume Claude Code is the only execution runtime. Tool routing needs to dispatch to the right engine (or both) per task.
+**Implication for daemon:** Add `--chrome` to agent spawn commands when GUI capabilities are needed. The session manager doesn't need to distinguish between "code work" and "GUI work" — the agent handles both.
 
 ## OpenClaw
 
