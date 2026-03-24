@@ -6,16 +6,16 @@ type: project
 
 ## Three Concerns
 
-**Execution:** Claude Code is the primary execution engine. Two capability tiers:
+**Execution:** Claude Code is the single execution engine. Three capability tiers:
 - **CLI tools** — Bash, file ops, git, testing, MCP servers, web fetch/search. Always available.
 - **Chrome browser control** (`--chrome` flag) — pixel-level control within Chrome tabs: click, type, screenshot, scroll, navigate, fill forms, run JS, inspect console/network. Scoped to Chrome, not the full desktop.
-- **Full desktop computer use** — screen control for any application (Figma, Slack, native apps). Available via Claude API and Desktop app, but NOT yet in the Claude Code CLI (as of v2.1.81). Watch for this.
+- **Full desktop computer use** (via Peekaboo) — screen control for ANY macOS application. Click, type, scroll, hotkey, drag, screenshots, app/window management. 21 tools. Called via Bash (`peekaboo click`, `peekaboo see`, `peekaboo type`, etc.) from any Claude Code session. Already installed on the machine.
 
-For web-based work (most SaaS, web apps, browser tools), Claude Code + `--chrome` covers it. For native desktop apps, full computer use will need to come to the CLI or be accessed via the API separately.
+Peekaboo is the interim solution for full desktop control until Anthropic ships native computer use in the Claude Code CLI. When that ships, evaluate whether to keep Peekaboo or switch to native.
 
-Not everything is dev work. Browser control matters for: design verification, QA, content workflows, research, web-based tools.
+Not everything is dev work. Desktop control matters for: connecting to Tailscale/VPN, testing native apps, design verification in Figma, QA, content workflows, interacting with GUI-only tools.
 
-**Orchestration:** Managing WHAT gets done, by WHOM, in WHAT order. Handoffs, SOPs, progress tracking across entities. Background coordinator. Must route to the right execution engine (Claude Code vs computer use vs both).
+**Orchestration:** Managing WHAT gets done, by WHOM, in WHAT order. Handoffs, SOPs, progress tracking across entities. Background coordinator.
 
 **Interaction:** How Jax communicates with agents. Terminal, Discord, Telegram. Jax is the front door; orchestrator is background infrastructure.
 

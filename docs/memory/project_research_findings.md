@@ -12,15 +12,17 @@ type: project
 
 **Implication:** Agent Teams can't leverage our archetype system until Anthropic ships profile support for teammates. Our orchestrator handles multi-agent coordination externally for now.
 
-## Computer Use — Two Tiers
+## Computer Use — Three Tiers
 
-**Chrome browser control (in Claude Code CLI now):** The `--chrome` flag enables pixel-level control within Chrome tabs — click, type, screenshot, scroll, navigate, fill forms, run JS, inspect console/network. Scoped to Chrome only, not the desktop. Same session as Bash/Read/Write/Edit. Useful for web-based verification, QA, form filling, web research.
+**Chrome browser control (Claude Code CLI, `--chrome`):** Pixel-level control within Chrome tabs — click, type, screenshot, scroll, navigate, fill forms, run JS, inspect console/network. Scoped to Chrome only, not the desktop.
 
-**Full desktop computer use (NOT in CLI yet):** Screen control for any application. Available via Claude API (with computer use tool + beta header) and Claude Desktop app. Not in Claude Code CLI as of v2.1.81. When this ships in the CLI, it will be a significant capability upgrade — agents could interact with Figma, Slack, native apps, etc.
+**Full desktop control (Peekaboo, installed now):** macOS screen control for ANY application — 21 tools including click, type, scroll, hotkey, drag, see (screenshot), app/window management, menu access. Called via Bash from any Claude Code session. Interim solution until Anthropic ships native desktop computer use in the CLI.
 
-**Why it matters for LobsterFarm:** Not everything is dev work. Chrome control covers web-based workflows today. Full desktop use is the gap to watch.
+**Native desktop computer use (Anthropic, NOT in CLI yet):** Available via Claude API and Claude Desktop app, but not in Claude Code CLI as of v2.1.81. When this ships in the CLI, evaluate whether to keep Peekaboo or switch to native.
 
-**Implication for daemon:** Add `--chrome` to agent spawn commands for browser capabilities. Watch for full desktop computer use coming to the CLI — will need architectural consideration when it ships.
+**Why it matters for LobsterFarm:** Not everything is dev work. Desktop control needed for: connecting to Tailscale/VPN, testing native apps, Figma, QA, content workflows. Peekaboo fills this gap today.
+
+**Implication for daemon:** Agents can use Peekaboo via Bash for desktop tasks. Add `--chrome` for browser-specific work. When native computer use ships in CLI, reassess.
 
 ## OpenClaw
 

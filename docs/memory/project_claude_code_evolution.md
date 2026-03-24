@@ -20,7 +20,9 @@ LobsterFarm is built entirely on Claude Code as sole runtime. New features direc
 
 **Subagents**: Custom profiles, tool restrictions, isolated context windows. Useful for scoped sub-tasks within a session.
 
-**Chrome browser control via `--chrome`**: Pixel-level control within Chrome tabs — click, type, screenshot, scroll, navigate, fill forms, run JS, inspect console/network. Scoped to Chrome, NOT the full desktop. Enables agents to write code and verify it in a browser in the same session. Full desktop computer use (any app) is in the Claude API and Desktop app but not yet in the CLI.
+**Chrome browser control via `--chrome`**: Pixel-level control within Chrome tabs — click, type, screenshot, scroll, navigate, fill forms, run JS, inspect console/network. Scoped to Chrome, NOT the full desktop.
+
+**Full desktop control via Peekaboo**: Interim solution. 21 tools for macOS screen control (click, type, scroll, hotkey, drag, screenshots, app/window management). Called via Bash. Already installed. Fills the gap until Anthropic ships native desktop computer use in the CLI.
 
 ## Known Limitations
 
