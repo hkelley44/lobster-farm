@@ -18,7 +18,7 @@ LobsterFarm uses two Discord bots:
 
 **Daemon bot** — server management. Has Manage Server permissions. Handles channel creation, category scaffolding, webhooks for agent identity, entity channel routing.
 
-**Commander bot (Pat)** — persistent Claude Code session in #command-center. Minimal permissions (View, Send, Read History, Attach Files, Add Reactions). Connected via `--channels plugin:discord@claude-plugins-official`.
+**Commander bot** — persistent Claude Code session in #command-center. Minimal permissions (View, Send, Read History, Attach Files, Add Reactions). Connected via `--channels plugin:discord@claude-plugins-official`.
 
 ## Scaffolding via Daemon API
 
@@ -39,7 +39,7 @@ Currently, entity scaffolding is also available via `!lf scaffold entity <id> <n
 ## Channel Structure
 
 ### Global (GLOBAL category)
-- `#command-center` — Pat's channel. Platform-level admin.
+- `#command-center` — Commander's channel. Platform-level admin.
 - `#system-status` — Daemon health, alerts, system events.
 
 ### Per-Entity ({Entity Name} [{entity-id}] category)
@@ -120,7 +120,7 @@ import { ChannelType } from "discord.js";
 - Manage Webhooks (create webhooks for agent identity)
 - View Channels, Send Messages, Read Message History
 
-**Commander bot (Pat) needs:**
+**Commander bot needs:**
 - View Channels
 - Send Messages, Send Messages in Threads
 - Read Message History
