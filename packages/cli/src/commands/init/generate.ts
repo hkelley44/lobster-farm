@@ -128,15 +128,17 @@ export async function generate_config_files(
 export async function generate_settings(path_overrides?: Partial<PathConfig>): Promise<string> {
   const settings = {
     permissions: {
-      bypassPermissions: true,
+      defaultMode: "bypassPermissions",
     },
+    effortLevel: "high",
+    skipDangerousModePermissionPrompt: true,
     hooks: {
       PreToolUse: [
         {
           matcher: "Edit|Write",
           hooks: [{
             type: "command",
-            command: 'bash -c \'BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then echo "BLOCK: Direct edits to $BRANCH are not allowed. Create a feature branch first." >&2; exit 2; fi\'',
+            command: `bash -c 'REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; FILE=$(echo "$TOOL_INPUT" | jq -r ".file_path // empty"); case "$FILE" in "$REPO_ROOT"/*) ;; *) exit 0;; esac; BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0; if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then echo "BLOCK: Direct edits to $BRANCH are not allowed. Create a feature branch first." >&2; exit 2; fi'`,
           }],
         },
         {
