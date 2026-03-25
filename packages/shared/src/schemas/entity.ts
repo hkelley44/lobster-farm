@@ -45,6 +45,10 @@ export const EntityConfigSchema = z.object({
 
     channels: z.array(ChannelMappingSchema).default([]),
 
+    // Blueprint this entity follows. Defines archetypes, SOPs, guidelines,
+    // channel structure, and model defaults. Entity config only needs overrides.
+    blueprint: z.string().optional(),
+
     agent_mode: AgentModeSchema.default("hybrid"),
 
     models: z.object({
@@ -66,14 +70,18 @@ export const EntityConfigSchema = z.object({
       auto_extract: z.boolean().default(true),
     }),
 
-    active_sops: z.array(z.string()).default([
-      "feature-lifecycle",
-      "pr-review-merge",
-      "sentry-triage",
-      "repo-scaffolding",
-      "secrets-management",
-      "readme-maintenance",
-    ]),
+    // SOPs come from the blueprint. Only list overrides here.
+    active_sops: z.array(z.string()).default([]),
+    sop_overrides: z.object({
+      add: z.array(z.string()).default([]),
+      remove: z.array(z.string()).default([]),
+    }).optional(),
+
+    // Guidelines come from the blueprint. Only list overrides here.
+    guideline_overrides: z.object({
+      add: z.array(z.string()).default([]),
+      remove: z.array(z.string()).default([]),
+    }).optional(),
 
     secrets: z.object({
       vault: z.string().default("1password"),

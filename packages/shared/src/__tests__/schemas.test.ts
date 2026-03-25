@@ -103,7 +103,7 @@ describe("EntityConfigSchema", () => {
     expect(config.entity.channels).toEqual([]);
     expect(config.entity.budget.monthly_warning_pct).toBe(80);
     expect(config.entity.budget.monthly_limit).toBeNull();
-    expect(config.entity.active_sops).toContain("feature-lifecycle");
+    expect(config.entity.active_sops).toEqual([]); // SOPs come from blueprint, not defaults
     expect(config.entity.secrets.vault).toBe("1password");
   });
 
