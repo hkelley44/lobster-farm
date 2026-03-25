@@ -73,6 +73,59 @@ export async function check_claude_code(): Promise<ClaudeCodeCheckResult> {
   };
 }
 
+export interface BunCheckResult {
+  installed: boolean;
+  status: string;
+}
+
+/** Check if Bun is installed (required by Discord channel plugin). */
+export async function check_bun(): Promise<BunCheckResult> {
+  const check_cmd = 'bun --version 2>/dev/null || ~/.bun/bin/bun --version 2>/dev/null';
+  const { exitCode, stdout } = await exec_command(check_cmd);
+  if (exitCode === 0 && stdout.trim()) {
+    const { exitCode: path_check } = await exec_command("which bun 2>/dev/null");
+    if (path_check !== 0) {
+      const home = process.env["HOME"] ?? "";
+      process.env["PATH"] = `${home}/.bun/bin:${process.env["PATH"] ?? ""}`;
+    }
+    return { installed: true, status: `Bun ${stdout.trim()}` };
+  }
+  return { installed: false, status: "Bun not found" };
+}
+
+export interface TmuxCheckResult {
+  installed: boolean;
+  status: string;
+}
+
+/** Check if tmux is installed (required for Commander session). */
+export async function check_tmux(): Promise<TmuxCheckResult> {
+  const { exitCode, stdout } = await exec_command("tmux -V 2>/dev/null");
+  if (exitCode === 0 && stdout.trim()) {
+    return { installed: true, status: stdout.trim() };
+  }
+  return { installed: false, status: "tmux not found" };
+}
+
+export interface GhCheckResult {
+  installed: boolean;
+  authenticated: boolean;
+  status: string;
+}
+
+/** Check if GitHub CLI is installed and authenticated. */
+export async function check_github_cli(): Promise<GhCheckResult> {
+  const { exitCode: which_exit } = await exec_command("which gh 2>/dev/null");
+  if (which_exit !== 0) {
+    return { installed: false, authenticated: false, status: "gh CLI not found" };
+  }
+  const { exitCode: auth_exit } = await exec_command("gh auth status 2>/dev/null");
+  if (auth_exit === 0) {
+    return { installed: true, authenticated: true, status: "gh CLI installed and authenticated" };
+  }
+  return { installed: true, authenticated: false, status: "gh CLI installed, not authenticated" };
+}
+
 export async function check_onepassword(): Promise<OnePasswordCheckResult> {
   const { exitCode: which_exit } = await exec_command("which op");
   const cli_installed = which_exit === 0;

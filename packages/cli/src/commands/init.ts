@@ -7,7 +7,7 @@ import {
   type TemplateVariables,
   type PathConfig,
 } from "@lobster-farm/shared";
-import { detect_machine, check_sudo, check_onepassword, check_claude_code } from "./init/detect.js";
+import { detect_machine, check_sudo, check_onepassword, check_claude_code, check_bun, check_tmux, check_github_cli } from "./init/detect.js";
 import {
   prompt_user_name,
   prompt_agent_names,
@@ -241,7 +241,108 @@ export const init_command = new Command("init")
       }
     }
 
-    // ── Step 7: macOS Full Disk Access ──
+    // ── Step 7: Bun (required by Discord channel plugin) ──
+    spin.start("Checking Bun...");
+    const bun = await check_bun();
+    spin.stop(`Bun: ${bun.status}`);
+
+    if (!bun.installed && !non_interactive) {
+      const install_bun = await p.confirm({
+        message: "Bun is required for the Discord channel plugin. Install it?",
+        initialValue: true,
+      });
+      if (p.isCancel(install_bun)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+      if (install_bun) {
+        spin.start("Installing Bun...");
+        const { exec_command } = await import("../lib/process.js");
+        const result = await exec_command("curl -fsSL https://bun.sh/install | bash");
+        if (result.exitCode === 0) {
+          const home = process.env["HOME"] ?? "";
+          process.env["PATH"] = `${home}/.bun/bin:${process.env["PATH"] ?? ""}`;
+          bun.installed = true;
+          bun.status = "Bun installed";
+          spin.stop("Bun installed");
+        } else {
+          spin.stop("Bun installation failed");
+          p.log.warning("Install manually: curl -fsSL https://bun.sh/install | bash");
+        }
+      }
+    }
+
+    // ── Step 8: tmux (required for Commander session) ──
+    spin.start("Checking tmux...");
+    const tmux = await check_tmux();
+    spin.stop(`tmux: ${tmux.status}`);
+
+    if (!tmux.installed && !non_interactive) {
+      const install_tmux = await p.confirm({
+        message: "tmux is required for the Commander (Pat) session. Install it?",
+        initialValue: true,
+      });
+      if (p.isCancel(install_tmux)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+      if (install_tmux) {
+        spin.start("Installing tmux...");
+        const { exec_command } = await import("../lib/process.js");
+        const result = await exec_command("brew install tmux");
+        if (result.exitCode === 0) {
+          tmux.installed = true;
+          tmux.status = "tmux installed";
+          spin.stop("tmux installed");
+        } else {
+          spin.stop("tmux installation failed");
+          p.log.warning("Install manually: brew install tmux");
+        }
+      }
+    }
+
+    // ── Step 9: GitHub CLI ──
+    spin.start("Checking GitHub CLI...");
+    const gh = await check_github_cli();
+    spin.stop(`GitHub CLI: ${gh.status}`);
+
+    if (!gh.installed && !non_interactive) {
+      const install_gh = await p.confirm({
+        message: "GitHub CLI (gh) is recommended for PR workflows. Install it?",
+        initialValue: true,
+      });
+      if (p.isCancel(install_gh)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+      if (install_gh) {
+        spin.start("Installing GitHub CLI...");
+        const { exec_command } = await import("../lib/process.js");
+        const result = await exec_command("brew install gh");
+        if (result.exitCode === 0) {
+          gh.installed = true;
+          spin.stop("GitHub CLI installed");
+        } else {
+          spin.stop("GitHub CLI installation failed");
+          p.log.warning("Install manually: brew install gh");
+        }
+      }
+    }
+
+    if (gh.installed && !gh.authenticated && !non_interactive) {
+      const do_gh_login = await p.confirm({
+        message: "GitHub CLI is not authenticated. Log in now?",
+        initialValue: true,
+      });
+      if (p.isCancel(do_gh_login)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+      if (do_gh_login) {
+        p.log.info("Opening browser for GitHub login...");
+        const { spawnSync } = await import("node:child_process");
+        spawnSync("gh", ["auth", "login", "-w"], { stdio: "inherit" });
+        // Set up git credential helper
+        const { exec_command } = await import("../lib/process.js");
+        await exec_command("gh auth setup-git");
+        gh.authenticated = true;
+        gh.status = "gh CLI installed and authenticated";
+      }
+    }
+
+    // ── Step 10: macOS Full Disk Access ──
     if (machine.platform === "darwin" && !non_interactive) {
       const { exec_command } = await import("../lib/process.js");
       const { spawnSync } = await import("node:child_process");
@@ -437,6 +538,78 @@ export const init_command = new Command("init")
       files.push(pat_env_path);
     }
 
+    // Install Discord channel plugin for Commander
+    if (discord_setup && !non_interactive) {
+      spin.start("Installing Discord channel plugin...");
+      const { exec_command } = await import("../lib/process.js");
+      const plugin_check = await exec_command("claude plugins list 2>/dev/null");
+      if (!plugin_check.stdout.includes("discord@claude-plugins-official")) {
+        const result = await exec_command("claude plugins install discord@claude-plugins-official 2>&1");
+        if (result.exitCode === 0) {
+          spin.stop("Discord channel plugin installed");
+        } else {
+          spin.stop("Discord plugin install failed — install manually: claude plugins install discord@claude-plugins-official");
+        }
+      } else {
+        spin.stop("Discord channel plugin already installed");
+      }
+    }
+
+    // Write Pat's access.json if commander token and Discord are configured
+    if (discord_setup?.commander_bot_token && !non_interactive) {
+      p.note(
+        "Pat needs to know which Discord channel to listen in and who to accept messages from.\n\n" +
+          "Enable Developer Mode in Discord: User Settings → Advanced → Developer Mode.\n" +
+          "Right-click the #command-center channel → Copy Channel ID.\n" +
+          "Right-click your own avatar → Copy User ID.",
+        "Commander Access Control",
+      );
+
+      const command_center_id = await p.text({
+        message: "#command-center channel ID:",
+        validate: (value) => {
+          if (!value.trim()) return "Channel ID is required for Pat.";
+          return undefined;
+        },
+      });
+      if (p.isCancel(command_center_id)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+      const user_discord_id = await p.text({
+        message: "Your Discord user ID:",
+        validate: (value) => {
+          if (!value.trim()) return "User ID is required.";
+          return undefined;
+        },
+      });
+      if (p.isCancel(user_discord_id)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+      const { writeFile: writeF, mkdir: mkdirFs } = await import("node:fs/promises");
+      const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+      const pat_dir = `${lf_dir(path_overrides)}/channels/pat`;
+      await mkdirFs(pat_dir, { recursive: true, mode: 0o700 });
+
+      const access_config = {
+        dmPolicy: "allowlist",
+        allowFrom: [user_discord_id.trim()],
+        groups: {
+          [command_center_id.trim()]: {
+            requireMention: false,
+            allowFrom: [],
+          },
+        },
+        pending: {},
+        ackReaction: "👀",
+        replyToMode: "first",
+        textChunkLimit: 2000,
+        chunkMode: "newline",
+      };
+
+      const access_path = `${pat_dir}/access.json`;
+      await writeF(access_path, JSON.stringify(access_config, null, 2) + "\n", { mode: 0o600 });
+      files.push(access_path);
+      p.log.success("Commander access control configured");
+    }
+
     spin.stop(`Wrote ${String(files.length + 2)} configuration files`);
 
     // ── Summary ──
@@ -449,6 +622,10 @@ export const init_command = new Command("init")
       `Sudo:       ${sudo.status}`,
       `1Password:  ${op.status}`,
     ];
+
+    summary_lines.push(`Bun:        ${bun.status}`);
+    summary_lines.push(`tmux:       ${tmux.status}`);
+    summary_lines.push(`GitHub CLI: ${gh.status}`);
 
     if (discord_setup) {
       const tokens = [discord_setup.daemon_bot_token ? "daemon" : ""].filter(Boolean);
