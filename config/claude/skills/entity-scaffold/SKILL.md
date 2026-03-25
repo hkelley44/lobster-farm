@@ -48,12 +48,15 @@ The blueprint defines: archetypes, SOPs, guidelines, channel structure, model ti
 ├── context/             # Reference docs
 │   ├── decisions.md     # Append-only decision log
 │   └── gotchas.md       # Known issues and workarounds
-└── files/               # Arbitrary entity files
+├── files/               # Arbitrary entity files
+└── repos/               # Entity codebases
+    └── {repo-name}/     # Git repo(s)
 ```
 
 ```bash
 mkdir -p ~/.lobsterfarm/entities/{id}/context
 mkdir -p ~/.lobsterfarm/entities/{id}/files
+mkdir -p ~/.lobsterfarm/entities/{id}/repos
 ```
 
 ### 3. Write entity config
@@ -120,18 +123,20 @@ Based on the repo strategy:
 
 **`new`** — Create a GitHub repo and clone it:
 ```bash
+cd ~/.lobsterfarm/entities/{id}/repos
 gh repo create {github_org}/{id} --private --clone --description "{description}"
 ```
 
 **`clone`** — Clone an existing repo:
 ```bash
-git clone {repo_url} ~/entities/{id}/{repo_name}
+git clone {repo_url} ~/.lobsterfarm/entities/{id}/repos/{repo_name}
 ```
 
-**`existing`** — Symlink an already-cloned repo:
+**`existing`** — Move or symlink an already-cloned repo:
 ```bash
-mkdir -p ~/entities/{id}
-ln -sf {existing_path} ~/entities/{id}/{repo_name}
+mv {existing_path} ~/.lobsterfarm/entities/{id}/repos/{repo_name}
+# or symlink if you want to keep the original location:
+ln -sf {existing_path} ~/.lobsterfarm/entities/{id}/repos/{repo_name}
 ```
 
 **`none`** — Skip repo setup. Entity has no codebase (content entity, research entity, etc.).

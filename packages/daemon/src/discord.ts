@@ -789,7 +789,7 @@ export class DiscordBot extends EventEmitter {
           status: "active",
           repo: {
             url: repo_url || `git@github.com:org/${entity_id}.git`,
-            path: `~/projects/${entity_id}/${entity_id}`,
+            path: `~/.lobsterfarm/entities/${entity_id}/repos/${entity_id}`,
             structure: "monorepo",
           },
           accounts: {},

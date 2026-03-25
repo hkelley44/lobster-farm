@@ -447,9 +447,6 @@ export const init_command = new Command("init")
 
     const discord_setup = non_interactive ? undefined : await prompt_discord(has_existing_discord_token);
     const github = non_interactive ? { username: "" } : await prompt_github();
-    const projects_dir = non_interactive
-      ? (path_overrides?.projects_dir ?? "~/projects")
-      : (path_overrides?.projects_dir ?? "~/entities");
 
     // ── Build TemplateVariables ──
     const permissions_parts: string[] = [];
@@ -476,13 +473,13 @@ export const init_command = new Command("init")
       BUILDER_NAME_LOWER: agent_names.builder.toLowerCase(),
       OPERATOR_NAME_LOWER: agent_names.operator.toLowerCase(),
       COMMANDER_NAME_LOWER: agent_names.commander.toLowerCase(),
-      PROJECTS_DIR: projects_dir,
+      PROJECTS_DIR: "~/.lobsterfarm/entities",
       GITHUB_USERNAME: github.username,
       GITHUB_ORG: "",
     });
 
     // ── Build LobsterFarmConfig ──
-    const config_paths: Record<string, string> = { projects_dir };
+    const config_paths: Record<string, string> = {};
     if (path_overrides?.lobsterfarm_dir) config_paths["lobsterfarm_dir"] = path_overrides.lobsterfarm_dir;
     if (path_overrides?.claude_dir) config_paths["claude_dir"] = path_overrides.claude_dir;
 
@@ -617,7 +614,7 @@ export const init_command = new Command("init")
       `Config:     ${config_path}`,
       `Settings:   ${settings_path}`,
       `Agents:     ${agent_names.planner} (planner), ${agent_names.designer} (designer), ${agent_names.builder} (builder), ${agent_names.operator} (operator), ${agent_names.commander} (commander)`,
-      `Projects:   ${projects_dir}`,
+      `Entities:   ~/.lobsterfarm/entities/`,
       `Machine:    ${machine.name}`,
       `Sudo:       ${sudo.status}`,
       `1Password:  ${op.status}`,

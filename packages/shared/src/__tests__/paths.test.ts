@@ -82,9 +82,9 @@ describe("entity paths", () => {
     );
   });
 
-  it("computes entity repo path", () => {
+  it("computes entity repo path under entity dir", () => {
     expect(entity_repo_path(undefined, "alpha", "alpha-platform")).toBe(
-      join(home, "projects", "alpha", "alpha-platform"),
+      join(home, ".lobsterfarm", "entities", "alpha", "repos", "alpha-platform"),
     );
   });
 
@@ -92,7 +92,7 @@ describe("entity paths", () => {
     expect(
       entity_worktree_path(undefined, "alpha", "alpha-platform", "42-chart"),
     ).toBe(
-      join(home, "projects", "alpha", "alpha-platform", "worktrees", "42-chart"),
+      join(home, ".lobsterfarm", "entities", "alpha", "repos", "alpha-platform", "worktrees", "42-chart"),
     );
   });
 });

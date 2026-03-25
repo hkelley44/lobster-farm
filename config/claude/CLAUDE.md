@@ -110,8 +110,8 @@ Everything not listed above: use your judgment and move fast.
 
 ## Repo Locations
 
-All repos: `{{PROJECTS_DIR}}/<entity>/<repo-name>/`
-Worktrees: `{{PROJECTS_DIR}}/<entity>/<repo-name>/worktrees/<feature-slug>/`
+All repos: `~/.lobsterfarm/entities/<entity>/repos/<repo-name>/`
+Worktrees: `~/.lobsterfarm/entities/<entity>/repos/<repo-name>/worktrees/<feature-slug>/`
 
 ---
 

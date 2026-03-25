@@ -137,14 +137,18 @@ export function entity_logs_dir(config: Partial<PathConfig> | undefined, entity_
   return join(logs_dir(config), "entities", entity_id);
 }
 
-// ── Per-entity project paths ──
+// ── Per-entity repo paths ──
+
+export function entity_repos_dir(config: Partial<PathConfig> | undefined, entity_id: string): string {
+  return join(entity_dir(config, entity_id), "repos");
+}
 
 export function entity_repo_path(
   config: Partial<PathConfig> | undefined,
   entity_id: string,
   repo_name: string,
 ): string {
-  return join(projects_dir(config), entity_id, repo_name);
+  return join(entity_repos_dir(config, entity_id), repo_name);
 }
 
 export function entity_worktree_path(
