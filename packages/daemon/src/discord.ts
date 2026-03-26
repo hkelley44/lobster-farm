@@ -539,6 +539,15 @@ export class DiscordBot extends EventEmitter {
       return;
     }
 
+    // Intercept !reset — release current bot, next real message triggers fresh assignment
+    if (message.content.trim().toLowerCase() === "!reset") {
+      if (this._pool) {
+        await this._pool.release(message.channelId);
+        await this.reply(message, "Session reset. Send a message to start fresh.");
+      }
+      return;
+    }
+
     // Non-command messages: auto-assign a pool bot if none is active on this channel
     if (this._pool) {
       const assignment = this._pool.get_assignment(message.channelId);
@@ -563,6 +572,8 @@ export class DiscordBot extends EventEmitter {
           message.channelId,
           entry.entity_id,
           archetype,
+          undefined, // resume_session_id — pool handles auto-resume from parked bots
+          entry.channel_type,
         );
         if (result) {
           // Bridge the first message: write to file, wait for bot, send via tmux

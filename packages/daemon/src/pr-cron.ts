@@ -1,10 +1,12 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { LobsterFarmConfig, EntityConfig } from "@lobster-farm/shared";
+import type { LobsterFarmConfig, EntityConfig, ArchetypeRole } from "@lobster-farm/shared";
 import { expand_home } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import type { DiscordBot } from "./discord.js";
+import type { FeatureManager } from "./features.js";
+import { detect_review_outcome } from "./actions.js";
 
 const exec = promisify(execFile);
 
@@ -40,6 +42,7 @@ export class PRReviewCron {
     private session_manager: ClaudeSessionManager,
     private config: LobsterFarmConfig,
     private discord: DiscordBot | null = null,
+    private feature_manager: FeatureManager | null = null,
   ) {}
 
   /** Start the polling cron. */
@@ -209,15 +212,8 @@ export class PRReviewCron {
         this.active_reviews.delete(key);
         console.log(`[pr-cron] Review completed for PR #${String(pr.number)} in ${entity_id}`);
 
-        // Notify in alerts
-        if (this.discord) {
-          void this.discord.send_to_entity(
-            entity_id,
-            "alerts",
-            `PR #${String(pr.number)} review completed: "${pr.title}"`,
-            "reviewer" as import("@lobster-farm/shared").ArchetypeRole,
-          );
-        }
+        // Detect review outcome and handle external PRs
+        void this.handle_review_completion(entity_id, repo_path, pr);
       };
 
       const on_fail = (session_id: string, error: string) => {
@@ -234,6 +230,93 @@ export class PRReviewCron {
     } catch (err) {
       this.active_reviews.delete(key);
       console.error(`[pr-cron] Failed to spawn reviewer for PR #${String(pr.number)}: ${String(err)}`);
+    }
+  }
+
+  /** After a reviewer session completes, detect the outcome and route accordingly. */
+  private async handle_review_completion(
+    entity_id: string,
+    repo_path: string,
+    pr: OpenPR,
+  ): Promise<void> {
+    const review_state = await detect_review_outcome(pr.number, repo_path);
+    const linked_feature = this.feature_manager?.find_by_pr(pr.number) ?? null;
+
+    if (linked_feature) {
+      // Internal PR caught by cron — feature manager handles its own transitions
+      console.log(`[pr-cron] PR #${String(pr.number)} linked to feature ${linked_feature.id} — deferring to feature manager`);
+      return;
+    }
+
+    // External PR — no tracked feature
+    if (review_state === "changes_requested") {
+      await this.spawn_external_pr_fixer(entity_id, repo_path, pr);
+      await this.notify_alerts(
+        entity_id,
+        `External PR #${String(pr.number)} needs changes — spawning builder to fix`,
+      );
+    } else if (review_state === "approved") {
+      // Never auto-merge external code — escalate to human
+      await this.notify_alerts(
+        entity_id,
+        `External PR #${String(pr.number)} approved — awaiting human merge approval`,
+      );
+    } else {
+      // Notify completion without specific action
+      await this.notify_alerts(
+        entity_id,
+        `PR #${String(pr.number)} review completed: "${pr.title}"`,
+      );
+    }
+  }
+
+  /** Spawn a builder session to fix an external PR based on reviewer feedback. */
+  private async spawn_external_pr_fixer(
+    entity_id: string,
+    repo_path: string,
+    pr: OpenPR,
+  ): Promise<void> {
+    const prompt = [
+      `An external PR needs fixes based on reviewer feedback.`,
+      `PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}`,
+      `Repository: ${repo_path}`,
+      ``,
+      `Steps:`,
+      `1. Check out the PR branch: git checkout ${pr.headRefName}`,
+      `2. Read the reviewer's comments: gh pr view ${String(pr.number)} --json reviews --jq '.reviews[].body'`,
+      `3. Make targeted fixes to address ONLY what the reviewer flagged — do not refactor beyond that`,
+      `4. Commit and push your changes to the PR branch`,
+      `5. Do NOT merge the PR`,
+    ].join("\n");
+
+    console.log(`[pr-cron] Spawning builder to fix external PR #${String(pr.number)} in ${entity_id}`);
+
+    try {
+      await this.session_manager.spawn({
+        entity_id,
+        feature_id: `external-pr-fix-${String(pr.number)}`,
+        archetype: "builder",
+        dna: ["coding-dna"],
+        model: { model: "opus", think: "high" },
+        worktree_path: repo_path,
+        prompt,
+        interactive: false,
+      });
+    } catch (err) {
+      console.error(`[pr-cron] Failed to spawn builder for external PR #${String(pr.number)}: ${String(err)}`);
+    }
+  }
+
+  /** Send a notification to the entity's alerts channel. */
+  private async notify_alerts(entity_id: string, message: string): Promise<void> {
+    console.log(`[pr-cron:alerts] ${message}`);
+    if (this.discord) {
+      await this.discord.send_to_entity(
+        entity_id,
+        "alerts",
+        message,
+        "reviewer" as ArchetypeRole,
+      );
     }
   }
 }

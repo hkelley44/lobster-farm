@@ -48,6 +48,7 @@ function make_feature(overrides: Partial<FeatureState> = {}): FeatureState {
     activeDna: ["coding-dna"],
     sessionId: null,
     lastSessionId: null,
+    lastBuilderSessionId: null,
     blocked: false,
     blockedReason: null,
     approved: false,
