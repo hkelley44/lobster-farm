@@ -478,6 +478,17 @@ export class DiscordBot extends EventEmitter {
 
   set_pool(pool: BotPool): void {
     this._pool = pool;
+
+    // When a waiting-for-human bot is evicted, notify the channel
+    pool.on("bot:parked_with_context", (info: { bot_id: number; channel_id: string | null; entity_id: string | null }) => {
+      if (info.channel_id) {
+        void this.send(
+          info.channel_id,
+          "This session was parked to free up a bot slot. " +
+          "Your conversation is saved — it will resume when you send a new message.",
+        );
+      }
+    });
   }
 
   // ── Internal message handling ──
@@ -588,7 +599,7 @@ export class DiscordBot extends EventEmitter {
           } catch { /* ignore */ }
           await this.reply(
             message,
-            "All agent slots are in use. Create another pool bot or try again shortly.",
+            "All bots are busy right now. Your message will be picked up when a slot opens.",
           );
         }
       } else {

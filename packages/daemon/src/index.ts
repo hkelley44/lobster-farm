@@ -56,10 +56,9 @@ async function main(): Promise<void> {
     `Session manager ready (max ${String(config.concurrency.max_active_sessions)} concurrent sessions)`,
   );
 
-  // Initialize bot pool and pre-assign planners to #general channels
+  // Initialize bot pool — bots are assigned on first message, not on startup
   const pool = new BotPool(config);
   await pool.initialize();
-  await pool.pre_assign_generals(registry);
 
   // Initialize Discord bot (optional — daemon works without it via HTTP API)
   const discord = new DiscordBot(config, registry);

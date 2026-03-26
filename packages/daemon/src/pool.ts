@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -5,7 +6,6 @@ import { homedir } from "node:os";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir, entity_dir } from "@lobster-farm/shared";
 import type { ChannelType } from "@lobster-farm/shared";
-import type { EntityRegistry } from "./registry.js";
 
 // ── Types ──
 
@@ -45,6 +45,9 @@ export interface PoolStatus {
     last_active: string | null;
   }>;
 }
+
+/** Activity state computed on demand from observable signals (tmux pane, timestamps). */
+export type ActivityState = "idle" | "working" | "waiting_for_human" | "active_conversation";
 
 // ── Agent name resolution ──
 
@@ -89,12 +92,13 @@ function bot_user_id_from_token(token: string): string | null {
 
 // ── Pool Manager ──
 
-export class BotPool {
+export class BotPool extends EventEmitter {
   private bots: PoolBot[] = [];
   private config: LobsterFarmConfig;
   private _draining = false;
 
   constructor(config: LobsterFarmConfig) {
+    super();
     this.config = config;
   }
 
@@ -221,43 +225,62 @@ export class BotPool {
       bot = this.bots.find(b => b.state === "free");
     }
 
-    // If none free, evict the least recently active (parked first, then assigned)
-    // Eviction priority: general-channel bots evicted before work-room bots
+    // Activity-aware eviction: free → parked → idle assigned → waiting_for_human → FLOOR
+    // Within each tier: general channels before work rooms, then LRU.
+    const eviction_sort = (a: PoolBot, b: PoolBot) => {
+      const type_a = a.channel_type === "work_room" ? 1 : 0;
+      const type_b = b.channel_type === "work_room" ? 1 : 0;
+      if (type_a !== type_b) return type_a - type_b;
+      return (a.last_active?.getTime() ?? 0) - (b.last_active?.getTime() ?? 0);
+    };
+
+    // Tier 2: Parked bots (cheapest eviction — already suspended)
     if (!bot) {
       const parked = this.bots
         .filter(b => b.state === "parked")
-        .sort((a, b) => {
-          // General channels evicted before work rooms
-          const type_a = a.channel_type === "work_room" ? 1 : 0;
-          const type_b = b.channel_type === "work_room" ? 1 : 0;
-          if (type_a !== type_b) return type_a - type_b;
-          return (a.last_active?.getTime() ?? 0) - (b.last_active?.getTime() ?? 0);
-        });
+        .sort(eviction_sort);
 
       if (parked.length > 0) {
         bot = parked[0];
         console.log(`[pool] Evicting parked bot pool-${String(bot!.id)} (${bot!.channel_type ?? "unknown"} channel, LRU)`);
-      } else {
-        // Evict least recently active assigned bot (general first)
-        const assigned = this.bots
-          .filter(b => b.state === "assigned")
-          .sort((a, b) => {
-            const type_a = a.channel_type === "work_room" ? 1 : 0;
-            const type_b = b.channel_type === "work_room" ? 1 : 0;
-            if (type_a !== type_b) return type_a - type_b;
-            return (a.last_active?.getTime() ?? 0) - (b.last_active?.getTime() ?? 0);
-          });
-
-        if (assigned.length > 0) {
-          bot = assigned[0];
-          console.log(`[pool] Evicting assigned bot pool-${String(bot!.id)} (LRU) — parking session`);
-          await this.park_bot(bot!);
-        }
       }
     }
 
+    // Tier 3: Idle assigned bots (>= 30 min since last human interaction)
     if (!bot) {
-      console.error("[pool] No bots available — pool exhausted");
+      const idle_assigned = this.bots
+        .filter(b => b.state === "assigned" && this.compute_activity_state(b) === "idle")
+        .sort(eviction_sort);
+
+      if (idle_assigned.length > 0) {
+        bot = idle_assigned[0];
+        console.log(`[pool] Evicting idle bot pool-${String(bot!.id)} — parking`);
+        await this.park_bot(bot!);
+      }
+    }
+
+    // Tier 4: Waiting-for-human bots (3-30 min since last interaction — expensive but necessary)
+    if (!bot) {
+      const waiting = this.bots
+        .filter(b => b.state === "assigned" && this.compute_activity_state(b) === "waiting_for_human")
+        .sort(eviction_sort);
+
+      if (waiting.length > 0) {
+        bot = waiting[0];
+        console.log(`[pool] Evicting waiting-for-human bot pool-${String(bot!.id)} — parking`);
+        await this.park_bot(bot!);
+        // Notify that this session was parked with active context
+        this.emit("bot:parked_with_context", {
+          bot_id: bot!.id,
+          channel_id: bot!.channel_id,
+          entity_id: bot!.entity_id,
+        });
+      }
+    }
+
+    // FLOOR: active_conversation and working bots are NEVER evicted
+    if (!bot) {
+      console.log("[pool] All bots at floor (active/working) — no eviction possible");
       return null;
     }
 
@@ -356,6 +379,48 @@ export class BotPool {
     };
   }
 
+  /**
+   * Compute the activity state of a bot from observable signals.
+   * Derived on demand from tmux pane state and last_active timestamp — never stored.
+   */
+  compute_activity_state(bot: PoolBot): ActivityState {
+    if (bot.state !== "assigned") return "idle";
+
+    // Check if bot is actively processing (tmux pane has no prompt)
+    if (!this.is_bot_idle(bot)) return "working";
+
+    // Check recency of last human interaction
+    const idle_minutes = bot.last_active
+      ? (Date.now() - bot.last_active.getTime()) / 60_000
+      : Infinity;
+
+    // < 3 min: active conversation — don't touch
+    if (idle_minutes < 3) return "active_conversation";
+    // 3-30 min: bot asked a question or showed output recently — evictable as last resort
+    if (idle_minutes < 30) return "waiting_for_human";
+    // >= 30 min: fair game
+    return "idle";
+  }
+
+  /**
+   * Check if a single bot is idle at the prompt (not actively processing).
+   * Returns true when the tmux pane shows a ❯ prompt or bypass permissions dialog.
+   * Fails open (returns true) when the tmux pane can't be read — safe for eviction checks.
+   */
+  protected is_bot_idle(bot: PoolBot): boolean {
+    try {
+      const output = execFileSync(
+        "tmux", ["capture-pane", "-t", bot.tmux_session, "-p"],
+        { encoding: "utf-8", timeout: 2000 },
+      );
+      const lines = output.trim().split("\n");
+      const last_line = lines[lines.length - 1] ?? "";
+      return last_line.includes("❯") || last_line.includes("bypass permissions");
+    } catch {
+      return true; // Can't check — assume idle (fail-open for eviction)
+    }
+  }
+
   /** Check if any pool bots are actively working (not idle at prompt). */
   has_active_work(): { active: boolean; working_bots: Array<{ id: number; archetype: string; channel_id: string }> } {
     const working: Array<{ id: number; archetype: string; channel_id: string }> = [];
@@ -363,25 +428,12 @@ export class BotPool {
     for (const bot of this.bots) {
       if (bot.state !== "assigned") continue;
 
-      try {
-        const output = execFileSync(
-          "tmux", ["capture-pane", "-t", bot.tmux_session, "-p"],
-          { encoding: "utf-8", timeout: 2000 },
-        );
-        // If the pane shows a spinner/working indicator (no ❯ prompt at the end),
-        // the bot is actively processing
-        const lines = output.trim().split("\n");
-        const last_line = lines[lines.length - 1] ?? "";
-        const is_idle = last_line.includes("❯") || last_line.includes("bypass permissions");
-        if (!is_idle) {
-          working.push({
-            id: bot.id,
-            archetype: bot.archetype ?? "unknown",
-            channel_id: bot.channel_id ?? "",
-          });
-        }
-      } catch {
-        // Can't check — assume not working
+      if (!this.is_bot_idle(bot)) {
+        working.push({
+          id: bot.id,
+          archetype: bot.archetype ?? "unknown",
+          channel_id: bot.channel_id ?? "",
+        });
       }
     }
 
@@ -543,22 +595,6 @@ export class BotPool {
       }
     } catch (err) {
       console.log(`[pool] Nickname set failed: ${String(err)}`);
-    }
-  }
-
-  /** Pre-assign bots to entity #general channels on daemon startup. */
-  async pre_assign_generals(registry: EntityRegistry): Promise<void> {
-    for (const entity_config of registry.get_active()) {
-      const entity_id = entity_config.entity.id;
-      const general_channel = entity_config.entity.channels.list.find(
-        ch => ch.type === "general",
-      );
-      if (!general_channel) continue;
-
-      const existing = this.get_assignment(general_channel.id);
-      if (existing) continue;
-
-      await this.assign(general_channel.id, entity_id, "planner");
     }
   }
 
