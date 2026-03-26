@@ -63,7 +63,7 @@ const PHASE_CONFIG: Record<Phase, PhaseConfig> = {
   },
   review: {
     archetype: "reviewer",
-    dna: ["review-dna"],
+    dna: ["review-guideline"],
     model: { model: "sonnet", think: "standard" },
     needs_approval: false,
     optional: false,

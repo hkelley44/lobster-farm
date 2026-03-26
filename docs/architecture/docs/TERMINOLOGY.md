@@ -34,7 +34,7 @@ A composable expertise lens — the standards, patterns, and preferences that de
 
 DNA is composable. A builder working on frontend loads `coding-dna + design-dna`. The same builder working on database schema loads `coding-dna + database-dna`. The DNA changes; the soul doesn't.
 
-Current DNA profiles: coding-dna (~710 lines), design-dna (~778 lines), planning-dna, review-dna, database-dna.
+Current DNA profiles: coding-dna (~710 lines), design-dna (~778 lines), planning-dna, review-guideline, database-dna.
 
 DNA evolves over time as agents learn what works and what doesn't.
 

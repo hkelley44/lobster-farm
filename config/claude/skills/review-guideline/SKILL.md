@@ -1,12 +1,12 @@
 ---
-name: review-dna
+name: review-guideline
 description: >
   Code review standards and quality evaluation criteria. Auto-loads during
   PR reviews, code audits, and pre-merge quality gates. Defines review
   priority order, comment format, and quality bars.
 ---
 
-# REVIEW-DNA.md — How We Review
+# Review Guideline
 
 _Fresh eyes. Clear standards. Every review improves the codebase._
 

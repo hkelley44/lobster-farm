@@ -9,7 +9,7 @@ What exists, what's designed, what's planned, and what's still open.
 These have been designed in detail through extensive architectural discussion. Specifications exist.
 
 - **Archetype definitions** — 5 archetypes (planner, designer, builder, reviewer, operator) with souls, identities, and frontmatter. Files produced and ready to install.
-- **DNA profiles** — 5 DNA skill files. coding-dna (~710 lines, ported from battle-tested CODE-DNA.md) and design-dna (~778 lines, ported from battle-tested DESIGN-DNA.md) are production-quality. planning-dna, review-dna, and database-dna are new and solid but less battle-tested.
+- **DNA profiles** — 5 DNA skill files. coding-dna (~710 lines, ported from battle-tested CODE-DNA.md) and design-dna (~778 lines, ported from battle-tested DESIGN-DNA.md) are production-quality. planning-dna, review-guideline, and database-dna are new and solid but less battle-tested.
 - **Global CLAUDE.md** — Shared soul foundation, session startup, role map, universal rules, escalation triggers. Written and ready to install.
 - **USER.md** — About Jax. Preferences, communication style, frustrations. Written and ready.
 - **TOOLS.md** — Machine infrastructure. Minimal, grows organically. Written and ready.

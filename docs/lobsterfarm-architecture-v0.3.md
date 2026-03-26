@@ -101,7 +101,7 @@ claude -p "Implement feature #42 per spec in the GitHub issue." \
 
 **Ephemeral Mode** — One-shot tasks (reviews, memory extraction):
 ```bash
-echo "Review PR #18 against review-dna standards" | claude -p --print
+echo "Review PR #18 against review-guideline standards" | claude -p --print
 ```
 
 **Native capabilities:**
@@ -262,7 +262,7 @@ Archetypes define agent identity. They are global — the same agent deployed ac
 | Gary | Planner | planning-dna | — |
 | Pearl | Designer | design-dna | coding-dna (coded prototypes) |
 | Bob | Builder | coding-dna | design-dna (frontend), database-dna (schema) |
-| Reviewer | QA (ephemeral) | review-dna | — |
+| Reviewer | QA (ephemeral) | review-guideline | — |
 | Ray | Operator | operator-dna (future) | — |
 
 **Agent mode:** Both dedicated agents (separate session per archetype) and generalist mode (one session swapping DNA) are supported. Configurable per entity. Battle-test both.
@@ -542,7 +542,7 @@ phases:
     steps:
       - code-review:
           archetype: reviewer
-          dna: [review-dna]
+          dna: [review-guideline]
           model: sonnet
           ephemeral: true
           action: review-pr
@@ -768,7 +768,7 @@ Each entity is a monorepo:
 │   ├── coding-dna/SKILL.md       # Engineering standards (~710 lines)
 │   ├── design-dna/SKILL.md       # Design standards (~778 lines)
 │   ├── planning-dna/SKILL.md     # Spec writing standards
-│   ├── review-dna/SKILL.md       # Review standards
+│   ├── review-guideline/SKILL.md       # Review standards
 │   └── database-dna/SKILL.md     # Schema/query standards
 └── commands/                     # Custom slash commands (future)
 ```

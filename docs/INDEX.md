@@ -16,7 +16,7 @@
 - `config/claude/skills/coding-dna/SKILL.md` — Engineering standards
 - `config/claude/skills/design-dna/SKILL.md` — Design standards
 - `config/claude/skills/planning-dna/SKILL.md` — Spec writing and discovery standards
-- `config/claude/skills/review-dna/SKILL.md` — Code review standards
+- `config/claude/skills/review-guideline/SKILL.md` — Code review standards
 - `config/claude/skills/database-dna/SKILL.md` — Schema and query standards
 
 ### ~/.lobsterfarm/ (LobsterFarm User Configuration)
