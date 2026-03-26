@@ -364,6 +364,17 @@ export class DiscordBot extends EventEmitter {
         }
 
         channels.push({ type: ch.type, id: channel.id, purpose: ch.purpose });
+
+        // Pin status message in work rooms
+        if (ch.type === "work_room") {
+          try {
+            const text_channel = channel as TextChannel;
+            const status_msg = await text_channel.send("🟢 Available");
+            await status_msg.pin();
+          } catch (pin_err) {
+            console.log(`[discord] Could not pin status in #${ch.name}: ${String(pin_err)}`);
+          }
+        }
       }
 
       // Rebuild channel map to include new channels
