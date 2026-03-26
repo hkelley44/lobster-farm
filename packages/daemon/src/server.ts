@@ -7,6 +7,8 @@ import type { TaskQueue, TaskSubmission } from "./queue.js";
 import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import type { CommanderProcess } from "./commander-process.js";
 import type { DiscordBot } from "./discord.js";
+import type { BotPool } from "./pool.js";
+import type { ArchetypeRole } from "@lobster-farm/shared";
 
 interface ServerContext {
   registry: EntityRegistry;
@@ -16,6 +18,7 @@ interface ServerContext {
   features: FeatureManager;
   commander: CommanderProcess | null;
   discord: DiscordBot | null;
+  pool: BotPool | null;
 }
 
 type RouteHandler = (
@@ -365,6 +368,75 @@ const handle_reload: RouteHandler = async (_req, res, ctx) => {
   }
 };
 
+// ── Pool routes ──
+
+const handle_pool_status: RouteHandler = (_req, res, ctx) => {
+  if (!ctx.pool) {
+    json_response(res, 503, { error: "Bot pool not initialized" });
+    return;
+  }
+  json_response(res, 200, ctx.pool.get_status());
+};
+
+const handle_pool_assign: RouteHandler = async (req, res, ctx) => {
+  if (!ctx.pool) {
+    json_response(res, 503, { error: "Bot pool not initialized" });
+    return;
+  }
+
+  const body = await read_body(req);
+  let params: { channel_id?: string; entity_id?: string; archetype?: string; resume_session_id?: string };
+  try {
+    params = JSON.parse(body) as typeof params;
+  } catch {
+    json_response(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+
+  if (!params.channel_id || !params.entity_id || !params.archetype) {
+    json_response(res, 400, { error: "Missing required fields: channel_id, entity_id, archetype" });
+    return;
+  }
+
+  const assignment = await ctx.pool.assign(
+    params.channel_id,
+    params.entity_id,
+    params.archetype as ArchetypeRole,
+    params.resume_session_id,
+  );
+
+  if (!assignment) {
+    json_response(res, 503, { error: "No pool bots available" });
+    return;
+  }
+
+  json_response(res, 200, assignment);
+};
+
+const handle_pool_release: RouteHandler = async (req, res, ctx) => {
+  if (!ctx.pool) {
+    json_response(res, 503, { error: "Bot pool not initialized" });
+    return;
+  }
+
+  const body = await read_body(req);
+  let params: { channel_id?: string };
+  try {
+    params = JSON.parse(body) as typeof params;
+  } catch {
+    json_response(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+
+  if (!params.channel_id) {
+    json_response(res, 400, { error: "Missing required field: channel_id" });
+    return;
+  }
+
+  await ctx.pool.release(params.channel_id);
+  json_response(res, 200, { ok: true });
+};
+
 // ── Router ──
 
 const routes: Route[] = [
@@ -379,6 +451,9 @@ const routes: Route[] = [
   { method: "GET", pattern: /^\/features\/[a-z0-9-]+$/, handler: handle_get_feature },
   { method: "POST", pattern: /^\/features\/[a-z0-9-]+\/advance$/, handler: handle_advance_feature },
   { method: "POST", pattern: /^\/features\/[a-z0-9-]+\/approve$/, handler: handle_approve_feature },
+  { method: "GET", pattern: /^\/pool$/, handler: handle_pool_status },
+  { method: "POST", pattern: /^\/pool\/assign$/, handler: handle_pool_assign },
+  { method: "POST", pattern: /^\/pool\/release$/, handler: handle_pool_release },
   { method: "POST", pattern: /^\/scaffold\/entity$/, handler: handle_scaffold_entity },
   { method: "POST", pattern: /^\/reload$/, handler: handle_reload },
   { method: "POST", pattern: /^\/webhooks\/github$/, handler: handle_webhook_github },
@@ -418,9 +493,10 @@ export function start_server(
   features: FeatureManager,
   commander: CommanderProcess | null = null,
   discord: DiscordBot | null = null,
+  pool: BotPool | null = null,
   port: number = DAEMON_PORT,
 ): Server {
-  const ctx: ServerContext = { registry, config, session_manager, queue, features, commander, discord };
+  const ctx: ServerContext = { registry, config, session_manager, queue, features, commander, discord, pool };
 
   const server = createServer((req, res) => {
     route_request(req, res, ctx);

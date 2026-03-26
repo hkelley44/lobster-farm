@@ -9,6 +9,7 @@ import { set_discord_bot } from "./actions.js";
 import { start_server } from "./server.js";
 import { write_pid, remove_pid } from "./pid.js";
 import { CommanderProcess } from "./commander-process.js";
+import { BotPool } from "./pool.js";
 
 async function main(): Promise<void> {
   console.log("Starting LobsterFarm daemon...");
@@ -46,6 +47,11 @@ async function main(): Promise<void> {
     `Session manager ready (max ${String(config.concurrency.max_active_sessions)} concurrent sessions)`,
   );
 
+  // Initialize bot pool and pre-assign planners to #general channels
+  const pool = new BotPool(config);
+  await pool.initialize();
+  await pool.pre_assign_generals(registry);
+
   // Initialize Discord bot (optional — daemon works without it via HTTP API)
   const discord = new DiscordBot(config, registry);
   let discord_connected = false;
@@ -54,6 +60,7 @@ async function main(): Promise<void> {
   if (bot_token) {
     try {
       discord.set_managers(feature_manager, queue);
+      discord.set_pool(pool);
       set_discord_bot(discord);
       await discord.connect(bot_token);
       discord_connected = true;
@@ -84,7 +91,7 @@ async function main(): Promise<void> {
   }
 
   // Start HTTP server
-  const server = start_server(registry, config, session_manager, queue, feature_manager, commander, discord_connected ? discord : null);
+  const server = start_server(registry, config, session_manager, queue, feature_manager, commander, discord_connected ? discord : null, pool);
 
   // Write PID file
   await write_pid(config);
@@ -98,6 +105,9 @@ async function main(): Promise<void> {
     shutting_down = true;
 
     console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+
+    // Stop pool bots
+    await pool.shutdown();
 
     // Stop Commander
     await commander.stop();

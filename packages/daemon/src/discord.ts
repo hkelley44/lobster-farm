@@ -31,6 +31,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import { route_message, type RouteAction, type RoutedMessage } from "./router.js";
 import type { TaskQueue } from "./queue.js";
+import type { BotPool } from "./pool.js";
 
 const exec = promisify(execFile);
 
@@ -407,10 +408,15 @@ export class DiscordBot extends EventEmitter {
   /** Set references to feature manager and queue for command handling. */
   private _features: FeatureManager | null = null;
   private _queue: TaskQueue | null = null;
+  private _pool: BotPool | null = null;
 
   set_managers(features: FeatureManager, queue: TaskQueue): void {
     this._features = features;
     this._queue = queue;
+  }
+
+  set_pool(pool: BotPool): void {
+    this._pool = pool;
   }
 
   // ── Internal message handling ──
@@ -448,8 +454,7 @@ export class DiscordBot extends EventEmitter {
       return;
     }
 
-    // In entity channels, daemon only handles !lf commands.
-    // Conversational messages are handled by archetype bots (Gary, Bob, etc.)
+    // Handle !lf commands in entity channels
     if (message.content.trim().startsWith("!lf")) {
       const routed: RoutedMessage = {
         entity_id: entry.entity_id,
@@ -470,9 +475,55 @@ export class DiscordBot extends EventEmitter {
           await this.reply(message, `Error: ${msg}`);
         }
       }
+      return;
     }
-    // Non-command messages in entity channels are ignored by the daemon.
-    // Archetype bots handle conversational interaction.
+
+    // Non-command messages: auto-assign a pool bot if none is active on this channel
+    if (this._pool) {
+      const assignment = this._pool.get_assignment(message.channelId);
+      if (!assignment) {
+        // Determine archetype: check if channel has a feature with an active phase
+        let archetype: ArchetypeRole = "planner"; // default
+        if (this._features && entry.assigned_feature) {
+          const feature = this._features.get_feature(entry.assigned_feature);
+          if (feature) {
+            const phase_archetypes: Record<string, ArchetypeRole> = {
+              plan: "planner", design: "designer", build: "builder",
+              review: "reviewer", ship: "planner", done: "planner",
+            };
+            archetype = phase_archetypes[feature.phase] ?? "planner";
+          }
+        }
+
+        // Show the user we're working on it
+        try { await message.react("⏳"); } catch { /* ignore */ }
+
+        const result = await this._pool.assign(
+          message.channelId,
+          entry.entity_id,
+          archetype,
+        );
+        if (result) {
+          // Bridge the first message: write to file, wait for bot, send via tmux
+          await this.bridge_first_message(result.tmux_session, message.content, message.author.displayName);
+          try {
+            await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
+            await message.react("👀");
+          } catch { /* ignore */ }
+        } else {
+          try {
+            await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
+          } catch { /* ignore */ }
+          await this.reply(
+            message,
+            "All agent slots are in use. Create another pool bot or try again shortly.",
+          );
+        }
+      } else {
+        // Bot is assigned — touch for LRU tracking
+        this._pool.touch(message.channelId);
+      }
+    }
   }
 
   private async execute_action(
@@ -531,6 +582,7 @@ export class DiscordBot extends EventEmitter {
             "• `!lf plan <entity> <title>` — create a feature in plan phase\n" +
             "• `!lf approve <feature-id>` — approve current phase gate\n" +
             "• `!lf advance <feature-id>` — advance to next phase\n" +
+            "• `!lf swap <agent>` — swap active agent in this channel (gary, bob, pearl, ray)\n" +
             "• `!lf status` — daemon status\n" +
             "• `!lf features [entity]` — list features\n" +
             "• `!lf scaffold server` — create GLOBAL Discord channels\n" +
@@ -561,6 +613,10 @@ export class DiscordBot extends EventEmitter {
 
       case "scaffold":
         await this.handle_scaffold_command(args, routed, message);
+        break;
+
+      case "swap":
+        await this.handle_swap_command(args, message);
         break;
 
       default:
@@ -866,6 +922,105 @@ export class DiscordBot extends EventEmitter {
         message,
         "Usage:\n• `!lf scaffold server` — create GLOBAL channels\n• `!lf scaffold entity <id> <name>` — create entity channels",
       );
+    }
+  }
+
+  /** Bridge a message to a freshly spawned pool bot via tmux send-keys. */
+  private async bridge_first_message(
+    tmux_session: string,
+    content: string,
+    author_name: string,
+  ): Promise<void> {
+    const { execFileSync } = await import("node:child_process");
+    const { writeFile: writeFileAsync, unlink } = await import("node:fs/promises");
+    const pending_path = `/tmp/lf-pending-${tmux_session}.txt`;
+
+    try {
+      // Write the message to a file (avoids tmux escaping issues)
+      await writeFileAsync(pending_path, `${author_name}: ${content}`, "utf-8");
+
+      // Wait for the bot to be ready (polling for the ❯ prompt + Listening)
+      const start = Date.now();
+      const timeout = 20000;
+      let ready = false;
+      while (Date.now() - start < timeout) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        try {
+          const output = execFileSync(
+            "tmux", ["capture-pane", "-t", tmux_session, "-p"],
+            { encoding: "utf-8", timeout: 2000 },
+          );
+          if (output.includes("Listening for channel messages") && output.includes("❯")) {
+            ready = true;
+            break;
+          }
+        } catch { /* ignore */ }
+      }
+
+      if (!ready) {
+        console.log(`[discord] Bot ${tmux_session} not ready after ${String(timeout)}ms — message not bridged`);
+        return;
+      }
+
+      // Small extra delay for the plugin to fully connect
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Send the prompt to the bot's tmux session
+      const prompt = `A user just messaged you in Discord. Read ${pending_path} for their message and respond to them.`;
+      execFileSync("tmux", ["send-keys", "-t", tmux_session, prompt, "Enter"], {
+        stdio: "ignore",
+        timeout: 5000,
+      });
+
+      console.log(`[discord] Bridged first message to ${tmux_session}`);
+
+      // Clean up after a delay
+      setTimeout(() => { void unlink(pending_path).catch(() => {}); }, 30000);
+    } catch (err) {
+      console.error(`[discord] Bridge failed: ${String(err)}`);
+    }
+  }
+
+  private async handle_swap_command(args: string[], message: Message): Promise<void> {
+    if (!this._pool) {
+      await this.reply(message, "Bot pool not available.");
+      return;
+    }
+
+    // Usage: !lf swap <archetype>
+    const archetype_name = args[0]?.toLowerCase();
+    const archetype_map: Record<string, ArchetypeRole> = {
+      gary: "planner", planner: "planner",
+      bob: "builder", builder: "builder",
+      pearl: "designer", designer: "designer",
+      ray: "operator", operator: "operator",
+    };
+
+    const archetype = archetype_map[archetype_name ?? ""];
+    if (!archetype) {
+      await this.reply(
+        message,
+        "Usage: `!lf swap <agent>` — gary, bob, pearl, or ray",
+      );
+      return;
+    }
+
+    const channel_id = message.channelId;
+    const entry = this.channel_map.get(channel_id);
+    if (!entry) {
+      await this.reply(message, "This channel isn't mapped to an entity.");
+      return;
+    }
+
+    // Release current bot, assign new one
+    await this._pool.release(channel_id);
+    const result = await this._pool.assign(channel_id, entry.entity_id, archetype);
+
+    if (result) {
+      const agent_display = this.config.agents[archetype === "reviewer" ? "planner" : archetype]?.name ?? archetype;
+      await this.reply(message, `Swapping to ${agent_display}...`);
+    } else {
+      await this.reply(message, "No pool bots available for swap.");
     }
   }
 
