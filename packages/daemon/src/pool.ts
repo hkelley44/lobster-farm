@@ -6,6 +6,9 @@ import { homedir } from "node:os";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir, entity_dir } from "@lobster-farm/shared";
 import type { ChannelType } from "@lobster-farm/shared";
+import { save_pool_state, load_pool_state } from "./persistence.js";
+import type { PersistedPoolBot } from "./persistence.js";
+import type { EntityRegistry } from "./registry.js";
 
 // ── Types ──
 
@@ -114,8 +117,8 @@ export class BotPool extends EventEmitter {
     return this._draining;
   }
 
-  /** Discover pool bot directories and initialize state. */
-  async initialize(): Promise<void> {
+  /** Discover pool bot directories, restore persisted state, and initialize. */
+  async initialize(registry?: EntityRegistry): Promise<void> {
     const channels_dir = join(lobsterfarm_dir(this.config.paths), "channels");
     const pool_dirs: string[] = [];
 
@@ -174,9 +177,59 @@ export class BotPool extends EventEmitter {
       });
     }
 
+    // Restore persisted assignments from last run
+    const saved = await load_pool_state(this.config);
+    let restored = 0;
+
+    for (const entry of saved) {
+      const bot = this.bots.find(b => b.id === entry.id);
+      if (!bot) continue; // Bot directory removed since last run
+
+      // Validate entity/channel still exist (if registry available)
+      if (registry && !this.validate_saved_entry(entry, registry)) {
+        console.log(
+          `[pool] Skipping stale entry for pool-${String(entry.id)}: ` +
+          `entity/channel no longer configured`,
+        );
+        continue;
+      }
+
+      if (bot.state === "assigned") {
+        // tmux is still running (survived restart, e.g. launchd) — restore metadata
+        bot.channel_id = entry.channel_id;
+        bot.entity_id = entry.entity_id;
+        bot.archetype = entry.archetype;
+        bot.channel_type = entry.channel_type;
+        bot.session_id = entry.session_id;
+        bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
+      } else {
+        // tmux is dead — mark as parked with preserved session ID.
+        // When someone messages the channel, existing parked-bot auto-resume
+        // logic in assign() reclaims this bot with --resume {session_id}.
+        bot.state = "parked";
+        bot.channel_id = entry.channel_id;
+        bot.entity_id = entry.entity_id;
+        bot.archetype = entry.archetype;
+        bot.channel_type = entry.channel_type;
+        bot.session_id = entry.session_id;
+        bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
+      }
+
+      restored++;
+    }
+
+    if (restored > 0) {
+      console.log(`[pool] Restored ${String(restored)} bot assignment(s) from persisted state`);
+    }
+
+    // Persist cleaned state (stale entries removed, current snapshot)
+    await this.persist();
+
     console.log(
       `[pool] Initialized ${String(this.bots.length)} pool bots ` +
-      `(${String(this.bots.filter(b => b.state === "free").length)} free)`,
+      `(${String(this.bots.filter(b => b.state === "free").length)} free, ` +
+      `${String(this.bots.filter(b => b.state === "parked").length)} parked, ` +
+      `${String(this.bots.filter(b => b.state === "assigned").length)} assigned)`,
     );
   }
 
@@ -308,6 +361,8 @@ export class BotPool extends EventEmitter {
     bot.session_id = resume_session_id ?? null;
     bot.last_active = new Date();
 
+    await this.persist();
+
     console.log(
       `[pool] Assigned pool-${String(bot.id)} to channel ${channel_id} ` +
       `as ${archetype} for entity ${entity_id}`,
@@ -342,6 +397,8 @@ export class BotPool extends EventEmitter {
     // Clear access.json
     await this.write_access_json(bot.state_dir, null);
 
+    await this.persist();
+
     console.log(`[pool] Released pool-${String(bot_id)}`);
     this.emit("bot:released", { bot_id });
   }
@@ -351,6 +408,7 @@ export class BotPool extends EventEmitter {
     this.kill_tmux(bot.tmux_session);
     bot.state = "parked";
     // session_id, channel_id, entity_id, archetype preserved for resume
+    await this.persist();
     console.log(
       `[pool] Parked pool-${String(bot.id)} ` +
       `(session: ${bot.session_id?.slice(0, 8) ?? "none"}, ` +
@@ -521,6 +579,54 @@ export class BotPool extends EventEmitter {
       }
     }
     console.log("[pool] All pool sessions stopped");
+  }
+
+  // ── Persistence ──
+
+  /**
+   * Persist current pool state to disk. Called after every state mutation
+   * (assign, release, park) for crash resilience — no shutdown hook dependency.
+   * Only persists assigned and parked bots; free bots have no meaningful state.
+   */
+  private async persist(): Promise<void> {
+    const to_save: PersistedPoolBot[] = this.bots
+      .filter(b => b.state !== "free")
+      .map(b => ({
+        id: b.id,
+        state: b.state as "assigned" | "parked",
+        channel_id: b.channel_id!,
+        entity_id: b.entity_id!,
+        archetype: b.archetype!,
+        channel_type: b.channel_type,
+        session_id: b.session_id,
+        last_active: b.last_active?.toISOString() ?? null,
+      }));
+
+    try {
+      await save_pool_state(to_save, this.config);
+    } catch (err) {
+      // Non-fatal: log and continue. Next mutation will retry the write.
+      console.error(`[pool] Failed to persist state: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Validate that a persisted entry still references a valid entity and channel.
+   * Returns false for stale entries (entity removed, channel deleted).
+   */
+  private validate_saved_entry(
+    entry: PersistedPoolBot,
+    registry: EntityRegistry,
+  ): boolean {
+    const entity = registry.get(entry.entity_id);
+    if (!entity) return false;
+
+    const channel = entity.entity.channels.list.find(
+      ch => ch.id === entry.channel_id,
+    );
+    if (!channel) return false;
+
+    return true;
   }
 
   // ── Internal ──

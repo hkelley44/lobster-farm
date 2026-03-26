@@ -56,9 +56,10 @@ async function main(): Promise<void> {
     `Session manager ready (max ${String(config.concurrency.max_active_sessions)} concurrent sessions)`,
   );
 
-  // Initialize bot pool — bots are assigned on first message, not on startup
+  // Initialize bot pool — bots are assigned on first message, not on startup.
+  // Pass registry so persisted state can be validated against current entities/channels.
   const pool = new BotPool(config);
-  await pool.initialize();
+  await pool.initialize(registry);
 
   // Wire pool to feature manager for interactive builder sessions
   feature_manager.set_pool(pool);
