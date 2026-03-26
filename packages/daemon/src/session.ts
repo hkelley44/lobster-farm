@@ -109,7 +109,7 @@ async function find_recent_daily_logs(
   }
 }
 
-async function build_entity_context(
+export async function build_entity_context(
   entity_id: string,
   feature_id: string,
   config: LobsterFarmConfig,

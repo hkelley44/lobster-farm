@@ -108,7 +108,7 @@ export async function create_pr(
   return pr_number;
 }
 
-/** Merge a pull request. */
+/** Merge a pull request. Idempotent — treats "already merged" as success. */
 export async function merge_pr(
   feature: FeatureState,
   _entity_config: EntityConfig,
@@ -119,15 +119,24 @@ export async function merge_pr(
 
   const cwd = feature.worktreePath ?? ".";
 
-  await run("gh", [
-    "pr",
-    "merge",
-    String(feature.prNumber),
-    "--squash",
-    "--delete-branch",
-  ], cwd);
-
-  console.log(`[actions] Merged PR #${String(feature.prNumber)} for ${feature.id}`);
+  try {
+    await run("gh", [
+      "pr",
+      "merge",
+      String(feature.prNumber),
+      "--squash",
+      "--delete-branch",
+    ], cwd);
+    console.log(`[actions] Merged PR #${String(feature.prNumber)} for ${feature.id}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // PR may have been merged by the reviewer already — treat as success
+    if (msg.includes("already been merged") || msg.includes("MERGED")) {
+      console.log(`[actions] PR #${String(feature.prNumber)} already merged — treating as success`);
+    } else {
+      throw err;
+    }
+  }
 }
 
 /** Run tests in a worktree. Returns true if tests pass. */
@@ -232,6 +241,12 @@ export async function assign_work_room(
   feature: FeatureState,
   entity_config: EntityConfig,
 ): Promise<string | null> {
+  // If already assigned (e.g., review→build bounce), return existing room
+  if (feature.discordWorkRoom) {
+    console.log(`[actions] Work room ${feature.discordWorkRoom} already assigned to ${feature.id}`);
+    return feature.discordWorkRoom;
+  }
+
   const channels = entity_config.entity.channels;
   const work_rooms = channels.list.filter((c: ChannelMapping) => c.type === "work_room");
 
@@ -330,6 +345,49 @@ export async function release_work_room(
   _discord?.build_channel_map();
 
   console.log(`[actions] Released work room ${channel_id} from ${feature.id}`);
+}
+
+// ── Review outcome detection ──
+
+export type ReviewOutcome = "approved" | "changes_requested" | "pending";
+
+/**
+ * Detect the review outcome for a PR by querying GitHub.
+ * Returns "approved", "changes_requested", or "pending".
+ * An already-merged PR is treated as "approved".
+ */
+export async function detect_review_outcome(
+  pr_number: number,
+  repo_path: string,
+): Promise<ReviewOutcome> {
+  try {
+    // Check if PR is already merged
+    const state = await run("gh", [
+      "pr", "view", String(pr_number),
+      "--json", "state",
+      "--jq", ".state",
+    ], repo_path);
+
+    if (state === "MERGED") {
+      return "approved";
+    }
+
+    // Check review decision
+    const decision = await run("gh", [
+      "pr", "view", String(pr_number),
+      "--json", "reviewDecision",
+      "--jq", ".reviewDecision",
+    ], repo_path);
+
+    switch (decision.toUpperCase()) {
+      case "APPROVED": return "approved";
+      case "CHANGES_REQUESTED": return "changes_requested";
+      default: return "pending";
+    }
+  } catch (err) {
+    console.error(`[actions] Failed to detect review outcome for PR #${String(pr_number)}: ${String(err)}`);
+    return "pending";
+  }
 }
 
 /** Update the topic of a feature's work room. */

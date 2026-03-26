@@ -101,6 +101,7 @@ async function main(): Promise<void> {
     session_manager,
     config,
     discord_connected ? discord : null,
+    feature_manager,
   );
   pr_cron.start();
 

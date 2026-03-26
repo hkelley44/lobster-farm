@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir, entity_dir } from "@lobster-farm/shared";
+import type { ChannelType } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
+import { build_entity_context } from "./session.js";
 
 // ── Types ──
 
@@ -14,6 +16,7 @@ export interface PoolBot {
   channel_id: string | null;
   entity_id: string | null;
   archetype: ArchetypeRole | null;
+  channel_type: ChannelType | null;
   session_id: string | null;
   tmux_session: string;
   last_active: Date | null;
@@ -159,6 +162,7 @@ export class BotPool {
         channel_id: null,
         entity_id: null,
         archetype: null,
+        channel_type: null,
         session_id: null,
         tmux_session,
         last_active: is_running ? new Date() : null,
@@ -178,6 +182,7 @@ export class BotPool {
     entity_id: string,
     archetype: ArchetypeRole,
     resume_session_id?: string,
+    channel_type?: ChannelType,
   ): Promise<PoolAssignment | null> {
     if (this._draining) {
       console.log("[pool] Rejecting assignment — draining");
@@ -198,24 +203,51 @@ export class BotPool {
       };
     }
 
-    // Find a free bot
-    let bot = this.bots.find(b => b.state === "free");
+    // Check for a parked bot that was previously on this channel — auto-resume
+    const returning = this.bots.find(
+      b => b.state === "parked" && b.channel_id === channel_id && b.entity_id === entity_id,
+    );
+    let bot: PoolBot | undefined;
+    if (returning) {
+      resume_session_id = resume_session_id ?? returning.session_id ?? undefined;
+      bot = returning;
+      console.log(
+        `[pool] Reclaiming parked bot pool-${String(bot.id)} for channel ${channel_id} ` +
+        `(session: ${resume_session_id?.slice(0, 8) ?? "fresh"})`,
+      );
+    }
+
+    // Find a free bot if we don't have a returning one
+    if (!bot) {
+      bot = this.bots.find(b => b.state === "free");
+    }
 
     // If none free, evict the least recently active (parked first, then assigned)
+    // Eviction priority: general-channel bots evicted before work-room bots
     if (!bot) {
-      // Try parked bots first
       const parked = this.bots
         .filter(b => b.state === "parked")
-        .sort((a, b) => (a.last_active?.getTime() ?? 0) - (b.last_active?.getTime() ?? 0));
+        .sort((a, b) => {
+          // General channels evicted before work rooms
+          const type_a = a.channel_type === "work_room" ? 1 : 0;
+          const type_b = b.channel_type === "work_room" ? 1 : 0;
+          if (type_a !== type_b) return type_a - type_b;
+          return (a.last_active?.getTime() ?? 0) - (b.last_active?.getTime() ?? 0);
+        });
 
       if (parked.length > 0) {
         bot = parked[0];
-        console.log(`[pool] Evicting parked bot pool-${String(bot!.id)} (LRU)`);
+        console.log(`[pool] Evicting parked bot pool-${String(bot!.id)} (${bot!.channel_type ?? "unknown"} channel, LRU)`);
       } else {
-        // Evict least recently active assigned bot
+        // Evict least recently active assigned bot (general first)
         const assigned = this.bots
           .filter(b => b.state === "assigned")
-          .sort((a, b) => (a.last_active?.getTime() ?? 0) - (b.last_active?.getTime() ?? 0));
+          .sort((a, b) => {
+            const type_a = a.channel_type === "work_room" ? 1 : 0;
+            const type_b = b.channel_type === "work_room" ? 1 : 0;
+            if (type_a !== type_b) return type_a - type_b;
+            return (a.last_active?.getTime() ?? 0) - (b.last_active?.getTime() ?? 0);
+          });
 
         if (assigned.length > 0) {
           bot = assigned[0];
@@ -248,6 +280,7 @@ export class BotPool {
     bot.channel_id = channel_id;
     bot.entity_id = entity_id;
     bot.archetype = archetype;
+    bot.channel_type = channel_type ?? null;
     bot.session_id = resume_session_id ?? null;
     bot.last_active = new Date();
 
@@ -277,6 +310,7 @@ export class BotPool {
     bot.channel_id = null;
     bot.entity_id = null;
     bot.archetype = null;
+    bot.channel_type = null;
     bot.session_id = null;
     bot.last_active = null;
 
@@ -420,6 +454,16 @@ export class BotPool {
 
     if (resume_session_id) {
       claude_args.push("--resume", resume_session_id);
+    }
+
+    // Inject entity context — parity with headless sessions in session.ts
+    try {
+      const feature_id = ""; // Pool bots may not have a feature; empty is safe
+      const entity_context = await build_entity_context(entity_id, feature_id, this.config);
+      claude_args.push("--append-system-prompt", entity_context);
+    } catch (err) {
+      console.log(`[pool] Failed to build entity context for pool-${String(bot.id)}: ${String(err)}`);
+      // Fail open — bot starts without context rather than failing entirely
     }
 
     const display_name = resolve_agent_display_name(archetype, this.config);

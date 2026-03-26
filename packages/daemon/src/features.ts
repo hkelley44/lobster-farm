@@ -165,6 +165,7 @@ export class FeatureManager extends EventEmitter {
       activeDna: [],
       sessionId: null,
       lastSessionId: null,
+      lastBuilderSessionId: null,
       blocked: false,
       blockedReason: null,
       approved: false,
@@ -297,6 +298,12 @@ export class FeatureManager extends EventEmitter {
     if (feature) {
       feature.sessionId = session.session_id;
       feature.lastSessionId = session.session_id;
+
+      // Preserve builder session ID separately so it survives the reviewer overwriting lastSessionId
+      if (feature.activeArchetype === "builder") {
+        feature.lastBuilderSessionId = session.session_id;
+      }
+
       this.session_to_feature.set(session.session_id, feature.id);
     }
   }
@@ -328,8 +335,15 @@ export class FeatureManager extends EventEmitter {
       this.config,
     );
 
-    // Auto-advance if no approval gate
     const phase_config = PHASE_CONFIG[feature.phase];
+
+    // Review phase: detect outcome instead of blind auto-advance
+    if (feature.phase === "review") {
+      await this.handle_review_outcome(feature);
+      return;
+    }
+
+    // Auto-advance if no approval gate
     if (!phase_config.needs_approval) {
       try {
         await this.advance_feature(feature_id);
@@ -346,6 +360,62 @@ export class FeatureManager extends EventEmitter {
         entity,
         { also_alerts: true },
       );
+    }
+  }
+
+  /** Detect review outcome and route: approved → ship, changes_requested → build bounce, pending → blocked. */
+  private async handle_review_outcome(feature: FeatureState): Promise<void> {
+    const entity = this.registry.get(feature.entity);
+
+    if (!feature.prNumber) {
+      console.error(`[features] Review completed for ${feature.id} but no PR number — blocking`);
+      feature.blocked = true;
+      feature.blockedReason = "Review completed but no PR number to check";
+      void this.persist();
+      return;
+    }
+
+    const repo_path = entity
+      ? expand_home_safe(entity.entity.repos[0]?.path ?? ".")
+      : ".";
+
+    const outcome = await actions.detect_review_outcome(feature.prNumber, repo_path);
+
+    switch (outcome) {
+      case "approved":
+        console.log(`[features] PR #${String(feature.prNumber)} approved — advancing ${feature.id} to ship`);
+        try {
+          await this.advance_feature(feature.id, "ship");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[features] Failed to advance ${feature.id} to ship: ${msg}`);
+        }
+        break;
+
+      case "changes_requested":
+        console.log(`[features] PR #${String(feature.prNumber)} changes requested — bouncing ${feature.id} back to build`);
+        try {
+          await this.advance_feature(feature.id, "build");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[features] Failed to bounce ${feature.id} to build: ${msg}`);
+        }
+        // Notify alerts about the bounce
+        await actions.notify_feature(
+          feature,
+          `Review bounced ${feature.id} back to build — changes requested on PR #${String(feature.prNumber)}`,
+          entity,
+          { also_alerts: true },
+        );
+        break;
+
+      case "pending":
+        console.log(`[features] Reviewer completed for ${feature.id} without posting a decision — blocking`);
+        feature.blocked = true;
+        feature.blockedReason = "Reviewer session completed without posting a review decision";
+        void this.persist();
+        this.emit("feature:blocked", feature, feature.blockedReason);
+        break;
     }
   }
 
@@ -394,6 +464,16 @@ export class FeatureManager extends EventEmitter {
     return [...this.features.values()];
   }
 
+  /** Find a feature by its linked PR number. Returns null if no feature is linked. */
+  find_by_pr(pr_number: number): FeatureState | null {
+    for (const feature of this.features.values()) {
+      if (feature.prNumber === pr_number) {
+        return feature;
+      }
+    }
+    return null;
+  }
+
   // ── Internal ──
 
   private determine_next_phase(feature: FeatureState): Phase | null {
@@ -425,11 +505,10 @@ export class FeatureManager extends EventEmitter {
     const prompt = resolve_prompt(phase_config.prompt_template, feature);
     const worktree_path = feature.worktreePath ?? expand_home_safe(entity.entity.repos[0]?.path ?? ".");
 
-    // Resume prior session only if the same archetype is being re-spawned
-    // (e.g., builder picks up where it left off after being unblocked or review bounce).
-    // Different archetype (e.g., plan→build) always gets a fresh session.
-    const same_archetype = feature.activeArchetype === phase_config.archetype;
-    const resume_id = same_archetype ? (feature.lastSessionId ?? undefined) : undefined;
+    // Resume builder session on review→build bounce using the dedicated lastBuilderSessionId.
+    // This is intentionally narrow — only builder bounce gets resume. All other transitions get fresh sessions.
+    const is_builder_bounce = phase_config.archetype === "builder" && Boolean(feature.lastBuilderSessionId);
+    const resume_id = is_builder_bounce ? (feature.lastBuilderSessionId ?? undefined) : undefined;
 
     const task_id = this.queue.submit({
       entity_id: feature.entity,
