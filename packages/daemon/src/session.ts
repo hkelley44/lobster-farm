@@ -35,6 +35,7 @@ export interface ActiveSession {
   entity_id: string;
   feature_id: string;
   archetype: ArchetypeRole;
+  resume: boolean;
   started_at: Date;
   pid: number | null;
   tmux_pane: string | null;
@@ -231,11 +232,14 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
     const session_id_idx = fresh_idx !== -1 ? fresh_idx : resume_idx;
     const session_id = args[session_id_idx + 1]!;
 
+    const is_resume = Boolean(options.resume_session_id);
+
     const session: ActiveSession = {
       session_id,
       entity_id: options.entity_id,
       feature_id: options.feature_id,
       archetype: options.archetype,
+      resume: is_resume,
       started_at: new Date(),
       pid: null,
       tmux_pane: null,

@@ -13,6 +13,7 @@ import { CommanderProcess } from "./commander-process.js";
 import { BotPool } from "./pool.js";
 import { PRReviewCron } from "./pr-cron.js";
 import { check_required_binaries, propagate_tmux_env } from "./env.js";
+import type { Phase } from "@lobster-farm/shared";
 import { append_session_log } from "./persistence.js";
 
 async function main(): Promise<void> {
@@ -51,8 +52,9 @@ async function main(): Promise<void> {
     entity_id: string;
     feature_id: string;
     archetype: ActiveSession["archetype"];
-    phase: string | null;
+    phase: Phase | null;
     started_at: string;
+    resume: boolean;
   }
   const queue_session_meta = new Map<string, QueueSessionMeta>();
 
@@ -68,6 +70,7 @@ async function main(): Promise<void> {
       archetype: session.archetype,
       phase: feature?.phase ?? null,
       started_at: session.started_at.toISOString(),
+      resume: session.resume,
     };
     queue_session_meta.set(session.session_id, meta);
 
@@ -84,7 +87,7 @@ async function main(): Promise<void> {
       exit_code: null,
       duration_ms: null,
       bot_id: null,
-      resume: false,
+      resume: session.resume,
     }, config);
   });
 
@@ -110,7 +113,7 @@ async function main(): Promise<void> {
         exit_code: result.exit_code,
         duration_ms: Date.now() - meta.start_ms,
         bot_id: null,
-        resume: false,
+        resume: meta.resume,
       }, config);
     }
   });
@@ -137,7 +140,7 @@ async function main(): Promise<void> {
         exit_code: 1,
         duration_ms: Date.now() - meta.start_ms,
         bot_id: null,
-        resume: false,
+        resume: meta.resume,
       }, config);
     }
   });
