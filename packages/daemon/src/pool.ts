@@ -538,7 +538,9 @@ export class BotPool extends EventEmitter {
    * Check all assigned bots for dead tmux sessions.
    * Protected so tests can call it directly without waiting for the interval.
    */
-  protected check_assigned_health(): void {
+  protected async check_assigned_health(): Promise<void> {
+    let changed = false;
+
     for (const bot of this.bots) {
       if (bot.state !== "assigned") continue;
       if (this.is_tmux_alive(bot.tmux_session)) continue;
@@ -563,10 +565,13 @@ export class BotPool extends EventEmitter {
       bot.channel_type = null;
       bot.session_id = null;
       bot.last_active = null;
+      changed = true;
 
       this.emit("bot:session_ended", event_data);
       this.emit("bot:released", { bot_id: bot.id });
     }
+
+    if (changed) await this.persist();
   }
 
   /** Stop all pool bot sessions. Used during daemon shutdown. */

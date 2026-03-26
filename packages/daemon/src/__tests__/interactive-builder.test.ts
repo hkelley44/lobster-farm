@@ -78,8 +78,8 @@ class MockBotPool extends BotPool {
   }
 
   /** Expose check_assigned_health for direct testing. */
-  trigger_health_check(): void {
-    this.check_assigned_health();
+  async trigger_health_check(): Promise<void> {
+    await this.check_assigned_health();
   }
 }
 
@@ -759,7 +759,7 @@ describe("Interactive builder sessions", () => {
   });
 
   describe("pool.ts: health monitor emits both events", () => {
-    it("check_assigned_health emits bot:session_ended and bot:released", () => {
+    it("check_assigned_health emits bot:session_ended and bot:released", async () => {
       pool.inject_bots([
         make_bot({
           id: 1,
@@ -776,7 +776,7 @@ describe("Interactive builder sessions", () => {
       pool.on("bot:session_ended", (event: unknown) => session_events.push(event));
       pool.on("bot:released", (event: unknown) => release_events.push(event));
 
-      pool.trigger_health_check();
+      await pool.trigger_health_check();
 
       expect(session_events).toHaveLength(1);
       expect(release_events).toHaveLength(1);

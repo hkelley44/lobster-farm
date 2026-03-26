@@ -261,10 +261,6 @@ describe("BotPool persistence", () => {
     it("assign() triggers persist", async () => {
       pool.inject_bots([make_bot({ id: 1, state: "free" })]);
 
-      // Spy on save_pool_state to verify it was called
-      const { save_pool_state: save_fn } = await import("../persistence.js");
-      const save_spy = vi.spyOn(await import("../persistence.js"), "save_pool_state");
-
       await pool.assign("ch-1", "e1", "builder", undefined, "general");
 
       // Verify state was written to disk
