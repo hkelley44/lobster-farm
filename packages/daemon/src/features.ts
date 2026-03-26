@@ -425,9 +425,11 @@ export class FeatureManager extends EventEmitter {
     const prompt = resolve_prompt(phase_config.prompt_template, feature);
     const worktree_path = feature.worktreePath ?? expand_home_safe(entity.entity.repos[0]?.path ?? ".");
 
-    // Resume prior session if same archetype is being re-spawned for this feature
-    // (e.g., builder picks up where it left off after being unblocked)
-    const resume_id = feature.lastSessionId ?? undefined;
+    // Resume prior session only if the same archetype is being re-spawned
+    // (e.g., builder picks up where it left off after being unblocked or review bounce).
+    // Different archetype (e.g., plan→build) always gets a fresh session.
+    const same_archetype = feature.activeArchetype === phase_config.archetype;
+    const resume_id = same_archetype ? (feature.lastSessionId ?? undefined) : undefined;
 
     const task_id = this.queue.submit({
       entity_id: feature.entity,

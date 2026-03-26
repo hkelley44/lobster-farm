@@ -225,8 +225,10 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
     }
 
     const { command, args } = await this.build_command(options);
-    // Extract session_id from the args (we passed it via --session-id)
-    const session_id_idx = args.indexOf("--session-id");
+    // Extract session_id from args — could be --session-id (fresh) or --resume (resumed)
+    const fresh_idx = args.indexOf("--session-id");
+    const resume_idx = args.indexOf("--resume");
+    const session_id_idx = fresh_idx !== -1 ? fresh_idx : resume_idx;
     const session_id = args[session_id_idx + 1]!;
 
     const session: ActiveSession = {
