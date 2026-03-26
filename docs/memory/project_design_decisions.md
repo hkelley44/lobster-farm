@@ -51,9 +51,11 @@ This means pool size is a soft limit. Sessions are preserved on disk — parking
 
 **Max capacity escalation.** If all bots are actively in use and a new channel needs one, Pat alerts the user: "All agent slots active. Create another bot or queue this?"
 
-**Phase transitions.** When a work room transitions (e.g., plan → build): kill the planner's pool bot session, reassign a pool bot with the builder archetype for that channel. The planner session was idle (you just approved), so no work is interrupted. The builder starts fresh or resumes a prior session.
+**Primary pattern: subagents, not pool cycling.** Gary spawns Bob/Pearl/Ray as subagents within his session for plan → build transitions. No pool cycling needed. The subagent inherits full conversation context — no information loss, no cold start. Pool cycling only happens when the user explicitly swaps agents via `!lf swap`.
 
-**Why:** Headless sessions introduce latency and prevent real-time collaboration. The user is a collaborator, not just an approver. Agents should surface discoveries and ask questions naturally. Dynamic pooling keeps resource usage proportional to actual concurrency, not total channels.
+**Pool tracks any archetype per channel.** Default assignment is planner (Gary), but the pool preserves whatever archetype was last active. If the user was riffing with Pearl in a work room and the session gets parked, resuming that channel restores Pearl, not Gary.
+
+**Why:** Headless sessions introduce latency and prevent real-time collaboration. The user is a collaborator, not just an approver. Agents should surface discoveries and ask questions naturally. Subagents eliminate the overhead of phase transitions. Dynamic pooling keeps resource usage proportional to actual concurrency.
 
 ## Channel Ownership
 

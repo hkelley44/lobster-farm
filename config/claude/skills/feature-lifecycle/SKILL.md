@@ -1,8 +1,8 @@
 ---
 name: feature-lifecycle
 description: >
-  The autonomous feature lifecycle — how features move from idea to shipped.
-  Auto-loads when creating features, advancing phases, managing the build loop,
+  The feature lifecycle — how features move from idea to shipped.
+  Auto-loads when creating features, planning work, managing the build loop,
   or understanding how work flows through the system.
 ---
 
@@ -14,155 +14,78 @@ _How a feature moves from idea to shipped code in LobsterFarm._
 
 ## Overview
 
-Features flow through a deterministic phase sequence. The daemon orchestrates — spawning agents, managing state, enforcing gates. You make decisions at approval gates. Everything else is autonomous.
+The planner (Gary) is the orchestrator for each entity. Features start as conversations — you riff with Gary in #general or a work room. When a feature is ready to build, Gary creates the GitHub issue, spawns Bob (builder) as a subagent, and manages the flow. You stay in Discord for everything — approvals, questions, feedback.
 
 ```
-plan → [design] → build → PR created → review-merge SOP → ship → done
+Riff with Gary → spec ready → GitHub issue created → Bob builds (subagent) → PR → review-merge SOP → shipped
 ```
 
-Design is optional — skipped unless the feature has UI/frontend/brand/design labels. Review is handled by the separate `pr-review-merge` SOP — the feature lifecycle creates the PR and waits for it to merge.
+## How It Works
 
-## Creating a Feature
+### 1. Discovery (in Discord)
 
-A feature requires:
-- **Entity ID** — which project this is for
-- **Title** — what the feature is
-- **GitHub issue number** — the spec lives on the issue
+You describe what you want in #general or a work room. Gary does socratic discovery — asks questions, proposes approaches, scopes the work. This is a conversation, not a form to fill out.
 
-Via Discord:
-```
-!lf plan {entity} "Feature title"
-```
+When the spec is solid, Gary creates a GitHub issue as the record. The issue is the OUTPUT of planning, not the input.
 
-Via HTTP API:
-```bash
-curl -s -X POST http://localhost:7749/features \
-  -H 'Content-Type: application/json' \
-  -d '{"entity_id": "{entity}", "title": "Feature title", "github_issue": 42}'
-```
+### 2. Approval (in Discord)
 
-Optional fields: `priority` (critical/high/medium/low), `labels` (array of strings — include "ui" or "frontend" to trigger the design phase).
+Gary posts the spec summary in the work room and asks for approval. You approve right there in the chat — "looks good, let's build it." No need for `!lf approve` unless you want to use it.
 
-## Phases
+Gary decides whether pre-PR approval is needed based on the feature type:
+- **Visual work (UI, design):** show screenshots/preview before PR
+- **Backend/infra:** PR can go up directly, user reviews the code
 
-### Plan
+### 3. Build (subagent)
 
-**Who:** Gary (planner)
-**DNA:** planning-dna
-**Model:** opus, high effort
-**Approval gate:** Yes — you must approve the spec before build begins
+Gary spawns Bob as a subagent within his session. Bob inherits full context from the planning conversation — no information loss. Bob:
+- Creates a feature branch
+- Implements the feature following the spec
+- Writes tests
+- Runs `/simplify` to clean up
+- Commits and pushes
+- Creates a PR with `Closes #{issue}` in the body
 
-Gary reads the GitHub issue and writes a detailed spec as an issue comment: acceptance criteria, technical approach, scope boundaries. When he's done, you get pinged in #alerts.
+Gary reports the result back to you in Discord.
 
-**To approve:**
-```
-!lf approve {feature-id}
-```
-or `POST /features/{id}/approve`
+### 4. Review & Merge (pr-review-merge SOP)
 
-**To advance after approval:**
-```
-!lf advance {feature-id}
-```
-or `POST /features/{id}/advance`
+The PR triggers the `pr-review-merge` SOP independently. See that skill for details. When the PR merges, the GitHub issue auto-closes.
 
-### Design (optional)
+### 5. Design (when needed)
 
-**Who:** Pearl (designer)
-**DNA:** design-dna, coding-dna
-**Model:** opus, standard effort
-**Approval gate:** Yes
-**Skipped unless:** feature has labels: ui, frontend, brand, or design
+For visual work, Gary can spawn Pearl (designer) as a subagent, or you can ask to talk to Pearl directly via `!lf swap pearl`. Pearl creates design artifacts — brand kits, component libraries, UI prototypes. Swap back to Gary when done.
 
-Pearl creates coded prototypes using the entity's design system. Pinged in #alerts when done.
+## Agent Model
 
-### Build
+**Gary is the front door for each entity.** One Gary session per entity #general channel, always available. You riff with Gary, Gary delegates.
 
-**Who:** Bob (builder)
-**DNA:** coding-dna
-**Model:** opus, high effort
-**Approval gate:** No — auto-creates PR when Bob finishes
+**Subagents, not phase cycling.** Gary spawns Bob, Pearl, or Ray as subagents within his session. No pool bot cycling, no cold starts, no context loss. The subagent inherits Gary's full conversation context.
 
-The daemon creates a git worktree on a feature branch (`feature/{issue#}-{slug}`). Bob implements the feature following the spec, writes tests, runs `/simplify` to clean up, commits and pushes.
+**Direct agent access via swap.** If you want to riff directly with Pearl on design or Bob on implementation, use `!lf swap pearl` or `!lf swap bob` in a work room. The daemon swaps the pool bot's archetype.
 
-**Agent behavior during build:** Plans drift. New information emerges. When an agent discovers something that could affect a decision or the outcome, it should surface it via #alerts — not assume. This isn't about asking permission for every line of code. It's about being a collaborator. Genuine questions get asked. Everything else, keep building.
+## Agent Behavior
 
-When the session completes, the daemon auto-creates a PR. The PR triggers the `pr-review-merge` SOP, which handles review, fixes, and merge independently.
+**Agents are collaborators, not task executors.** During any phase, agents should surface discoveries that could affect decisions. Plans drift during implementation — new information should be communicated, not suppressed. Ask genuine questions. Don't assume.
 
-### Review (handed off to pr-review-merge SOP)
+**PR bodies must include `Closes #{issue}`.** This auto-closes the GitHub issue on merge. The spec, the PR, and the issue are linked.
 
-The feature lifecycle does not manage review directly. Once the PR is created, the `pr-review-merge` SOP takes over:
-- Reviewer reviews the PR
-- If changes needed, Bob fixes and re-pushes
-- Loop until review passes
-- Merge
+**Run `/simplify` before pushing.** Less noise for the reviewer.
 
-See the `pr-review-merge` skill for full details.
+**Update daily logs.** After completing work, write to `daily/YYYY-MM-DD.md` with what was done, decisions made, and any open questions.
 
-The feature lifecycle watches for the PR to merge. When it does, the feature advances to ship.
+## Work Room Management
 
-### Ship
-
-**Who:** No agent — deterministic actions only
-**What happens:**
-1. Clean up the git worktree
-2. Release the Discord work room
-3. Post confirmation to #general
-
-Auto-advances to done.
-
-### Done
-
-Terminal state. Feature is complete.
-
-## State Management
-
-Features are persisted to `~/.lobsterfarm/state/features.json` on every state change. The daemon reloads them on startup.
-
-**Feature state includes:**
-- Current phase, approval status, blocked status
-- Active session ID (which Claude Code process is working on it)
-- Worktree path, PR number, branch name
-- Priority, labels, timestamps
-
-## Blocking and Unblocking
-
-If a session fails (Claude Code crashes, timeout, etc.), the feature is automatically blocked. You'll be notified in #alerts.
-
-To unblock and retry:
-```
-!lf unblock {feature-id}
-!lf advance {feature-id}
-```
-
-## Notifications
-
-- **#work-log** — phase transitions, agent activity
-- **#alerts** — approval requests, blocks, errors, agent questions
-- **#general** — feature shipped confirmation
-
-## What the Daemon Does vs What Agents Do
-
-**Daemon (deterministic):**
-- Create/advance features through phases
-- Spawn agents with the right archetype, DNA, and model
-- Create worktrees and PRs
-- Enforce approval gates
-- Track state, persist to disk
-- Route notifications to Discord
-- Detect PR merge and advance feature to ship
-
-**Agents (intelligent):**
-- Write specs, designs, code
-- Make technical decisions within their scope
-- Ask questions via #alerts when they have genuine questions
-- Surface discoveries that could affect decisions
-- Run `/simplify` before pushing code
-- Commit and push code
+- **Status pins:** each work room has a pinned status message updated by the daemon
+  - `🟢 Available`
+  - `🔵 Secret Scanning Hook — Plan`
+  - `🟡 Secret Scanning Hook — Build`
+- **Auto-assignment:** messaging an empty work room auto-assigns a planner
+- **Room release:** when a feature ships, the room status resets to available
 
 ## What NOT to Do
 
-- Don't skip approval gates — they exist for a reason
-- Don't manually advance a blocked feature without understanding why it blocked
-- Don't create features without a GitHub issue — the issue is the spec's home
-- Don't merge PRs outside the review-merge SOP — the daemon tracks PR state
+- Don't skip the planning conversation for non-trivial features
+- Don't create PRs without `Closes #{issue}` in the body
+- Don't merge PRs outside the review-merge SOP — it tracks PR state
+- Don't suppress discoveries — if you learned something that matters, say it

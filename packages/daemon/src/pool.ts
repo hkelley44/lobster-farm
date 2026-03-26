@@ -373,6 +373,8 @@ export class BotPool {
       claude_args.push("--resume", resume_session_id);
     }
 
+    const display_name = resolve_agent_display_name(archetype, this.config);
+    const git_env = `GIT_AUTHOR_NAME="${display_name} (LobsterFarm)" GIT_AUTHOR_EMAIL="${agent_name}@lobsterfarm.dev" GIT_COMMITTER_NAME="${display_name} (LobsterFarm)" GIT_COMMITTER_EMAIL="${agent_name}@lobsterfarm.dev"`;
     const claude_cmd = claude_args.join(" ");
 
     return new Promise<void>((resolve, reject) => {
@@ -380,13 +382,17 @@ export class BotPool {
         "new-session", "-d",
         "-s", bot.tmux_session,
         "-x", "200", "-y", "50",
-        `DISCORD_STATE_DIR=${bot.state_dir} ${claude_cmd}`,
+        `DISCORD_STATE_DIR=${bot.state_dir} ${git_env} ${claude_cmd}`,
       ], {
         cwd: working_dir,
         stdio: "ignore",
         env: {
           ...process.env,
           DISCORD_STATE_DIR: bot.state_dir,
+          GIT_AUTHOR_NAME: `${display_name} (LobsterFarm)`,
+          GIT_AUTHOR_EMAIL: `${agent_name}@lobsterfarm.dev`,
+          GIT_COMMITTER_NAME: `${display_name} (LobsterFarm)`,
+          GIT_COMMITTER_EMAIL: `${agent_name}@lobsterfarm.dev`,
         },
       });
 
