@@ -313,11 +313,20 @@ export class PRReviewCron {
         `External PR #${String(pr.number)} needs changes — spawning builder to fix`,
       );
     } else if (review_state === "approved") {
-      // Never auto-merge external code — escalate to human
-      await this.notify_alerts(
-        entity_id,
-        `External PR #${String(pr.number)} approved — awaiting human merge approval`,
-      );
+      // Check if the reviewer already merged (they're instructed to merge on approval)
+      const is_merged = await this.check_pr_merged(repo_path, pr.number);
+      if (is_merged) {
+        await this.notify_alerts(
+          entity_id,
+          `External PR #${String(pr.number)} approved and merged`,
+        );
+      } else {
+        // Not yet merged — escalate to human
+        await this.notify_alerts(
+          entity_id,
+          `External PR #${String(pr.number)} approved — awaiting human merge approval`,
+        );
+      }
     } else {
       // Notify completion without specific action
       await this.notify_alerts(
@@ -374,6 +383,20 @@ export class PRReviewCron {
         message,
         "reviewer" as ArchetypeRole,
       );
+    }
+  }
+
+  /** Check if a PR has been merged. */
+  private async check_pr_merged(repo_path: string, pr_number: number): Promise<boolean> {
+    try {
+      const { stdout } = await exec("gh", [
+        "pr", "view", String(pr_number),
+        "--json", "state",
+        "--jq", ".state",
+      ], { cwd: repo_path, timeout: 15_000 });
+      return stdout.trim() === "MERGED";
+    } catch {
+      return false;
     }
   }
 }
