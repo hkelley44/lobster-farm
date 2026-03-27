@@ -26,8 +26,9 @@ import {
   expand_home,
   write_yaml,
 } from "@lobster-farm/shared";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { lobsterfarm_dir } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
 import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import { route_message, type RouteAction, type RoutedMessage } from "./router.js";
@@ -60,11 +61,25 @@ interface ChannelEntry {
 
 // ── Discord Bot ──
 
+// ── Avatar cache paths ──
+
+const AVATAR_EXTENSIONS = [".jpg", ".png", ".webp"];
+
+function avatars_dir(): string {
+  return join(lobsterfarm_dir(), "avatars");
+}
+
+function avatar_cache_path(config: LobsterFarmConfig): string {
+  return join(lobsterfarm_dir(config.paths), "state", "avatar-urls.json");
+}
+
 export class DiscordBot extends EventEmitter {
   private client: Client;
   private channel_map = new Map<string, ChannelEntry>();
   private entity_channels = new Map<string, Map<ChannelType, string>>();
   private connected = false;
+  /** Cached avatar CDN URLs keyed by lowercase agent name. */
+  private avatar_urls = new Map<string, string>();
 
   constructor(
     private config: LobsterFarmConfig,
@@ -246,9 +261,10 @@ export class DiscordBot extends EventEmitter {
 
   // ── Agent identity ──
 
-  private resolve_agent_identity(archetype: ArchetypeRole | "system"): { name: string; avatar_url: string | undefined } {
+  resolve_agent_identity(archetype: ArchetypeRole | "system"): { name: string; avatar_url: string | undefined } {
     if (archetype === "system") {
-      return { name: "LobsterFarm", avatar_url: undefined };
+      const system_url = this.avatar_urls.get("lobsterfarm");
+      return { name: "LobsterFarm", avatar_url: system_url };
     }
 
     const agents = this.config.agents;
@@ -261,10 +277,198 @@ export class DiscordBot extends EventEmitter {
       reviewer: "Reviewer",
     };
 
-    // Emoji-based "avatars" as fallback — Discord webhooks can use avatar URLs
-    // Users can configure real avatar URLs in the future
     const name = names[archetype] ?? archetype;
-    return { name, avatar_url: undefined };
+    const avatar_url = this.avatar_urls.get(name.toLowerCase());
+    return { name, avatar_url };
+  }
+
+  // ── Avatar management ──
+
+  /** Load avatar URL cache from disk. Returns the parsed map (also populates this.avatar_urls). */
+  async load_avatar_cache(): Promise<Map<string, string>> {
+    try {
+      const raw = await readFile(avatar_cache_path(this.config), "utf-8");
+      const data: unknown = JSON.parse(raw);
+      if (data && typeof data === "object" && !Array.isArray(data)) {
+        for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+          if (typeof value === "string") {
+            this.avatar_urls.set(key, value);
+          }
+        }
+      }
+    } catch {
+      // File doesn't exist or is invalid — start with empty cache
+    }
+    return new Map(this.avatar_urls);
+  }
+
+  /** Save current avatar URL cache to disk. */
+  async save_avatar_cache(): Promise<void> {
+    const path = avatar_cache_path(this.config);
+    await mkdir(join(path, ".."), { recursive: true });
+    const obj: Record<string, string> = {};
+    for (const [key, value] of this.avatar_urls) {
+      obj[key] = value;
+    }
+    await writeFile(path, JSON.stringify(obj, null, 2), "utf-8");
+  }
+
+  /**
+   * Upload agent avatars to Discord and cache the CDN URLs.
+   *
+   * For each configured agent, checks if an avatar file exists at
+   * ~/.lobsterfarm/avatars/{name}.{jpg,png,webp}. If the URL is already
+   * cached, skips the upload. Otherwise uploads to a system channel
+   * and extracts the CDN URL from the resulting attachment.
+   *
+   * Must be called after Discord is connected.
+   */
+  async upload_avatars(): Promise<void> {
+    // Load any existing cache from disk
+    await this.load_avatar_cache();
+
+    // Collect all agent names from config
+    const agents = this.config.agents;
+    const agent_names = [
+      agents.planner.name.toLowerCase(),
+      agents.designer.name.toLowerCase(),
+      agents.builder.name.toLowerCase(),
+      agents.operator.name.toLowerCase(),
+      agents.commander.name.toLowerCase(),
+    ];
+
+    // Discover avatar files on disk
+    let dir_entries: string[] = [];
+    try {
+      dir_entries = await readdir(avatars_dir());
+    } catch {
+      console.log("[discord:avatars] No avatars directory found — skipping avatar upload");
+      return;
+    }
+
+    // Build a map of agent name → file path for files that exist on disk
+    const avatar_files = new Map<string, string>();
+    for (const filename of dir_entries) {
+      const dot = filename.lastIndexOf(".");
+      if (dot === -1) continue;
+      const ext = filename.slice(dot).toLowerCase();
+      if (!AVATAR_EXTENSIONS.includes(ext)) continue;
+      const name = filename.slice(0, dot).toLowerCase();
+      avatar_files.set(name, join(avatars_dir(), filename));
+    }
+
+    // Find a channel to upload to (system-status preferred, any entity channel as fallback)
+    const upload_channel_id = this.find_upload_channel();
+    if (!upload_channel_id) {
+      console.log("[discord:avatars] No channel available for avatar upload — skipping");
+      return;
+    }
+
+    let uploaded = 0;
+    let cached = 0;
+
+    for (const name of agent_names) {
+      // Already cached — skip
+      if (this.avatar_urls.has(name)) {
+        cached++;
+        continue;
+      }
+
+      const file_path = avatar_files.get(name);
+      if (!file_path) continue;
+
+      try {
+        const url = await this.upload_avatar_file(upload_channel_id, name, file_path);
+        if (url) {
+          this.avatar_urls.set(name, url);
+          uploaded++;
+        }
+      } catch (err) {
+        console.error(`[discord:avatars] Failed to upload avatar for ${name}: ${String(err)}`);
+      }
+    }
+
+    // Also upload any non-agent avatar files (e.g., "lobsterfarm" for system identity)
+    for (const [name, file_path] of avatar_files) {
+      if (agent_names.includes(name)) continue; // already handled
+      if (this.avatar_urls.has(name)) {
+        cached++;
+        continue;
+      }
+
+      try {
+        const url = await this.upload_avatar_file(upload_channel_id, name, file_path);
+        if (url) {
+          this.avatar_urls.set(name, url);
+          uploaded++;
+        }
+      } catch (err) {
+        console.error(`[discord:avatars] Failed to upload avatar for ${name}: ${String(err)}`);
+      }
+    }
+
+    // Save cache to disk if anything changed
+    if (uploaded > 0) {
+      await this.save_avatar_cache();
+    }
+
+    console.log(
+      `[discord:avatars] ${String(uploaded)} uploaded, ${String(cached)} cached, ${String(this.avatar_urls.size)} total`,
+    );
+  }
+
+  /** Upload a single avatar file to Discord and return the CDN URL. */
+  private async upload_avatar_file(
+    channel_id: string,
+    name: string,
+    file_path: string,
+  ): Promise<string | null> {
+    const channel = await this.client.channels.fetch(channel_id);
+    if (!channel?.isTextBased()) return null;
+
+    const text_channel = channel as TextChannel;
+    const message = await text_channel.send({
+      content: `Avatar: ${name}`,
+      files: [{ attachment: file_path, name: `${name}${file_path.slice(file_path.lastIndexOf("."))}` }],
+    });
+
+    const attachment = message.attachments.first();
+    if (!attachment?.url) {
+      console.log(`[discord:avatars] Upload succeeded but no attachment URL for ${name}`);
+      return null;
+    }
+
+    // Delete the upload message — we only needed the CDN URL
+    try {
+      await message.delete();
+    } catch {
+      // Not critical — message stays in the channel but that's fine
+    }
+
+    return attachment.url;
+  }
+
+  /** Find a channel suitable for avatar uploads. Prefers system-status. */
+  private find_upload_channel(): string | null {
+    // Try to find system-status channel from global config
+    // (it's not in entity_channels — check by iterating channels)
+    for (const [channel_id] of this.channel_map) {
+      return channel_id; // any mapped channel will work
+    }
+
+    // Fallback: try any entity's first channel
+    for (const [, entity_map] of this.entity_channels) {
+      for (const [, channel_id] of entity_map) {
+        return channel_id;
+      }
+    }
+
+    return null;
+  }
+
+  /** Get the current avatar URL for an agent name (for testing/inspection). */
+  get_avatar_url(name: string): string | undefined {
+    return this.avatar_urls.get(name.toLowerCase());
   }
 
   // ── Webhook management ──

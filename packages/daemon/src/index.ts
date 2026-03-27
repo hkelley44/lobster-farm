@@ -184,6 +184,16 @@ async function main(): Promise<void> {
     console.log("[discord] Daemon will run with HTTP API only.");
   }
 
+  // Upload agent avatars to Discord CDN (cached — only uploads on first run)
+  if (discord_connected) {
+    try {
+      await discord.upload_avatars();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[discord:avatars] Avatar upload failed: ${msg}`);
+    }
+  }
+
   // Reset stale work room topics from previous daemon runs
   if (discord_connected) {
     await reset_idle_work_room_topics(registry);
