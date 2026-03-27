@@ -696,7 +696,7 @@ export class BotPool extends EventEmitter {
    */
   private async persist(): Promise<void> {
     const to_save: PersistedPoolBot[] = this.bots
-      .filter(b => b.state !== "free")
+      .filter(b => b.state !== "free" && b.channel_id && b.entity_id && b.archetype)
       .map(b => ({
         id: b.id,
         state: b.state as "assigned" | "parked",
@@ -718,19 +718,38 @@ export class BotPool extends EventEmitter {
 
   /**
    * Validate that a persisted entry still references a valid entity and channel.
-   * Returns false for stale entries (entity removed, channel deleted).
+   * Returns false for stale entries (entity removed, channel deleted, or null metadata).
    */
   private validate_saved_entry(
     entry: PersistedPoolBot,
     registry: EntityRegistry,
   ): boolean {
+    if (!entry.entity_id || !entry.channel_id) {
+      console.log(
+        `[pool] Rejecting pool-${String(entry.id)}: null metadata ` +
+        `(entity: ${String(entry.entity_id)}, channel: ${String(entry.channel_id)})`,
+      );
+      return false;
+    }
+
     const entity = registry.get(entry.entity_id);
-    if (!entity) return false;
+    if (!entity) {
+      console.log(
+        `[pool] Rejecting pool-${String(entry.id)}: entity "${entry.entity_id}" not in registry`,
+      );
+      return false;
+    }
 
     const channel = entity.entity.channels.list.find(
       ch => ch.id === entry.channel_id,
     );
-    if (!channel) return false;
+    if (!channel) {
+      console.log(
+        `[pool] Rejecting pool-${String(entry.id)}: channel "${entry.channel_id}" ` +
+        `not found in entity "${entry.entity_id}"`,
+      );
+      return false;
+    }
 
     return true;
   }
