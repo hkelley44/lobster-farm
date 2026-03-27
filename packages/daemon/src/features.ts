@@ -18,6 +18,7 @@ import type { SessionResult } from "./session.js";
 import * as actions from "./actions.js";
 import { save_features, load_features, append_session_log } from "./persistence.js";
 import { extract_session_learnings } from "./hooks.js";
+import { PersistQueue } from "./persist-queue.js";
 
 // ── Phase configuration ──
 
@@ -143,6 +144,8 @@ export class FeatureManager extends EventEmitter {
   /** Optional pool reference — set via set_pool() after construction. */
   private pool: BotPool | null = null;
 
+  private persist_queue: PersistQueue;
+
   constructor(
     private registry: EntityRegistry,
     private queue: TaskQueue,
@@ -150,8 +153,15 @@ export class FeatureManager extends EventEmitter {
   ) {
     super();
 
+    this.persist_queue = new PersistQueue(() => this.persist());
+
     // When the queue drains (a task completes), retry features blocked due to queue-full
     this.queue.on("drain", () => this.retry_queue_blocked());
+  }
+
+  /** Drain the persist queue. Call during graceful shutdown. */
+  drain_persist(): Promise<void> {
+    return this.persist_queue.drain();
   }
 
   /**
@@ -313,7 +323,7 @@ export class FeatureManager extends EventEmitter {
     );
 
     // Persist after entry actions so worktreePath / discordWorkRoom are captured
-    void this.persist();
+    this.persist_queue.enqueue();
 
     this.emit("feature:created", feature);
     return feature;
@@ -333,7 +343,7 @@ export class FeatureManager extends EventEmitter {
 
     feature.approved = true;
     feature.updatedAt = new Date().toISOString();
-    void this.persist();
+    this.persist_queue.enqueue();
 
     console.log(`[features] Phase "${feature.phase}" approved for ${feature_id}`);
     this.emit("feature:approved", feature);
@@ -414,7 +424,7 @@ export class FeatureManager extends EventEmitter {
       }
     }
 
-    void this.persist();
+    this.persist_queue.enqueue();
     this.emit("feature:advanced", feature, old_phase);
 
     // When a feature reaches done, check if any blocked features can be unblocked
@@ -453,7 +463,7 @@ export class FeatureManager extends EventEmitter {
     feature.agentDone = true;
     feature.sessionId = null;
     feature.updatedAt = new Date().toISOString();
-    void this.persist();
+    this.persist_queue.enqueue();
 
     console.log(
       `[features] Agent completed for ${feature_id} (phase: ${feature.phase})`,
@@ -504,7 +514,7 @@ export class FeatureManager extends EventEmitter {
       console.error(`[features] Review completed for ${feature.id} but no PR number -- blocking`);
       feature.blocked = true;
       feature.blockedReason = "Review completed but no PR number to check";
-      void this.persist();
+      this.persist_queue.enqueue();
       return;
     }
 
@@ -546,7 +556,7 @@ export class FeatureManager extends EventEmitter {
         console.log(`[features] Reviewer completed for ${feature.id} without posting a decision -- blocking`);
         feature.blocked = true;
         feature.blockedReason = "Reviewer session completed without posting a review decision";
-        void this.persist();
+        this.persist_queue.enqueue();
         this.emit("feature:blocked", feature, feature.blockedReason);
         break;
     }
@@ -565,7 +575,7 @@ export class FeatureManager extends EventEmitter {
     feature.blockedReason = error;
     feature.sessionId = null;
     feature.updatedAt = new Date().toISOString();
-    void this.persist();
+    this.persist_queue.enqueue();
 
     console.error(`[features] Session failed for ${feature_id}: ${error}`);
     this.emit("feature:blocked", feature, error);
@@ -579,7 +589,7 @@ export class FeatureManager extends EventEmitter {
     feature.blocked = false;
     feature.blockedReason = null;
     feature.updatedAt = new Date().toISOString();
-    void this.persist();
+    this.persist_queue.enqueue();
     return feature;
   }
 
@@ -621,7 +631,7 @@ export class FeatureManager extends EventEmitter {
       this.emit("feature:unblocked", feature);
     }
 
-    void this.persist();
+    this.persist_queue.enqueue();
   }
 
   /**
@@ -648,7 +658,7 @@ export class FeatureManager extends EventEmitter {
 
       // spawn_phase_agent will re-block if the queue is still full
       void this.spawn_phase_agent(feature, phase_config);
-      void this.persist();
+      this.persist_queue.enqueue();
     }
   }
 
@@ -676,7 +686,7 @@ export class FeatureManager extends EventEmitter {
 
       // spawn_phase_agent will re-block if pool is still full
       void this.spawn_phase_agent(feature, phase_config);
-      void this.persist();
+      this.persist_queue.enqueue();
     }
   }
 
@@ -724,7 +734,7 @@ export class FeatureManager extends EventEmitter {
 
     if (feature.phase !== "build") {
       // Not in build phase — just clean up, don't try to advance
-      void this.persist();
+      this.persist_queue.enqueue();
       return;
     }
 
@@ -743,7 +753,7 @@ export class FeatureManager extends EventEmitter {
         // PR exists — advance to review
         feature.prNumber = pr_number;
         console.log(`[features] Builder exited with PR #${String(pr_number)} for ${feature.id} -- advancing to review`);
-        void this.persist();
+        this.persist_queue.enqueue();
 
         try {
           await this.advance_feature(feature.id, "review");
@@ -765,7 +775,7 @@ export class FeatureManager extends EventEmitter {
       entity,
       { also_alerts: true },
     );
-    void this.persist();
+    this.persist_queue.enqueue();
   }
 
   /**
@@ -871,7 +881,7 @@ export class FeatureManager extends EventEmitter {
         feature.blocked = true;
         feature.blockedReason = "Queue full -- will retry when capacity frees up";
         feature.updatedAt = new Date().toISOString();
-        void this.persist();
+        this.persist_queue.enqueue();
 
         console.log(`[features] Queue full -- ${feature.id} blocked, will retry on drain`);
         this.emit("feature:blocked", feature, feature.blockedReason);
@@ -939,7 +949,7 @@ export class FeatureManager extends EventEmitter {
       feature.blocked = true;
       feature.blockedReason = "No pool bots available -- will retry when one is freed";
       feature.updatedAt = new Date().toISOString();
-      void this.persist();
+      this.persist_queue.enqueue();
 
       console.log(`[features] No pool bots available -- ${feature.id} blocked, will retry on release`);
       this.emit("feature:blocked", feature, feature.blockedReason);
@@ -989,7 +999,7 @@ export class FeatureManager extends EventEmitter {
       );
     }
 
-    void this.persist();
+    this.persist_queue.enqueue();
   }
 
   /**

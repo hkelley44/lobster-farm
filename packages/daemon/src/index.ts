@@ -272,6 +272,9 @@ async function main(): Promise<void> {
     // surviving tmux sessions and the daemon's pool metadata.
     await pool.shutdown();
 
+    // Drain the feature persist queue so pending state writes complete before exit
+    await feature_manager.drain_persist();
+
     // Stop Commander
     await commander.stop();
 
