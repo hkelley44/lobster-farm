@@ -644,6 +644,35 @@ export class BotPool extends EventEmitter {
     }
   }
 
+  /** Check if an assigned bot's tmux session is still alive.
+   * Returns false if the bot is not found, not assigned, or its tmux session is dead.
+   * Used by discord.ts handle_message() to detect dead sessions on incoming messages. */
+  is_session_alive(bot_id: number): boolean {
+    const bot = this.bots.find(b => b.id === bot_id);
+    if (!bot || bot.state !== "assigned") return false;
+    return this.is_tmux_alive(bot.tmux_session);
+  }
+
+  /** Release a bot while preserving its session_id in history for future resume.
+   * Stashes session_id before calling release(), which nulls all bot metadata.
+   * Used by discord.ts when a message arrives for a bot with a dead tmux session. */
+  async release_with_history(bot_id: number): Promise<void> {
+    const bot = this.bots.find(b => b.id === bot_id);
+    if (!bot || !bot.channel_id) return;
+
+    if (bot.session_id && bot.entity_id) {
+      const key = `${bot.entity_id}:${bot.channel_id}`;
+      this.session_history.set(key, bot.session_id);
+      console.log(
+        `[pool] Stashed session history for ${key}: ${bot.session_id.slice(0, 8)}`,
+      );
+    }
+
+    // release() uses channel_id to find the bot — grab it before it's nulled
+    const channel_id = bot.channel_id;
+    await this.release(channel_id);
+  }
+
   /** Get pool status. */
   get_status(): PoolStatus {
     return {
@@ -787,6 +816,17 @@ export class BotPool extends EventEmitter {
         `[pool] Detected dead tmux session for pool-${String(bot.id)} ` +
         `(channel: ${bot.channel_id ?? "none"})`,
       );
+
+      // Preserve session_id in history so the channel can resume when reassigned.
+      // This is the safety net for when the health monitor fires before a message
+      // triggers the lazy-resume path in handle_message().
+      if (bot.session_id && bot.channel_id && bot.entity_id) {
+        const key = `${bot.entity_id}:${bot.channel_id}`;
+        this.session_history.set(key, bot.session_id);
+        console.log(
+          `[pool] Stashed session history for ${key}: ${bot.session_id.slice(0, 8)}`,
+        );
+      }
 
       // Reset bot to free state
       bot.state = "free";
