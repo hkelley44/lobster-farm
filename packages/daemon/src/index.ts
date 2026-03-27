@@ -270,6 +270,9 @@ async function main(): Promise<void> {
     // from the CLI side before unloading the service.
     pool.stop_health_monitor();
 
+    // Drain the feature persist queue so pending state writes complete before exit
+    await feature_manager.drain_persist();
+
     // Stop Commander
     await commander.stop();
 
