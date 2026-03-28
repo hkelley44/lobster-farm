@@ -2195,7 +2195,12 @@ export class DiscordBot extends EventEmitter {
     // Long-running commands must defer within 3 seconds to avoid
     // Discord's "This application did not respond" error.
     if (deferred) {
-      await interaction.deferReply({ ephemeral });
+      try {
+        await interaction.deferReply({ ephemeral });
+      } catch (err) {
+        console.error(`[discord:slash] deferReply failed for /${command_name}: ${String(err)}`);
+        return; // Can't respond — Discord already timed out or errored
+      }
     }
 
     const target = target_from_interaction(interaction, ephemeral, deferred);
