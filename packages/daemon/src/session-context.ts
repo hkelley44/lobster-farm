@@ -116,14 +116,12 @@ async function parse_session_usage(file_path: string): Promise<{ used_tokens: nu
 
       // Each assistant turn's input_tokens is cumulative — the last one
       // represents the full context window fill level.
+      // All three fields must come from the same turn to avoid cross-turn
+      // contamination (cache fields are optional and may be absent, not 0).
       if (typeof usage.input_tokens === "number") {
         last_input_tokens = usage.input_tokens;
-      }
-      if (typeof usage.cache_creation_input_tokens === "number") {
-        last_cache_creation = usage.cache_creation_input_tokens;
-      }
-      if (typeof usage.cache_read_input_tokens === "number") {
-        last_cache_read = usage.cache_read_input_tokens;
+        last_cache_creation = usage.cache_creation_input_tokens ?? 0;
+        last_cache_read = usage.cache_read_input_tokens ?? 0;
       }
     } catch {
       // Skip malformed lines
@@ -182,12 +180,10 @@ export async function read_session_context(session_id: string): Promise<SessionC
 
 // ── Helpers ──
 
-/** Resolve the context window size based on model name. */
-function resolve_context_window(model: string | null): number {
-  // All current Claude models (opus, sonnet) have 200k context windows.
-  // If a model string contains a known identifier, we could differentiate,
-  // but for now 200k is the universal default.
-  if (!model) return DEFAULT_CONTEXT_WINDOW;
+/** Resolve the context window size based on model name.
+ * All current Claude models (opus, sonnet) share a 200k window.
+ * Expand the lookup here when models with different windows ship. */
+function resolve_context_window(_model: string | null): number {
   return DEFAULT_CONTEXT_WINDOW;
 }
 

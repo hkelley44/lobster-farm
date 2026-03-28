@@ -91,7 +91,7 @@ export async function fetch_subscription_usage(): Promise<SubscriptionUsageSumma
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": "claude-code/1.0.0",
       },
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(5_000),
     });
 
     if (!response.ok) {

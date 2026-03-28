@@ -167,6 +167,45 @@ describe("session-context", () => {
       expect(result!.summary).toBe("150k / 200k (75%)");
     });
 
+    it("does not carry cache tokens forward from earlier turns", async () => {
+      const session_id = "cache-bleed-1234-5678-9012-123456789012";
+      const file_path = join(tmp_dir, ".claude", "projects", "test-project", `${session_id}.jsonl`);
+
+      // Turn 1 has cache_creation_input_tokens: 500
+      // Turn 2 has input_tokens: 5000 but cache_creation_input_tokens is ABSENT (not 0)
+      // Without the fix, last_cache_creation would bleed through from turn 1 → used_tokens = 5500
+      // With the fix, all cache fields reset when input_tokens updates → used_tokens = 5000
+      const lines = [
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            usage: {
+              input_tokens: 1000,
+              cache_creation_input_tokens: 500,
+              cache_read_input_tokens: 0,
+              output_tokens: 100,
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            usage: {
+              input_tokens: 5000,
+              output_tokens: 200,
+              // cache_creation_input_tokens intentionally absent
+              // cache_read_input_tokens intentionally absent
+            },
+          },
+        }),
+      ];
+      await writeFile(file_path, lines.join("\n"));
+
+      const result = await read_session_context(session_id);
+      expect(result).not.toBeNull();
+      expect(result!.used_tokens).toBe(5000);
+    });
+
     it("formats sub-thousand token counts correctly", async () => {
       const session_id = "small-tok-1234-5678-9012-123456789012";
       const file_path = join(tmp_dir, ".claude", "projects", "test-project", `${session_id}.jsonl`);
