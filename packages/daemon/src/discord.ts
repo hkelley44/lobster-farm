@@ -35,6 +35,7 @@ import type { FeatureManager, CreateFeatureOptions } from "./features.js";
 import { route_message, type RouteAction, type RoutedMessage } from "./router.js";
 import type { TaskQueue } from "./queue.js";
 import type { BotPool, PoolBot } from "./pool.js";
+import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
 
@@ -134,12 +135,22 @@ export class DiscordBot extends EventEmitter {
 
     await this.client.login(token);
     await ready;
+
+    sentry.addBreadcrumb({
+      category: "daemon.lifecycle",
+      message: "Discord connected",
+      data: { tag: this.client.user?.tag },
+    });
   }
 
   /** Disconnect from Discord. */
   async disconnect(): Promise<void> {
     if (this.connected) {
       console.log("[discord] Disconnecting...");
+      sentry.addBreadcrumb({
+        category: "daemon.lifecycle",
+        message: "Discord disconnecting",
+      });
       this.client.destroy();
       this.connected = false;
     }
@@ -164,6 +175,9 @@ export class DiscordBot extends EventEmitter {
       }
     } catch (err) {
       console.error(`[discord] Failed to send to ${channel_id}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "send" },
+      });
     }
   }
 
@@ -239,6 +253,9 @@ export class DiscordBot extends EventEmitter {
       }
     } catch (err) {
       console.error(`[discord] Failed to set topic for ${channel_id}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "set_topic" },
+      });
     }
   }
 
@@ -261,6 +278,9 @@ export class DiscordBot extends EventEmitter {
       return channel.id;
     } catch (err) {
       console.error(`[discord] Failed to create channel "${name}": ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "create_channel" },
+      });
       return null;
     }
   }
@@ -276,6 +296,9 @@ export class DiscordBot extends EventEmitter {
       return true;
     } catch (err) {
       console.error(`[discord] Failed to delete channel ${channel_id}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "delete_channel" },
+      });
       return false;
     }
   }
@@ -541,6 +564,9 @@ export class DiscordBot extends EventEmitter {
       return await this.client.guilds.fetch(server_id);
     } catch (err) {
       console.error(`[discord] Failed to fetch guild ${server_id}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "fetch_guild" },
+      });
       return null;
     }
   }
@@ -596,6 +622,9 @@ export class DiscordBot extends EventEmitter {
       }
     } catch (err) {
       console.error(`[discord] Server scaffold failed: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "scaffold_server" },
+      });
     }
 
     return result;
@@ -662,6 +691,9 @@ export class DiscordBot extends EventEmitter {
       this.build_channel_map();
     } catch (err) {
       console.error(`[discord] Entity scaffold failed for ${entity_id}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "scaffold_entity", entity: entity_id },
+      });
     }
 
     return { category_id, channels };
@@ -1479,6 +1511,9 @@ export class DiscordBot extends EventEmitter {
       setTimeout(() => { void unlink(pending_path).catch(() => {}); }, 30000);
     } catch (err) {
       console.error(`[discord] Bridge failed: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "bridge" },
+      });
     }
   }
 

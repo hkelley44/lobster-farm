@@ -11,6 +11,7 @@ import { fetch_review_comments, build_review_fix_prompt } from "./features.js";
 import { detect_review_outcome } from "./actions.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { PRReviewState } from "./persistence.js";
+import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
 
@@ -119,6 +120,16 @@ export class PRReviewCron {
     }
 
     this.running = true;
+
+    // Sentry cron monitoring: report check-in status
+    const checkInId = sentry.cronCheckInStart("pr-review-cron", {
+      schedule: { type: "interval", value: 30, unit: "minute" },
+      checkinMargin: 5,
+      maxRuntime: 15,
+      failureIssueThreshold: 3,
+      recoveryThreshold: 2,
+    });
+
     try {
       const entities = this.registry.get_active();
 
@@ -131,8 +142,14 @@ export class PRReviewCron {
           await this.check_repo(entity_id, repo_path, entity_config);
         }
       }
+
+      sentry.cronCheckInFinish(checkInId, "pr-review-cron", "ok");
     } catch (err) {
       console.error(`[pr-cron] Poll failed: ${String(err)}`);
+      sentry.cronCheckInFinish(checkInId, "pr-review-cron", "error");
+      sentry.captureException(err, {
+        tags: { module: "pr-cron" },
+      });
     } finally {
       this.running = false;
     }
@@ -346,6 +363,9 @@ export class PRReviewCron {
         spawn_env = { GH_TOKEN: gh_token };
       } catch (err) {
         console.error(`[pr-cron] Failed to get GitHub App token: ${String(err)}`);
+        sentry.captureException(err, {
+          tags: { module: "pr-cron", entity: entity_id },
+        });
         // Continue without app token — reviewer will use default gh auth
       }
     }
@@ -376,7 +396,13 @@ export class PRReviewCron {
 
         // Persist completion so we don't re-review after restart
         void this.persist_review_completion(entity_id, pr, repo_path)
-          .catch(err => console.error(`[pr-cron] Failed to persist review for PR #${String(pr.number)}: ${String(err)}`));
+          .catch(err => {
+            console.error(`[pr-cron] Failed to persist review for PR #${String(pr.number)}: ${String(err)}`);
+            sentry.captureException(err, {
+              tags: { module: "pr-cron", entity: entity_id },
+              contexts: { pr: { number: pr.number, title: pr.title } },
+            });
+          });
       };
 
       const on_fail = (session_id: string, error: string) => {
@@ -386,6 +412,10 @@ export class PRReviewCron {
 
         this.active_reviews.delete(key);
         console.error(`[pr-cron] Review failed for PR #${String(pr.number)}: ${error}`);
+        sentry.captureException(new Error(error), {
+          tags: { module: "pr-cron", entity: entity_id },
+          contexts: { pr: { number: pr.number, title: pr.title } },
+        });
       };
 
       this.session_manager.on("session:completed", on_complete);
@@ -393,6 +423,10 @@ export class PRReviewCron {
     } catch (err) {
       this.active_reviews.delete(key);
       console.error(`[pr-cron] Failed to spawn reviewer for PR #${String(pr.number)}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "pr-cron", entity: entity_id, action: "spawn_reviewer" },
+        contexts: { pr: { number: pr.number, title: pr.title } },
+      });
     }
   }
 
@@ -512,6 +546,9 @@ export class PRReviewCron {
         fix_env = { GH_TOKEN: gh_token };
       } catch (err) {
         console.error(`[pr-cron] Failed to get GitHub App token for fixer: ${String(err)}`);
+        sentry.captureException(err, {
+          tags: { module: "pr-cron", entity: entity_id, action: "fixer_token" },
+        });
       }
     }
 
@@ -529,6 +566,10 @@ export class PRReviewCron {
       });
     } catch (err) {
       console.error(`[pr-cron] Failed to spawn builder for external PR #${String(pr.number)}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "pr-cron", entity: entity_id, action: "spawn_fixer" },
+        contexts: { pr: { number: pr.number, title: pr.title } },
+      });
     }
   }
 

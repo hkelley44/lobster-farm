@@ -21,6 +21,7 @@ import type { FeatureManager } from "./features.js";
 import type { DiscordBot } from "./discord.js";
 import { detect_review_outcome } from "./actions.js";
 import { fetch_review_comments, build_review_fix_prompt } from "./features.js";
+import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
 
@@ -173,6 +174,10 @@ export async function handle_github_webhook(
   // 5. Route event
   void route_event(event_type, payload, ctx).catch((err) => {
     console.error(`[webhook] Error handling ${event_type}.${payload.action}: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "webhook", webhook_source: "github" },
+      contexts: { event: { type: event_type, action: payload.action } },
+    });
   });
 }
 
@@ -216,6 +221,12 @@ async function route_event(
     `in ${match.entity_id} (${repo_full_name})`,
   );
 
+  sentry.addBreadcrumb({
+    category: "daemon.api",
+    message: `Webhook: pull_request.${action} PR #${String(pr.number)}`,
+    data: { entity: match.entity_id, pr_number: pr.number, action },
+  });
+
   // Deduplicate: if review already in-flight for this PR, mark for requeue
   const key = review_key(match.entity_id, pr.number);
   const existing = active_reviews.get(key);
@@ -253,6 +264,10 @@ async function spawn_review(
     gh_token = await ctx.github_app.get_token();
   } catch (err) {
     console.error(`[webhook] Failed to get installation token: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "webhook", entity: entity_id },
+      contexts: { pr: { number: pr.number, title: pr.title } },
+    });
     active_reviews.delete(key);
     return;
   }
@@ -296,7 +311,13 @@ async function spawn_review(
       ctx.session_manager.removeListener("session:failed", on_fail);
 
       void handle_review_completion(entity_id, repo_path, pr, ctx).catch(
-        (err) => console.error(`[webhook] Post-review error: ${String(err)}`),
+        (err) => {
+          console.error(`[webhook] Post-review error: ${String(err)}`);
+          sentry.captureException(err, {
+            tags: { module: "webhook", entity: entity_id },
+            contexts: { pr: { number: pr.number, title: pr.title } },
+          });
+        },
       );
     };
 
@@ -308,6 +329,10 @@ async function spawn_review(
       console.error(
         `[webhook] Review session failed for PR #${String(pr.number)}: ${error}`,
       );
+      sentry.captureException(new Error(error), {
+        tags: { module: "webhook", entity: entity_id },
+        contexts: { pr: { number: pr.number, title: pr.title } },
+      });
       cleanup_and_maybe_requeue(key, entity_id, repo_path, pr, ctx);
     };
 
@@ -317,6 +342,10 @@ async function spawn_review(
     console.error(
       `[webhook] Failed to spawn reviewer for PR #${String(pr.number)}: ${String(err)}`,
     );
+    sentry.captureException(err, {
+      tags: { module: "webhook", entity: entity_id, action: "spawn_reviewer" },
+      contexts: { pr: { number: pr.number, title: pr.title } },
+    });
     active_reviews.delete(key);
   }
 }
@@ -390,9 +419,13 @@ function cleanup_and_maybe_requeue(
     console.log(
       `[webhook] Re-reviewing PR #${String(pr.number)} — new commits arrived during previous review`,
     );
-    void spawn_review(entity_id, repo_path, pr, ctx).catch((err) =>
-      console.error(`[webhook] Requeue failed for PR #${String(pr.number)}: ${String(err)}`),
-    );
+    void spawn_review(entity_id, repo_path, pr, ctx).catch((err) => {
+      console.error(`[webhook] Requeue failed for PR #${String(pr.number)}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "webhook", entity: entity_id, action: "requeue" },
+        contexts: { pr: { number: pr.number, title: pr.title } },
+      });
+    });
   }
 }
 
@@ -441,6 +474,10 @@ async function spawn_fixer(
     console.error(
       `[webhook] Failed to spawn builder for PR #${String(pr.number)}: ${String(err)}`,
     );
+    sentry.captureException(err, {
+      tags: { module: "webhook", entity: entity_id, action: "spawn_fixer" },
+      contexts: { pr: { number: pr.number, title: pr.title } },
+    });
   }
 }
 

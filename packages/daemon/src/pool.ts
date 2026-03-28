@@ -11,6 +11,7 @@ import { save_pool_state, load_pool_state } from "./persistence.js";
 import type { PersistedPoolBot } from "./persistence.js";
 import type { EntityRegistry } from "./registry.js";
 import { sq } from "./shell.js";
+import * as sentry from "./sentry.js";
 
 // ── Types ──
 
@@ -423,6 +424,10 @@ export class BotPool extends EventEmitter {
         console.error(
           `[pool] Failed to resume pool-${String(bot.id)}: ${String(err)}`,
         );
+        sentry.captureException(err, {
+          tags: { module: "pool", bot_id: String(bot.id) },
+          contexts: { resume: { entity_id: candidate.entity_id, session_id: candidate.session_id } },
+        });
         // Leave the bot in its current state — parked bots can still be resumed
         // on next message; assigned bots with dead tmux will be caught by health monitor
       }
@@ -621,6 +626,12 @@ export class BotPool extends EventEmitter {
         `as ${archetype} for entity ${entity_id}`,
       );
 
+      sentry.addBreadcrumb({
+        category: "daemon.pool",
+        message: `Assigned pool-${String(bot.id)} as ${archetype}`,
+        data: { bot_id: bot.id, channel_id, entity_id, archetype },
+      });
+
       return {
         bot_id: bot.id,
         channel_id,
@@ -666,6 +677,13 @@ export class BotPool extends EventEmitter {
       await this.persist();
 
       console.log(`[pool] Released pool-${String(bot_id)}`);
+
+      sentry.addBreadcrumb({
+        category: "daemon.pool",
+        message: `Released pool-${String(bot_id)}`,
+        data: { bot_id },
+      });
+
       this.emit("bot:released", { bot_id });
     } finally {
       this.releasing_channels.delete(channel_id);
@@ -954,6 +972,9 @@ export class BotPool extends EventEmitter {
     } catch (err) {
       // Non-fatal: log and continue. Next mutation will retry the write.
       console.error(`[pool] Failed to persist state: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "pool", action: "persist" },
+      });
     }
   }
 
@@ -1079,6 +1100,9 @@ export class BotPool extends EventEmitter {
       proc.on("close", (code) => {
         if (code !== 0) {
           console.error(`[pool] tmux new-session failed for pool-${String(bot.id)} (code ${String(code)})`);
+          sentry.captureException(new Error(`tmux new-session failed for pool-${String(bot.id)} with code ${String(code)}`), {
+            tags: { module: "pool", bot_id: String(bot.id) },
+          });
           reject(new Error(`tmux failed with code ${String(code)}`));
           return;
         }
@@ -1097,6 +1121,9 @@ export class BotPool extends EventEmitter {
           resolve();
         } else {
           console.error(`[pool] tmux session did not start for pool-${String(bot.id)}`);
+          sentry.captureException(new Error(`tmux session did not start for pool-${String(bot.id)}`), {
+            tags: { module: "pool", bot_id: String(bot.id) },
+          });
           reject(new Error("tmux session did not start"));
         }
       });

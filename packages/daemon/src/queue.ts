@@ -7,6 +7,7 @@ import type {
   Priority,
 } from "@lobster-farm/shared";
 import type { ClaudeSessionManager, SessionResult } from "./session.js";
+import * as sentry from "./sentry.js";
 
 // ── Types ──
 
@@ -159,6 +160,10 @@ export class TaskQueue extends EventEmitter {
         this.failed_count++;
 
         console.error(`[queue] Task ${task.id.slice(0, 8)} failed to start: ${error}`);
+        sentry.captureException(err, {
+          tags: { module: "queue", entity: task.entity_id, archetype: task.archetype },
+          contexts: { task: { id: task.id, feature_id: task.feature_id } },
+        });
       }
     }
   }
