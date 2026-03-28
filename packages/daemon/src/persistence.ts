@@ -138,6 +138,7 @@ export async function load_pool_state(
 
     // Old format: plain array of bots
     if (Array.isArray(data)) {
+      console.log(`[pool] Loaded pool-state.json (old array format, ${String(data.length)} entries)`);
       return { bots: data as PersistedPoolBot[], session_history: {} };
     }
 
@@ -148,11 +149,20 @@ export async function load_pool_state(
       const history = (typeof obj["session_history"] === "object" && obj["session_history"] !== null && !Array.isArray(obj["session_history"]))
         ? (obj["session_history"] as Record<string, string>)
         : {};
+      console.log(
+        `[pool] Loaded pool-state.json (${String(bots.length)} bots, ` +
+        `${String(Object.keys(history).length)} history entries)`,
+      );
       return { bots, session_history: history };
     }
 
+    console.log("[pool] pool-state.json has unexpected format — starting fresh");
     return { bots: [], session_history: {} };
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT'
+      ? "file not found"
+      : String(err);
+    console.log(`[pool] Could not load pool-state.json: ${msg} — starting fresh`);
     return { bots: [], session_history: {} };
   }
 }

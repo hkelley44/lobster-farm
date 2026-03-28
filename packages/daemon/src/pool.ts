@@ -215,6 +215,18 @@ export class BotPool extends EventEmitter {
 
     // Restore persisted assignments from last run
     const saved_state = await load_pool_state(this.config);
+    if (saved_state.bots.length > 0) {
+      console.log(`[pool] Loaded ${String(saved_state.bots.length)} saved bot entries from pool-state.json`);
+      for (const entry of saved_state.bots) {
+        console.log(
+          `[pool]   pool-${String(entry.id)}: state=${entry.state}, ` +
+          `channel=${entry.channel_id}, session=${entry.session_id?.slice(0, 8) ?? "none"}`,
+        );
+      }
+    } else {
+      console.log("[pool] No saved bot entries found in pool-state.json");
+    }
+
     let restored = 0;
     this.resume_candidates = [];
 
@@ -806,6 +818,8 @@ export class BotPool extends EventEmitter {
    * Protected so tests can call it directly without waiting for the interval.
    */
   protected async check_assigned_health(): Promise<void> {
+    if (this._draining) return;
+
     let changed = false;
 
     for (const bot of this.bots) {
@@ -856,6 +870,10 @@ export class BotPool extends EventEmitter {
   /** Stop all pool bot sessions. Used during daemon shutdown. */
   async shutdown(): Promise<void> {
     this.stop_health_monitor();
+
+    // Snapshot current state before killing tmux — this is what the next
+    // daemon startup will load for proactive resume.
+    await this.persist();
 
     for (const bot of this.bots) {
       if (bot.state === "assigned") {
