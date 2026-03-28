@@ -1446,8 +1446,6 @@ export class DiscordBot extends EventEmitter {
     const lines = [
       "**Session Status**",
       `Agent: ${agent_label}`,
-      `Entity: ${bot.entity_id ?? routed.entity_id}`,
-      `Channel: <#${routed.channel_id}>`,
     ];
 
     if (bot.session_id) {
