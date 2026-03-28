@@ -37,6 +37,11 @@ import type { BotPool, PoolBot } from "./pool.js";
 
 const exec = promisify(execFile);
 
+/** Discord snowflake IDs are numeric strings, 17-20 digits. */
+export function is_discord_snowflake(id: string): boolean {
+  return /^\d{17,20}$/.test(id);
+}
+
 /**
  * Extract GitHub owner/repo (nwo) from a repo URL.
  * Handles both SSH (git@github.com:owner/repo.git) and
@@ -682,6 +687,14 @@ export class DiscordBot extends EventEmitter {
       const entity_map = new Map<ChannelType, string>();
 
       for (const channel of entity_config.entity.channels.list) {
+        if (!is_discord_snowflake(channel.id)) {
+          console.log(
+            `[discord] Skipping invalid channel ID "${channel.id}" ` +
+            `in entity "${entity_id}" — not a Discord snowflake`,
+          );
+          continue;
+        }
+
         this.channel_map.set(channel.id, {
           entity_id,
           channel_type: channel.type,
