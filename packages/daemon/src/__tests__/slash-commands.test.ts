@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   build_slash_commands,
+  EPHEMERAL_COMMAND_NAMES,
   type CommandTarget,
 } from "../discord.js";
 
@@ -32,17 +33,9 @@ describe("build_slash_commands", () => {
     expect(options[0]!.toJSON().required).toBe(true);
   });
 
-  it("/status has an optional scope option with choices", () => {
+  it("/status has no options", () => {
     const status = commands.find(c => c.name === "status")!;
-    const options = status.options;
-    expect(options).toHaveLength(1);
-    const opt = options[0]!.toJSON();
-    expect(opt.name).toBe("scope");
-    expect(opt.required).toBeFalsy();
-    expect(opt.choices).toEqual([
-      { name: "entity", value: "entity" },
-      { name: "all", value: "all" },
-    ]);
+    expect(status.options).toHaveLength(0);
   });
 
   it("/swap has a required agent option with fixed choices", () => {
@@ -91,22 +84,31 @@ describe("build_slash_commands", () => {
     expect(bp_opt.required).toBeFalsy();
   });
 
-  it("/approve and /advance have optional feature options", () => {
+  it("/approve and /advance have required feature options", () => {
     for (const cmd_name of ["approve", "advance"]) {
       const cmd = commands.find(c => c.name === cmd_name)!;
       const options = cmd.options;
       expect(options).toHaveLength(1);
       const opt = options[0]!.toJSON();
       expect(opt.name).toBe("feature");
-      expect(opt.required).toBeFalsy();
+      expect(opt.required).toBe(true);
     }
   });
 
-  it("/help, /close, /compact, /reset have no options", () => {
-    for (const cmd_name of ["help", "close", "compact", "reset"]) {
+  it("/help, /compact, /reset have no options", () => {
+    for (const cmd_name of ["help", "compact", "reset"]) {
       const cmd = commands.find(c => c.name === cmd_name)!;
       expect(cmd.options).toHaveLength(0);
     }
+  });
+
+  it("/close has an optional force boolean option", () => {
+    const close = commands.find(c => c.name === "close")!;
+    const options = close.options;
+    expect(options).toHaveLength(1);
+    const opt = options[0]!.toJSON();
+    expect(opt.name).toBe("force");
+    expect(opt.required).toBeFalsy();
   });
 });
 
@@ -135,21 +137,18 @@ describe("CommandTarget contract", () => {
 // ── Ephemeral commands ──
 
 describe("EPHEMERAL_COMMANDS", () => {
-  // The EPHEMERAL_COMMANDS set is module-private, but we can verify behavior
-  // through the build_slash_commands output — ephemeral commands should be
-  // help, status, features (per spec)
-  it("help, status, features are the ephemeral commands per spec", () => {
-    // This is a documentation test — the actual ephemeral behavior is
-    // enforced in target_from_interaction which checks EPHEMERAL_COMMANDS
-    const ephemeral_names = ["help", "status", "features"];
+  it("EPHEMERAL_COMMAND_NAMES matches the spec (help, status, features)", () => {
+    expect([...EPHEMERAL_COMMAND_NAMES]).toEqual(["help", "status", "features"]);
+  });
+
+  it("all ephemeral and public commands are registered", () => {
     const public_names = ["plan", "approve", "advance", "swap", "scaffold",
       "room", "close", "resume", "compact", "reset"];
 
     const all_commands = build_slash_commands();
     const all_names = all_commands.map(c => c.name);
 
-    // All ephemeral and public commands are registered
-    for (const name of [...ephemeral_names, ...public_names]) {
+    for (const name of [...EPHEMERAL_COMMAND_NAMES, ...public_names]) {
       expect(all_names).toContain(name);
     }
   });

@@ -107,13 +107,7 @@ export function build_slash_commands(): SlashCommandBuilder[] {
 
     new SlashCommandBuilder()
       .setName("status")
-      .setDescription("Show session and entity status")
-      .addStringOption(opt =>
-        opt.setName("scope").setDescription("Status scope").addChoices(
-          { name: "entity", value: "entity" },
-          { name: "all", value: "all" },
-        ),
-      ) as SlashCommandBuilder,
+      .setDescription("Show session and entity status"),
 
     new SlashCommandBuilder()
       .setName("features")
@@ -130,14 +124,14 @@ export function build_slash_commands(): SlashCommandBuilder[] {
       .setName("approve")
       .setDescription("Approve the current phase gate for a feature")
       .addStringOption(opt =>
-        opt.setName("feature").setDescription("Feature ID"),
+        opt.setName("feature").setDescription("Feature ID").setRequired(true),
       ) as SlashCommandBuilder,
 
     new SlashCommandBuilder()
       .setName("advance")
       .setDescription("Advance a feature to the next phase")
       .addStringOption(opt =>
-        opt.setName("feature").setDescription("Feature ID"),
+        opt.setName("feature").setDescription("Feature ID").setRequired(true),
       ) as SlashCommandBuilder,
 
     new SlashCommandBuilder()
@@ -171,7 +165,10 @@ export function build_slash_commands(): SlashCommandBuilder[] {
 
     new SlashCommandBuilder()
       .setName("close")
-      .setDescription("Archive and close the current work room"),
+      .setDescription("Archive and close the current work room")
+      .addBooleanOption(opt =>
+        opt.setName("force").setDescription("Force close even if a feature is active"),
+      ) as SlashCommandBuilder,
 
     new SlashCommandBuilder()
       .setName("resume")
@@ -191,7 +188,12 @@ export function build_slash_commands(): SlashCommandBuilder[] {
 }
 
 // Commands whose responses should be ephemeral (only visible to the invoker).
-const EPHEMERAL_COMMANDS = new Set(["help", "status", "features"]);
+export const EPHEMERAL_COMMAND_NAMES = ["help", "status", "features"] as const;
+const EPHEMERAL_COMMANDS = new Set<string>(EPHEMERAL_COMMAND_NAMES);
+
+// Commands that perform external I/O and may exceed Discord's 3-second
+// interaction response window. These get deferReply() before processing.
+const DEFERRED_COMMANDS = new Set(["plan", "scaffold", "room", "resume"]);
 
 /** Create a CommandTarget from a Discord text message. */
 function target_from_message(message: Message, send_fallback: (channel_id: string, content: string) => Promise<void>): CommandTarget {
@@ -212,19 +214,21 @@ function target_from_message(message: Message, send_fallback: (channel_id: strin
 }
 
 /** Create a CommandTarget from a slash command interaction. */
-function target_from_interaction(interaction: ChatInputCommandInteraction, ephemeral: boolean): CommandTarget {
+function target_from_interaction(interaction: ChatInputCommandInteraction, ephemeral: boolean, deferred = false): CommandTarget {
   let replied = false;
   return {
     channel_id: interaction.channelId,
     author_name: interaction.user.displayName,
     async reply(content: string) {
       try {
-        if (!replied) {
+        if (deferred && !replied) {
+          await interaction.editReply({ content });
+        } else if (!replied) {
           await interaction.reply({ content, ephemeral });
-          replied = true;
         } else {
           await interaction.followUp({ content, ephemeral });
         }
+        replied = true;
       } catch (err) {
         console.error(`[discord:slash] Reply failed: ${String(err)}`);
       }
@@ -1535,13 +1539,17 @@ export class DiscordBot extends EventEmitter {
         return;
       }
 
-      // Parse remaining args for name and optional --repo
+      // Parse remaining args for name, optional --repo, and optional --blueprint
       const remaining = args.slice(2);
       let repo_url = "";
+      let blueprint = "software";
       const name_parts: string[] = [];
       for (let i = 0; i < remaining.length; i++) {
         if (remaining[i] === "--repo" && remaining[i + 1]) {
           repo_url = remaining[i + 1]!;
+          i++;
+        } else if (remaining[i] === "--blueprint" && remaining[i + 1]) {
+          blueprint = remaining[i + 1]!;
           i++;
         } else {
           name_parts.push(remaining[i]!);
@@ -1573,7 +1581,7 @@ export class DiscordBot extends EventEmitter {
           name: entity_name,
           description: "",
           status: "active",
-          blueprint: "software",
+          blueprint,
           repos: [{
             name: entity_id,
             url: repo_url || `git@github.com:org/${entity_id}.git`,
@@ -2101,7 +2109,15 @@ export class DiscordBot extends EventEmitter {
   private async handle_slash_command(interaction: ChatInputCommandInteraction): Promise<void> {
     const command_name = interaction.commandName;
     const ephemeral = EPHEMERAL_COMMANDS.has(command_name);
-    const target = target_from_interaction(interaction, ephemeral);
+    const deferred = DEFERRED_COMMANDS.has(command_name);
+
+    // Long-running commands must defer within 3 seconds to avoid
+    // Discord's "This application did not respond" error.
+    if (deferred) {
+      await interaction.deferReply({ ephemeral });
+    }
+
+    const target = target_from_interaction(interaction, ephemeral, deferred);
 
     // Build entity context from channel map
     const entry = this.channel_map.get(interaction.channelId);
@@ -2152,11 +2168,18 @@ export class DiscordBot extends EventEmitter {
         // /scaffold name:"my-entity" maps to args: ["entity", "my-entity"]
         const scaffold_name = interaction.options.getString("name") ?? "";
         if (scaffold_name === "server") return ["server"];
-        return ["entity", scaffold_name];
+        const blueprint = interaction.options.getString("blueprint");
+        const result = ["entity", scaffold_name];
+        if (blueprint) result.push("--blueprint", blueprint);
+        return result;
       }
       case "room": {
         const room_name = interaction.options.getString("name") ?? "";
         return [room_name];
+      }
+      case "close": {
+        const force = interaction.options.getBoolean("force");
+        return force ? ["--force"] : [];
       }
       case "resume": {
         const resume_name = interaction.options.getString("name") ?? "";
