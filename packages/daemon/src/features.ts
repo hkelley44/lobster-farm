@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
-import { execFileSync } from "node:child_process";
+import { execFileSync, execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { writeFile as writeFileAsync, unlink } from "node:fs/promises";
 import type {
   FeatureState,
@@ -19,6 +20,14 @@ import * as actions from "./actions.js";
 import { save_features, load_features, append_session_log } from "./persistence.js";
 import { extract_session_learnings } from "./hooks.js";
 import { PersistQueue } from "./persist-queue.js";
+
+const exec_async = promisify(execFile);
+
+/** Maximum number of review->build bounces before escalating to a human. */
+const MAX_REVIEW_BOUNCES = 3;
+
+/** Marker in review comments that forces immediate escalation. */
+const ESCALATE_MARKER = "ESCALATE";
 
 // ── Phase configuration ──
 
@@ -143,6 +152,10 @@ export class FeatureManager extends EventEmitter {
 
   /** Optional pool reference — set via set_pool() after construction. */
   private pool: BotPool | null = null;
+
+  /** Transient cache of review comments from the most recent bounce.
+   * Keyed by feature ID, consumed when the builder is spawned. */
+  private last_review_comments = new Map<string, string>();
 
   private persist_queue: PersistQueue;
 
@@ -295,6 +308,7 @@ export class FeatureManager extends EventEmitter {
       labels: opts.labels ?? [],
       poolBotId: null,
       prNumber: null,
+      reviewBounceCount: 0,
       agentDone: false,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -506,7 +520,17 @@ export class FeatureManager extends EventEmitter {
     }
   }
 
-  /** Detect review outcome and route: approved -> ship, changes_requested -> build bounce, pending -> blocked. */
+  /**
+   * Detect review outcome and route:
+   *   approved -> ship
+   *   changes_requested -> build bounce (with safety rails)
+   *   pending -> blocked
+   *
+   * Safety rails on changes_requested:
+   *   - Increment reviewBounceCount; escalate if > MAX_REVIEW_BOUNCES
+   *   - Check review comments for ESCALATE marker
+   *   - Check PR for merge conflicts
+   */
   private async handle_review_outcome(feature: FeatureState): Promise<void> {
     const entity = this.registry.get(feature.entity);
 
@@ -527,6 +551,8 @@ export class FeatureManager extends EventEmitter {
     switch (outcome) {
       case "approved":
         console.log(`[features] PR #${String(feature.prNumber)} approved -- advancing ${feature.id} to ship`);
+        // Reset bounce count on approval (clean slate if feature is ever re-reviewed)
+        feature.reviewBounceCount = 0;
         try {
           await this.advance_feature(feature.id, "ship");
         } catch (err) {
@@ -535,22 +561,87 @@ export class FeatureManager extends EventEmitter {
         }
         break;
 
-      case "changes_requested":
-        console.log(`[features] PR #${String(feature.prNumber)} changes requested -- bouncing ${feature.id} back to build`);
+      case "changes_requested": {
+        feature.reviewBounceCount += 1;
+        this.persist_queue.enqueue();
+
+        const bounce = feature.reviewBounceCount;
+        const pr = String(feature.prNumber);
+        console.log(
+          `[features] PR #${pr} changes requested -- bounce ${String(bounce)}/${String(MAX_REVIEW_BOUNCES)} for ${feature.id}`,
+        );
+
+        // Fetch the latest review comments so we can check for ESCALATE and pass to builder
+        const review_comments = await fetch_review_comments(feature.prNumber, repo_path);
+
+        // Safety rail: reviewer flagged ESCALATE
+        if (review_comments.toUpperCase().includes(ESCALATE_MARKER)) {
+          console.log(`[features] Review contains ${ESCALATE_MARKER} marker -- escalating ${feature.id}`);
+          feature.blocked = true;
+          feature.blockedReason = `Reviewer flagged ${ESCALATE_MARKER} on PR #${pr}. Human review needed.`;
+          this.persist_queue.enqueue();
+          this.emit("feature:blocked", feature, feature.blockedReason);
+          await actions.notify_feature(
+            feature,
+            `PR #${pr}: ${feature.title} -- reviewer flagged ${ESCALATE_MARKER}. Human review needed.`,
+            entity,
+            { also_alerts: true },
+          );
+          return;
+        }
+
+        // Safety rail: max bounce count exceeded
+        if (bounce > MAX_REVIEW_BOUNCES) {
+          console.log(`[features] Review loop exceeded ${String(MAX_REVIEW_BOUNCES)} bounces -- escalating ${feature.id}`);
+          feature.blocked = true;
+          feature.blockedReason = `Review loop exceeded ${String(MAX_REVIEW_BOUNCES)} attempts for #${String(feature.githubIssue)}. Human review needed.`;
+          this.persist_queue.enqueue();
+          this.emit("feature:blocked", feature, feature.blockedReason);
+          await actions.notify_feature(
+            feature,
+            `PR #${pr}: ${feature.title} -- review loop exceeded ${String(MAX_REVIEW_BOUNCES)} attempts. Human review needed.`,
+            entity,
+            { also_alerts: true },
+          );
+          return;
+        }
+
+        // Safety rail: merge conflicts
+        const has_conflicts = await check_merge_conflicts(feature.prNumber, repo_path);
+        if (has_conflicts) {
+          console.log(`[features] PR #${pr} has merge conflicts -- escalating ${feature.id}`);
+          feature.blocked = true;
+          feature.blockedReason = `PR #${pr} has merge conflicts. Human intervention needed.`;
+          this.persist_queue.enqueue();
+          this.emit("feature:blocked", feature, feature.blockedReason);
+          await actions.notify_feature(
+            feature,
+            `PR #${pr}: ${feature.title} -- merge conflicts detected. Human intervention needed.`,
+            entity,
+            { also_alerts: true },
+          );
+          return;
+        }
+
+        // All safety rails passed -- bounce back to build with review feedback
+        // Store review comments so bridge methods can pick them up
+        this.last_review_comments.set(feature.id, review_comments);
+
         try {
           await this.advance_feature(feature.id, "build");
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[features] Failed to bounce ${feature.id} to build: ${msg}`);
         }
-        // Notify alerts about the bounce
+
         await actions.notify_feature(
           feature,
-          `PR #${String(feature.prNumber)}: ${feature.title} — changes requested, bouncing back to build`,
+          `PR #${pr}: ${feature.title} -- changes requested (bounce ${String(bounce)}/${String(MAX_REVIEW_BOUNCES)}), dispatching builder`,
           entity,
           { also_alerts: true },
         );
         break;
+      }
 
       case "pending":
         console.log(`[features] Reviewer completed for ${feature.id} without posting a decision -- blocking`);
@@ -852,13 +943,22 @@ export class FeatureManager extends EventEmitter {
     const entity = this.registry.get(feature.entity);
     if (!entity) return;
 
-    const prompt = resolve_prompt(phase_config.prompt_template, feature);
     const worktree_path = feature.worktreePath ?? expand_home_safe(entity.entity.repos[0]?.path ?? ".");
 
     // Resume builder session on review->build bounce using the dedicated lastBuilderSessionId.
     // This is intentionally narrow — only builder bounce gets resume. All other transitions get fresh sessions.
     const is_builder_bounce = phase_config.archetype === "builder" && Boolean(feature.lastBuilderSessionId);
     const resume_id = is_builder_bounce ? (feature.lastBuilderSessionId ?? undefined) : undefined;
+
+    // On review->build bounce, use the review feedback as the prompt instead of the generic build template
+    let prompt: string;
+    const cached_comments = this.last_review_comments.get(feature.id);
+    if (is_builder_bounce && feature.prNumber && cached_comments) {
+      this.last_review_comments.delete(feature.id);
+      prompt = build_review_fix_prompt(feature.prNumber, feature.title, cached_comments);
+    } else {
+      prompt = resolve_prompt(phase_config.prompt_template, feature);
+    }
 
     let task_id: string;
     try {
@@ -1075,6 +1175,8 @@ export class FeatureManager extends EventEmitter {
   /**
    * Bridge review feedback to a pool bot via tmux send-keys.
    * Used for review->build bounce — tells the builder what to fix.
+   * Includes the actual review comments when available so the builder
+   * has full context without needing to fetch from GitHub.
    */
   private async bridge_review_feedback_to_tmux(
     tmux_session: string,
@@ -1083,12 +1185,12 @@ export class FeatureManager extends EventEmitter {
     const pr_number = feature.prNumber;
     if (!pr_number) return;
 
+    // Consume cached review comments if available
+    const cached_comments = this.last_review_comments.get(feature.id);
+    this.last_review_comments.delete(feature.id);
+
     const feedback_path = `/tmp/lf-review-feedback-${feature.id}.txt`;
-    const feedback = (
-      `The reviewer requested changes on PR #${String(pr_number)}.\n` +
-      `Read the review comments with \`gh pr view ${String(pr_number)} --json reviews\` and make the fixes.\n` +
-      `When done, commit, push, and post in this channel that the fixes are ready.`
-    );
+    const feedback = build_review_fix_prompt(pr_number, feature.title, cached_comments);
 
     try {
       await writeFileAsync(feedback_path, feedback, "utf-8");
@@ -1310,4 +1412,94 @@ function expand_home_safe(p: string): string {
     return p.replace("~", process.env["HOME"] ?? "/root");
   }
   return p;
+}
+
+// ── Review feedback helpers ──
+
+/**
+ * Fetch the most recent review comments from a PR.
+ * Returns the concatenated review body text, or a fallback message if fetching fails.
+ */
+export async function fetch_review_comments(
+  pr_number: number,
+  repo_path: string,
+): Promise<string> {
+  try {
+    const { stdout } = await exec_async("gh", [
+      "pr", "view", String(pr_number),
+      "--json", "reviews",
+      "--jq", ".reviews | map(select(.state == \"CHANGES_REQUESTED\")) | last | .body // empty",
+    ], { cwd: repo_path, timeout: 15_000 });
+    const body = stdout.trim();
+    if (body) return body;
+  } catch {
+    // Fall through to fallback
+  }
+
+  // Fallback: try to get any review body
+  try {
+    const { stdout } = await exec_async("gh", [
+      "pr", "view", String(pr_number),
+      "--json", "reviews",
+      "--jq", ".reviews | last | .body // empty",
+    ], { cwd: repo_path, timeout: 15_000 });
+    return stdout.trim() || `(No review body found. Run \`gh pr view ${String(pr_number)} --json reviews\` to inspect.)`;
+  } catch {
+    return `(Could not fetch review comments. Run \`gh pr view ${String(pr_number)} --json reviews\` to inspect.)`;
+  }
+}
+
+/**
+ * Check if a PR has merge conflicts by inspecting its mergeable state.
+ */
+export async function check_merge_conflicts(
+  pr_number: number,
+  repo_path: string,
+): Promise<boolean> {
+  try {
+    const { stdout } = await exec_async("gh", [
+      "pr", "view", String(pr_number),
+      "--json", "mergeable",
+      "--jq", ".mergeable",
+    ], { cwd: repo_path, timeout: 15_000 });
+
+    // GitHub returns "CONFLICTING", "MERGEABLE", or "UNKNOWN"
+    return stdout.trim().toUpperCase() === "CONFLICTING";
+  } catch {
+    // If we can't determine, err on the side of not blocking
+    return false;
+  }
+}
+
+/**
+ * Build the prompt given to a builder when fixing reviewer feedback.
+ * Used by both the pool (tmux bridge) and queue (headless) paths.
+ */
+export function build_review_fix_prompt(
+  pr_number: number,
+  title: string,
+  review_comments?: string,
+): string {
+  const pr = String(pr_number);
+  const lines = [
+    `The reviewer requested changes on PR #${pr}: ${title}`,
+    ``,
+  ];
+
+  if (review_comments) {
+    lines.push(`## Reviewer Feedback`, ``, review_comments, ``);
+  }
+
+  lines.push(
+    `## Instructions`,
+    ``,
+    `1. Read the reviewer's feedback carefully`,
+    `2. Fix each issue mentioned`,
+    `3. Run the test suite to verify your changes`,
+    `4. Commit and push`,
+    ``,
+    `Do NOT change anything the reviewer didn't flag. Keep changes minimal and targeted.`,
+  );
+
+  return lines.join("\n");
 }
