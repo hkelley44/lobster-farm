@@ -16,6 +16,7 @@ import { init_github_app_from_env } from "./github-app.js";
 import { check_required_binaries, propagate_tmux_env } from "./env.js";
 import type { Phase } from "@lobster-farm/shared";
 import { append_session_log } from "./persistence.js";
+import * as sentry from "./sentry.js";
 
 async function main(): Promise<void> {
   console.log("Starting LobsterFarm daemon...");
@@ -180,6 +181,9 @@ async function main(): Promise<void> {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[discord] Failed to connect: ${msg}`);
       console.log("[discord] Daemon will continue without Discord. HTTP API still available.");
+      sentry.captureException(err, {
+        tags: { module: "startup", phase: "discord" },
+      });
     }
   } else {
     console.log(
@@ -195,6 +199,9 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[discord:avatars] Avatar upload failed: ${msg}`);
+      sentry.captureException(err, {
+        tags: { module: "startup", phase: "avatars" },
+      });
     }
   }
 
@@ -224,6 +231,9 @@ async function main(): Promise<void> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[commander] Failed to start: ${msg}`);
+      sentry.captureException(err, {
+        tags: { module: "startup", phase: "commander" },
+      });
     }
   } else {
     console.log("[commander] No token configured. Pat will not start.");
@@ -256,6 +266,18 @@ async function main(): Promise<void> {
   // Write PID file
   await write_pid(config);
   console.log(`PID file written (pid: ${String(process.pid)})`);
+
+  // Record startup breadcrumb for Sentry context
+  sentry.addBreadcrumb({
+    category: "daemon.lifecycle",
+    message: "Daemon startup complete",
+    data: {
+      entities: registry.count(),
+      discord: discord_connected,
+      github_app: !!github_app,
+      pool_bots: pool.get_status().total,
+    },
+  });
 
   // Graceful shutdown handler
   let shutting_down = false;
@@ -334,6 +356,9 @@ async function main(): Promise<void> {
       });
     });
 
+    // Flush pending Sentry events before exit
+    await sentry.flush(2000);
+
     await remove_pid(config);
     console.log("PID file removed. Goodbye.");
     process.exit(0);
@@ -342,5 +367,18 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
+
+// ── Global unhandled error handlers ──
+
+process.on("uncaughtException", (err) => {
+  console.error("[fatal] Uncaught exception:", err);
+  sentry.captureException(err, { tags: { severity: "fatal" } });
+  void sentry.flush(2000).finally(() => process.exit(1));
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[fatal] Unhandled rejection:", reason);
+  sentry.captureException(reason, { tags: { severity: "unhandled_rejection" } });
+});
 
 void main();

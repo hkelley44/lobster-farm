@@ -7,6 +7,7 @@ import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import { resolve_model_id } from "./models.js";
 import { sq } from "./shell.js";
+import * as sentry from "./sentry.js";
 
 export interface CommanderHealth {
   state: "stopped" | "starting" | "running" | "crashed";
@@ -144,6 +145,9 @@ export class CommanderProcess extends EventEmitter {
     proc.on("close", (code) => {
       if (code !== 0) {
         console.error(`[commander] tmux new-session failed with code ${String(code)}`);
+        sentry.captureException(new Error(`Commander tmux new-session failed with code ${String(code)}`), {
+          tags: { module: "commander" },
+        });
         this.state = "crashed";
         this.schedule_restart();
         return;
@@ -178,6 +182,9 @@ export class CommanderProcess extends EventEmitter {
         }, BACKOFF_RESET_MS);
       } else {
         console.error("[commander] tmux session did not start");
+        sentry.captureException(new Error("Commander tmux session did not start"), {
+          tags: { module: "commander" },
+        });
         this.state = "crashed";
         this.schedule_restart();
       }
@@ -186,6 +193,9 @@ export class CommanderProcess extends EventEmitter {
     proc.on("error", (err) => {
       this.state = "crashed";
       console.error(`[commander] Failed to spawn tmux: ${err.message}`);
+      sentry.captureException(err, {
+        tags: { module: "commander" },
+      });
       this.emit("error", err);
       this.schedule_restart();
     });
@@ -225,6 +235,9 @@ export class CommanderProcess extends EventEmitter {
       console.error(
         `[commander] Max restarts (${String(MAX_RESTARTS)}) exceeded. Giving up.`,
       );
+      sentry.captureMessage(`Commander exceeded ${String(MAX_RESTARTS)} restarts -- giving up`, "error", {
+        tags: { module: "commander" },
+      });
       this.emit("gave_up", this.restart_count);
       return;
     }

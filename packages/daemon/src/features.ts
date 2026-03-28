@@ -20,6 +20,7 @@ import * as actions from "./actions.js";
 import { save_features, load_features, append_session_log } from "./persistence.js";
 import { extract_session_learnings } from "./hooks.js";
 import { PersistQueue } from "./persist-queue.js";
+import * as sentry from "./sentry.js";
 
 const exec_async = promisify(execFile);
 
@@ -421,6 +422,12 @@ export class FeatureManager extends EventEmitter {
 
     console.log(`[features] ${feature_id}: ${old_phase} → ${next_phase}`);
 
+    sentry.addBreadcrumb({
+      category: "daemon.feature",
+      message: `Feature ${feature_id}: ${old_phase} -> ${next_phase}`,
+      data: { feature_id, entity: feature.entity, from: old_phase, to: next_phase },
+    });
+
     // Run entry actions for the new phase
     await this.run_entry_actions(feature, next_phase, old_phase);
 
@@ -514,6 +521,10 @@ export class FeatureManager extends EventEmitter {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[features] Auto-advance failed for ${feature_id}: ${msg}`);
+        sentry.captureException(err, {
+          tags: { module: "features", feature_id },
+          contexts: { feature: { phase: feature.phase, entity: feature.entity } },
+        });
       }
     } else {
       // Notify that the phase is done and awaiting approval
@@ -543,6 +554,9 @@ export class FeatureManager extends EventEmitter {
 
     if (!feature.prNumber) {
       console.error(`[features] Review completed for ${feature.id} but no PR number -- blocking`);
+      sentry.captureMessage(`Review completed for ${feature.id} but no PR number`, "error", {
+        tags: { module: "features", feature_id: feature.id },
+      });
       feature.blocked = true;
       feature.blockedReason = "Review completed but no PR number to check";
       this.persist_queue.enqueue();
@@ -565,6 +579,9 @@ export class FeatureManager extends EventEmitter {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[features] Failed to advance ${feature.id} to ship: ${msg}`);
+          sentry.captureException(err, {
+            tags: { module: "features", feature_id: feature.id },
+          });
         }
         break;
 
@@ -639,6 +656,9 @@ export class FeatureManager extends EventEmitter {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[features] Failed to bounce ${feature.id} to build: ${msg}`);
+          sentry.captureException(err, {
+            tags: { module: "features", feature_id: feature.id },
+          });
         }
 
         await actions.notify_feature(
@@ -676,6 +696,10 @@ export class FeatureManager extends EventEmitter {
     this.persist_queue.enqueue();
 
     console.error(`[features] Session failed for ${feature_id}: ${error}`);
+    sentry.captureException(new Error(error), {
+      tags: { module: "features", feature_id },
+      contexts: { feature: { phase: feature?.phase, entity: feature?.entity } },
+    });
     this.emit("feature:blocked", feature, error);
   }
 
@@ -858,6 +882,9 @@ export class FeatureManager extends EventEmitter {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[features] Failed to advance ${feature.id} to review: ${msg}`);
+          sentry.captureException(err, {
+            tags: { module: "features", feature_id: feature.id },
+          });
         }
         return;
       }
@@ -1183,6 +1210,9 @@ export class FeatureManager extends EventEmitter {
       setTimeout(() => { void unlink(pending_path).catch(() => {}); }, 60_000);
     } catch (err) {
       console.error(`[features] Failed to bridge build prompt: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "features", feature_id: feature.id, action: "bridge_build" },
+      });
     }
   }
 
@@ -1259,6 +1289,9 @@ export class FeatureManager extends EventEmitter {
       setTimeout(() => { void unlink(feedback_path).catch(() => {}); }, 60_000);
     } catch (err) {
       console.error(`[features] Failed to bridge review feedback: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "features", feature_id: feature.id, action: "bridge_review" },
+      });
     }
   }
 
@@ -1328,6 +1361,9 @@ export class FeatureManager extends EventEmitter {
       setTimeout(() => { void unlink(feedback_path).catch(() => {}); }, 60_000);
     } catch (err) {
       console.error(`[features] Failed to bridge conflict feedback: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "features", feature_id: feature.id, action: "bridge_conflict" },
+      });
     }
   }
 
@@ -1366,6 +1402,9 @@ export class FeatureManager extends EventEmitter {
             feature.prNumber = pr_number;
           } catch (err) {
             console.error(`[features] Failed to create PR: ${String(err)}`);
+            sentry.captureException(err, {
+              tags: { module: "features", feature_id: feature.id, action: "create_pr" },
+            });
           }
         }
         break;
@@ -1420,6 +1459,10 @@ export class FeatureManager extends EventEmitter {
         } catch (err) {
           const error_msg = String(err);
           console.error(`[features] Failed to merge PR: ${error_msg}`);
+          sentry.captureException(err, {
+            tags: { module: "features", feature_id: feature.id, action: "merge_pr" },
+            contexts: { pr: { number: feature.prNumber } },
+          });
 
           const error_kind = actions.classify_merge_error(error_msg);
           feature.mergeAttempts = (feature.mergeAttempts ?? 0) + 1;
@@ -1444,6 +1487,9 @@ export class FeatureManager extends EventEmitter {
               await this.advance_feature(feature.id, "build");
             } catch (bounce_err) {
               console.error(`[features] Failed to bounce ${feature.id} to build: ${String(bounce_err)}`);
+              sentry.captureException(bounce_err, {
+                tags: { module: "features", feature_id: feature.id, action: "bounce_build" },
+              });
               feature.blocked = true;
               feature.blockedReason = `Merge conflict bounce failed: ${String(bounce_err)}`;
             }

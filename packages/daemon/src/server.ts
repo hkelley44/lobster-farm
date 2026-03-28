@@ -13,6 +13,8 @@ import type { ArchetypeRole } from "@lobster-farm/shared";
 import { persist_entity_config } from "./actions.js";
 import type { GitHubAppAuth } from "./github-app.js";
 import { handle_github_webhook, type WebhookContext } from "./webhook-handler.js";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import * as sentry from "./sentry.js";
 
 interface ServerContext {
   registry: EntityRegistry;
@@ -134,11 +136,114 @@ const handle_webhook_github: RouteHandler = async (req, res, ctx) => {
   await handle_github_webhook(req, res, webhook_ctx);
 };
 
-const handle_webhook_sentry: RouteHandler = async (req, res) => {
-  const body = await read_body(req);
-  console.log("Sentry webhook received:", body.slice(0, 200));
+const handle_webhook_sentry: RouteHandler = async (req, res, ctx) => {
+  const raw_body = await read_body(req);
+
+  // Respond quickly after buffering body — process asynchronously
   json_response(res, 200, { ok: true });
+
+  // Process the webhook event async
+  void process_sentry_webhook(req, raw_body, ctx).catch((err) => {
+    console.error(`[sentry-webhook] Error processing event: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "webhook", webhook_source: "sentry" },
+    });
+  });
 };
+
+/** Verify Sentry webhook HMAC-SHA256 signature. */
+function verify_sentry_signature(body: string, signature: string, secret: string): boolean {
+  const expected = createHmac("sha256", secret).update(body, "utf-8").digest("hex");
+  try {
+    return timingSafeEqual(Buffer.from(expected, "utf-8"), Buffer.from(signature, "utf-8"));
+  } catch {
+    return false;
+  }
+}
+
+/** Process a Sentry webhook event asynchronously (after 200 response). */
+async function process_sentry_webhook(
+  req: IncomingMessage,
+  raw_body: string,
+  ctx: ServerContext,
+): Promise<void> {
+  // Verify signature if webhook secret is configured
+  const webhook_secret = process.env["SENTRY_WEBHOOK_SECRET"];
+  if (!webhook_secret) {
+    console.warn("[sentry-webhook] SENTRY_WEBHOOK_SECRET not configured — webhook is unauthenticated");
+  } else {
+    const signature = req.headers["sentry-hook-signature"] as string | undefined;
+    if (!signature || !verify_sentry_signature(raw_body, signature, webhook_secret)) {
+      console.log("[sentry-webhook] Invalid or missing signature -- rejecting");
+      return;
+    }
+  }
+
+  const resource = req.headers["sentry-hook-resource"] as string | undefined;
+  console.log(`[sentry-webhook] Received ${resource ?? "unknown"} event`);
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(raw_body) as Record<string, unknown>;
+  } catch {
+    console.log("[sentry-webhook] Invalid JSON payload");
+    return;
+  }
+
+  // Only process issue and event_alert resources
+  if (resource !== "issue" && resource !== "event_alert") {
+    console.log(`[sentry-webhook] Ignoring resource type: ${resource ?? "unknown"}`);
+    return;
+  }
+
+  // Extract error info from payload
+  const data = payload["data"] as Record<string, unknown> | undefined;
+  if (!data) return;
+
+  const issue = (resource === "issue" ? data : data["issue"]) as Record<string, unknown> | undefined;
+  const error_title = (issue?.["title"] as string) ?? "Unknown error";
+  const issue_url = (issue?.["web_url"] as string) ?? (issue?.["shortId"] as string) ?? "";
+  const project_name = (data["project_name"] as string) ??
+    ((data["project"] as Record<string, unknown>)?.["name"] as string) ?? "unknown";
+
+  // Try to map Sentry project to an entity for targeted routing
+  let target_entity_id: string | null = null;
+  for (const entity of ctx.registry.get_active()) {
+    const sentry_project = (entity.entity.accounts as Record<string, unknown>)?.["sentry"] as Record<string, unknown> | undefined;
+    if (sentry_project?.["project"] === project_name) {
+      target_entity_id = entity.entity.id;
+      break;
+    }
+  }
+
+  // Format alert message
+  const action = payload["action"] as string | undefined;
+  const env = (issue?.["environment"] as string) ?? "";
+  const prefix = action === "resolved" ? "Resolved" : "Sentry";
+  const env_part = env ? ` | Env: ${env}` : "";
+  const alert_message = `${prefix}: ${error_title}\nProject: ${project_name}${env_part}\n${issue_url}`;
+
+  sentry.addBreadcrumb({
+    category: "daemon.api",
+    message: `Sentry webhook: ${resource}.${action ?? "unknown"}`,
+    data: { project: project_name, error_title },
+  });
+
+  // Post to entity alerts channel, or fall back to all active entities
+  if (ctx.discord) {
+    if (target_entity_id) {
+      await ctx.discord.send_to_entity(target_entity_id, "alerts", alert_message, "system");
+    } else {
+      // No entity mapping -- post to first active entity's alerts as a catch-all
+      const first_active = ctx.registry.get_active()[0];
+      if (first_active) {
+        await ctx.discord.send_to_entity(first_active.entity.id, "alerts", alert_message, "system");
+      }
+    }
+  }
+
+  console.log(`[sentry-webhook] Alert forwarded: ${error_title}`);
+}
 
 // ── Hook endpoints ──
 
@@ -589,6 +694,9 @@ function route_request(
     if (route.method === method && route.pattern.test(url.pathname)) {
       void Promise.resolve(route.handler(req, res, ctx)).catch((err: unknown) => {
         console.error("Route handler error:", err);
+        sentry.captureException(err, {
+          tags: { module: "server", route: url.pathname },
+        });
         if (!res.headersSent) {
           json_response(res, 500, { error: "Internal server error" });
         }

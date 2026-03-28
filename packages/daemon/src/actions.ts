@@ -7,6 +7,7 @@ import type { DiscordBot } from "./discord.js";
 import type { FeatureManager } from "./features.js";
 import type { BotPool } from "./pool.js";
 import type { EntityRegistry } from "./registry.js";
+import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
 const exec_shell = promisify(execCb);
@@ -80,6 +81,9 @@ export async function cleanup_worktree(
       console.log(`[actions] Force-removed worktree at ${feature.worktreePath}`);
     } catch (err) {
       console.error(`[actions] Failed to clean up worktree: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "actions", action: "cleanup_worktree" },
+      });
     }
   }
 }
@@ -426,6 +430,10 @@ export async function detect_review_outcome(
     }
   } catch (err) {
     console.error(`[actions] Failed to detect review outcome for PR #${String(pr_number)}: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "actions", action: "detect_review_outcome" },
+      contexts: { pr: { number: pr_number } },
+    });
     return "pending";
   }
 }

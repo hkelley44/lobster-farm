@@ -6,6 +6,7 @@ import type {
   LobsterFarmConfig,
   ModelTier,
 } from "@lobster-farm/shared";
+import * as sentry from "./sentry.js";
 import { readdir } from "node:fs/promises";
 import {
   entity_memory_path,
@@ -270,6 +271,12 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
         `(pid: ${String(session.pid)}) for ${options.entity_id}/${options.feature_id}`,
     );
 
+    sentry.addBreadcrumb({
+      category: "daemon.session",
+      message: `Session spawned: ${options.archetype} for ${options.entity_id}/${options.feature_id}`,
+      data: { session_id, entity_id: options.entity_id, archetype: options.archetype, resume: is_resume },
+    });
+
     this.emit("session:started", session);
 
     // Capture stdout (stream-json)
@@ -327,6 +334,10 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
       this.output_buffers.delete(session_id);
 
       console.error(`[session] Failed to spawn session ${session_id}:`, err.message);
+      sentry.captureException(err, {
+        tags: { module: "session", entity: options.entity_id, archetype: options.archetype },
+        contexts: { session: { session_id, feature_id: options.feature_id } },
+      });
       this.emit("session:failed", session_id, err.message);
     });
 

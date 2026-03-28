@@ -11,6 +11,7 @@ import { fetch_review_comments, build_review_fix_prompt } from "./features.js";
 import { detect_review_outcome } from "./actions.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { PRReviewState } from "./persistence.js";
+import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
 
@@ -69,6 +70,7 @@ export class PRReviewCron {
   private active_reviews = new Map<string, ActiveReview>(); // key: "entity:pr#"
   private processed: PRReviewState = {}; // persisted to disk — tracks completed reviews
   private running = false;
+  private interval_ms: number = DEFAULT_INTERVAL_MS;
 
   constructor(
     private registry: EntityRegistry,
@@ -90,6 +92,7 @@ export class PRReviewCron {
       console.log(`[pr-cron] Loaded ${String(count)} processed PR reviews from disk`);
     }
 
+    this.interval_ms = interval_ms;
     console.log(`[pr-cron] Starting PR review cron (every ${String(interval_ms / 1000)}s)`);
 
     // Run immediately on start, then on interval
@@ -119,6 +122,17 @@ export class PRReviewCron {
     }
 
     this.running = true;
+
+    // Sentry cron monitoring: derive schedule from actual interval
+    const interval_minutes = Math.round(this.interval_ms / 60_000);
+    const checkInId = sentry.cronCheckInStart("pr-review-cron", {
+      schedule: { type: "interval", value: interval_minutes, unit: "minute" },
+      checkinMargin: Math.max(1, Math.round(interval_minutes * 0.2)),
+      maxRuntime: 15,
+      failureIssueThreshold: 3,
+      recoveryThreshold: 2,
+    });
+
     try {
       const entities = this.registry.get_active();
 
@@ -131,8 +145,14 @@ export class PRReviewCron {
           await this.check_repo(entity_id, repo_path, entity_config);
         }
       }
+
+      sentry.cronCheckInFinish(checkInId, "pr-review-cron", "ok");
     } catch (err) {
       console.error(`[pr-cron] Poll failed: ${String(err)}`);
+      sentry.cronCheckInFinish(checkInId, "pr-review-cron", "error");
+      sentry.captureException(err, {
+        tags: { module: "pr-cron" },
+      });
     } finally {
       this.running = false;
     }
@@ -346,6 +366,9 @@ export class PRReviewCron {
         spawn_env = { GH_TOKEN: gh_token };
       } catch (err) {
         console.error(`[pr-cron] Failed to get GitHub App token: ${String(err)}`);
+        sentry.captureException(err, {
+          tags: { module: "pr-cron", entity: entity_id },
+        });
         // Continue without app token — reviewer will use default gh auth
       }
     }
@@ -376,7 +399,13 @@ export class PRReviewCron {
 
         // Persist completion so we don't re-review after restart
         void this.persist_review_completion(entity_id, pr, repo_path)
-          .catch(err => console.error(`[pr-cron] Failed to persist review for PR #${String(pr.number)}: ${String(err)}`));
+          .catch(err => {
+            console.error(`[pr-cron] Failed to persist review for PR #${String(pr.number)}: ${String(err)}`);
+            sentry.captureException(err, {
+              tags: { module: "pr-cron", entity: entity_id },
+              contexts: { pr: { number: pr.number, title: pr.title } },
+            });
+          });
       };
 
       const on_fail = (session_id: string, error: string) => {
@@ -386,6 +415,10 @@ export class PRReviewCron {
 
         this.active_reviews.delete(key);
         console.error(`[pr-cron] Review failed for PR #${String(pr.number)}: ${error}`);
+        sentry.captureException(new Error(error), {
+          tags: { module: "pr-cron", entity: entity_id },
+          contexts: { pr: { number: pr.number, title: pr.title } },
+        });
       };
 
       this.session_manager.on("session:completed", on_complete);
@@ -393,6 +426,10 @@ export class PRReviewCron {
     } catch (err) {
       this.active_reviews.delete(key);
       console.error(`[pr-cron] Failed to spawn reviewer for PR #${String(pr.number)}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "pr-cron", entity: entity_id, action: "spawn_reviewer" },
+        contexts: { pr: { number: pr.number, title: pr.title } },
+      });
     }
   }
 
@@ -512,6 +549,9 @@ export class PRReviewCron {
         fix_env = { GH_TOKEN: gh_token };
       } catch (err) {
         console.error(`[pr-cron] Failed to get GitHub App token for fixer: ${String(err)}`);
+        sentry.captureException(err, {
+          tags: { module: "pr-cron", entity: entity_id, action: "fixer_token" },
+        });
       }
     }
 
@@ -529,6 +569,10 @@ export class PRReviewCron {
       });
     } catch (err) {
       console.error(`[pr-cron] Failed to spawn builder for external PR #${String(pr.number)}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "pr-cron", entity: entity_id, action: "spawn_fixer" },
+        contexts: { pr: { number: pr.number, title: pr.title } },
+      });
     }
   }
 
