@@ -195,6 +195,63 @@ const EPHEMERAL_COMMANDS = new Set<string>(EPHEMERAL_COMMAND_NAMES);
 // interaction response window. These get deferReply() before processing.
 const DEFERRED_COMMANDS = new Set(["plan", "scaffold", "room", "resume"]);
 
+/** Minimal interface for the subset of ChatInputCommandInteraction used by extract_slash_args. */
+export interface SlashInteractionLike {
+  commandName: string;
+  options: {
+    getString(name: string): string | null;
+    getBoolean(name: string): boolean | null;
+  };
+}
+
+/**
+ * Extract slash command options into the positional args array that
+ * the shared handle_command dispatch expects. Each slash command
+ * maps its named options to the legacy positional format.
+ */
+export function extract_slash_args(interaction: SlashInteractionLike): string[] {
+  const name = interaction.commandName;
+
+  switch (name) {
+    case "plan": {
+      const title = interaction.options.getString("title") ?? "";
+      return [title];
+    }
+    case "approve":
+    case "advance": {
+      const feature = interaction.options.getString("feature");
+      return feature ? [feature] : [];
+    }
+    case "swap": {
+      const agent = interaction.options.getString("agent") ?? "";
+      return [agent];
+    }
+    case "scaffold": {
+      // /scaffold name:"my-entity" maps to args: ["entity", "my-entity"]
+      const scaffold_name = interaction.options.getString("name") ?? "";
+      if (scaffold_name === "server") return ["server"];
+      const blueprint = interaction.options.getString("blueprint");
+      const result = ["entity", scaffold_name];
+      if (blueprint) result.push("--blueprint", blueprint);
+      return result;
+    }
+    case "room": {
+      const room_name = interaction.options.getString("name") ?? "";
+      return [room_name];
+    }
+    case "close": {
+      const force = interaction.options.getBoolean("force");
+      return force ? ["--force"] : [];
+    }
+    case "resume": {
+      const resume_name = interaction.options.getString("name") ?? "";
+      return [resume_name];
+    }
+    default:
+      return [];
+  }
+}
+
 /** Create a CommandTarget from a Discord text message. */
 function target_from_message(message: Message, send_fallback: (channel_id: string, content: string) => Promise<void>): CommandTarget {
   return {
@@ -1909,7 +1966,7 @@ export class DiscordBot extends EventEmitter {
       if (active_features.length > 0 && !args.includes("--force")) {
         const title = active_features[0]!.title ?? active_features[0]!.id;
         await target.reply(
-          `This room has an active feature (**${title}**). Close anyway? Use \`/close\` with \`--force\`.`,
+          `This room has an active feature (**${title}**). Close anyway? Use \`/close\` with the \`force\` option, or \`!lf close --force\`.`,
         );
         return;
       }
@@ -2132,61 +2189,13 @@ export class DiscordBot extends EventEmitter {
 
     // Extract args from interaction options, mapping to the same
     // positional format that the text command handlers expect
-    const args = this.extract_slash_args(interaction);
+    const args = extract_slash_args(interaction);
 
     try {
       await this.handle_command(command_name, args, routed, target);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await target.reply(`Error: ${msg}`);
-    }
-  }
-
-  /**
-   * Extract slash command options into the positional args array that
-   * the shared handle_command dispatch expects. Each slash command
-   * maps its named options to the legacy positional format.
-   */
-  private extract_slash_args(interaction: ChatInputCommandInteraction): string[] {
-    const name = interaction.commandName;
-
-    switch (name) {
-      case "plan": {
-        const title = interaction.options.getString("title") ?? "";
-        return [title];
-      }
-      case "approve":
-      case "advance": {
-        const feature = interaction.options.getString("feature");
-        return feature ? [feature] : [];
-      }
-      case "swap": {
-        const agent = interaction.options.getString("agent") ?? "";
-        return [agent];
-      }
-      case "scaffold": {
-        // /scaffold name:"my-entity" maps to args: ["entity", "my-entity"]
-        const scaffold_name = interaction.options.getString("name") ?? "";
-        if (scaffold_name === "server") return ["server"];
-        const blueprint = interaction.options.getString("blueprint");
-        const result = ["entity", scaffold_name];
-        if (blueprint) result.push("--blueprint", blueprint);
-        return result;
-      }
-      case "room": {
-        const room_name = interaction.options.getString("name") ?? "";
-        return [room_name];
-      }
-      case "close": {
-        const force = interaction.options.getBoolean("force");
-        return force ? ["--force"] : [];
-      }
-      case "resume": {
-        const resume_name = interaction.options.getString("name") ?? "";
-        return [resume_name];
-      }
-      default:
-        return [];
     }
   }
 

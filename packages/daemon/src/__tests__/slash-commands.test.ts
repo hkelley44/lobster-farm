@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   build_slash_commands,
+  extract_slash_args,
   EPHEMERAL_COMMAND_NAMES,
   type CommandTarget,
+  type SlashInteractionLike,
 } from "../discord.js";
 
 // ── build_slash_commands ──
@@ -151,5 +153,91 @@ describe("EPHEMERAL_COMMANDS", () => {
     for (const name of [...EPHEMERAL_COMMAND_NAMES, ...public_names]) {
       expect(all_names).toContain(name);
     }
+  });
+});
+
+// ── extract_slash_args ──
+
+/** Helper to create a mock interaction with named string/boolean options. */
+function mock_interaction(
+  commandName: string,
+  strings: Record<string, string | null> = {},
+  booleans: Record<string, boolean | null> = {},
+): SlashInteractionLike {
+  return {
+    commandName,
+    options: {
+      getString(name: string) { return strings[name] ?? null; },
+      getBoolean(name: string) { return booleans[name] ?? null; },
+    },
+  };
+}
+
+describe("extract_slash_args", () => {
+  it("/plan extracts title", () => {
+    expect(extract_slash_args(mock_interaction("plan", { title: "Add auth" }))).toEqual(["Add auth"]);
+  });
+
+  it("/plan with no title returns empty string", () => {
+    expect(extract_slash_args(mock_interaction("plan"))).toEqual([""]);
+  });
+
+  it("/approve extracts feature id", () => {
+    expect(extract_slash_args(mock_interaction("approve", { feature: "feat-42" }))).toEqual(["feat-42"]);
+  });
+
+  it("/advance with no feature returns empty array", () => {
+    expect(extract_slash_args(mock_interaction("advance"))).toEqual([]);
+  });
+
+  it("/swap extracts agent name", () => {
+    expect(extract_slash_args(mock_interaction("swap", { agent: "builder" }))).toEqual(["builder"]);
+  });
+
+  it("/scaffold name:server → ['server']", () => {
+    expect(extract_slash_args(mock_interaction("scaffold", { name: "server" }))).toEqual(["server"]);
+  });
+
+  it("/scaffold name:my-entity → ['entity', 'my-entity']", () => {
+    expect(extract_slash_args(mock_interaction("scaffold", { name: "my-entity" }))).toEqual(["entity", "my-entity"]);
+  });
+
+  it("/scaffold with blueprint → ['entity', name, '--blueprint', bp]", () => {
+    expect(extract_slash_args(mock_interaction("scaffold", { name: "acme", blueprint: "custom" }))).toEqual([
+      "entity", "acme", "--blueprint", "custom",
+    ]);
+  });
+
+  it("/scaffold name:server ignores blueprint", () => {
+    // "server" short-circuits before blueprint is checked
+    expect(extract_slash_args(mock_interaction("scaffold", { name: "server", blueprint: "custom" }))).toEqual(["server"]);
+  });
+
+  it("/room extracts name", () => {
+    expect(extract_slash_args(mock_interaction("room", { name: "auth-work" }))).toEqual(["auth-work"]);
+  });
+
+  it("/close with force:true → ['--force']", () => {
+    expect(extract_slash_args(mock_interaction("close", {}, { force: true }))).toEqual(["--force"]);
+  });
+
+  it("/close with force:false → []", () => {
+    expect(extract_slash_args(mock_interaction("close", {}, { force: false }))).toEqual([]);
+  });
+
+  it("/close with no force option → []", () => {
+    expect(extract_slash_args(mock_interaction("close"))).toEqual([]);
+  });
+
+  it("/resume extracts name", () => {
+    expect(extract_slash_args(mock_interaction("resume", { name: "old-session" }))).toEqual(["old-session"]);
+  });
+
+  it("unknown command returns empty array", () => {
+    expect(extract_slash_args(mock_interaction("unknown"))).toEqual([]);
+  });
+
+  it("/help returns empty array (no options)", () => {
+    expect(extract_slash_args(mock_interaction("help"))).toEqual([]);
   });
 });
