@@ -6,6 +6,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import type { DiscordBot } from "./discord.js";
 import type { FeatureManager } from "./features.js";
+import { fetch_review_comments, build_review_fix_prompt } from "./features.js";
 import { detect_review_outcome } from "./actions.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { PRReviewState } from "./persistence.js";
@@ -343,17 +344,19 @@ export class PRReviewCron {
     repo_path: string,
     pr: OpenPR,
   ): Promise<void> {
+    // Fetch the actual review comments to give the builder full context
+    const review_comments = await fetch_review_comments(pr.number, repo_path);
+
     const prompt = [
       `An external PR needs fixes based on reviewer feedback.`,
       `PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}`,
       `Repository: ${repo_path}`,
       ``,
-      `Steps:`,
-      `1. Check out the PR branch: git checkout ${pr.headRefName}`,
-      `2. Read the reviewer's comments: gh pr view ${String(pr.number)} --json reviews --jq '.reviews[].body'`,
-      `3. Make targeted fixes to address ONLY what the reviewer flagged — do not refactor beyond that`,
-      `4. Commit and push your changes to the PR branch`,
-      `5. Do NOT merge the PR`,
+      `First, check out the PR branch: git checkout ${pr.headRefName}`,
+      ``,
+      build_review_fix_prompt(pr.number, pr.title, review_comments),
+      ``,
+      `Do NOT merge the PR.`,
     ].join("\n");
 
     console.log(`[pr-cron] Spawning builder to fix external PR #${String(pr.number)} in ${entity_id}`);

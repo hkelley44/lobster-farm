@@ -25,6 +25,7 @@ export const FeatureStateSchema = z.object({
   labels: z.array(z.string()).default([]),
   poolBotId: z.number().int().nullable().default(null),
   prNumber: z.number().int().nullable().default(null),
+  reviewBounceCount: z.number().default(0),
   agentDone: z.boolean().default(false),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
