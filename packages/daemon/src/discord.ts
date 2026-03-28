@@ -193,7 +193,7 @@ const EPHEMERAL_COMMANDS = new Set<string>(EPHEMERAL_COMMAND_NAMES);
 
 // Commands that perform external I/O and may exceed Discord's 3-second
 // interaction response window. These get deferReply() before processing.
-const DEFERRED_COMMANDS = new Set(["plan", "scaffold", "room", "resume"]);
+const DEFERRED_COMMANDS = new Set(["plan", "scaffold", "room", "resume", "close"]);
 
 /** Minimal interface for the subset of ChatInputCommandInteraction used by extract_slash_args. */
 export interface SlashInteractionLike {
@@ -881,7 +881,7 @@ export class DiscordBot extends EventEmitter {
   /**
    * Scaffold Discord channels for a new entity.
    * Creates a category and standard channels (general, alerts).
-   * Work rooms are created on demand via !lf room.
+   * Work rooms are created on demand via /room (or !lf room).
    * Returns the channel mappings to store in entity config.
    */
   async scaffold_entity(
@@ -1827,7 +1827,7 @@ export class DiscordBot extends EventEmitter {
         stdio: "ignore",
         timeout: 5000,
       });
-      await target.react("\u2705");
+      await target.reply("✅ Compact triggered.");
     } catch {
       await target.reply("Failed to send compact — session may be unresponsive.");
     }
@@ -2029,6 +2029,10 @@ export class DiscordBot extends EventEmitter {
         `Session archived as \`${room_name}\`. Use \`/resume ${room_name}\` to restore.`,
       );
     }
+
+    // Acknowledge the interaction. For slash commands, the interaction token
+    // remains valid even after the channel is deleted.
+    await target.reply(`Session archived. Use \`/resume ${room_name}\` to restore.`);
   }
 
   /**
