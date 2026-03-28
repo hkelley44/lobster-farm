@@ -10,9 +10,6 @@
 
 import * as Sentry from "@sentry/node";
 
-// Re-export Sentry for direct access when the wrappers aren't sufficient
-export { Sentry };
-
 // ── Error capture ──
 
 interface CaptureContext {

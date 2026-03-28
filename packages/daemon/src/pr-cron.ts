@@ -70,6 +70,7 @@ export class PRReviewCron {
   private active_reviews = new Map<string, ActiveReview>(); // key: "entity:pr#"
   private processed: PRReviewState = {}; // persisted to disk — tracks completed reviews
   private running = false;
+  private interval_ms: number = DEFAULT_INTERVAL_MS;
 
   constructor(
     private registry: EntityRegistry,
@@ -91,6 +92,7 @@ export class PRReviewCron {
       console.log(`[pr-cron] Loaded ${String(count)} processed PR reviews from disk`);
     }
 
+    this.interval_ms = interval_ms;
     console.log(`[pr-cron] Starting PR review cron (every ${String(interval_ms / 1000)}s)`);
 
     // Run immediately on start, then on interval
@@ -121,10 +123,11 @@ export class PRReviewCron {
 
     this.running = true;
 
-    // Sentry cron monitoring: report check-in status
+    // Sentry cron monitoring: derive schedule from actual interval
+    const interval_minutes = Math.round(this.interval_ms / 60_000);
     const checkInId = sentry.cronCheckInStart("pr-review-cron", {
-      schedule: { type: "interval", value: 30, unit: "minute" },
-      checkinMargin: 5,
+      schedule: { type: "interval", value: interval_minutes, unit: "minute" },
+      checkinMargin: Math.max(1, Math.round(interval_minutes * 0.2)),
       maxRuntime: 15,
       failureIssueThreshold: 3,
       recoveryThreshold: 2,

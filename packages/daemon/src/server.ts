@@ -139,7 +139,7 @@ const handle_webhook_github: RouteHandler = async (req, res, ctx) => {
 const handle_webhook_sentry: RouteHandler = async (req, res, ctx) => {
   const raw_body = await read_body(req);
 
-  // Respond within 1 second (Sentry timeout constraint) -- process asynchronously
+  // Respond quickly after buffering body — process asynchronously
   json_response(res, 200, { ok: true });
 
   // Process the webhook event async
@@ -169,7 +169,9 @@ async function process_sentry_webhook(
 ): Promise<void> {
   // Verify signature if webhook secret is configured
   const webhook_secret = process.env["SENTRY_WEBHOOK_SECRET"];
-  if (webhook_secret) {
+  if (!webhook_secret) {
+    console.warn("[sentry-webhook] SENTRY_WEBHOOK_SECRET not configured — webhook is unauthenticated");
+  } else {
     const signature = req.headers["sentry-hook-signature"] as string | undefined;
     if (!signature || !verify_sentry_signature(raw_body, signature, webhook_secret)) {
       console.log("[sentry-webhook] Invalid or missing signature -- rejecting");
