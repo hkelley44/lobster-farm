@@ -11,6 +11,12 @@ import { fetch_review_comments, build_review_fix_prompt } from "./features.js";
 import { detect_review_outcome } from "./actions.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { PRReviewState } from "./persistence.js";
+import {
+  extract_linked_issues,
+  fetch_issue_context,
+  close_linked_issues,
+  nwo_from_url,
+} from "./issue-utils.js";
 import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
@@ -322,10 +328,10 @@ export class PRReviewCron {
 
     // Fetch linked issue context from PR body (Closes/Fixes/Resolves #N) and title (#N)
     let issue_context = "";
-    const linked_issues = this.extract_linked_issues(pr.body, pr.title);
+    const linked_issues = extract_linked_issues(pr.body, pr.title);
     if (linked_issues.length > 0) {
       const contexts = await Promise.all(
-        linked_issues.map((n) => this.fetch_issue_context(repo_path, n)),
+        linked_issues.map((n) => fetch_issue_context(repo_path, n)),
       );
       issue_context = contexts.filter(Boolean).join("\n\n---\n\n");
     }
@@ -492,6 +498,12 @@ export class PRReviewCron {
     } else if (review_state === "approved") {
       // Check if the reviewer already merged (they're instructed to merge on approval)
       const is_merged = await this.check_pr_merged(repo_path, pr.number);
+
+      // Close linked issues after merge — GitHub Apps don't trigger auto-close
+      if (is_merged) {
+        await this.close_issues_for_merged_pr(entity_id, repo_path, pr);
+      }
+
       if (is_internal) {
         await this.notify_alerts(
           entity_id,
@@ -603,46 +615,65 @@ export class PRReviewCron {
     }
   }
 
-  /** Extract linked issue numbers from PR body (Closes/Fixes/Resolves #N) and title (#N). */
-  private extract_linked_issues(body: string | null, title: string | null): number[] {
-    const issues = new Set<number>();
+  /**
+   * Close linked issues after a PR merge via the GitHub REST API.
+   * Derives the repo full name (owner/repo) from the entity's config.
+   * Failures are logged but never thrown.
+   */
+  private async close_issues_for_merged_pr(
+    entity_id: string,
+    repo_path: string,
+    pr: OpenPR,
+  ): Promise<void> {
+    const issue_numbers = extract_linked_issues(pr.body, pr.title);
+    if (issue_numbers.length === 0) return;
 
-    // Parse "Closes #N", "Fixes #N", "Resolves #N" from body (all occurrences)
-    if (body) {
-      for (const match of body.matchAll(/(?:closes|fixes|resolves)\s+#(\d+)/gi)) {
-        issues.add(parseInt(match[1]!, 10));
-      }
+    // Derive repo full name (owner/repo) from entity config
+    const entity_config = this.registry.get(entity_id);
+    const repo = entity_config?.entity.repos.find(
+      (r: { path: string; url: string }) => expand_home(r.path) === repo_path,
+    );
+    const repo_full_name = repo ? nwo_from_url(repo.url) : undefined;
+    if (!repo_full_name) {
+      console.warn(`[pr-cron] Cannot derive repo full name for ${repo_path} — skipping issue close`);
+      return;
     }
 
-    // Parse "(#N)" from PR title
-    if (title) {
-      const title_match = title.match(/#(\d+)/);
-      if (title_match) {
-        issues.add(parseInt(title_match[1]!, 10));
-      }
+    // Get GitHub App token for the API call
+    if (!this.github_app) {
+      console.warn(`[pr-cron] No GitHub App configured — cannot close linked issues`);
+      return;
     }
 
-    return [...issues];
-  }
-
-  /** Fetch issue title + body via gh CLI for reviewer context. */
-  private async fetch_issue_context(repo_path: string, issue_number: number): Promise<string> {
+    let gh_token: string;
     try {
-      const { stdout } = await exec("gh", [
-        "issue", "view", String(issue_number),
-        "--json", "title,body,number",
-        "--jq", `"## Issue #" + (.number | tostring) + ": " + .title + "\\n\\n" + .body`,
-      ], { cwd: repo_path, timeout: 15_000 });
-      const result = stdout.trim();
-
-      // Truncate very long issue bodies to avoid blowing up reviewer context
-      if (result.length > 2000) {
-        return result.slice(0, 2000) + "\n\n[...truncated]";
-      }
-      return result;
+      gh_token = await this.github_app.get_token();
     } catch (err) {
-      console.log(`[pr-cron] Could not fetch issue #${String(issue_number)}: ${String(err)}`);
-      return "";
+      console.error(`[pr-cron] Failed to get token for issue closing: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "pr-cron", entity: entity_id, action: "close_issues" },
+        contexts: { pr: { number: pr.number, title: pr.title } },
+      });
+      return;
+    }
+
+    console.log(
+      `[pr-cron] Closing linked issues ${issue_numbers.map(n => `#${String(n)}`).join(", ")} ` +
+      `for merged PR #${String(pr.number)}`,
+    );
+
+    const results = await close_linked_issues(repo_full_name, pr.number, issue_numbers, gh_token);
+
+    for (const result of results) {
+      if (!result.success) {
+        sentry.captureException(new Error(result.error ?? "unknown"), {
+          tags: { module: "pr-cron", entity: entity_id, action: "close_issue" },
+          contexts: {
+            pr: { number: pr.number, title: pr.title },
+            issue: { number: result.issue_number },
+          },
+        });
+      }
     }
   }
 }

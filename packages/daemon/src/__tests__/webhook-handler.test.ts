@@ -21,6 +21,7 @@ function make_pr_payload(
   action: string = "opened",
   pr_number: number = 42,
   repo_full_name: string = "ultim88888888/lobster-farm",
+  overrides: Record<string, unknown> = {},
 ): string {
   return JSON.stringify({
     action,
@@ -30,6 +31,7 @@ function make_pr_payload(
       head: { ref: "feature/test" },
       body: "Closes #10",
       user: { login: "testuser" },
+      ...overrides,
     },
     repository: { full_name: repo_full_name },
   });
@@ -205,8 +207,8 @@ describe("handle_github_webhook", () => {
       expect((ctx.session_manager as any).spawn).not.toHaveBeenCalled();
     });
 
-    it("ignores pull_request.closed events", async () => {
-      const body = make_pr_payload("closed", 300);
+    it("does not spawn reviewer for pull_request.closed without merge", async () => {
+      const body = make_pr_payload("closed", 300, "ultim88888888/lobster-farm", { merged: false });
       const req = make_request(body, {
         "x-github-event": "pull_request",
         "x-hub-signature-256": sign_payload(body),
@@ -221,6 +223,45 @@ describe("handle_github_webhook", () => {
 
       expect(res._status).toBe(200);
       expect((ctx.session_manager as any).spawn).not.toHaveBeenCalled();
+    });
+
+    it("closes linked issues on pull_request.closed with merge", async () => {
+      const fetch_spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        new Response("{}", { status: 200 }),
+      );
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      try {
+        const body = make_pr_payload("closed", 300, "ultim88888888/lobster-farm", { merged: true });
+        const req = make_request(body, {
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": sign_payload(body),
+        });
+        const res = make_response();
+        const ctx = make_context();
+
+        await handle_github_webhook(req, res, ctx);
+
+        // Give async route_event time to process
+        await vi.waitFor(() => {
+          // Should have called fetch for the comment + close API calls on issue #10
+          expect(fetch_spy).toHaveBeenCalledWith(
+            "https://api.github.com/repos/ultim88888888/lobster-farm/issues/10/comments",
+            expect.objectContaining({ method: "POST" }),
+          );
+          expect(fetch_spy).toHaveBeenCalledWith(
+            "https://api.github.com/repos/ultim88888888/lobster-farm/issues/10",
+            expect.objectContaining({ method: "PATCH" }),
+          );
+        }, { timeout: 2000 });
+
+        expect(res._status).toBe(200);
+        // No reviewer spawned for merged PRs
+        expect((ctx.session_manager as any).spawn).not.toHaveBeenCalled();
+      } finally {
+        fetch_spy.mockRestore();
+        log_spy.mockRestore();
+      }
     });
 
     it("spawns reviewer for pull_request.opened", async () => {

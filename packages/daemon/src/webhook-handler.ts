@@ -21,6 +21,12 @@ import type { FeatureManager } from "./features.js";
 import type { DiscordBot } from "./discord.js";
 import { detect_review_outcome } from "./actions.js";
 import { fetch_review_comments, build_review_fix_prompt } from "./features.js";
+import {
+  extract_first_linked_issue,
+  extract_linked_issues,
+  fetch_issue_context,
+  close_linked_issues,
+} from "./issue-utils.js";
 import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
@@ -42,6 +48,7 @@ interface WebhookPR {
   head: { ref: string };
   body: string | null;
   user: { login: string };
+  merged?: boolean;
 }
 
 interface WebhookPayload {
@@ -75,16 +82,6 @@ function read_body(req: IncomingMessage): Promise<string> {
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });
-}
-
-/**
- * Extract "Closes #N" or "Fixes #N" references from PR body.
- * Returns the first matched issue number, or null.
- */
-function extract_linked_issue(body: string | null): number | null {
-  if (!body) return null;
-  const match = body.match(/(?:closes|fixes|resolves)\s+#(\d+)/i);
-  return match ? parseInt(match[1]!, 10) : null;
 }
 
 /**
@@ -202,17 +199,27 @@ async function route_event(
     return;
   }
 
-  // Only handle PR events that warrant a review
-  const reviewable_actions = ["opened", "synchronize", "reopened"];
-  if (!reviewable_actions.includes(action)) {
-    console.log(`[webhook] Ignoring pull_request.${action} for #${String(pr.number)}`);
-    return;
-  }
-
   // Map repo to entity
   const match = find_entity_for_repo(repo_full_name, ctx.registry);
   if (!match) {
     console.log(`[webhook] No entity found for repo ${repo_full_name} — ignoring`);
+    return;
+  }
+
+  // Handle merged PRs — close linked issues
+  if (action === "closed" && pr.merged === true) {
+    console.log(
+      `[webhook] pull_request.closed (merged) for #${String(pr.number)} ` +
+      `in ${match.entity_id} (${repo_full_name})`,
+    );
+    await handle_pr_merged(pr, repo_full_name, ctx);
+    return;
+  }
+
+  // Only handle PR events that warrant a review
+  const reviewable_actions = ["opened", "synchronize", "reopened"];
+  if (!reviewable_actions.includes(action)) {
+    console.log(`[webhook] Ignoring pull_request.${action} for #${String(pr.number)}`);
     return;
   }
 
@@ -274,7 +281,7 @@ async function spawn_review(
 
   // Fetch linked issue context if available (for #109)
   let issue_context = "";
-  const linked_issue = extract_linked_issue(pr.body);
+  const linked_issue = extract_first_linked_issue(pr.body);
   if (linked_issue) {
     issue_context = await fetch_issue_context(repo_path, linked_issue, gh_token);
   }
@@ -517,29 +524,54 @@ function build_reviewer_prompt(
   return lines.join("\n");
 }
 
-// ── Issue context fetching ──
+// ── Merged PR handling ──
 
-async function fetch_issue_context(
-  repo_path: string,
-  issue_number: number,
-  gh_token: string,
-): Promise<string> {
+/**
+ * Handle a PR that was just merged: close any linked issues.
+ *
+ * GitHub Apps don't trigger auto-close when they merge PRs, so we do it
+ * explicitly via the REST API. Failures are logged but never thrown.
+ */
+async function handle_pr_merged(
+  pr: WebhookPR,
+  repo_full_name: string,
+  ctx: WebhookContext,
+): Promise<void> {
+  const issue_numbers = extract_linked_issues(pr.body, pr.title);
+  if (issue_numbers.length === 0) {
+    console.log(`[webhook] Merged PR #${String(pr.number)} has no linked issues to close`);
+    return;
+  }
+
+  let gh_token: string;
   try {
-    const { stdout } = await exec("gh", [
-      "issue", "view", String(issue_number),
-      "--json", "title,body",
-      "--jq", `"## Issue #" + (.number | tostring) + ": " + .title + "\\n\\n" + .body`,
-    ], {
-      cwd: repo_path,
-      timeout: 15_000,
-      env: { ...process.env, GH_TOKEN: gh_token },
-    });
-    return stdout.trim();
+    gh_token = await ctx.github_app.get_token();
   } catch (err) {
-    console.log(
-      `[webhook] Could not fetch issue #${String(issue_number)}: ${String(err)}`,
-    );
-    return "";
+    console.error(`[webhook] Failed to get token for issue closing: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "webhook", action: "close_issues" },
+      contexts: { pr: { number: pr.number, title: pr.title } },
+    });
+    return;
+  }
+
+  console.log(
+    `[webhook] Closing linked issues ${issue_numbers.map(n => `#${String(n)}`).join(", ")} ` +
+    `for merged PR #${String(pr.number)}`,
+  );
+
+  const results = await close_linked_issues(repo_full_name, pr.number, issue_numbers, gh_token);
+
+  for (const result of results) {
+    if (!result.success) {
+      sentry.captureException(new Error(result.error ?? "unknown"), {
+        tags: { module: "webhook", action: "close_issue" },
+        contexts: {
+          pr: { number: pr.number, title: pr.title },
+          issue: { number: result.issue_number },
+        },
+      });
+    }
   }
 }
 
