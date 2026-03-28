@@ -35,9 +35,16 @@ describe("build_slash_commands", () => {
     expect(options[0]!.toJSON().required).toBe(true);
   });
 
-  it("/status has no options", () => {
+  it("/status has an optional scope option with entity/all choices", () => {
     const status = commands.find(c => c.name === "status")!;
-    expect(status.options).toHaveLength(0);
+    const options = status.options;
+    expect(options).toHaveLength(1);
+    const opt = options[0]!.toJSON();
+    expect(opt.name).toBe("scope");
+    expect(opt.required).toBeFalsy();
+    expect(opt.choices).toHaveLength(2);
+    const values = opt.choices!.map((c: { value: string }) => c.value);
+    expect(values).toEqual(["entity", "all"]);
   });
 
   it("/swap has a required agent option with fixed choices", () => {
@@ -235,6 +242,18 @@ describe("extract_slash_args", () => {
 
   it("unknown command returns empty array", () => {
     expect(extract_slash_args(mock_interaction("unknown"))).toEqual([]);
+  });
+
+  it("/status with scope:entity → ['entity']", () => {
+    expect(extract_slash_args(mock_interaction("status", { scope: "entity" }))).toEqual(["entity"]);
+  });
+
+  it("/status with scope:all → ['all']", () => {
+    expect(extract_slash_args(mock_interaction("status", { scope: "all" }))).toEqual(["all"]);
+  });
+
+  it("/status with no scope → []", () => {
+    expect(extract_slash_args(mock_interaction("status"))).toEqual([]);
   });
 
   it("/help returns empty array (no options)", () => {

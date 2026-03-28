@@ -107,7 +107,13 @@ export function build_slash_commands(): SlashCommandBuilder[] {
 
     new SlashCommandBuilder()
       .setName("status")
-      .setDescription("Show session and entity status"),
+      .setDescription("Show session and entity status")
+      .addStringOption(opt =>
+        opt.setName("scope").setDescription("Scope").addChoices(
+          { name: "entity", value: "entity" },
+          { name: "all", value: "all" },
+        ),
+      ) as SlashCommandBuilder,
 
     new SlashCommandBuilder()
       .setName("features")
@@ -120,6 +126,10 @@ export function build_slash_commands(): SlashCommandBuilder[] {
         opt.setName("title").setDescription("Feature title").setRequired(true),
       ) as SlashCommandBuilder,
 
+    // NOTE: Spec defines `feature` as optional for /approve and /advance, but we
+    // mark it required because there's no "infer from active channel" mechanism yet.
+    // Requiring the ID is safer than silently failing. Tracked as a deliberate
+    // deviation — revisit when per-channel feature inference is implemented.
     new SlashCommandBuilder()
       .setName("approve")
       .setDescription("Approve the current phase gate for a feature")
@@ -213,6 +223,10 @@ export function extract_slash_args(interaction: SlashInteractionLike): string[] 
   const name = interaction.commandName;
 
   switch (name) {
+    case "status": {
+      const scope = interaction.options.getString("scope");
+      return scope ? [scope] : [];
+    }
     case "plan": {
       const title = interaction.options.getString("title") ?? "";
       return [title];
@@ -279,6 +293,8 @@ function target_from_interaction(interaction: ChatInputCommandInteraction, ephem
     async reply(content: string) {
       try {
         if (deferred && !replied) {
+          // editReply inherits the ephemeral flag from the earlier deferReply()
+          // call — no need to pass ephemeral here.
           await interaction.editReply({ content });
         } else if (!replied) {
           await interaction.reply({ content, ephemeral });
@@ -388,6 +404,10 @@ export class DiscordBot extends EventEmitter {
       console.log(`[discord] Registered ${String(commands.length)} slash commands on guild`);
     } catch (err) {
       console.error(`[discord] Failed to register slash commands: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { component: "discord", operation: "register_slash_commands" },
+        extra: { hint: "Most likely missing applications.commands OAuth2 scope" },
+      });
     }
   }
 
