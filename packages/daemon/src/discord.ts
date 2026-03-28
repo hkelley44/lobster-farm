@@ -795,7 +795,21 @@ export class DiscordBot extends EventEmitter {
 
     // Non-command messages: auto-assign a pool bot if none is active on this channel
     if (this._pool) {
-      const assignment = this._pool.get_assignment(message.channelId);
+      let assignment = this._pool.get_assignment(message.channelId);
+
+      // If a bot is assigned but its tmux session is dead, release it (preserving
+      // session_id for resume) and fall through to the auto-assign branch below.
+      // This is the lazy-resume path: the first message after a tmux death triggers
+      // reassignment with session resume, so the user never sees a gap.
+      if (assignment && !this._pool.is_session_alive(assignment.id)) {
+        console.log(
+          `[discord] Dead tmux detected for pool-${String(assignment.id)} on message ` +
+          `— releasing with history`,
+        );
+        await this._pool.release_with_history(assignment.id);
+        assignment = undefined;
+      }
+
       if (!assignment) {
         // Determine archetype: check if channel has a feature with an active phase
         let archetype: ArchetypeRole = "planner"; // default
@@ -817,7 +831,7 @@ export class DiscordBot extends EventEmitter {
           message.channelId,
           entry.entity_id,
           archetype,
-          undefined, // resume_session_id — pool handles auto-resume from parked bots
+          undefined, // resume_session_id — pool handles auto-resume from parked bots + session_history
           entry.channel_type,
         );
         if (result) {
@@ -837,7 +851,7 @@ export class DiscordBot extends EventEmitter {
           );
         }
       } else {
-        // Bot is assigned — touch for LRU tracking
+        // Bot is assigned and tmux is alive — touch for LRU tracking
         this._pool.touch(message.channelId);
       }
     }
