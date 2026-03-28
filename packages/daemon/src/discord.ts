@@ -89,6 +89,67 @@ function avatars_dir(): string {
   return join(lobsterfarm_dir(), "avatars");
 }
 
+/**
+ * Set a pool bot's Discord profile avatar using a raw REST call.
+ * Reads the bot's token from its .env file, reads the avatar image from disk,
+ * and PATCHes /users/@me. The token is only held in memory for the duration
+ * of the fetch call — never stored, logged, or passed to other modules.
+ *
+ * @param state_dir - The pool bot's channel directory (contains .env with token)
+ * @param agent_name - Lowercase agent name (e.g., "gary") used to find the avatar file
+ */
+export async function set_bot_profile_avatar(
+  state_dir: string,
+  agent_name: string,
+): Promise<void> {
+  // Read bot token from .env file
+  const env_content = await readFile(join(state_dir, ".env"), "utf-8");
+  const token_match = env_content.match(/DISCORD_BOT_TOKEN=(.+)/);
+  const token = token_match?.[1]?.trim();
+  if (!token) {
+    throw new Error(`No DISCORD_BOT_TOKEN in ${state_dir}/.env`);
+  }
+
+  // Find avatar file on disk
+  const base_dir = avatars_dir();
+  let avatar_path: string | null = null;
+  for (const ext of AVATAR_EXTENSIONS) {
+    const candidate = join(base_dir, `${agent_name}${ext}`);
+    try {
+      await readFile(candidate, { flag: "r" }).then(() => null); // existence check
+      avatar_path = candidate;
+      break;
+    } catch {
+      continue;
+    }
+  }
+
+  if (!avatar_path) {
+    throw new Error(`No avatar file found for "${agent_name}" in ${base_dir}`);
+  }
+
+  // Read file and encode as data URI for Discord API
+  const avatar_buffer = await readFile(avatar_path);
+  const ext = avatar_path.split(".").pop()!;
+  const mime = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+  const data_uri = `data:${mime};base64,${avatar_buffer.toString("base64")}`;
+
+  // PATCH /users/@me with the bot's own token
+  const response = await fetch("https://discord.com/api/v10/users/@me", {
+    method: "PATCH",
+    headers: {
+      "Authorization": `Bot ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ avatar: data_uri }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Discord API ${String(response.status)}: ${body}`);
+  }
+}
+
 function avatar_cache_path(config: LobsterFarmConfig): string {
   return join(lobsterfarm_dir(config.paths), "state", "avatar-urls.json");
 }
@@ -757,6 +818,13 @@ export class DiscordBot extends EventEmitter {
       if (!guild) return;
       const member = await guild.members.fetch(user_id);
       await member.setNickname(display_name);
+    });
+
+    // Register avatar handler so pool can set bot profile pictures.
+    // Uses a raw REST call with the bot's own token — the daemon bot
+    // cannot change another bot's profile avatar via the gateway.
+    pool.set_avatar_handler(async (state_dir: string, agent_name: string) => {
+      await set_bot_profile_avatar(state_dir, agent_name);
     });
 
     // When a waiting-for-human bot is evicted, notify the channel
