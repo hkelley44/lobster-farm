@@ -1,12 +1,18 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig, ArchetypeRole } from "@lobster-farm/shared";
 import { BotPool, AVATAR_COOLDOWN_MS } from "../pool.js";
 import type { PoolBot, AvatarHandler } from "../pool.js";
 
+let temp_dir: string;
+
 function make_config(): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
     user: { name: "Test" },
+    paths: { lobsterfarm_dir: temp_dir },
   });
 }
 
@@ -52,7 +58,8 @@ describe("Pool bot avatar management", () => {
   let pool: TestBotPool;
   let avatar_handler: ReturnType<typeof vi.fn>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    temp_dir = await mkdtemp(join(tmpdir(), "pool-avatars-test-"));
     config = make_config();
     pool = new TestBotPool(config);
 
@@ -75,6 +82,11 @@ describe("Pool bot avatar management", () => {
     // Register a spy avatar handler
     avatar_handler = vi.fn<AvatarHandler>().mockResolvedValue(undefined);
     pool.set_avatar_handler(avatar_handler);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(temp_dir, { recursive: true, force: true });
   });
 
   describe("avatar set on assign", () => {

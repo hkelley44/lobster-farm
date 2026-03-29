@@ -1,4 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach, vi, type Mock } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { BotPool } from "../pool.js";
@@ -34,9 +36,14 @@ import { execFileSync } from "node:child_process";
 
 // ── Test helpers ──
 
+// Use a static temp path per test run — mkdtemp is not mocked but we use a
+// unique-enough path since fs writes are already mocked in this file.
+let temp_dir: string;
+
 function make_config(): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
     user: { name: "Test" },
+    paths: { lobsterfarm_dir: temp_dir },
   });
 }
 
@@ -93,6 +100,10 @@ describe("resume nudge (issue #156)", () => {
     // Use fake timers so we can skip the readiness polling delays
     vi.useFakeTimers({ shouldAdvanceTime: true });
 
+    // Use a unique temp path to isolate config from production ~/.lobsterfarm.
+    // mkdtemp is not available here (fs mocked), but mkdir is also mocked so
+    // the directory doesn't need to actually exist — we just need a non-production path.
+    temp_dir = join(tmpdir(), `resume-nudge-test-${Date.now()}`);
     config = make_config();
     pool = new TestBotPool(config);
 

@@ -1,12 +1,18 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 
+let temp_dir: string;
+
 function make_config(): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
     user: { name: "Test" },
+    paths: { lobsterfarm_dir: temp_dir },
   });
 }
 
@@ -76,9 +82,15 @@ describe("shutdown() persists state before killing tmux", () => {
   let config: LobsterFarmConfig;
   let pool: TestBotPool;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    temp_dir = await mkdtemp(join(tmpdir(), "fix-resume-persist-test-"));
     config = make_config();
     pool = new TestBotPool(config);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(temp_dir, { recursive: true, force: true });
   });
 
   it("calls persist() before killing any tmux sessions", async () => {
@@ -142,7 +154,8 @@ describe("check_assigned_health() drain guard", () => {
   let config: LobsterFarmConfig;
   let pool: TestBotPool;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    temp_dir = await mkdtemp(join(tmpdir(), "fix-resume-persist-test-"));
     config = make_config();
     pool = new TestBotPool(config);
 
@@ -153,6 +166,11 @@ describe("check_assigned_health() drain guard", () => {
       .mockReturnValue(false);
     vi.spyOn(pool as unknown as Record<string, unknown>, "persist" as never)
       .mockResolvedValue(undefined);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(temp_dir, { recursive: true, force: true });
   });
 
   it("returns early without modifying state when draining", async () => {
