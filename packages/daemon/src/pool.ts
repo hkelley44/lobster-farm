@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { writeFile, readFile } from "node:fs/promises";
+import { writeFile, readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
@@ -505,6 +505,14 @@ export class BotPool extends EventEmitter {
           bot_id: bot.id,
           channel_id: bot.channel_id,
           entity_id: bot.entity_id,
+        });
+
+        // Bridge a continuation nudge so the resumed session doesn't sit idle.
+        // Fire-and-forget — don't let a nudge failure block the resume loop.
+        this.bridge_resume_nudge(bot).catch(nudge_err => {
+          console.warn(
+            `[pool] Failed to nudge pool-${String(bot.id)} after resume: ${String(nudge_err)}`,
+          );
         });
       } catch (err) {
         console.error(
@@ -1381,6 +1389,67 @@ export class BotPool extends EventEmitter {
         tags: { module: "pool", bot_id: String(bot.id), action: "set_avatar" },
       });
     }
+  }
+
+  /**
+   * Bridge a continuation nudge to a resumed bot's Claude Code process.
+   * Writes a pending message file that the MCP Discord plugin picks up,
+   * using the same mechanism as bridge_first_message in discord.ts.
+   *
+   * Waits for the Claude process to be ready (prompt indicator visible in
+   * the tmux pane) before writing the file, so the plugin is listening.
+   */
+  private async bridge_resume_nudge(bot: PoolBot): Promise<void> {
+    const pending_path = `/tmp/lf-pending-${bot.tmux_session}.txt`;
+    const nudge =
+      "The daemon restarted and your session was resumed. " +
+      "Check where you left off and continue any in-progress work.";
+
+    // Poll the tmux pane for the ready indicator — same pattern as
+    // bridge_first_message in discord.ts. The Claude process needs time
+    // to load history via --resume before it starts the MCP plugin.
+    const start = Date.now();
+    const timeout = 20_000;
+    let ready = false;
+
+    while (Date.now() - start < timeout) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      try {
+        const output = execFileSync(
+          "tmux", ["capture-pane", "-t", bot.tmux_session, "-p"],
+          { encoding: "utf-8", timeout: 2000 },
+        );
+        if (output.includes("Listening for channel messages") && output.includes("❯")) {
+          ready = true;
+          break;
+        }
+      } catch { /* tmux pane not ready yet */ }
+    }
+
+    if (!ready) {
+      console.log(
+        `[pool] Bot ${bot.tmux_session} not ready after ${String(timeout)}ms — resume nudge not sent`,
+      );
+      return;
+    }
+
+    // Small extra delay for the MCP plugin to fully connect
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    await writeFile(pending_path, nudge, "utf-8");
+
+    // Deliver the nudge via tmux send-keys — the file alone is not enough.
+    // The send-keys call injects a prompt into Claude's stdin telling it
+    // to read the pending file (same pattern as bridge_first_message).
+    execFileSync("tmux", ["send-keys", "-t", bot.tmux_session,
+      `Your session was resumed after a daemon restart. Read ${pending_path} and continue any in-progress work.`,
+      "Enter",
+    ], { stdio: "ignore", timeout: 5000 });
+
+    console.log(`[pool] Bridged resume nudge to ${bot.tmux_session}`);
+
+    // Clean up the pending file after a delay
+    setTimeout(() => { void unlink(pending_path).catch(() => {}); }, 30_000);
   }
 
   private is_tmux_alive(session_name: string): boolean {
