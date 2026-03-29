@@ -54,6 +54,8 @@ interface WebhookPayload {
   action: string;
   pull_request?: WebhookPR;
   repository?: { full_name: string };
+  /** GitHub includes the installation that generated the webhook event. */
+  installation?: { id: number };
 }
 
 interface ActiveWebhookReview {
@@ -112,6 +114,19 @@ function find_entity_for_repo(
   }
 
   return null;
+}
+
+/**
+ * Resolve a GitHub App token for the given installation ID.
+ * Falls back to the default installation when no ID is provided.
+ */
+function resolve_token(
+  github_app: GitHubAppAuth,
+  installation_id: string | undefined,
+): Promise<string> {
+  return installation_id
+    ? github_app.get_token_for_installation(installation_id)
+    : github_app.get_token();
 }
 
 // ── Active review tracking ──
@@ -198,6 +213,12 @@ async function route_event(
     return;
   }
 
+  // Extract installation ID from the webhook payload so we authenticate
+  // against the correct GitHub account (multi-installation support).
+  const installation_id = payload.installation?.id != null
+    ? String(payload.installation.id)
+    : undefined;
+
   // Map repo to entity
   const match = find_entity_for_repo(repo_full_name, ctx.registry);
   if (!match) {
@@ -211,7 +232,7 @@ async function route_event(
       `[webhook] pull_request.closed (merged) for #${String(pr.number)} ` +
       `in ${match.entity_id} (${repo_full_name})`,
     );
-    await handle_pr_merged(pr, repo_full_name, match.repo_path, ctx);
+    await handle_pr_merged(pr, repo_full_name, match.repo_path, ctx, installation_id);
     return;
   }
 
@@ -244,7 +265,7 @@ async function route_event(
     return;
   }
 
-  await spawn_review(match.entity_id, match.repo_path, pr, ctx);
+  await spawn_review(match.entity_id, match.repo_path, pr, ctx, installation_id);
 }
 
 // ── Reviewer spawning ──
@@ -254,6 +275,7 @@ async function spawn_review(
   repo_path: string,
   pr: WebhookPR,
   ctx: WebhookContext,
+  installation_id?: string,
 ): Promise<void> {
   const key = review_key(entity_id, pr.number);
 
@@ -267,7 +289,7 @@ async function spawn_review(
   // Get installation token for the reviewer subprocess
   let gh_token: string;
   try {
-    gh_token = await ctx.github_app.get_token();
+    gh_token = await resolve_token(ctx.github_app, installation_id);
   } catch (err) {
     console.error(`[webhook] Failed to get installation token: ${String(err)}`);
     sentry.captureException(err, {
@@ -316,7 +338,7 @@ async function spawn_review(
       ctx.session_manager.removeListener("session:completed", on_complete);
       ctx.session_manager.removeListener("session:failed", on_fail);
 
-      void handle_review_completion(entity_id, repo_path, pr, ctx).catch(
+      void handle_review_completion(entity_id, repo_path, pr, ctx, installation_id).catch(
         (err) => {
           console.error(`[webhook] Post-review error: ${String(err)}`);
           sentry.captureException(err, {
@@ -339,7 +361,7 @@ async function spawn_review(
         tags: { module: "webhook", entity: entity_id },
         contexts: { pr: { number: pr.number, title: pr.title } },
       });
-      cleanup_and_maybe_requeue(key, entity_id, repo_path, pr, ctx);
+      cleanup_and_maybe_requeue(key, entity_id, repo_path, pr, ctx, installation_id);
     };
 
     ctx.session_manager.on("session:completed", on_complete);
@@ -363,6 +385,7 @@ async function handle_review_completion(
   repo_path: string,
   pr: WebhookPR,
   ctx: WebhookContext,
+  installation_id?: string,
 ): Promise<void> {
   const key = review_key(entity_id, pr.number);
   const outcome = await detect_review_outcome(pr.number, repo_path);
@@ -374,7 +397,7 @@ async function handle_review_completion(
   // Route outcome
   if (outcome === "changes_requested") {
     // Spawn builder to fix
-    await spawn_fixer(entity_id, repo_path, pr, ctx);
+    await spawn_fixer(entity_id, repo_path, pr, ctx, installation_id);
     await notify_alerts(
       entity_id,
       `PR #${String(pr.number)}: ${pr.title} — changes requested, spawning builder to fix`,
@@ -397,7 +420,7 @@ async function handle_review_completion(
   }
 
   // Check if we need to re-review (new commits arrived during review)
-  cleanup_and_maybe_requeue(key, entity_id, repo_path, pr, ctx);
+  cleanup_and_maybe_requeue(key, entity_id, repo_path, pr, ctx, installation_id);
 }
 
 /**
@@ -410,6 +433,7 @@ function cleanup_and_maybe_requeue(
   repo_path: string,
   pr: WebhookPR,
   ctx: WebhookContext,
+  installation_id?: string,
 ): void {
   const review = active_reviews.get(key);
   active_reviews.delete(key);
@@ -418,7 +442,7 @@ function cleanup_and_maybe_requeue(
     console.log(
       `[webhook] Re-reviewing PR #${String(pr.number)} — new commits arrived during previous review`,
     );
-    void spawn_review(entity_id, repo_path, pr, ctx).catch((err) => {
+    void spawn_review(entity_id, repo_path, pr, ctx, installation_id).catch((err) => {
       console.error(`[webhook] Requeue failed for PR #${String(pr.number)}: ${String(err)}`);
       sentry.captureException(err, {
         tags: { module: "webhook", entity: entity_id, action: "requeue" },
@@ -435,6 +459,7 @@ async function spawn_fixer(
   repo_path: string,
   pr: WebhookPR,
   ctx: WebhookContext,
+  installation_id?: string,
 ): Promise<void> {
   const review_comments = await fetch_review_comments(pr.number, repo_path);
 
@@ -456,7 +481,7 @@ async function spawn_fixer(
 
   try {
     // Get fresh token for builder too
-    const gh_token = await ctx.github_app.get_token();
+    const gh_token = await resolve_token(ctx.github_app, installation_id);
 
     await ctx.session_manager.spawn({
       entity_id,
@@ -531,6 +556,7 @@ async function handle_pr_merged(
   repo_full_name: string,
   repo_path: string,
   ctx: WebhookContext,
+  installation_id?: string,
 ): Promise<void> {
   // Close linked issues
   const issue_numbers = extract_linked_issues(pr.body, pr.title);
@@ -539,7 +565,7 @@ async function handle_pr_merged(
   } else {
     let gh_token: string;
     try {
-      gh_token = await ctx.github_app.get_token();
+      gh_token = await resolve_token(ctx.github_app, installation_id);
     } catch (err) {
       console.error(`[webhook] Failed to get token for issue closing: ${String(err)}`);
       sentry.captureException(err, {

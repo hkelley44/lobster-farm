@@ -323,6 +323,30 @@ export class PRReviewCron {
     }
   }
 
+  /**
+   * Resolve a GitHub App token for the given entity.
+   * Uses the entity's `github_app_installation_id` if configured,
+   * otherwise falls back to the default installation from env.
+   */
+  private async resolve_entity_token(
+    entity_config: EntityConfig,
+  ): Promise<string | undefined> {
+    if (!this.github_app) return undefined;
+
+    const override_id = entity_config.entity.accounts?.github?.github_app_installation_id;
+    try {
+      return override_id
+        ? await this.github_app.get_token_for_installation(override_id)
+        : await this.github_app.get_token();
+    } catch (err) {
+      console.error(`[pr-cron] Failed to get GitHub App token: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "pr-cron", entity: entity_config.entity.id },
+      });
+      return undefined;
+    }
+  }
+
   /** Spawn a reviewer session for a PR. */
   private async review_pr(
     entity_id: string,
@@ -378,19 +402,12 @@ export class PRReviewCron {
 
     console.log(`[pr-cron] Spawning reviewer for PR #${String(pr.number)} in ${entity_id}`);
 
-    // Inject GitHub App token if available — gives reviewer its own identity
+    // Inject GitHub App token if available — gives reviewer its own identity.
+    // Uses per-entity installation ID when configured.
     let spawn_env: Record<string, string> | undefined;
-    if (this.github_app) {
-      try {
-        const gh_token = await this.github_app.get_token();
-        spawn_env = { GH_TOKEN: gh_token };
-      } catch (err) {
-        console.error(`[pr-cron] Failed to get GitHub App token: ${String(err)}`);
-        sentry.captureException(err, {
-          tags: { module: "pr-cron", entity: entity_id },
-        });
-        // Continue without app token — reviewer will use default gh auth
-      }
+    const gh_token = await this.resolve_entity_token(entity_config);
+    if (gh_token) {
+      spawn_env = { GH_TOKEN: gh_token };
     }
 
     try {
@@ -490,7 +507,7 @@ export class PRReviewCron {
     const is_internal = github_user != null && pr.author.login === github_user;
 
     if (review_state === "changes_requested") {
-      await this.spawn_external_pr_fixer(entity_id, repo_path, pr);
+      await this.spawn_external_pr_fixer(entity_id, repo_path, pr, entity_config);
       if (is_internal) {
         await this.notify_alerts(
           entity_id,
@@ -508,7 +525,7 @@ export class PRReviewCron {
 
       // Close linked issues after merge — GitHub Apps don't trigger auto-close
       if (is_merged) {
-        await this.close_issues_for_merged_pr(entity_id, repo_path, pr);
+        await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
       }
 
       if (is_internal) {
@@ -542,6 +559,7 @@ export class PRReviewCron {
     entity_id: string,
     repo_path: string,
     pr: OpenPR,
+    entity_config?: EntityConfig,
   ): Promise<void> {
     // Fetch the actual review comments to give the builder full context
     const review_comments = await fetch_review_comments(pr.number, repo_path);
@@ -560,17 +578,13 @@ export class PRReviewCron {
 
     console.log(`[pr-cron] Spawning builder to fix external PR #${String(pr.number)} in ${entity_id}`);
 
-    // Inject GitHub App token if available
+    // Inject GitHub App token if available — uses per-entity installation ID when configured
     let fix_env: Record<string, string> | undefined;
-    if (this.github_app) {
-      try {
-        const gh_token = await this.github_app.get_token();
+    const config = entity_config ?? this.registry.get(entity_id);
+    if (config) {
+      const gh_token = await this.resolve_entity_token(config);
+      if (gh_token) {
         fix_env = { GH_TOKEN: gh_token };
-      } catch (err) {
-        console.error(`[pr-cron] Failed to get GitHub App token for fixer: ${String(err)}`);
-        sentry.captureException(err, {
-          tags: { module: "pr-cron", entity: entity_id, action: "fixer_token" },
-        });
       }
     }
 
@@ -631,13 +645,14 @@ export class PRReviewCron {
     entity_id: string,
     repo_path: string,
     pr: OpenPR,
+    entity_config?: EntityConfig,
   ): Promise<void> {
     const issue_numbers = extract_linked_issues(pr.body, pr.title);
     if (issue_numbers.length === 0) return;
 
     // Derive repo full name (owner/repo) from entity config
-    const entity_config = this.registry.get(entity_id);
-    const repo = entity_config?.entity.repos.find(
+    const config = entity_config ?? this.registry.get(entity_id);
+    const repo = config?.entity.repos.find(
       (r: { path: string; url: string }) => expand_home(r.path) === repo_path,
     );
     const repo_full_name = repo ? nwo_from_url(repo.url) : undefined;
@@ -646,21 +661,15 @@ export class PRReviewCron {
       return;
     }
 
-    // Get GitHub App token for the API call
+    // Get GitHub App token for the API call — uses per-entity installation ID when configured
     if (!this.github_app) {
       console.warn(`[pr-cron] No GitHub App configured — cannot close linked issues`);
       return;
     }
 
-    let gh_token: string;
-    try {
-      gh_token = await this.github_app.get_token();
-    } catch (err) {
-      console.error(`[pr-cron] Failed to get token for issue closing: ${String(err)}`);
-      sentry.captureException(err, {
-        tags: { module: "pr-cron", entity: entity_id, action: "close_issues" },
-        contexts: { pr: { number: pr.number, title: pr.title } },
-      });
+    const gh_token = config ? await this.resolve_entity_token(config) : undefined;
+    if (!gh_token) {
+      console.error(`[pr-cron] Failed to get token for issue closing in ${entity_id}`);
       return;
     }
 

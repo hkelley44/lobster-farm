@@ -84,6 +84,10 @@ Think of it as a specific project's workspace — everything unique to that enga
 
 The background coordinator that manages agent lifecycles, handoffs between phases, deterministic workflows, and cross-entity status. It is NOT the front door — you talk directly to agents. The orchestrator handles what happens when you're not actively engaged.
 
+## AutoReviewer
+
+The automated PR review and merge system. A GitHub App that receives webhook events when PRs are opened or updated, spawns ephemeral reviewer sessions, and auto-merges approved PRs. Supports multiple GitHub account installations so it can review repos owned by different accounts (e.g. `ultim8`, `rg-jax`). Components: `github-app.ts` (auth + token caching), `webhook-handler.ts` (event routing), `pr-cron.ts` (polling fallback).
+
 ---
 
 *These terms are the shared language. Use them consistently in all documentation, conversations, and code.*

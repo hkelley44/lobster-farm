@@ -57,8 +57,9 @@ function make_pr_payload(
   pr_number: number = 42,
   repo_full_name: string = "test-org/lobster-farm",
   overrides: Record<string, unknown> = {},
+  options: { installation_id?: number } = {},
 ): string {
-  return JSON.stringify({
+  const payload: Record<string, unknown> = {
     action,
     pull_request: {
       number: pr_number,
@@ -69,7 +70,13 @@ function make_pr_payload(
       ...overrides,
     },
     repository: { full_name: repo_full_name },
-  });
+  };
+
+  if (options.installation_id != null) {
+    payload["installation"] = { id: options.installation_id };
+  }
+
+  return JSON.stringify(payload);
 }
 
 /** Create a mock IncomingMessage that emits body data. */
@@ -120,6 +127,9 @@ function make_github_app(): GitHubAppAuth {
       return sig === `sha256=${expected}`;
     }),
     get_token: vi.fn().mockResolvedValue("ghs_mock_token"),
+    get_token_for_installation: vi.fn().mockImplementation(
+      (id: string) => Promise.resolve(`ghs_install_${id}`),
+    ),
   } as unknown as GitHubAppAuth;
 }
 
@@ -760,6 +770,97 @@ describe("handle_github_webhook", () => {
 
       const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
       expect(spawn_args.archetype).toBe("reviewer");
+    });
+  });
+
+  describe("multi-installation support", () => {
+    it("uses get_token_for_installation when payload includes installation.id", async () => {
+      const body = make_pr_payload("opened", 900, "test-org/lobster-farm", {}, {
+        installation_id: 55555,
+      });
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      const res = make_response();
+      const ctx = make_context();
+
+      await handle_github_webhook(req, res, ctx);
+
+      await vi.waitFor(() => {
+        expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+      }, { timeout: 2000 });
+
+      // Should have called get_token_for_installation, not get_token
+      expect(ctx.github_app.get_token_for_installation).toHaveBeenCalledWith("55555");
+      expect(ctx.github_app.get_token).not.toHaveBeenCalled();
+
+      // Spawned session should use the installation-specific token
+      const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
+      expect(spawn_args.env).toEqual({ GH_TOKEN: "ghs_install_55555" });
+    });
+
+    it("falls back to get_token when payload has no installation field", async () => {
+      const body = make_pr_payload("opened", 901, "test-org/lobster-farm");
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      const res = make_response();
+      const ctx = make_context();
+
+      await handle_github_webhook(req, res, ctx);
+
+      await vi.waitFor(() => {
+        expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+      }, { timeout: 2000 });
+
+      // Should have called get_token, not get_token_for_installation
+      expect(ctx.github_app.get_token).toHaveBeenCalled();
+      expect(ctx.github_app.get_token_for_installation).not.toHaveBeenCalled();
+
+      const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
+      expect(spawn_args.env).toEqual({ GH_TOKEN: "ghs_mock_token" });
+    });
+
+    it("uses installation-specific token for merged PR issue closing", async () => {
+      const { extract_linked_issues, close_linked_issues } = await import("../issue-utils.js");
+      (extract_linked_issues as ReturnType<typeof vi.fn>).mockReturnValue([30]);
+      (close_linked_issues as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { issue_number: 30, success: true },
+      ]);
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      try {
+        const body = make_pr_payload("closed", 902, "test-org/lobster-farm", {
+          merged: true,
+        }, {
+          installation_id: 77777,
+        });
+        const req = make_request(body, {
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": sign_payload(body),
+        });
+        const res = make_response();
+        const ctx = make_context();
+
+        await handle_github_webhook(req, res, ctx);
+
+        await vi.waitFor(() => {
+          expect(close_linked_issues).toHaveBeenCalledWith(
+            "test-org/lobster-farm",
+            902,
+            [30],
+            "ghs_install_77777",
+          );
+        }, { timeout: 2000 });
+
+        expect(ctx.github_app.get_token_for_installation).toHaveBeenCalledWith("77777");
+        expect(ctx.github_app.get_token).not.toHaveBeenCalled();
+      } finally {
+        log_spy.mockRestore();
+        (extract_linked_issues as ReturnType<typeof vi.fn>).mockReturnValue([]);
+      }
     });
   });
 });

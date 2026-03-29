@@ -44,6 +44,10 @@ export const EntityConfigSchema = z.object({
       github: z.object({
         org: z.string().optional(),
         user: z.string().optional(),
+        // Override the default GitHub App installation ID for this entity.
+        // Used by the AutoReviewer to authenticate against repos owned by
+        // different GitHub accounts (e.g. rg-jax vs ultim8).
+        github_app_installation_id: z.string().optional(),
       }).optional(),
       vercel: z.object({
         project: z.string().optional(),
