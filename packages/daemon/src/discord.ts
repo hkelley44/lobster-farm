@@ -1404,7 +1404,12 @@ export class DiscordBot extends EventEmitter {
     ]);
 
     if (context_usage) {
-      lines.push(`Context: ${context_usage.summary}`);
+      let context_line = `Context: ${context_usage.summary}`;
+      if (context_usage.compactions > 0) {
+        const label = context_usage.compactions === 1 ? "compaction" : "compactions";
+        context_line += ` \u00b7 ${String(context_usage.compactions)} ${label}`;
+      }
+      lines.push(context_line);
     }
     if (subscription_usage) {
       lines.push(`Usage: ${subscription_usage.summary}`);
