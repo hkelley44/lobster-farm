@@ -15,6 +15,7 @@ import { init_github_app_from_env } from "./github-app.js";
 import { check_required_binaries, propagate_tmux_env } from "./env.js";
 import { append_session_log } from "./persistence.js";
 import { sweep_stale_worktrees } from "./worktree-cleanup.js";
+import { prune_daily_logs } from "./memory-pruning.js";
 import * as sentry from "./sentry.js";
 
 async function main(): Promise<void> {
@@ -254,6 +255,25 @@ async function main(): Promise<void> {
   }, WORKTREE_SWEEP_INTERVAL_MS);
   console.log("[worktree-cleanup] Stale worktree sweep scheduled (every 60 min)");
 
+  // Start weekly memory pruning — archives daily logs older than 30 days.
+  // Runs once on startup (catches up if daemon was down) then weekly.
+  const MEMORY_PRUNE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 1 week
+  void prune_daily_logs(config).catch((err) => {
+    console.error(`[memory] Startup pruning failed: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "memory-pruning", action: "startup" },
+    });
+  });
+  const memory_prune_timer = setInterval(() => {
+    void prune_daily_logs(config).catch((err) => {
+      console.error(`[memory] Pruning failed: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "memory-pruning", action: "scheduled" },
+      });
+    });
+  }, MEMORY_PRUNE_INTERVAL_MS);
+  console.log("[memory] Weekly daily-log pruning scheduled");
+
   // Write PID file
   await write_pid(config);
   console.log(`PID file written (pid: ${String(process.pid)})`);
@@ -287,6 +307,7 @@ async function main(): Promise<void> {
     pool.drain();
     pr_cron.stop();
     clearInterval(worktree_sweep_timer);
+    clearInterval(memory_prune_timer);
 
     // Check for active work
     const work_check = pool.has_active_work();
