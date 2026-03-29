@@ -1,12 +1,18 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 
+let temp_dir: string;
+
 function make_config(): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
     user: { name: "Test" },
+    paths: { lobsterfarm_dir: temp_dir },
   });
 }
 
@@ -71,7 +77,8 @@ describe("BotPool", () => {
   let config: LobsterFarmConfig;
   let pool: TestBotPool;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    temp_dir = await mkdtemp(join(tmpdir(), "pool-test-"));
     config = make_config();
     pool = new TestBotPool(config);
 
@@ -93,6 +100,11 @@ describe("BotPool", () => {
       .mockImplementation(async (bot: PoolBot) => {
         bot.state = "parked";
       });
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(temp_dir, { recursive: true, force: true });
   });
 
   describe("compute_activity_state", () => {

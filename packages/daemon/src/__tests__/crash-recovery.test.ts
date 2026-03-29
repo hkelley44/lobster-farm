@@ -1,4 +1,7 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { BotPool } from "../pool.js";
@@ -27,9 +30,12 @@ vi.mock("../sentry.js", () => ({
 
 // ── Test helpers ──
 
+let temp_dir: string;
+
 function make_config(): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
     user: { name: "Test" },
+    paths: { lobsterfarm_dir: temp_dir },
   });
 }
 
@@ -95,6 +101,7 @@ describe("crash recovery (issue #157)", () => {
   let mock_notify: ReturnType<typeof vi.fn>;
 
   beforeEach(async () => {
+    temp_dir = await mkdtemp(join(tmpdir(), "crash-recovery-test-"));
     config = make_config();
     pool = new TestBotPool(config);
 
@@ -121,6 +128,11 @@ describe("crash recovery (issue #157)", () => {
     mock_is_tmux_alive = vi.spyOn(
       pool as unknown as Record<string, unknown>, "is_tmux_alive" as never,
     ).mockReturnValue(false) as unknown as ReturnType<typeof vi.fn>;
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(temp_dir, { recursive: true, force: true });
   });
 
   // ── Single crash → restart ──
