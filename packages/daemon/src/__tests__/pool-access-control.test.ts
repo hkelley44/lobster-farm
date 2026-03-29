@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { BotPool } from "../pool.js";
@@ -45,6 +45,10 @@ describe("pool bot access control", () => {
     await mkdir(tmp_dir, { recursive: true });
   });
 
+  afterEach(async () => {
+    await rm(tmp_dir, { recursive: true }).catch(() => {});
+  });
+
   it("writes configured user_id into access.json allowFrom", async () => {
     const config = make_config("999888777666555");
     const pool = new TestBotPool(config);
@@ -60,35 +64,22 @@ describe("pool bot access control", () => {
     const config = make_config(); // no user_id
     const pool = new TestBotPool(config);
 
-    // Capture the console warning
-    const warn_spy = vi.spyOn(console, "log").mockImplementation(() => {});
-
     await pool.test_write_access_json(tmp_dir, "chan-123");
 
     const content = JSON.parse(await readFile(join(tmp_dir, "access.json"), "utf-8"));
     expect(content.allowFrom).toEqual([]);
-
-    // Should have warned about missing user_id
-    expect(warn_spy).toHaveBeenCalledWith(
-      expect.stringContaining("discord.user_id not set"),
-    );
-
-    warn_spy.mockRestore();
+    // Warning is logged once in initialize(), not per write_access_json call
   });
 
   it("writes empty allowFrom when discord section is absent", async () => {
     const config = make_config_no_discord();
     const pool = new TestBotPool(config);
 
-    const warn_spy = vi.spyOn(console, "log").mockImplementation(() => {});
-
     await pool.test_write_access_json(tmp_dir, null);
 
     const content = JSON.parse(await readFile(join(tmp_dir, "access.json"), "utf-8"));
     expect(content.allowFrom).toEqual([]);
     expect(content.groups).toEqual({});
-
-    warn_spy.mockRestore();
   });
 
   it("does not contain any hardcoded Discord user IDs", async () => {

@@ -408,6 +408,11 @@ export class BotPool extends EventEmitter {
     }
     console.log(`[pool] Reconciled access.json for ${String(this.bots.length)} bots`);
 
+    // Warn once if user_id is missing — rather than on every write_access_json call
+    if (!this.config.discord?.user_id) {
+      console.warn("[pool] discord.user_id not set in config — pool bot DM allowlist will be empty. Run `lf init` to configure.");
+    }
+
     // Persist cleaned state (stale entries removed, duplicates resolved, current snapshot)
     await this.persist();
 
@@ -1124,9 +1129,6 @@ export class BotPool extends EventEmitter {
     // discord.user_id in config.yaml (captured during lf init).
     const owner_id = this.config.discord?.user_id;
     const allow_from = owner_id ? [owner_id] : [];
-    if (!owner_id) {
-      console.log("[pool] Warning: discord.user_id not set in config — pool bot DM allowlist is empty");
-    }
 
     const access = {
       dmPolicy: "allowlist",
