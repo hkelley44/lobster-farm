@@ -863,4 +863,146 @@ describe("handle_github_webhook", () => {
       }
     });
   });
+
+  describe("post-review token threading", () => {
+    it("passes installation token to detect_review_outcome after review completes", async () => {
+      const { detect_review_outcome } = await import("../actions.js");
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      try {
+        // Use installation_id to test cross-account token threading
+        const body = make_pr_payload("opened", 950, "test-org/lobster-farm", {}, {
+          installation_id: 88888,
+        });
+        const req = make_request(body, {
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": sign_payload(body),
+        });
+        const res = make_response();
+        const ctx = make_context();
+
+        await handle_github_webhook(req, res, ctx);
+
+        // Wait for reviewer to be spawned
+        await vi.waitFor(() => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        }, { timeout: 2000 });
+
+        // Simulate reviewer session completion
+        const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
+        (ctx.session_manager as any).emit("session:completed", {
+          session_id: spawn_result.session_id,
+          exit_code: 0,
+        });
+
+        // Wait for post-review handling (resolve_token + detect_review_outcome)
+        await vi.waitFor(() => {
+          expect(detect_review_outcome).toHaveBeenCalled();
+        }, { timeout: 2000 });
+
+        // detect_review_outcome should have been called with the installation token
+        // get_token_for_installation("88888") returns "ghs_install_88888"
+        expect(detect_review_outcome).toHaveBeenCalledWith(
+          950,
+          "/tmp/test-repo",
+          "ghs_install_88888",
+        );
+      } finally {
+        log_spy.mockRestore();
+      }
+    });
+
+    it("passes default token to detect_review_outcome when no installation_id", async () => {
+      const { detect_review_outcome } = await import("../actions.js");
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      try {
+        const body = make_pr_payload("opened", 951, "test-org/lobster-farm");
+        const req = make_request(body, {
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": sign_payload(body),
+        });
+        const res = make_response();
+        const ctx = make_context();
+
+        await handle_github_webhook(req, res, ctx);
+
+        await vi.waitFor(() => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        }, { timeout: 2000 });
+
+        // Simulate reviewer session completion
+        const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
+        (ctx.session_manager as any).emit("session:completed", {
+          session_id: spawn_result.session_id,
+          exit_code: 0,
+        });
+
+        await vi.waitFor(() => {
+          expect(detect_review_outcome).toHaveBeenCalled();
+        }, { timeout: 2000 });
+
+        // Default token from get_token() is "ghs_mock_token"
+        expect(detect_review_outcome).toHaveBeenCalledWith(
+          951,
+          "/tmp/test-repo",
+          "ghs_mock_token",
+        );
+      } finally {
+        log_spy.mockRestore();
+      }
+    });
+
+    it("falls back gracefully when post-review token resolution fails", async () => {
+      const { detect_review_outcome } = await import("../actions.js");
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const error_spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      try {
+        const body = make_pr_payload("opened", 952, "test-org/lobster-farm");
+        const req = make_request(body, {
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": sign_payload(body),
+        });
+        const res = make_response();
+        const ctx = make_context();
+
+        // First call succeeds (for spawn_review), subsequent calls fail (for post-review)
+        let call_count = 0;
+        (ctx.github_app.get_token as ReturnType<typeof vi.fn>).mockImplementation(() => {
+          call_count++;
+          if (call_count === 1) return Promise.resolve("ghs_mock_token");
+          return Promise.reject(new Error("token expired"));
+        });
+
+        await handle_github_webhook(req, res, ctx);
+
+        await vi.waitFor(() => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        }, { timeout: 2000 });
+
+        // Simulate reviewer session completion
+        const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
+        (ctx.session_manager as any).emit("session:completed", {
+          session_id: spawn_result.session_id,
+          exit_code: 0,
+        });
+
+        // Wait for detect_review_outcome — should still be called (with undefined token)
+        await vi.waitFor(() => {
+          expect(detect_review_outcome).toHaveBeenCalled();
+        }, { timeout: 2000 });
+
+        // Token should be undefined since resolution failed
+        expect(detect_review_outcome).toHaveBeenCalledWith(
+          952,
+          "/tmp/test-repo",
+          undefined,
+        );
+      } finally {
+        log_spy.mockRestore();
+        error_spy.mockRestore();
+      }
+    });
+  });
 });

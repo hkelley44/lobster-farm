@@ -388,7 +388,22 @@ async function handle_review_completion(
   installation_id?: string,
 ): Promise<void> {
   const key = review_key(entity_id, pr.number);
-  const outcome = await detect_review_outcome(pr.number, repo_path);
+
+  // Resolve a token so detect_review_outcome and check_pr_merged can
+  // authenticate against the correct GitHub account (cross-account repos).
+  let gh_token: string | undefined;
+  try {
+    gh_token = await resolve_token(ctx.github_app, installation_id);
+  } catch (err) {
+    console.error(`[webhook] Failed to get token for post-review: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "webhook", entity: entity_id, action: "post_review_token" },
+      contexts: { pr: { number: pr.number, title: pr.title } },
+    });
+    // Fall through — detect_review_outcome will use daemon's default auth
+  }
+
+  const outcome = await detect_review_outcome(pr.number, repo_path, gh_token);
 
   console.log(
     `[webhook] Review completed for PR #${String(pr.number)} — outcome: ${outcome}`,
@@ -405,7 +420,7 @@ async function handle_review_completion(
     );
   } else if (outcome === "approved") {
     // Check if reviewer already merged
-    const is_merged = await check_pr_merged(repo_path, pr.number);
+    const is_merged = await check_pr_merged(repo_path, pr.number, gh_token);
     await notify_alerts(
       entity_id,
       `PR #${String(pr.number)}: ${pr.title} — ${is_merged ? "approved and merged" : "approved"}`,
@@ -631,13 +646,20 @@ async function notify_alerts(
   }
 }
 
-async function check_pr_merged(repo_path: string, pr_number: number): Promise<boolean> {
+async function check_pr_merged(
+  repo_path: string,
+  pr_number: number,
+  gh_token?: string,
+): Promise<boolean> {
   try {
+    const env = gh_token
+      ? { ...process.env, GH_TOKEN: gh_token }
+      : undefined;
     const { stdout } = await exec("gh", [
       "pr", "view", String(pr_number),
       "--json", "state",
       "--jq", ".state",
-    ], { cwd: repo_path, timeout: 15_000 });
+    ], { cwd: repo_path, timeout: 15_000, ...(env ? { env } : {}) });
     return stdout.trim() === "MERGED";
   } catch {
     return false;
