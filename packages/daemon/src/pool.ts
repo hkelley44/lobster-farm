@@ -1070,7 +1070,6 @@ export class BotPool extends EventEmitter {
 
     const resume_id = session_id ?? randomUUID();
     const is_resume = !!session_id;
-    let restarted = false;
     try {
       // Resolve per-entity GitHub token (if configured)
       const extra_env: Record<string, string> = {};
@@ -1098,8 +1097,13 @@ export class BotPool extends EventEmitter {
       bot.assigned_at = new Date();
 
       await this.persist();
-      restarted = true;
+
+      console.log(
+        `[pool] Restarted pool-${String(bot.id)} after crash ` +
+        `(${is_resume ? `resumed session: ${resume_id.slice(0, 8)}` : "fresh session"})`,
+      );
     } catch (err) {
+      // Only restart failures land here — notify is NOT in this block
       console.error(
         `[pool] Failed to restart pool-${String(bot.id)} after crash: ${String(err)}`,
       );
@@ -1136,34 +1140,27 @@ export class BotPool extends EventEmitter {
         entity_id,
       });
       this.emit("bot:released", { bot_id: bot.id });
+      return;
     }
 
-    // Everything below runs outside the critical try/catch — a failure here
-    // must not undo a successful restart (which would orphan the live tmux session).
-    if (restarted) {
-      console.log(
-        `[pool] Restarted pool-${String(bot.id)} after crash ` +
-        `(${is_resume ? `resumed session: ${resume_id.slice(0, 8)}` : "fresh session"})`,
+    // Success path — these run outside the restart-failure catch so a
+    // notify() failure cannot undo a successful restart (which would
+    // orphan the live tmux session).
+    try {
+      await notify(
+        "alerts",
+        `\u26a0\ufe0f Pool bot ${String(bot.id)} (${archetype}) crashed and was auto-restarted for ${entity_id}`,
+        entity_config,
       );
-
-      this.emit("bot:crash_restarted", {
-        bot_id: bot.id,
-        channel_id,
-        entity_id,
-        resumed: is_resume,
-      });
-
-      // Wrap notify separately — an alert failure should not undo a successful restart
-      try {
-        await notify(
-          "alerts",
-          `\u26a0\ufe0f Pool bot ${String(bot.id)} (${archetype}) crashed and was auto-restarted for ${entity_id}`,
-          entity_config,
-        );
-      } catch (notify_err) {
-        console.warn(`[pool] Failed to alert #alerts for pool-${String(bot.id)}: ${String(notify_err)}`);
-      }
+    } catch (notify_err) {
+      console.warn(`[pool] Failed to send crash alert for pool-${String(bot.id)}: ${String(notify_err)}`);
     }
+    this.emit("bot:crash_restarted", {
+      bot_id: bot.id,
+      channel_id,
+      entity_id,
+      resumed: is_resume,
+    });
   }
 
   /**
