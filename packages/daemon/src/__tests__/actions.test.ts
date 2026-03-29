@@ -623,6 +623,48 @@ describe("detect_review_outcome", () => {
     const result = await detect_review_outcome(42, "/repos/test-repo");
     expect(result).toBe("approved");
   });
+
+  it("passes GH_TOKEN in env when gh_token is provided", async () => {
+    exec_mock_impl = async (_cmd, args) => {
+      if (args.includes("state")) {
+        return { stdout: "OPEN", stderr: "" };
+      }
+      if (args.includes("reviewDecision")) {
+        return { stdout: "APPROVED", stderr: "" };
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    await detect_review_outcome(42, "/repos/test-repo", "ghs_cross_account_token");
+
+    // All gh calls should have GH_TOKEN in their env
+    const gh_calls = exec_calls.filter((c) => c.command === "gh");
+    expect(gh_calls.length).toBeGreaterThan(0);
+    for (const call of gh_calls) {
+      expect((call.options as Record<string, unknown>)?.env).toBeDefined();
+      expect(
+        ((call.options as Record<string, unknown>)?.env as Record<string, string>)?.GH_TOKEN,
+      ).toBe("ghs_cross_account_token");
+    }
+  });
+
+  it("does not set env when gh_token is not provided", async () => {
+    exec_mock_impl = async (_cmd, args) => {
+      if (args.includes("state")) {
+        return { stdout: "MERGED", stderr: "" };
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    await detect_review_outcome(42, "/repos/test-repo");
+
+    const gh_calls = exec_calls.filter((c) => c.command === "gh");
+    expect(gh_calls.length).toBeGreaterThan(0);
+    for (const call of gh_calls) {
+      // When no token is provided, env should not be set on the options
+      expect((call.options as Record<string, unknown>)?.env).toBeUndefined();
+    }
+  });
 });
 
 describe("classify_merge_error", () => {

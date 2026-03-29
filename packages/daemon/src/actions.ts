@@ -35,11 +35,13 @@ async function run(
   command: string,
   args: string[],
   cwd?: string,
+  env?: Record<string, string>,
 ): Promise<string> {
   const { stdout } = await exec(command, args, {
     cwd,
     timeout: 60_000,
     maxBuffer: 10 * 1024 * 1024,
+    ...(env ? { env: { ...process.env, ...env } } : {}),
   });
   return stdout.trim();
 }
@@ -374,18 +376,25 @@ export type ReviewOutcome = "approved" | "changes_requested" | "pending";
  * Detect the review outcome for a PR by querying GitHub.
  * Returns "approved", "changes_requested", or "pending".
  * An already-merged PR is treated as "approved".
+ *
+ * @param gh_token - Optional GitHub token for cross-account authentication.
+ *   Without this, `gh` inherits the daemon's default auth, which can't see
+ *   private repos on other GitHub accounts.
  */
 export async function detect_review_outcome(
   pr_number: number,
   repo_path: string,
+  gh_token?: string,
 ): Promise<ReviewOutcome> {
+  const env = gh_token ? { GH_TOKEN: gh_token } : undefined;
+
   try {
     // Check if PR is already merged
     const state = await run("gh", [
       "pr", "view", String(pr_number),
       "--json", "state",
       "--jq", ".state",
-    ], repo_path);
+    ], repo_path, env);
 
     if (state === "MERGED") {
       return "approved";
@@ -396,7 +405,7 @@ export async function detect_review_outcome(
       "pr", "view", String(pr_number),
       "--json", "reviewDecision",
       "--jq", ".reviewDecision",
-    ], repo_path);
+    ], repo_path, env);
 
     switch (decision.toUpperCase()) {
       case "APPROVED": return "approved";

@@ -435,7 +435,7 @@ export class PRReviewCron {
         console.log(`[pr-cron] Review completed for PR #${String(pr.number)} in ${entity_id}`);
 
         // Persist completion so we don't re-review after restart
-        void this.persist_review_completion(entity_id, pr, repo_path)
+        void this.persist_review_completion(entity_id, pr, repo_path, entity_config)
           .catch(err => {
             console.error(`[pr-cron] Failed to persist review for PR #${String(pr.number)}: ${String(err)}`);
             sentry.captureException(err, {
@@ -475,9 +475,15 @@ export class PRReviewCron {
     entity_id: string,
     pr: OpenPR,
     repo_path: string,
+    entity_config: EntityConfig,
   ): Promise<void> {
     const key = `${entity_id}:${String(pr.number)}`;
-    const outcome = await detect_review_outcome(pr.number, repo_path);
+
+    // Resolve a token so detect_review_outcome and check_pr_merged can
+    // authenticate against the correct GitHub account (cross-account repos).
+    const gh_token = await this.resolve_entity_token(entity_config);
+
+    const outcome = await detect_review_outcome(pr.number, repo_path, gh_token);
 
     this.processed[key] = {
       entity_id,
@@ -489,7 +495,7 @@ export class PRReviewCron {
     console.log(`[pr-cron] Persisted review for PR #${String(pr.number)} (${outcome})`);
 
     // Route the outcome (alerts, fix spawning, etc.)
-    await this.handle_review_completion(entity_id, repo_path, pr, outcome);
+    await this.handle_review_completion(entity_id, repo_path, pr, outcome, gh_token);
   }
 
   /** After a reviewer session completes, detect the outcome and route accordingly. */
@@ -498,8 +504,9 @@ export class PRReviewCron {
     repo_path: string,
     pr: OpenPR,
     review_outcome?: "approved" | "changes_requested" | "pending",
+    gh_token?: string,
   ): Promise<void> {
-    const review_state = review_outcome ?? await detect_review_outcome(pr.number, repo_path);
+    const review_state = review_outcome ?? await detect_review_outcome(pr.number, repo_path, gh_token);
 
     // Determine if internal (our agents) or truly external
     const entity_config = this.registry.get(entity_id);
@@ -521,7 +528,7 @@ export class PRReviewCron {
       }
     } else if (review_state === "approved") {
       // Check if the reviewer already merged (they're instructed to merge on approval)
-      const is_merged = await this.check_pr_merged(repo_path, pr.number);
+      const is_merged = await this.check_pr_merged(repo_path, pr.number, gh_token);
 
       // Close linked issues after merge — GitHub Apps don't trigger auto-close
       if (is_merged) {
@@ -623,13 +630,20 @@ export class PRReviewCron {
   }
 
   /** Check if a PR has been merged. */
-  private async check_pr_merged(repo_path: string, pr_number: number): Promise<boolean> {
+  private async check_pr_merged(
+    repo_path: string,
+    pr_number: number,
+    gh_token?: string,
+  ): Promise<boolean> {
     try {
+      const env = gh_token
+        ? { ...process.env, GH_TOKEN: gh_token }
+        : process.env;
       const { stdout } = await exec(this.gh_bin, [
         "pr", "view", String(pr_number),
         "--json", "state",
         "--jq", ".state",
-      ], { cwd: repo_path, env: process.env, timeout: 15_000 });
+      ], { cwd: repo_path, env, timeout: 15_000 });
       return stdout.trim() === "MERGED";
     } catch {
       return false;
