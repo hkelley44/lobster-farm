@@ -163,6 +163,136 @@ describe("GitHubAppAuth", () => {
       vi.unstubAllGlobals();
     });
   });
+
+  describe("get_token_for_installation (multi-installation)", () => {
+    it("caches tokens independently per installation ID", async () => {
+      const auth = new GitHubAppAuth(TEST_CONFIG);
+      const expires_at = new Date(Date.now() + 3600_000).toISOString();
+
+      let call_count = 0;
+      const mock_fetch = vi.fn().mockImplementation((url: string) => {
+        call_count++;
+        const install_id = url.match(/installations\/(\d+)/)?.[1];
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            token: `ghs_install_${install_id!}_${String(call_count)}`,
+            expires_at,
+          }),
+        });
+      });
+      vi.stubGlobal("fetch", mock_fetch);
+
+      // Fetch tokens for two different installations
+      const token_a = await auth.get_token_for_installation("111");
+      const token_b = await auth.get_token_for_installation("222");
+
+      // Each installation should have gotten its own token
+      expect(token_a).toBe("ghs_install_111_1");
+      expect(token_b).toBe("ghs_install_222_2");
+      expect(mock_fetch).toHaveBeenCalledTimes(2);
+
+      // Subsequent calls should return cached tokens (no new API calls)
+      const token_a2 = await auth.get_token_for_installation("111");
+      const token_b2 = await auth.get_token_for_installation("222");
+      expect(token_a2).toBe("ghs_install_111_1");
+      expect(token_b2).toBe("ghs_install_222_2");
+      expect(mock_fetch).toHaveBeenCalledTimes(2); // still 2
+
+      vi.unstubAllGlobals();
+    });
+
+    it("get_token delegates to get_token_for_installation with default ID", async () => {
+      const auth = new GitHubAppAuth(TEST_CONFIG);
+      const expires_at = new Date(Date.now() + 3600_000).toISOString();
+
+      const mock_fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ token: "ghs_default", expires_at }),
+      });
+      vi.stubGlobal("fetch", mock_fetch);
+
+      // get_token() should use the config's installation_id
+      const token = await auth.get_token();
+      expect(token).toBe("ghs_default");
+
+      // The URL should contain the config's default installation_id
+      const call_url = mock_fetch.mock.calls[0]![0] as string;
+      expect(call_url).toContain(`/app/installations/${TEST_CONFIG.installation_id}/`);
+
+      // get_token_for_installation with the same ID should return the cached token
+      const token2 = await auth.get_token_for_installation(TEST_CONFIG.installation_id);
+      expect(token2).toBe("ghs_default");
+      expect(mock_fetch).toHaveBeenCalledTimes(1); // shared cache
+
+      vi.unstubAllGlobals();
+    });
+
+    it("coalesces concurrent refreshes per installation independently", async () => {
+      const auth = new GitHubAppAuth(TEST_CONFIG);
+      const expires_at = new Date(Date.now() + 3600_000).toISOString();
+
+      const resolvers: Array<{ url: string; resolve: (v: unknown) => void }> = [];
+      const mock_fetch = vi.fn().mockImplementation((url: string) => {
+        return new Promise((resolve) => {
+          resolvers.push({ url, resolve });
+        });
+      });
+      vi.stubGlobal("fetch", mock_fetch);
+
+      // Two concurrent calls for installation "aaa"
+      const p1 = auth.get_token_for_installation("aaa");
+      const p2 = auth.get_token_for_installation("aaa");
+      // One call for installation "bbb"
+      const p3 = auth.get_token_for_installation("bbb");
+
+      // Should have made exactly 2 fetch calls (one per installation)
+      expect(mock_fetch).toHaveBeenCalledTimes(2);
+
+      // Resolve both — match by URL
+      for (const entry of resolvers) {
+        if (entry.url.includes("/installations/aaa/")) {
+          entry.resolve({
+            ok: true,
+            json: async () => ({ token: "ghs_aaa", expires_at }),
+          });
+        } else if (entry.url.includes("/installations/bbb/")) {
+          entry.resolve({
+            ok: true,
+            json: async () => ({ token: "ghs_bbb", expires_at }),
+          });
+        }
+      }
+
+      const [t1, t2, t3] = await Promise.all([p1, p2, p3]);
+
+      expect(t1).toBe("ghs_aaa");
+      expect(t2).toBe("ghs_aaa"); // coalesced with p1
+      expect(t3).toBe("ghs_bbb");
+
+      vi.unstubAllGlobals();
+    });
+
+    it("calls the correct installation URL", async () => {
+      const auth = new GitHubAppAuth(TEST_CONFIG);
+      const expires_at = new Date(Date.now() + 3600_000).toISOString();
+
+      const mock_fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ token: "ghs_custom", expires_at }),
+      });
+      vi.stubGlobal("fetch", mock_fetch);
+
+      await auth.get_token_for_installation("99999");
+
+      const call_url = mock_fetch.mock.calls[0]![0] as string;
+      expect(call_url).toBe(
+        "https://api.github.com/app/installations/99999/access_tokens",
+      );
+
+      vi.unstubAllGlobals();
+    });
+  });
 });
 
 describe("init_github_app_from_env", () => {

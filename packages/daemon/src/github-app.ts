@@ -89,8 +89,10 @@ function normalize_pem(raw: string): string {
 // ── Class ──
 
 export class GitHubAppAuth {
-  private cached: CachedToken | null = null;
-  private refresh_promise: Promise<string> | null = null;
+  /** Per-installation token cache, keyed by installation ID. */
+  private cached = new Map<string, CachedToken>();
+  /** Per-installation in-flight refresh promises for coalescing concurrent calls. */
+  private refresh_promises = new Map<string, Promise<string>>();
 
   constructor(private config: GitHubAppConfig) {}
 
@@ -120,34 +122,44 @@ export class GitHubAppAuth {
   // ── Installation token ──
 
   /**
-   * Get a valid installation access token. Cached and auto-refreshed.
-   *
-   * Concurrent callers share the same in-flight refresh to avoid
-   * redundant API calls.
+   * Get a valid token for a specific GitHub App installation.
+   * Each installation ID gets its own independently cached token and
+   * concurrent callers for the same installation share a single in-flight refresh.
    */
-  async get_token(): Promise<string> {
-    if (this.cached && Date.now() < this.cached.expires_at - TOKEN_REFRESH_MARGIN_MS) {
-      return this.cached.token;
+  async get_token_for_installation(installation_id: string): Promise<string> {
+    const entry = this.cached.get(installation_id);
+    if (entry && Date.now() < entry.expires_at - TOKEN_REFRESH_MARGIN_MS) {
+      return entry.token;
     }
 
-    // Coalesce concurrent refreshes
-    if (this.refresh_promise) {
-      return this.refresh_promise;
+    // Coalesce concurrent refreshes for the same installation
+    const in_flight = this.refresh_promises.get(installation_id);
+    if (in_flight) {
+      return in_flight;
     }
 
-    this.refresh_promise = this.fetch_installation_token();
+    const promise = this.fetch_installation_token(installation_id);
+    this.refresh_promises.set(installation_id, promise);
     try {
-      return await this.refresh_promise;
+      return await promise;
     } finally {
-      this.refresh_promise = null;
+      this.refresh_promises.delete(installation_id);
     }
   }
 
-  private async fetch_installation_token(): Promise<string> {
+  /**
+   * Get a valid installation access token using the default installation ID
+   * from config. Backward-compatible convenience method.
+   */
+  async get_token(): Promise<string> {
+    return this.get_token_for_installation(this.config.installation_id);
+  }
+
+  private async fetch_installation_token(installation_id: string): Promise<string> {
     const jwt = this.sign_jwt();
 
     const res = await fetch(
-      `https://api.github.com/app/installations/${this.config.installation_id}/access_tokens`,
+      `https://api.github.com/app/installations/${installation_id}/access_tokens`,
       {
         method: "POST",
         headers: {
@@ -167,13 +179,13 @@ export class GitHubAppAuth {
 
     const data = (await res.json()) as { token: string; expires_at: string };
 
-    this.cached = {
+    this.cached.set(installation_id, {
       token: data.token,
       expires_at: new Date(data.expires_at).getTime(),
-    };
+    });
 
     console.log(
-      `[github-app] Installation token refreshed (expires ${data.expires_at})`,
+      `[github-app] Installation token refreshed for ${installation_id} (expires ${data.expires_at})`,
     );
 
     return data.token;
