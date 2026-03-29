@@ -1238,10 +1238,16 @@ export class BotPool extends EventEmitter {
       });
 
       proc.on("close", (code) => {
-        // Clean up the temp .env.op file after tmux has started (op run reads
-        // the file then execs the command, so it's safe to remove).
+        // Clean up the temp .env.op file after a delay. The tmux session
+        // starts detached (-d), so the close handler fires immediately —
+        // before `op run` inside tmux has a chance to read the file.
+        // A 30s delay gives op run plenty of time. The file only contains
+        // op:// references (not actual secrets), so a brief window is safe.
+        // Registered unconditionally so cleanup runs even on tmux failure.
         if (github_token_ref) {
-          unlink(env_op_path).catch(() => { /* best effort cleanup */ });
+          setTimeout(() => {
+            unlink(env_op_path).catch(() => { /* best effort cleanup */ });
+          }, 30_000);
         }
 
         if (code !== 0) {

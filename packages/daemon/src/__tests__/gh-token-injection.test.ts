@@ -285,17 +285,27 @@ describe("per-entity GitHub token injection", () => {
       expect(env_op_write!.content).toBe(`GH_TOKEN=${ref}\n`);
     });
 
-    it("cleans up temp .env.op file after tmux starts", async () => {
+    it("cleans up temp .env.op file after tmux starts (30s delay)", async () => {
+      vi.useFakeTimers();
       const ref = "op://entity-cleanup/github/credential";
       registry.add(make_entity_config({ id: "cleanup-entity", github_token_ref: ref }));
       pool.inject_registry(registry);
       pool.inject_bots([make_bot({ id: 2, state: "free" })]);
 
-      await pool.assign("ch-test", "cleanup-entity", "builder", undefined, "work_room");
+      const assign_p = pool.assign("ch-test", "cleanup-entity", "builder", undefined, "work_room");
 
-      // Wait for the close handler's unlink call
-      await new Promise(resolve => setTimeout(resolve, 10));
+      // Advance past the spawn mock's setTimeout(0) close emit
+      await vi.advanceTimersByTimeAsync(0);
+      await assign_p;
+
+      // unlink should NOT have been called yet — it's on a 30s delay
+      expect(unlink).not.toHaveBeenCalled();
+
+      // Advance past the 30-second cleanup delay
+      await vi.advanceTimersByTimeAsync(30_000);
       expect(unlink).toHaveBeenCalledWith("/tmp/lf-env-pool-2.op");
+
+      vi.useRealTimers();
     });
 
     it("resolves op binary path via resolve_binary", async () => {

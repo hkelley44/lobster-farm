@@ -1749,8 +1749,11 @@ export class DiscordBot extends EventEmitter {
         "utf-8",
       );
 
-      // 5. Reload entity into registry
+      // 5. Reload entity into registry and rebuild channel map so the new
+      //    entity's channels are routable immediately (the build_channel_map
+      //    call inside scaffold_entity runs before the registry has the entity).
       await this.registry.load_all();
+      this.build_channel_map();
 
       // 6. Report
       const channel_lines = channels.map((c) => `  • #${c.purpose} → ${c.type}`);
