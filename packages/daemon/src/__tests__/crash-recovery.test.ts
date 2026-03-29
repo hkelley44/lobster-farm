@@ -290,6 +290,46 @@ describe("crash recovery (issue #157)", () => {
       const history = pool.get_session_history();
       expect(history.get("test-entity:ch-1")).toBe("sess-abc-123");
     });
+
+    it("keeps bot assigned when notify() throws after successful restart", async () => {
+      mock_notify.mockRejectedValueOnce(new Error("Discord down"));
+
+      const bot = make_bot({
+        id: 2,
+        state: "assigned",
+        channel_id: "ch-1",
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-abc-123",
+      });
+      pool.inject_bots([bot]);
+
+      const events: unknown[] = [];
+      pool.on("bot:crash_restarted", (data) => events.push(data));
+      pool.on("bot:released", (data) => events.push({ type: "released", ...data as Record<string, unknown> }));
+
+      await pool.run_health_check();
+
+      // Bot must stay assigned — notify() failure must not undo the restart
+      const bots = pool.get_bots();
+      expect(bots[0].state).toBe("assigned");
+      expect(bots[0].channel_id).toBe("ch-1");
+      expect(bots[0].entity_id).toBe("test-entity");
+      expect(bots[0].session_id).toBe("sess-abc-123");
+
+      // start_tmux was called exactly once (the restart succeeded)
+      expect(mock_start_tmux).toHaveBeenCalledTimes(1);
+
+      // crash_restarted event should still have fired (it's before notify)
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ bot_id: 2, resumed: true });
+
+      // bot:released must NOT have fired
+      const released = events.filter((e: unknown) =>
+        (e as Record<string, unknown>).type === "released"
+      );
+      expect(released).toHaveLength(0);
+    });
   });
 
   // ── Crash loop detection ──
@@ -685,6 +725,72 @@ describe("crash recovery (issue #157)", () => {
       );
       expect(released).toHaveLength(1);
       expect(crash_loop).toHaveLength(1);
+    });
+  });
+
+  // ── notify() failure isolation ──
+
+  describe("notify failure does not undo successful restart", () => {
+    it("keeps bot assigned when notify throws after successful restart", async () => {
+      mock_notify.mockRejectedValue(new Error("Discord API down"));
+
+      const bot = make_bot({
+        id: 7,
+        state: "assigned",
+        channel_id: "ch-1",
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-notify-1",
+      });
+      pool.inject_bots([bot]);
+
+      const events: unknown[] = [];
+      pool.on("bot:crash_restarted", (data) => events.push(data));
+
+      await pool.run_health_check();
+
+      // Bot should still be assigned — notify failure must not trigger
+      // the catch block that frees the bot
+      const bots = pool.get_bots();
+      expect(bots[0].state).toBe("assigned");
+      expect(bots[0].session_id).toBe("sess-notify-1");
+      expect(mock_start_tmux).toHaveBeenCalledTimes(1);
+      expect(events).toHaveLength(1);
+    });
+
+    it("still emits bot:crash_loop when notify throws in crash loop path", async () => {
+      mock_notify.mockRejectedValue(new Error("Discord API down"));
+
+      const bot = make_bot({
+        id: 8,
+        state: "assigned",
+        channel_id: "ch-1",
+        entity_id: "test-entity",
+        archetype: "builder",
+        session_id: "sess-notify-2",
+      });
+      pool.inject_bots([bot]);
+
+      // Pre-populate with 3 recent crashes to trigger crash loop on the 4th
+      const now = Date.now();
+      pool.get_crash_history().set(8, [
+        now - 45 * 60_000,
+        now - 20 * 60_000,
+        now - 5 * 60_000,
+      ]);
+
+      const events: unknown[] = [];
+      pool.on("bot:crash_loop", (data) => events.push(data));
+
+      await pool.run_health_check();
+
+      // crash_loop event should still have fired despite notify() throwing
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        bot_id: 8,
+        entity_id: "test-entity",
+        archetype: "builder",
+      });
     });
   });
 });

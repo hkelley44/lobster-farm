@@ -1068,6 +1068,9 @@ export class BotPool extends EventEmitter {
     // Look up entity config for alerting and GH_TOKEN resolution
     const entity_config = this.registry?.get(entity_id);
 
+    const resume_id = session_id ?? randomUUID();
+    const is_resume = !!session_id;
+    let restarted = false;
     try {
       // Resolve per-entity GitHub token (if configured)
       const extra_env: Record<string, string> = {};
@@ -1087,8 +1090,6 @@ export class BotPool extends EventEmitter {
 
       // Restart tmux — use --resume if we have a session_id
       const working_dir = entity_dir(this.config.paths, entity_id);
-      const resume_id = session_id ?? randomUUID();
-      const is_resume = !!session_id;
       await this.start_tmux(bot, archetype, entity_id, working_dir, resume_id, is_resume, extra_env);
 
       // Update state — bot stays assigned with refreshed timestamps
@@ -1097,25 +1098,7 @@ export class BotPool extends EventEmitter {
       bot.assigned_at = new Date();
 
       await this.persist();
-
-      console.log(
-        `[pool] Restarted pool-${String(bot.id)} after crash ` +
-        `(${is_resume ? `resumed session: ${resume_id.slice(0, 8)}` : "fresh session"})`,
-      );
-
-      // Alert the entity's #alerts channel
-      await notify(
-        "alerts",
-        `\u26a0\ufe0f Pool bot ${String(bot.id)} (${archetype}) crashed and was auto-restarted for ${entity_id}`,
-        entity_config,
-      );
-
-      this.emit("bot:crash_restarted", {
-        bot_id: bot.id,
-        channel_id,
-        entity_id,
-        resumed: is_resume,
-      });
+      restarted = true;
     } catch (err) {
       console.error(
         `[pool] Failed to restart pool-${String(bot.id)} after crash: ${String(err)}`,
@@ -1153,6 +1136,33 @@ export class BotPool extends EventEmitter {
         entity_id,
       });
       this.emit("bot:released", { bot_id: bot.id });
+    }
+
+    // Everything below runs outside the critical try/catch — a failure here
+    // must not undo a successful restart (which would orphan the live tmux session).
+    if (restarted) {
+      console.log(
+        `[pool] Restarted pool-${String(bot.id)} after crash ` +
+        `(${is_resume ? `resumed session: ${resume_id.slice(0, 8)}` : "fresh session"})`,
+      );
+
+      this.emit("bot:crash_restarted", {
+        bot_id: bot.id,
+        channel_id,
+        entity_id,
+        resumed: is_resume,
+      });
+
+      // Wrap notify separately — an alert failure should not undo a successful restart
+      try {
+        await notify(
+          "alerts",
+          `\u26a0\ufe0f Pool bot ${String(bot.id)} (${archetype}) crashed and was auto-restarted for ${entity_id}`,
+          entity_config,
+        );
+      } catch (notify_err) {
+        console.warn(`[pool] Failed to alert #alerts for pool-${String(bot.id)}: ${String(notify_err)}`);
+      }
     }
   }
 
@@ -1201,13 +1211,6 @@ export class BotPool extends EventEmitter {
       this.emit("bot:released", { bot_id: bot.id });
     }
 
-    // Alert the entity's #alerts channel
-    await notify(
-      "alerts",
-      `\ud83d\udd34 Pool bot ${String(bot.id)} crash loop detected for ${entity_id ?? "unknown"} — released. Check daemon logs.`,
-      entity_config,
-    );
-
     // Note: bot:session_ended is intentionally NOT emitted here. The crash loop
     // path releases the bot via this.release() which handles cleanup. The
     // restart-failure path emits both bot:session_ended and bot:released because
@@ -1218,6 +1221,18 @@ export class BotPool extends EventEmitter {
       entity_id,
       archetype,
     });
+
+    // Alert outside the release/event flow — a notify() failure must not
+    // prevent the crash_loop event or skip remaining bots in the health check.
+    try {
+      await notify(
+        "alerts",
+        `\ud83d\udd34 Pool bot ${String(bot.id)} crash loop detected for ${entity_id ?? "unknown"} — released. Check daemon logs.`,
+        entity_config,
+      );
+    } catch (notify_err) {
+      console.warn(`[pool] Failed to alert #alerts for pool-${String(bot.id)} crash loop: ${String(notify_err)}`);
+    }
   }
 
   /** Record a crash event for a bot. */
