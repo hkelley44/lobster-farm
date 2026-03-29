@@ -160,6 +160,15 @@ describe("resume nudge (issue #156)", () => {
       expect.stringContaining("daemon restarted"),
       "utf-8",
     );
+
+    // The actual delivery mechanism: tmux send-keys injects the prompt
+    expect(execFileSync).toHaveBeenCalledWith(
+      "tmux",
+      ["send-keys", "-t", "pool-3",
+        expect.stringContaining("/tmp/lf-pending-pool-3.txt"),
+        "Enter"],
+      expect.objectContaining({ stdio: "ignore", timeout: 5000 }),
+    );
   });
 
   it("nudge content includes instruction to continue work", async () => {
@@ -194,6 +203,15 @@ describe("resume nudge (issue #156)", () => {
 
     const content = nudge_call![1] as string;
     expect(content).toContain("continue any in-progress work");
+
+    // send-keys must also be called to deliver the nudge
+    expect(execFileSync).toHaveBeenCalledWith(
+      "tmux",
+      ["send-keys", "-t", "pool-0",
+        expect.stringContaining("Read /tmp/lf-pending-pool-0.txt"),
+        "Enter"],
+      expect.objectContaining({ stdio: "ignore", timeout: 5000 }),
+    );
   });
 
   it("nudge file path matches bot ID", async () => {
@@ -224,6 +242,15 @@ describe("resume nudge (issue #156)", () => {
       "/tmp/lf-pending-pool-7.txt",
       expect.any(String),
       "utf-8",
+    );
+
+    // send-keys targets the correct tmux session
+    expect(execFileSync).toHaveBeenCalledWith(
+      "tmux",
+      ["send-keys", "-t", "pool-7",
+        expect.stringContaining("/tmp/lf-pending-pool-7.txt"),
+        "Enter"],
+      expect.objectContaining({ stdio: "ignore", timeout: 5000 }),
     );
   });
 
@@ -261,6 +288,13 @@ describe("resume nudge (issue #156)", () => {
       (c: unknown[]) => (c[0] as string).includes("lf-pending-pool-2"),
     );
     expect(nudge_call).toBeUndefined();
+
+    // send-keys should NOT have been called for this bot
+    const send_calls = (execFileSync as Mock).mock.calls.filter(
+      (c: unknown[]) => c[0] === "tmux" && (c[1] as string[])[0] === "send-keys"
+        && (c[1] as string[])[2] === "pool-2",
+    );
+    expect(send_calls).toHaveLength(0);
   });
 
   it("does not nudge if bot is not ready within timeout", async () => {
@@ -305,5 +339,12 @@ describe("resume nudge (issue #156)", () => {
       (c: unknown[]) => (c[0] as string).includes("lf-pending-pool-4"),
     );
     expect(nudge_call).toBeUndefined();
+
+    // send-keys should NOT have been called for this bot
+    const send_calls = (execFileSync as Mock).mock.calls.filter(
+      (c: unknown[]) => c[0] === "tmux" && (c[1] as string[])[0] === "send-keys"
+        && (c[1] as string[])[2] === "pool-4",
+    );
+    expect(send_calls).toHaveLength(0);
   });
 });

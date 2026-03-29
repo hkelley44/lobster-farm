@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { writeFile, readFile } from "node:fs/promises";
+import { writeFile, readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
@@ -1437,7 +1437,19 @@ export class BotPool extends EventEmitter {
     await new Promise(resolve => setTimeout(resolve, 2000));
 
     await writeFile(pending_path, nudge, "utf-8");
+
+    // Deliver the nudge via tmux send-keys — the file alone is not enough.
+    // The send-keys call injects a prompt into Claude's stdin telling it
+    // to read the pending file (same pattern as bridge_first_message).
+    execFileSync("tmux", ["send-keys", "-t", bot.tmux_session,
+      `Your session was resumed after a daemon restart. Read ${pending_path} and continue any in-progress work.`,
+      "Enter",
+    ], { stdio: "ignore", timeout: 5000 });
+
     console.log(`[pool] Bridged resume nudge to ${bot.tmux_session}`);
+
+    // Clean up the pending file after a delay
+    setTimeout(() => { void unlink(pending_path).catch(() => {}); }, 30_000);
   }
 
   private is_tmux_alive(session_name: string): boolean {
