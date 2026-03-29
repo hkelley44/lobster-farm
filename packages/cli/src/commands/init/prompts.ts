@@ -84,13 +84,7 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
   }
 
   p.note(
-    "LobsterFarm uses two Discord bots:\n\n" +
-      "1. Daemon bot — manages entity channels, scaffolding, webhooks.\n" +
-      "   Needs: Manage Server, View Channels, Send Messages, Manage Webhooks.\n\n" +
-      "2. Commander bot — your admin agent (Pat). Reads and replies in #command-center.\n" +
-      "   Needs: View Channels, Send Messages, Read Message History, Attach Files, Add Reactions.\n\n" +
-      "Create both at https://discord.com/developers/applications.\n" +
-      "Enable Message Content Intent in the Bot tab for both.\n\n" +
+    "LobsterFarm uses multiple Discord bots. You'll create them one at a time.\n\n" +
       "To copy Discord IDs, enable Developer Mode first:\n" +
       "  Discord → User Settings → Advanced → Developer Mode toggle ON\n\n" +
       "Then right-click the server name → Copy Server ID.",
@@ -110,8 +104,20 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
     process.exit(0);
   }
 
+  p.note(
+    'Step 1: Go to https://discord.com/developers/applications\n' +
+      'Step 2: Click "New Application" → name it "Daemon"\n' +
+      'Step 3: In the Installation tab → set Install Link to "None"\n' +
+      "Step 4: In the Bot tab:\n" +
+      '  - Uncheck "Public Bot"\n' +
+      "  - Enable all 3 Privileged Gateway Intents:\n" +
+      "    Presence Intent, Server Members Intent, Message Content Intent\n" +
+      '  - Click "Reset Token" → copy the token',
+    "Create Daemon Bot",
+  );
+
   const daemon_token = await p.password({
-    message: "Daemon bot token (server management):",
+    message: "Daemon bot token:",
     validate: (value) => {
       if (!value.trim()) return "Daemon bot token is required.";
       return undefined;
@@ -121,6 +127,18 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
     p.cancel("Setup cancelled.");
     process.exit(0);
   }
+
+  p.note(
+    'Step 1: Go to https://discord.com/developers/applications\n' +
+      'Step 2: Click "New Application" → name it "Pat"\n' +
+      'Step 3: In the Installation tab → set Install Link to "None"\n' +
+      "Step 4: In the Bot tab:\n" +
+      '  - Uncheck "Public Bot"\n' +
+      "  - Enable all 3 Privileged Gateway Intents:\n" +
+      "    Presence Intent, Server Members Intent, Message Content Intent\n" +
+      '  - Click "Reset Token" → copy the token',
+    "Create Commander Bot (Pat)",
+  );
 
   const commander_token = await p.password({
     message: "Commander bot token (Pat — press Enter to skip):",
@@ -164,6 +182,59 @@ export async function prompt_github(): Promise<{
   return {
     username: (username ?? "").trim(),
   };
+}
+
+/** Prompt for how many pool bots to create. Returns 0 if the user declines. */
+export async function prompt_pool_bot_count(): Promise<number> {
+  p.note(
+    "Pool bots are your workers — each one can run one agent session at a time.\n" +
+      "3 bots = 3 concurrent sessions (e.g., a planner, a builder, and a reviewer).",
+    "Pool Bot Setup",
+  );
+
+  const count = await p.text({
+    message: "How many pool bots to create? (recommended: 3, max: 10, 0 to skip)",
+    placeholder: "3",
+    defaultValue: "3",
+    validate: (value) => {
+      const n = parseInt(value, 10);
+      if (isNaN(n) || n < 0 || n > 10) return "Enter a number between 0 and 10.";
+      return undefined;
+    },
+  });
+  if (p.isCancel(count)) {
+    p.cancel("Setup cancelled.");
+    process.exit(0);
+  }
+  return parseInt(count, 10);
+}
+
+/** Prompt for a single pool bot token. Shows step-by-step creation guidance. */
+export async function prompt_pool_bot_token(index: number): Promise<string> {
+  p.note(
+    `Step 1: Go to https://discord.com/developers/applications\n` +
+      `Step 2: Click "New Application" → name it "LF-${String(index)}"\n` +
+      'Step 3: In the Installation tab → set Install Link to "None"\n' +
+      "Step 4: In the Bot tab:\n" +
+      '  - Uncheck "Public Bot"\n' +
+      "  - Enable all 3 Privileged Gateway Intents:\n" +
+      "    Presence Intent, Server Members Intent, Message Content Intent\n" +
+      '  - Click "Reset Token" → copy the token',
+    `Create Pool Bot LF-${String(index)}`,
+  );
+
+  const token = await p.password({
+    message: `LF-${String(index)} bot token:`,
+    validate: (value) => {
+      if (!value.trim()) return "Bot token is required.";
+      return undefined;
+    },
+  });
+  if (p.isCancel(token)) {
+    p.cancel("Setup cancelled.");
+    process.exit(0);
+  }
+  return token.trim();
 }
 
 /** Prompt for entities directory (where entity repos live on disk). */

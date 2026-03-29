@@ -7,13 +7,15 @@ import {
   type TemplateVariables,
   type PathConfig,
 } from "@lobster-farm/shared";
-import { detect_machine, check_sudo, check_onepassword, check_claude_code, check_bun, check_tmux, check_github_cli } from "./init/detect.js";
+import { detect_machine, check_sudo, check_onepassword, check_claude_code, check_bun, check_tmux, check_github_cli, check_pool_bots } from "./init/detect.js";
 import { setup_tool_integrations } from "./init/tools.js";
 import {
   prompt_user_name,
   prompt_agent_names,
   prompt_discord,
   prompt_github,
+  prompt_pool_bot_count,
+  prompt_pool_bot_token,
   // prompt_projects_dir removed — always defaults to ~/entities
 } from "./init/prompts.js";
 import {
@@ -160,6 +162,7 @@ export const init_command = new Command("init")
 
         if (do_login) {
           p.log.info("Opening browser for Claude Code login...");
+          p.log.warning("Note: Claude Code will open an interactive session. After authenticating in your browser, press Ctrl+C to return to the wizard.");
           const { spawnSync } = await import("node:child_process");
           spawnSync("claude", ["/login"], { stdio: "inherit" });
         }
@@ -853,6 +856,105 @@ Always clean up after yourself:
       files.push(pat_env_path);
     }
 
+    // ── Pool Bot Setup ──
+    // Tracks tokens collected this session for invite URL generation
+    const pool_bot_tokens: string[] = [];
+    let pool_bot_count = 0;
+
+    if (discord_setup && !non_interactive) {
+      const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+      const lf_path = lf_dir(path_overrides);
+      const existing_pool = await check_pool_bots(lf_path);
+
+      if (existing_pool.count > 0) {
+        p.log.info(`Found ${String(existing_pool.count)} existing pool bot${existing_pool.count > 1 ? "s" : ""} (${existing_pool.indices.map(i => `LF-${String(i)}`).join(", ")}).`);
+        const reconfigure = await p.confirm({
+          message: "Pool bots already configured. Set up new ones?",
+          initialValue: false,
+        });
+        if (p.isCancel(reconfigure)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+        if (!reconfigure) {
+          pool_bot_count = existing_pool.count;
+        } else {
+          pool_bot_count = await prompt_pool_bot_count();
+        }
+      } else {
+        pool_bot_count = await prompt_pool_bot_count();
+      }
+
+      if (pool_bot_count > 0 && (existing_pool.count === 0 || pool_bot_count !== existing_pool.count)) {
+        const { writeFile: writeF, mkdir: mkdirFs } = await import("node:fs/promises");
+
+        for (let i = 0; i < pool_bot_count; i++) {
+          const token = await prompt_pool_bot_token(i);
+          pool_bot_tokens.push(token);
+
+          const pool_dir = `${lf_path}/channels/pool-${String(i)}`;
+          await mkdirFs(pool_dir, { recursive: true, mode: 0o700 });
+          const pool_env_path = `${pool_dir}/.env`;
+          await writeF(pool_env_path, `DISCORD_BOT_TOKEN=${token}\n`, { mode: 0o600 });
+          files.push(pool_env_path);
+        }
+
+        p.log.success(`${String(pool_bot_count)} pool bot${pool_bot_count > 1 ? "s" : ""} configured.`);
+      }
+    }
+
+    // ── Bot Invite URLs ──
+    // Generate zero-permission invite URLs for all bots and open them in the browser.
+    if (discord_setup && !non_interactive) {
+      // Collect all tokens we have access to (daemon, commander, pool bots from this session)
+      const bot_entries: Array<{ name: string; token: string }> = [];
+
+      bot_entries.push({ name: "Daemon", token: discord_setup.daemon_bot_token });
+      if (discord_setup.commander_bot_token) {
+        bot_entries.push({ name: "Pat (Commander)", token: discord_setup.commander_bot_token });
+      }
+      for (let i = 0; i < pool_bot_tokens.length; i++) {
+        bot_entries.push({ name: `LF-${String(i)}`, token: pool_bot_tokens[i]! });
+      }
+
+      if (bot_entries.length > 0) {
+        p.note(
+          "Now let's invite all bots to your server.\n\n" +
+            'Tip: Create a single role called "bot" in your server with these permissions:\n' +
+            "  Manage Server, Manage Channels, View Channels, Send Messages,\n" +
+            "  Read Message History, Manage Webhooks, Attach Files, Add Reactions,\n" +
+            "  Manage Nicknames\n" +
+            'Then assign the "bot" role to all bots at once.',
+          "Bot Invites",
+        );
+
+        const do_invite = await p.confirm({
+          message: `Open invite links for ${String(bot_entries.length)} bot${bot_entries.length > 1 ? "s" : ""} in your browser?`,
+          initialValue: true,
+        });
+        if (p.isCancel(do_invite)) { p.cancel("Setup cancelled."); process.exit(0); }
+
+        if (do_invite) {
+          const { spawnSync } = await import("node:child_process");
+          const { setTimeout: sleep } = await import("node:timers/promises");
+
+          for (const entry of bot_entries) {
+            // Extract application/client ID from the token's first segment (base64-encoded)
+            const first_segment = entry.token.split(".")[0];
+            if (!first_segment) continue;
+            const client_id = Buffer.from(first_segment, "base64").toString("utf-8");
+            const invite_url = `https://discord.com/oauth2/authorize?client_id=${client_id}&scope=bot&permissions=0`;
+
+            p.log.info(`Opening invite for ${entry.name}...`);
+            spawnSync("open", [invite_url]);
+            // Brief pause between opens so the user can accept each invite
+            await sleep(2500);
+          }
+
+          const ack = await p.confirm({ message: "Done inviting all bots to your server?" });
+          if (p.isCancel(ack)) { p.cancel("Setup cancelled."); process.exit(0); }
+        }
+      }
+    }
+
     // Install Discord channel plugin for Commander
     if (discord_setup && !non_interactive) {
       spin.start("Installing Discord channel plugin...");
@@ -955,6 +1057,11 @@ Always clean up after yourself:
       const tokens = [discord_setup.daemon_bot_token ? "daemon" : ""].filter(Boolean);
       if (discord_setup.commander_bot_token) tokens.push("commander");
       summary_lines.push(`Discord:    server ${discord_setup.server_id} (${tokens.join(" + ")} token${tokens.length > 1 ? "s" : ""} saved)`);
+    }
+
+    if (pool_bot_count > 0) {
+      const last_index = pool_bot_count - 1;
+      summary_lines.push(`Pool bots:  ${String(pool_bot_count)} configured (LF-0 through LF-${String(last_index)})`);
     }
 
     if (github.username) {
