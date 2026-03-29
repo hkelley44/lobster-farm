@@ -557,4 +557,134 @@ describe("crash recovery (issue #157)", () => {
       expect(mock_start_tmux).not.toHaveBeenCalled();
     });
   });
+
+  // ── Concurrent health check serialization ──
+
+  describe("concurrent health check guard", () => {
+    it("serializes overlapping health checks — second call is a no-op", async () => {
+      // Use a deferred promise so start_tmux blocks until we resolve it
+      let resolve_start!: () => void;
+      const blocking_promise = new Promise<void>((r) => { resolve_start = r; });
+      mock_start_tmux.mockReturnValue(blocking_promise);
+
+      const bot = make_bot({
+        id: 1,
+        state: "assigned",
+        channel_id: "ch-1",
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-1",
+      });
+      pool.inject_bots([bot]);
+
+      // Fire two health checks without awaiting the first
+      const first = pool.run_health_check();
+      const second = pool.run_health_check();
+
+      // Let start_tmux complete
+      resolve_start();
+      await first;
+      await second;
+
+      // start_tmux should have been called exactly once — the second
+      // health check returned early because the first was still running
+      expect(mock_start_tmux).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ── Null-guard force-free ──
+
+  describe("null-guard force-free", () => {
+    it("force-frees bot when entity_id is null in restart path", async () => {
+      const bot = make_bot({
+        id: 4,
+        state: "assigned",
+        channel_id: "ch-1",
+        entity_id: null, // missing — triggers null guard
+        archetype: "planner",
+        session_id: "sess-1",
+      });
+      pool.inject_bots([bot]);
+
+      const events: unknown[] = [];
+      pool.on("bot:released", (data) => events.push(data));
+
+      await pool.run_health_check();
+
+      const bots = pool.get_bots();
+      expect(bots[0].state).toBe("free");
+      expect(bots[0].channel_id).toBeNull();
+      expect(bots[0].entity_id).toBeNull();
+      expect(bots[0].archetype).toBeNull();
+      expect(bots[0].session_id).toBeNull();
+      expect(mock_start_tmux).not.toHaveBeenCalled();
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ bot_id: 4 });
+    });
+
+    it("force-frees bot when archetype is null in restart path", async () => {
+      const bot = make_bot({
+        id: 5,
+        state: "assigned",
+        channel_id: "ch-1",
+        entity_id: "test-entity",
+        archetype: null, // missing — triggers null guard
+        session_id: "sess-1",
+      });
+      pool.inject_bots([bot]);
+
+      const events: unknown[] = [];
+      pool.on("bot:released", (data) => events.push(data));
+
+      await pool.run_health_check();
+
+      const bots = pool.get_bots();
+      expect(bots[0].state).toBe("free");
+      expect(mock_start_tmux).not.toHaveBeenCalled();
+      expect(events).toHaveLength(1);
+    });
+
+    it("force-frees bot when channel_id is null in crash loop path", async () => {
+      const bot = make_bot({
+        id: 6,
+        state: "assigned",
+        channel_id: null, // missing — release() can't work
+        entity_id: "test-entity",
+        archetype: "builder",
+        session_id: "sess-loop-1",
+      });
+      pool.inject_bots([bot]);
+
+      // Pre-populate with 3 recent crashes to trigger crash loop on the 4th
+      const now = Date.now();
+      pool.get_crash_history().set(6, [
+        now - 45 * 60_000,
+        now - 20 * 60_000,
+        now - 5 * 60_000,
+      ]);
+
+      const events: unknown[] = [];
+      pool.on("bot:released", (data) => events.push(data));
+      pool.on("bot:crash_loop", (data) => events.push(data));
+
+      await pool.run_health_check();
+
+      const bots = pool.get_bots();
+      expect(bots[0].state).toBe("free");
+      expect(bots[0].channel_id).toBeNull();
+      expect(bots[0].entity_id).toBeNull();
+      expect(bots[0].session_id).toBeNull();
+      expect(mock_start_tmux).not.toHaveBeenCalled();
+      // Should have both bot:released (from force-free) and bot:crash_loop
+      const released = events.filter((e: unknown) =>
+        (e as Record<string, unknown>).bot_id === 6 &&
+        !("archetype" in (e as Record<string, unknown>))
+      );
+      const crash_loop = events.filter((e: unknown) =>
+        (e as Record<string, unknown>).archetype === "builder"
+      );
+      expect(released).toHaveLength(1);
+      expect(crash_loop).toHaveLength(1);
+    });
+  });
 });

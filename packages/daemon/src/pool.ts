@@ -132,6 +132,7 @@ export class BotPool extends EventEmitter {
   private bots: PoolBot[] = [];
   private config: LobsterFarmConfig;
   private _draining = false;
+  private _health_check_running = false;
   private health_timer: ReturnType<typeof setInterval> | null = null;
   /** In-flight lock: channels currently being assigned. Prevents check-then-act races. */
   private assigning_channels = new Set<string>();
@@ -996,31 +997,37 @@ export class BotPool extends EventEmitter {
    */
   protected async check_assigned_health(): Promise<void> {
     if (this._draining) return;
+    if (this._health_check_running) return;
+    this._health_check_running = true;
 
-    // Clean up old crash history entries (>1 hour) to prevent memory growth
-    this.cleanup_crash_history();
+    try {
+      // Clean up old crash history entries (>1 hour) to prevent memory growth
+      this.cleanup_crash_history();
 
-    for (const bot of this.bots) {
-      if (bot.state !== "assigned") continue;
-      if (this.is_tmux_alive(bot.tmux_session)) continue;
+      for (const bot of this.bots) {
+        if (bot.state !== "assigned") continue;
+        if (this.is_tmux_alive(bot.tmux_session)) continue;
 
-      // Tmux session died — attempt recovery
-      console.warn(
-        `[pool] pool-${String(bot.id)} tmux crashed — attempting restart ` +
-        `(channel: ${bot.channel_id ?? "none"})`,
-      );
+        // Tmux session died — attempt recovery
+        console.warn(
+          `[pool] pool-${String(bot.id)} tmux crashed — attempting restart ` +
+          `(channel: ${bot.channel_id ?? "none"})`,
+        );
 
-      // Record this crash for loop detection
-      this.record_crash(bot.id);
+        // Record this crash for loop detection
+        this.record_crash(bot.id);
 
-      // Check for crash loop before attempting restart
-      if (this.is_crash_loop(bot.id)) {
-        await this.handle_crash_loop(bot);
-        continue;
+        // Check for crash loop before attempting restart
+        if (this.is_crash_loop(bot.id)) {
+          await this.handle_crash_loop(bot);
+          continue;
+        }
+
+        // Attempt restart
+        await this.restart_crashed_session(bot);
       }
-
-      // Attempt restart
-      await this.restart_crashed_session(bot);
+    } finally {
+      this._health_check_running = false;
     }
   }
 
@@ -1041,8 +1048,20 @@ export class BotPool extends EventEmitter {
 
     if (!entity_id || !archetype) {
       console.error(
-        `[pool] Cannot restart pool-${String(bot.id)}: missing entity_id or archetype`,
+        `[pool] Cannot restart pool-${String(bot.id)}: missing fields — force-freeing`,
       );
+      bot.state = "free";
+      bot.channel_id = null;
+      bot.entity_id = null;
+      bot.archetype = null;
+      bot.channel_type = null;
+      bot.session_id = null;
+      bot.model = null;
+      bot.effort = null;
+      bot.last_active = null;
+      bot.assigned_at = null;
+      await this.persist();
+      this.emit("bot:released", { bot_id: bot.id });
       return;
     }
 
@@ -1162,6 +1181,24 @@ export class BotPool extends EventEmitter {
     // Release the bot — this kills tmux, frees the bot, clears access.json
     if (channel_id) {
       await this.release(channel_id);
+    } else {
+      // No channel_id — can't go through release(), force-free inline
+      console.error(
+        `[pool] Crash loop for pool-${String(bot.id)} with no channel_id — force-freeing`,
+      );
+      this.kill_tmux(bot.tmux_session);
+      bot.state = "free";
+      bot.channel_id = null;
+      bot.entity_id = null;
+      bot.archetype = null;
+      bot.channel_type = null;
+      bot.session_id = null;
+      bot.model = null;
+      bot.effort = null;
+      bot.last_active = null;
+      bot.assigned_at = null;
+      await this.persist();
+      this.emit("bot:released", { bot_id: bot.id });
     }
 
     // Alert the entity's #alerts channel
