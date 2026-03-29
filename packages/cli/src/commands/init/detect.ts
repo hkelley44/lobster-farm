@@ -1,4 +1,6 @@
-import { hostname, arch, cpus, platform } from "node:os";
+import { hostname, arch, cpus, platform, homedir } from "node:os";
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { exec_command } from "../../lib/process.js";
 
 export interface MachineInfo {
@@ -359,4 +361,58 @@ export async function check_sentry(): Promise<SentryCheckResult> {
   }
 
   return { installed: true, authenticated: false, org: null, status: "installed, not authenticated" };
+}
+
+export interface PoolBotCheckResult {
+  /** Number of pool-N directories that contain a valid .env with a token. */
+  count: number;
+  /** The pool bot indices found (e.g. [0, 1, 2]). */
+  indices: number[];
+  status: string;
+}
+
+/**
+ * Scan ~/.lobsterfarm/channels/pool-* for existing pool bot configurations.
+ * A pool bot is considered configured if its directory contains a .env file
+ * with a DISCORD_BOT_TOKEN line.
+ */
+export async function check_pool_bots(lobsterfarm_path?: string): Promise<PoolBotCheckResult> {
+  const channels_dir = join(lobsterfarm_path ?? join(homedir(), ".lobsterfarm"), "channels");
+  const indices: number[] = [];
+
+  try {
+    const entries = await readdir(channels_dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith("pool-")) continue;
+      const id = parseInt(entry.name.replace("pool-", ""), 10);
+      if (isNaN(id)) continue;
+
+      try {
+        const env_content = await readFile(join(channels_dir, entry.name, ".env"), "utf-8");
+        if (env_content.includes("DISCORD_BOT_TOKEN=")) {
+          indices.push(id);
+        }
+      } catch {
+        // No .env file — skip
+      }
+    }
+  } catch {
+    // No channels directory — no pool bots configured
+  }
+
+  indices.sort((a, b) => a - b);
+  const count = indices.length;
+
+  if (count === 0) {
+    return { count, indices, status: "no pool bots configured" };
+  }
+  const last = indices[count - 1]!;
+  const range = count === 1
+    ? `LF-${String(indices[0])}`
+    : `LF-0 through LF-${String(last)}`;
+  return {
+    count,
+    indices,
+    status: `${String(count)} pool bot${count > 1 ? "s" : ""} configured (${range})`,
+  };
 }
