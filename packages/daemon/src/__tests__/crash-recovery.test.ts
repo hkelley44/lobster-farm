@@ -295,7 +295,7 @@ describe("crash recovery (issue #157)", () => {
   // ── Crash loop detection ──
 
   describe("crash loop detection", () => {
-    it("does not trigger crash loop on first 3 crashes", async () => {
+    it("does not trigger crash loop with 3 total crashes (2 prior + 1 new)", async () => {
       const bot = make_bot({
         id: 3,
         state: "assigned",
@@ -306,27 +306,23 @@ describe("crash recovery (issue #157)", () => {
       });
       pool.inject_bots([bot]);
 
-      // Simulate 3 prior crashes within the last hour
+      // Simulate 2 prior crashes within the last hour — health check
+      // records a 3rd. Total = 3, which does NOT exceed the >3 threshold.
       const now = Date.now();
       pool.get_crash_history().set(3, [
-        now - 50 * 60_000,
         now - 30 * 60_000,
         now - 10 * 60_000,
       ]);
 
       await pool.run_health_check();
 
-      // 4th crash (the one detected now) triggers crash loop
-      // After recording the 4th, total is 4 — this IS a crash loop.
-      // But the first 3 should not have triggered it. Let me verify
-      // that the bot state reflects crash loop handling.
+      // Bot should be restarted (not released) — crash loop not triggered
       const bots = pool.get_bots();
-      // With 3 prior + 1 new = 4, crash loop IS triggered (>3).
-      // The bot should be released.
-      expect(bots[0].state).toBe("free");
+      expect(bots[0].state).toBe("assigned");
+      expect(mock_start_tmux).toHaveBeenCalledTimes(1);
     });
 
-    it("triggers crash loop on 4th crash in 1 hour", async () => {
+    it("triggers crash loop on 4th crash in 1 hour (3 prior + 1 new)", async () => {
       const bot = make_bot({
         id: 3,
         state: "assigned",

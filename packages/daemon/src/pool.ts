@@ -964,7 +964,9 @@ export class BotPool extends EventEmitter {
   /**
    * Start the tmux session health monitor.
    * Checks every 30 seconds for assigned bots whose tmux sessions have died.
-   * Emits "bot:session_ended" and cleans up bot state when a dead session is found.
+   * When a dead session is found, attempts to restart it automatically.
+   * If restart fails, emits "bot:session_ended" and frees the bot.
+   * If the bot is in a crash loop (>3 crashes/hour), releases without restart.
    */
   start_health_monitor(): void {
     if (this.health_timer) return; // already running
@@ -1075,19 +1077,6 @@ export class BotPool extends EventEmitter {
       bot.last_active = new Date();
       bot.assigned_at = new Date();
 
-      // Bridge a nudge message so the restarted session knows it was auto-recovered
-      try {
-        const pending_path = `/tmp/lf-pending-pool-${String(bot.id)}.txt`;
-        await writeFile(
-          pending_path,
-          "Your previous session crashed and was auto-restarted by the daemon. " +
-          "Resume where you left off.",
-          "utf-8",
-        );
-      } catch {
-        // Non-fatal — the nudge is a nice-to-have
-      }
-
       await this.persist();
 
       console.log(
@@ -1182,6 +1171,10 @@ export class BotPool extends EventEmitter {
       entity_config,
     );
 
+    // Note: bot:session_ended is intentionally NOT emitted here. The crash loop
+    // path releases the bot via this.release() which handles cleanup. The
+    // restart-failure path emits both bot:session_ended and bot:released because
+    // it handles cleanup inline without going through release().
     this.emit("bot:crash_loop", {
       bot_id: bot.id,
       channel_id,
