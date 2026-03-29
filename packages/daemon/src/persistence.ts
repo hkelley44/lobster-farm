@@ -1,4 +1,5 @@
-import { readFile, writeFile, mkdir, appendFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir, appendFile, rename } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { LobsterFarmConfig, ArchetypeRole, ChannelType } from "@lobster-farm/shared";
 import { lobsterfarm_dir, entity_dir } from "@lobster-farm/shared";
@@ -31,14 +32,16 @@ export interface ProcessedPR {
 /** Keyed by "entity_id:pr_number" */
 export type PRReviewState = Record<string, ProcessedPR>;
 
-/** Save PR review state to disk. */
+/** Save PR review state to disk. Uses atomic write-to-temp-then-rename. */
 export async function save_pr_reviews(
   state: PRReviewState,
   config: LobsterFarmConfig,
 ): Promise<void> {
   const path = pr_reviews_path(config);
+  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(state, null, 2), "utf-8");
+  await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
+  await rename(tmp_path, path);
 }
 
 /** Load PR review state from disk. Returns empty object if file doesn't exist. */
@@ -97,7 +100,9 @@ export interface PersistedPoolState {
   avatar_state?: Record<string, PersistedBotAvatarState>;
 }
 
-/** Save pool state (bots + session history + avatar state) to disk. */
+/** Save pool state (bots + session history + avatar state) to disk.
+ * Uses atomic write-to-temp-then-rename so a crash mid-write never
+ * corrupts the real file. rename() is atomic on POSIX same-device. */
 export async function save_pool_state(
   bots: PersistedPoolBot[],
   config: LobsterFarmConfig,
@@ -105,13 +110,15 @@ export async function save_pool_state(
   avatar_state?: Record<string, PersistedBotAvatarState>,
 ): Promise<void> {
   const path = pool_state_path(config);
+  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
   await mkdir(dirname(path), { recursive: true });
   const state: PersistedPoolState = {
     bots,
     session_history: session_history ?? {},
     avatar_state: avatar_state ?? {},
   };
-  await writeFile(path, JSON.stringify(state, null, 2), "utf-8");
+  await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
+  await rename(tmp_path, path);
 }
 
 /**

@@ -83,6 +83,37 @@ describe("LobsterFarmConfigSchema", () => {
     expect(() => LobsterFarmConfigSchema.parse({})).toThrow();
     expect(() => LobsterFarmConfigSchema.parse({ user: {} })).toThrow();
   });
+
+  it("accepts pr_cron config with enabled: false", () => {
+    const config = LobsterFarmConfigSchema.parse({
+      user: { name: "Jax" },
+      pr_cron: { enabled: false },
+    });
+    expect(config.pr_cron?.enabled).toBe(false);
+  });
+
+  it("accepts pr_cron config with enabled: true", () => {
+    const config = LobsterFarmConfigSchema.parse({
+      user: { name: "Jax" },
+      pr_cron: { enabled: true },
+    });
+    expect(config.pr_cron?.enabled).toBe(true);
+  });
+
+  it("defaults pr_cron.enabled to true when pr_cron object is present", () => {
+    const config = LobsterFarmConfigSchema.parse({
+      user: { name: "Jax" },
+      pr_cron: {},
+    });
+    expect(config.pr_cron?.enabled).toBe(true);
+  });
+
+  it("allows pr_cron to be omitted (backward compatible)", () => {
+    const config = LobsterFarmConfigSchema.parse({
+      user: { name: "Jax" },
+    });
+    expect(config.pr_cron).toBeUndefined();
+  });
 });
 
 describe("EntityConfigSchema", () => {

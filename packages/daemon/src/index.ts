@@ -232,7 +232,6 @@ async function main(): Promise<void> {
   const server = start_server(registry, config, session_manager, queue, commander, discord_connected ? discord : null, pool, github_app);
 
   // Start PR review cron (safety net — 30 min when webhooks are active, 5 min otherwise)
-  const cron_interval_ms = github_app ? 30 * 60 * 1000 : 5 * 60 * 1000;
   const pr_cron = new PRReviewCron(
     registry,
     session_manager,
@@ -240,7 +239,13 @@ async function main(): Promise<void> {
     discord_connected ? discord : null,
     github_app,
   );
-  await pr_cron.start(cron_interval_ms);
+  const pr_cron_enabled = config.pr_cron?.enabled !== false; // default true for backward compat
+  if (pr_cron_enabled) {
+    const cron_interval_ms = github_app ? 30 * 60 * 1000 : 5 * 60 * 1000;
+    await pr_cron.start(cron_interval_ms);
+  } else {
+    console.log("[pr-cron] Disabled via config (pr_cron.enabled: false)");
+  }
 
   // Start periodic worktree sweep (hourly) — cleans up stale worktrees from
   // merged PRs that the webhook handler missed or from manual merges.

@@ -65,6 +65,10 @@ export const LobsterFarmConfigSchema = z.object({
     commander: AgentNameSchema.default({ name: "Pat" }),
   }).default({}),
 
+  pr_cron: z.object({
+    enabled: z.boolean().default(true),
+  }).optional(),
+
   tools: z.object({
     tailscale: z.object({
       installed: z.boolean().default(false),
