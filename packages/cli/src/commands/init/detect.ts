@@ -407,9 +407,12 @@ export async function check_pool_bots(lobsterfarm_path?: string): Promise<PoolBo
     return { count, indices, status: "no pool bots configured" };
   }
   const last = indices[count - 1]!;
+  const range = count === 1
+    ? `LF-${String(indices[0])}`
+    : `LF-0 through LF-${String(last)}`;
   return {
     count,
     indices,
-    status: `${String(count)} pool bot${count > 1 ? "s" : ""} configured (LF-0 through LF-${String(last)})`,
+    status: `${String(count)} pool bot${count > 1 ? "s" : ""} configured (${range})`,
   };
 }

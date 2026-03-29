@@ -865,6 +865,7 @@ Always clean up after yourself:
       const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
       const lf_path = lf_dir(path_overrides);
       const existing_pool = await check_pool_bots(lf_path);
+      let should_write_pool = false;
 
       if (existing_pool.count > 0) {
         p.log.info(`Found ${String(existing_pool.count)} existing pool bot${existing_pool.count > 1 ? "s" : ""} (${existing_pool.indices.map(i => `LF-${String(i)}`).join(", ")}).`);
@@ -874,17 +875,19 @@ Always clean up after yourself:
         });
         if (p.isCancel(reconfigure)) { p.cancel("Setup cancelled."); process.exit(0); }
 
-        if (!reconfigure) {
-          pool_bot_count = existing_pool.count;
-        } else {
+        if (reconfigure) {
           pool_bot_count = await prompt_pool_bot_count();
+          should_write_pool = true;
+        } else {
+          pool_bot_count = existing_pool.count;
         }
       } else {
         pool_bot_count = await prompt_pool_bot_count();
+        should_write_pool = pool_bot_count > 0;
       }
 
-      if (pool_bot_count > 0 && (existing_pool.count === 0 || pool_bot_count !== existing_pool.count)) {
-        const { writeFile: writeF, mkdir: mkdirFs } = await import("node:fs/promises");
+      if (should_write_pool) {
+        const { writeFile: writeF, mkdir: mkdirFs, rm } = await import("node:fs/promises");
 
         for (let i = 0; i < pool_bot_count; i++) {
           const token = await prompt_pool_bot_token(i);
@@ -895,6 +898,12 @@ Always clean up after yourself:
           const pool_env_path = `${pool_dir}/.env`;
           await writeF(pool_env_path, `DISCORD_BOT_TOKEN=${token}\n`, { mode: 0o600 });
           files.push(pool_env_path);
+        }
+
+        // Clean up orphaned pool directories when count decreases
+        for (let i = pool_bot_count; i < existing_pool.count; i++) {
+          const stale_dir = `${lf_path}/channels/pool-${String(i)}`;
+          await rm(stale_dir, { recursive: true, force: true });
         }
 
         p.log.success(`${String(pool_bot_count)} pool bot${pool_bot_count > 1 ? "s" : ""} configured.`);
@@ -941,6 +950,12 @@ Always clean up after yourself:
             const first_segment = entry.token.split(".")[0];
             if (!first_segment) continue;
             const client_id = Buffer.from(first_segment, "base64").toString("utf-8");
+
+            if (!client_id || !/^\d{17,20}$/.test(client_id)) {
+              p.log.warn(`Could not extract client ID for ${entry.name} — invite URL skipped. Visit https://discord.com/developers/applications to invite manually.`);
+              continue;
+            }
+
             const invite_url = `https://discord.com/oauth2/authorize?client_id=${client_id}&scope=bot&permissions=0`;
 
             p.log.info(`Opening invite for ${entry.name}...`);

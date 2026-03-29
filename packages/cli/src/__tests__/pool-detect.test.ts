@@ -100,6 +100,6 @@ describe("check_pool_bots", () => {
     await writeFile(join(dir, ".env"), "DISCORD_BOT_TOKEN=token\n");
 
     const result = await check_pool_bots(temp_dir);
-    expect(result.status).toBe("1 pool bot configured (LF-0 through LF-0)");
+    expect(result.status).toBe("1 pool bot configured (LF-0)");
   });
 });
