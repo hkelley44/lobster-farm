@@ -1119,9 +1119,18 @@ export class BotPool extends EventEmitter {
       groups[channel_id] = { requireMention: false, allowFrom: [] };
     }
 
+    // The owner's Discord user ID controls who can DM pool bots.
+    // Falls back to empty allowlist if not configured — the user must set
+    // discord.user_id in config.yaml (captured during lf init).
+    const owner_id = this.config.discord?.user_id;
+    const allow_from = owner_id ? [owner_id] : [];
+    if (!owner_id) {
+      console.log("[pool] Warning: discord.user_id not set in config — pool bot DM allowlist is empty");
+    }
+
     const access = {
       dmPolicy: "allowlist",
-      allowFrom: ["732686813856006245"], // Jax's user ID
+      allowFrom: allow_from,
       groups,
       pending: {},
       ackReaction: "👀",

@@ -58,6 +58,8 @@ export interface DiscordSetup {
   server_id: string;
   daemon_bot_token: string;
   commander_bot_token?: string;
+  /** The user's Discord ID — used for pool bot access control and Pat's allowlist. */
+  user_id?: string;
 }
 
 /** Prompt for Discord setup (optional). Returns server ID + bot tokens or undefined. */
@@ -88,8 +90,10 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
       "2. Commander bot — your admin agent (Pat). Reads and replies in #command-center.\n" +
       "   Needs: View Channels, Send Messages, Read Message History, Attach Files, Add Reactions.\n\n" +
       "Create both at https://discord.com/developers/applications.\n" +
-      "Enable Message Content Intent in the Bot tab for both.\n" +
-      "Copy the server ID (right-click server → Copy Server ID).",
+      "Enable Message Content Intent in the Bot tab for both.\n\n" +
+      "To copy Discord IDs, enable Developer Mode first:\n" +
+      "  Discord → User Settings → Advanced → Developer Mode toggle ON\n\n" +
+      "Then right-click the server name → Copy Server ID.",
     "Discord Setup",
   );
 
@@ -126,10 +130,20 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
     process.exit(0);
   }
 
+  const user_id = await p.text({
+    message: "Your Discord user ID (right-click your avatar → Copy User ID, or press Enter to skip):",
+    defaultValue: "",
+  });
+  if (p.isCancel(user_id)) {
+    p.cancel("Setup cancelled.");
+    process.exit(0);
+  }
+
   return {
     server_id: server_id.trim(),
     daemon_bot_token: daemon_token.trim(),
     commander_bot_token: commander_token?.trim() || undefined,
+    user_id: (user_id ?? "").trim() || undefined,
   };
 }
 

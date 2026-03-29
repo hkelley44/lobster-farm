@@ -43,6 +43,8 @@ export const LobsterFarmConfigSchema = z.object({
   discord: z.object({
     server_id: z.string(),
     bot_token_ref: z.string().optional(),
+    /** The owner's Discord user ID — used for pool bot access control. */
+    user_id: z.string().optional(),
   }).optional(),
 
   user: z.object({
