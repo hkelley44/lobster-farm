@@ -1,16 +1,15 @@
 /**
  * Tests for per-entity GitHub token injection via 1Password.
  *
- * Verifies that start_tmux():
- * - Wraps the claude command with `op run` when entity has github_token_ref
- * - Leaves the command unchanged when entity has no github_token_ref
- * - Writes correct .env.op file content (reference only, never the token)
- * - Cleans up temp .env.op files after tmux starts
- * - Gracefully falls back if op run setup fails
+ * Verifies that:
+ * - resolve_op_secret is called when entity has github_token_ref
+ * - GH_TOKEN appears in the spawn env and tmux command when token is resolved
+ * - Session starts gracefully without GH_TOKEN when resolve_op_secret fails
+ * - No token resolution when entity has no github_token_ref
  */
 
 import { EventEmitter } from "node:events";
-import { describe, expect, it, beforeEach, vi, type Mock } from "vitest";
+import { describe, expect, it, beforeEach, vi } from "vitest";
 import { LobsterFarmConfigSchema, EntityConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig, EntityConfig } from "@lobster-farm/shared";
 import { BotPool } from "../pool.js";
@@ -40,31 +39,18 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
 });
 
-// Track writeFile and unlink calls
-let write_file_calls: Array<{ path: string; content: string }> = [];
-let write_file_should_fail = false;
-
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
-    writeFile: vi.fn(async (path: string, content: string) => {
-      if (write_file_should_fail && typeof path === "string" && path.includes("lf-env-pool")) {
-        throw new Error("Permission denied");
-      }
-      write_file_calls.push({ path, content: String(content) });
-    }),
+    writeFile: vi.fn(async () => {}),
     readFile: vi.fn(actual.readFile),
-    unlink: vi.fn().mockResolvedValue(undefined),
   };
 });
 
 vi.mock("../env.js", () => ({
   resolve_binary: vi.fn((name: string) => `/usr/local/bin/${name}`),
 }));
-
-import { unlink } from "node:fs/promises";
-import { resolve_binary } from "../env.js";
 
 // ── Minimal mock registry ──
 
@@ -117,6 +103,11 @@ class GhTokenTestPool extends BotPool {
     (this as unknown as { registry: MockRegistry }).registry = registry;
   }
 
+  /** Replace resolve_op_secret with a test double. */
+  override_resolve_op_secret(mock: (ref: string) => Promise<string>): void {
+    (this as unknown as { resolve_op_secret: (ref: string) => Promise<string> }).resolve_op_secret = mock;
+  }
+
   protected override is_bot_idle(): boolean {
     return true;
   }
@@ -150,8 +141,6 @@ describe("per-entity GitHub token injection", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     spawn_calls = [];
-    write_file_calls = [];
-    write_file_should_fail = false;
 
     config = make_config();
     pool = new GhTokenTestPool(config);
@@ -208,53 +197,48 @@ describe("per-entity GitHub token injection", () => {
   });
 
   describe("tmux command without github_token_ref", () => {
-    it("does NOT wrap with op run", async () => {
+    it("does NOT include GH_TOKEN in tmux command or spawn env", async () => {
       registry.add(make_entity_config({ id: "no-gh-token" }));
       pool.inject_registry(registry);
       pool.inject_bots([make_bot({ id: 3, state: "free" })]);
 
       await pool.assign("ch-test", "no-gh-token", "builder", undefined, "work_room");
 
-      // Find the tmux spawn call
       const tmux_call = spawn_calls.find(c => c.command === "tmux");
       expect(tmux_call).toBeDefined();
 
       // The tmux command string (last element in the args array)
       const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
-      expect(cmd_string).not.toContain("op' run");
+      expect(cmd_string).not.toContain("GH_TOKEN=");
       expect(cmd_string).toContain("claude");
+
+      // Spawn env should not have GH_TOKEN
+      const spawn_env = tmux_call!.options.env as Record<string, string>;
+      expect(spawn_env.GH_TOKEN).toBeUndefined();
     });
 
-    it("does not write a .env.op file", async () => {
-      registry.add(make_entity_config({ id: "no-env-op" }));
+    it("does not call resolve_op_secret", async () => {
+      registry.add(make_entity_config({ id: "no-resolve" }));
       pool.inject_registry(registry);
       pool.inject_bots([make_bot({ id: 1, state: "free" })]);
 
-      await pool.assign("ch-test", "no-env-op", "builder", undefined, "work_room");
+      const resolve_spy = vi.fn();
+      pool.override_resolve_op_secret(resolve_spy);
 
-      const env_op_writes = write_file_calls.filter(c => c.path.includes("lf-env-pool"));
-      expect(env_op_writes).toHaveLength(0);
-    });
+      await pool.assign("ch-test", "no-resolve", "builder", undefined, "work_room");
 
-    it("does not call unlink", async () => {
-      registry.add(make_entity_config({ id: "no-cleanup" }));
-      pool.inject_registry(registry);
-      pool.inject_bots([make_bot({ id: 8, state: "free" })]);
-
-      await pool.assign("ch-test", "no-cleanup", "builder", undefined, "work_room");
-
-      // Wait for the close handler to run
-      await new Promise(resolve => setTimeout(resolve, 10));
-      expect(unlink).not.toHaveBeenCalled();
+      expect(resolve_spy).not.toHaveBeenCalled();
     });
   });
 
   describe("tmux command with github_token_ref", () => {
-    it("wraps with op run", async () => {
+    it("injects GH_TOKEN into tmux command and spawn env", async () => {
       const ref = "op://entity-client/github/credential";
       registry.add(make_entity_config({ id: "gh-token-entity", github_token_ref: ref }));
       pool.inject_registry(registry);
       pool.inject_bots([make_bot({ id: 5, state: "free" })]);
+
+      pool.override_resolve_op_secret(async () => "ghp_test_token_abc123");
 
       await pool.assign("ch-test", "gh-token-entity", "builder", undefined, "work_room");
 
@@ -262,76 +246,44 @@ describe("per-entity GitHub token injection", () => {
       expect(tmux_call).toBeDefined();
       const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
 
-      // op binary is shell-quoted by sq(), so look for the resolved path + "run"
-      expect(cmd_string).toContain("/usr/local/bin/op' run");
-      expect(cmd_string).toContain("--env-file");
-      expect(cmd_string).toContain("lf-env-pool-5.op");
-      // claude command should come after the op run wrapper (after --)
-      expect(cmd_string).toContain("-- ");
+      // GH_TOKEN should appear as an env var prefix in the tmux command
+      expect(cmd_string).toContain("GH_TOKEN=");
       expect(cmd_string).toContain("claude");
+      // Should NOT use op run wrapping
+      expect(cmd_string).not.toContain("op' run");
+      expect(cmd_string).not.toContain("--env-file");
+
+      // Spawn env should also have GH_TOKEN
+      const spawn_env = tmux_call!.options.env as Record<string, string>;
+      expect(spawn_env.GH_TOKEN).toBe("ghp_test_token_abc123");
     });
 
-    it("writes correct .env.op file content", async () => {
+    it("calls resolve_op_secret with the ref from entity config", async () => {
       const ref = "op://entity-client/github/credential";
-      registry.add(make_entity_config({ id: "env-op-entity", github_token_ref: ref }));
-      pool.inject_registry(registry);
-      pool.inject_bots([make_bot({ id: 7, state: "free" })]);
-
-      await pool.assign("ch-test", "env-op-entity", "builder", undefined, "work_room");
-
-      const env_op_write = write_file_calls.find(c => c.path.includes("lf-env-pool-7.op"));
-      expect(env_op_write).toBeDefined();
-      expect(env_op_write!.path).toBe("/tmp/lf-env-pool-7.op");
-      expect(env_op_write!.content).toBe(`GH_TOKEN=${ref}\n`);
-    });
-
-    it("cleans up temp .env.op file after tmux starts (30s delay)", async () => {
-      vi.useFakeTimers();
-      const ref = "op://entity-cleanup/github/credential";
-      registry.add(make_entity_config({ id: "cleanup-entity", github_token_ref: ref }));
-      pool.inject_registry(registry);
-      pool.inject_bots([make_bot({ id: 2, state: "free" })]);
-
-      const assign_p = pool.assign("ch-test", "cleanup-entity", "builder", undefined, "work_room");
-
-      // Advance past the spawn mock's setTimeout(0) close emit
-      await vi.advanceTimersByTimeAsync(0);
-      await assign_p;
-
-      // unlink should NOT have been called yet — it's on a 30s delay
-      expect(unlink).not.toHaveBeenCalled();
-
-      // Advance past the 30-second cleanup delay
-      await vi.advanceTimersByTimeAsync(30_000);
-      expect(unlink).toHaveBeenCalledWith("/tmp/lf-env-pool-2.op");
-
-      vi.useRealTimers();
-    });
-
-    it("resolves op binary path via resolve_binary", async () => {
-      const ref = "op://entity-resolve/github/credential";
       registry.add(make_entity_config({ id: "resolve-entity", github_token_ref: ref }));
       pool.inject_registry(registry);
       pool.inject_bots([make_bot({ id: 4, state: "free" })]);
 
+      const resolve_spy = vi.fn().mockResolvedValue("ghp_resolved");
+      pool.override_resolve_op_secret(resolve_spy);
+
       await pool.assign("ch-test", "resolve-entity", "builder", undefined, "work_room");
 
-      expect(resolve_binary).toHaveBeenCalledWith("op");
-
-      const tmux_call = spawn_calls.find(c => c.command === "tmux");
-      const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
-      expect(cmd_string).toContain("/usr/local/bin/op");
+      expect(resolve_spy).toHaveBeenCalledWith(ref);
+      expect(resolve_spy).toHaveBeenCalledTimes(1);
     });
   });
 
   describe("graceful fallback", () => {
-    it("session starts without op run when .env.op write fails", async () => {
+    it("session starts without GH_TOKEN when resolve_op_secret fails", async () => {
       const ref = "op://entity-fail/github/credential";
       registry.add(make_entity_config({ id: "fail-entity", github_token_ref: ref }));
       pool.inject_registry(registry);
       pool.inject_bots([make_bot({ id: 6, state: "free" })]);
 
-      write_file_should_fail = true;
+      pool.override_resolve_op_secret(async () => {
+        throw new Error("op: item not found");
+      });
 
       // Should NOT throw — session starts without GH_TOKEN
       await pool.assign("ch-test", "fail-entity", "builder", undefined, "work_room");
@@ -340,23 +292,33 @@ describe("per-entity GitHub token injection", () => {
       expect(tmux_call).toBeDefined();
       const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
 
-      // Should NOT contain "op run" since setup failed
-      expect(cmd_string).not.toContain("op' run");
+      // Should NOT contain GH_TOKEN since resolution failed
+      expect(cmd_string).not.toContain("GH_TOKEN=");
       // But should still contain claude
       expect(cmd_string).toContain("claude");
+
+      // Spawn env should not have GH_TOKEN
+      const spawn_env = tmux_call!.options.env as Record<string, string>;
+      expect(spawn_env.GH_TOKEN).toBeUndefined();
     });
 
-    it("backward compatible — no registry means no op run wrapping", async () => {
+    it("backward compatible — no registry means no token resolution", async () => {
       // Pool without a registry (legacy path)
       pool.inject_bots([make_bot({ id: 9, state: "free" })]);
 
+      const resolve_spy = vi.fn();
+      pool.override_resolve_op_secret(resolve_spy);
+
       await pool.assign("ch-test", "some-entity", "builder", undefined, "work_room");
+
+      // resolve_op_secret should never be called — resolve_github_token_ref returns null
+      expect(resolve_spy).not.toHaveBeenCalled();
 
       const tmux_call = spawn_calls.find(c => c.command === "tmux");
       expect(tmux_call).toBeDefined();
       const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
 
-      expect(cmd_string).not.toContain("op' run");
+      expect(cmd_string).not.toContain("GH_TOKEN=");
       expect(cmd_string).toContain("claude");
     });
   });

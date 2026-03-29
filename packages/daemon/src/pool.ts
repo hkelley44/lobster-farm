@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { writeFile, readFile, unlink } from "node:fs/promises";
+import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
@@ -472,10 +472,22 @@ export class BotPool extends EventEmitter {
         await this.set_bot_nickname(bot, candidate.archetype);
         await this.set_bot_avatar(bot, candidate.archetype);
 
+        // Resolve per-entity GitHub token (if configured) before spawning tmux.
+        // The token is injected as a plain env var — no op run wrapping needed.
+        const extra_env: Record<string, string> = {};
+        const github_token_ref = this.resolve_github_token_ref(candidate.entity_id);
+        if (github_token_ref) {
+          try {
+            extra_env.GH_TOKEN = await this.resolve_op_secret(github_token_ref);
+          } catch (err) {
+            console.warn(`[pool] Failed to resolve GH_TOKEN for ${candidate.entity_id}: ${String(err)}`);
+          }
+        }
+
         // Spawn a fresh Claude process with --resume — establishes a new MCP
         // connection to this daemon while preserving conversation context
         const working_dir = entity_dir(this.config.paths, candidate.entity_id);
-        await this.start_tmux(bot, candidate.archetype, candidate.entity_id, working_dir, candidate.session_id!, true);
+        await this.start_tmux(bot, candidate.archetype, candidate.entity_id, working_dir, candidate.session_id!, true, extra_env);
 
         // Update bot state to assigned
         bot.state = "assigned";
@@ -670,12 +682,25 @@ export class BotPool extends EventEmitter {
       await this.set_bot_nickname(bot, archetype);
       await this.set_bot_avatar(bot, archetype);
 
+      // Resolve per-entity GitHub token (if configured) before spawning tmux.
+      // The token is injected as a plain env var — no op run wrapping needed.
+      const extra_env: Record<string, string> = {};
+      const github_token_ref = this.resolve_github_token_ref(entity_id);
+      if (github_token_ref) {
+        try {
+          extra_env.GH_TOKEN = await this.resolve_op_secret(github_token_ref);
+        } catch (err) {
+          console.warn(`[pool] Failed to resolve GH_TOKEN for ${entity_id}: ${String(err)}`);
+          // Non-fatal: session starts without GH_TOKEN
+        }
+      }
+
       // Start the tmux session — use override working_dir if provided (e.g., feature worktree)
       // For fresh sessions, generate a UUID so pool-state.json always has a session_id
       // for proactive resume on daemon restart.
       const session_id = resume_session_id ?? randomUUID();
       const resolved_dir = working_dir ?? entity_dir(this.config.paths, entity_id);
-      await this.start_tmux(bot, archetype, entity_id, resolved_dir, session_id, !!resume_session_id);
+      await this.start_tmux(bot, archetype, entity_id, resolved_dir, session_id, !!resume_session_id, extra_env);
 
       // Update bot state
       const assigned_defaults = DEFAULT_ARCHETYPES[archetype];
@@ -1157,6 +1182,7 @@ export class BotPool extends EventEmitter {
     working_dir: string,
     session_id: string,
     is_resume: boolean = false,
+    extra_env: Record<string, string> = {},
   ): Promise<void> {
     const claude_bin = process.env["CLAUDE_BIN"] ?? "claude";
     const agent_name = resolve_agent_name(archetype, this.config);
@@ -1195,46 +1221,26 @@ export class BotPool extends EventEmitter {
     const display_name = resolve_agent_display_name(archetype, this.config);
     const git_env = `GIT_AUTHOR_NAME=${sq(`${display_name} (LobsterFarm)`)} GIT_AUTHOR_EMAIL=${sq(`${agent_name}@lobsterfarm.dev`)} GIT_COMMITTER_NAME=${sq(`${display_name} (LobsterFarm)`)} GIT_COMMITTER_EMAIL=${sq(`${agent_name}@lobsterfarm.dev`)}`;
 
-    // Check if this entity has a per-entity GitHub token reference.
-    // If so, wrap the claude command with `op run` to inject GH_TOKEN at runtime.
-    const env_op_path = `/tmp/lf-env-pool-${String(bot.id)}.op`;
-    const github_token_ref = this.resolve_github_token_ref(entity_id);
-    let op_prefix = "";
-
-    if (github_token_ref) {
-      try {
-        await writeFile(env_op_path, `GH_TOKEN=${github_token_ref}\n`, "utf-8");
-        const op_bin = resolve_binary("op");
-        op_prefix = `${sq(op_bin)} run --env-file ${sq(env_op_path)} -- `;
-        console.log(
-          `[pool] pool-${String(bot.id)}: wrapping with op run for entity "${entity_id}" GH_TOKEN`,
-        );
-      } catch (err) {
-        // Non-fatal: session starts without GH_TOKEN, inheriting global gh auth
-        console.warn(
-          `[pool] pool-${String(bot.id)}: failed to set up op run for GH_TOKEN: ${String(err)}`,
-        );
-        sentry.captureException(err, {
-          tags: { module: "pool", bot_id: String(bot.id), action: "gh_token_setup" },
-        });
-        op_prefix = "";
-      }
-    }
+    // Build extra env var prefix for the tmux command string (e.g., GH_TOKEN=...)
+    const extra_env_str = Object.entries(extra_env)
+      .map(([k, v]) => `${k}=${sq(v)}`)
+      .join(" ");
 
     const claude_cmd = claude_args.join(" ");
-    const full_cmd = `${op_prefix}${claude_cmd}`;
+    const env_prefix = extra_env_str ? `${extra_env_str} ` : "";
 
     return new Promise<void>((resolve, reject) => {
       const proc = spawn("tmux", [
         "new-session", "-d",
         "-s", bot.tmux_session,
         "-x", "200", "-y", "50",
-        `DISCORD_STATE_DIR=${sq(bot.state_dir)} ${git_env} ${full_cmd}`,
+        `DISCORD_STATE_DIR=${sq(bot.state_dir)} ${git_env} ${env_prefix}${claude_cmd}`,
       ], {
         cwd: working_dir,
         stdio: "ignore",
         env: {
           ...process.env,
+          ...extra_env,
           DISCORD_STATE_DIR: bot.state_dir,
           GIT_AUTHOR_NAME: `${display_name} (LobsterFarm)`,
           GIT_AUTHOR_EMAIL: `${agent_name}@lobsterfarm.dev`,
@@ -1244,18 +1250,6 @@ export class BotPool extends EventEmitter {
       });
 
       proc.on("close", (code) => {
-        // Clean up the temp .env.op file after a delay. The tmux session
-        // starts detached (-d), so the close handler fires immediately —
-        // before `op run` inside tmux has a chance to read the file.
-        // A 30s delay gives op run plenty of time. The file only contains
-        // op:// references (not actual secrets), so a brief window is safe.
-        // Registered unconditionally so cleanup runs even on tmux failure.
-        if (github_token_ref) {
-          setTimeout(() => {
-            unlink(env_op_path).catch(() => { /* best effort cleanup */ });
-          }, 30_000);
-        }
-
         if (code !== 0) {
           console.error(`[pool] tmux new-session failed for pool-${String(bot.id)} (code ${String(code)})`);
           sentry.captureException(new Error(`tmux new-session failed for pool-${String(bot.id)} with code ${String(code)}`), {
@@ -1295,6 +1289,20 @@ export class BotPool extends EventEmitter {
     const entity_config = this.registry.get(entity_id);
     if (!entity_config) return null;
     return entity_config.entity.secrets.github_token_ref ?? null;
+  }
+
+  /** Resolve a 1Password secret reference to its plaintext value.
+   * Safe to call in the daemon process (runs under `op run` via start-daemon.sh).
+   * The resolved value is held in a JS variable, never written to disk or stdout. */
+  private async resolve_op_secret(ref: string): Promise<string> {
+    const op_bin = resolve_binary("op");
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+    const { stdout } = await execFileAsync(op_bin, ["read", ref, "--no-newline"], {
+      timeout: 10_000,
+    });
+    return stdout;
   }
 
   /** Set a pool bot's server nickname via the daemon bot's Discord client.
