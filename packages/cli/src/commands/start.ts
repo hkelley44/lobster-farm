@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { statSync } from "node:fs";
 import { writeFile, mkdir, access, chmod } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,34 +20,44 @@ import {
 } from "../lib/launchd.js";
 import { read_pid_file, is_process_running } from "../lib/process.js";
 
-/** Resolve the daemon entry point. */
-function resolve_daemon_path(): string {
-  // Primary: look in the entity-zero repo location
+/** Resolve the daemon entry point.
+ *
+ * Tries paths in order of likelihood:
+ * 1. install.sh location: ~/.lobsterfarm/src/packages/daemon/dist/index.js
+ * 2. Walk up from this CLI file (works when running from a dev checkout)
+ * 3. Legacy entity-zero path (our own dev instance)
+ */
+export function resolve_daemon_path(): string {
   const home = homedir();
-  const standard = join(home, ".lobsterfarm", "entities", "lobster-farm", "repos", "lobster-farm", "packages", "daemon", "dist", "index.js");
-  try {
-    require.resolve(standard);
-    return standard;
-  } catch {
-    // noop
-  }
 
-  // Fallback: resolve relative to this CLI file
+  // Primary: where install.sh clones the repo
+  const install_path = join(home, ".lobsterfarm", "src", "packages", "daemon", "dist", "index.js");
+  if (file_exists(install_path)) return install_path;
+
+  // Walk up from this CLI file — works in dev checkouts and worktrees
   const this_file = fileURLToPath(import.meta.url);
   let dir = dirname(this_file);
   for (let i = 0; i < 10; i++) {
     const candidate = join(dir, "packages", "daemon", "dist", "index.js");
-    try {
-      require.resolve(candidate);
-      return candidate;
-    } catch {
-      // noop
-    }
+    if (file_exists(candidate)) return candidate;
     dir = dirname(dir);
   }
 
-  // Last resort
-  return standard;
+  // Fallback: legacy entity-zero repo location (our own dev instance)
+  const legacy = join(home, ".lobsterfarm", "entities", "lobster-farm", "repos", "lobster-farm", "packages", "daemon", "dist", "index.js");
+  if (file_exists(legacy)) return legacy;
+
+  // Nothing found — return the install path so the error message is useful
+  return install_path;
+}
+
+/** Check if a file exists on disk (synchronous). */
+function file_exists(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
 }
 
 /** Resolve the absolute path to the node binary. */

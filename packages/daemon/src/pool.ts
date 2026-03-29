@@ -408,6 +408,11 @@ export class BotPool extends EventEmitter {
     }
     console.log(`[pool] Reconciled access.json for ${String(this.bots.length)} bots`);
 
+    // Warn once if user_id is missing — rather than on every write_access_json call
+    if (!this.config.discord?.user_id) {
+      console.warn("[pool] discord.user_id not set in config — pool bot DM allowlist will be empty. Run `lf init` to configure.");
+    }
+
     // Persist cleaned state (stale entries removed, duplicates resolved, current snapshot)
     await this.persist();
 
@@ -1119,9 +1124,15 @@ export class BotPool extends EventEmitter {
       groups[channel_id] = { requireMention: false, allowFrom: [] };
     }
 
+    // The owner's Discord user ID controls who can DM pool bots.
+    // Falls back to empty allowlist if not configured — the user must set
+    // discord.user_id in config.yaml (captured during lf init).
+    const owner_id = this.config.discord?.user_id;
+    const allow_from = owner_id ? [owner_id] : [];
+
     const access = {
       dmPolicy: "allowlist",
-      allowFrom: ["732686813856006245"], // Jax's user ID
+      allowFrom: allow_from,
       groups,
       pending: {},
       ackReaction: "👀",

@@ -70,6 +70,23 @@ describe("LobsterFarmConfigSchema", () => {
     expect(config.discord?.server_id).toBe("123456789");
   });
 
+  it("accepts discord config with user_id", () => {
+    const config = LobsterFarmConfigSchema.parse({
+      user: { name: "Jax" },
+      discord: { server_id: "123456789", user_id: "999888777666555" },
+    });
+    expect(config.discord?.server_id).toBe("123456789");
+    expect(config.discord?.user_id).toBe("999888777666555");
+  });
+
+  it("allows discord.user_id to be omitted (backward compatible)", () => {
+    const config = LobsterFarmConfigSchema.parse({
+      user: { name: "Jax" },
+      discord: { server_id: "123456789" },
+    });
+    expect(config.discord?.user_id).toBeUndefined();
+  });
+
   it("rejects missing user name", () => {
     expect(() => LobsterFarmConfigSchema.parse({})).toThrow();
     expect(() => LobsterFarmConfigSchema.parse({ user: {} })).toThrow();

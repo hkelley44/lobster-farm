@@ -808,7 +808,11 @@ Always clean up after yourself:
     };
 
     if (discord_setup) {
-      config_input["discord"] = { server_id: discord_setup.server_id };
+      const discord_config: Record<string, string> = { server_id: discord_setup.server_id };
+      if (discord_setup.user_id) {
+        discord_config["user_id"] = discord_setup.user_id;
+      }
+      config_input["discord"] = discord_config;
     }
 
     if (tools_config && Object.keys(tools_config).length > 0) {
@@ -870,9 +874,10 @@ Always clean up after yourself:
     if (discord_setup?.commander_bot_token && !non_interactive) {
       p.note(
         "Pat needs to know which Discord channel to listen in and who to accept messages from.\n\n" +
-          "Enable Developer Mode in Discord: User Settings → Advanced → Developer Mode.\n" +
           "Right-click the #command-center channel → Copy Channel ID.\n" +
-          "Right-click your own avatar → Copy User ID.",
+          (discord_setup.user_id
+            ? `Using your Discord user ID from earlier: ${discord_setup.user_id}`
+            : "Right-click your own avatar → Copy User ID."),
         "Commander Access Control",
       );
 
@@ -885,14 +890,21 @@ Always clean up after yourself:
       });
       if (p.isCancel(command_center_id)) { p.cancel("Setup cancelled."); process.exit(0); }
 
-      const user_discord_id = await p.text({
-        message: "Your Discord user ID:",
-        validate: (value) => {
-          if (!value.trim()) return "User ID is required.";
-          return undefined;
-        },
-      });
-      if (p.isCancel(user_discord_id)) { p.cancel("Setup cancelled."); process.exit(0); }
+      // Reuse the user ID captured during Discord setup if available
+      let user_discord_id: string;
+      if (discord_setup.user_id) {
+        user_discord_id = discord_setup.user_id;
+      } else {
+        const id_result = await p.text({
+          message: "Your Discord user ID:",
+          validate: (value) => {
+            if (!value.trim()) return "User ID is required.";
+            return undefined;
+          },
+        });
+        if (p.isCancel(id_result)) { p.cancel("Setup cancelled."); process.exit(0); }
+        user_discord_id = id_result.trim();
+      }
 
       const { writeFile: writeF, mkdir: mkdirFs } = await import("node:fs/promises");
       const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
@@ -901,7 +913,7 @@ Always clean up after yourself:
 
       const access_config = {
         dmPolicy: "allowlist",
-        allowFrom: [user_discord_id.trim()],
+        allowFrom: [user_discord_id],
         groups: {
           [command_center_id.trim()]: {
             requireMention: false,
