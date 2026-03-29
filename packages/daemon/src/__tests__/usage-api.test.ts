@@ -112,8 +112,8 @@ describe("fetch_subscription_usage", () => {
     };
 
     const api_response: SubscriptionUsageResponse = {
-      five_hour: { utilization: 0.42, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
-      seven_day: { utilization: 0.62, resets_at: new Date(Date.now() + 2 * 86_400_000 + 4 * 3_600_000).toISOString() },
+      five_hour: { utilization: 5, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
+      seven_day: { utilization: 29, resets_at: new Date(Date.now() + 2 * 86_400_000 + 4 * 3_600_000).toISOString() },
     };
 
     fetch_spy.mockResolvedValueOnce(new Response(JSON.stringify(api_response), {
@@ -123,9 +123,9 @@ describe("fetch_subscription_usage", () => {
 
     const result = await fetch_subscription_usage();
     expect(result).not.toBeNull();
-    expect(result!.summary).toContain("5h: 42%");
-    expect(result!.summary).toContain("Weekly: 62%");
-    expect(result!.raw.five_hour?.utilization).toBe(0.42);
+    expect(result!.summary).toContain("5h: 5%");
+    expect(result!.summary).toContain("Weekly: 29%");
+    expect(result!.raw.five_hour?.utilization).toBe(5);
   });
 
   it("sends correct Authorization header and beta flag", async () => {
@@ -181,8 +181,8 @@ describe("fetch_subscription_usage", () => {
     };
 
     const api_response: SubscriptionUsageResponse = {
-      five_hour: { utilization: 0.1, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
-      extra_usage: { is_enabled: true, monthly_limit: 100, used_credits: 23.5, utilization: 0.235 },
+      five_hour: { utilization: 10, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
+      extra_usage: { is_enabled: true, monthly_limit: 100, used_credits: 23.5, utilization: 23.5 },
     };
 
     fetch_spy.mockResolvedValueOnce(new Response(JSON.stringify(api_response), {
@@ -204,7 +204,7 @@ describe("fetch_subscription_usage", () => {
     };
 
     const api_response: SubscriptionUsageResponse = {
-      seven_day: { utilization: 0.5, resets_at: new Date(Date.now() + 3 * 86_400_000).toISOString() },
+      seven_day: { utilization: 50, resets_at: new Date(Date.now() + 3 * 86_400_000).toISOString() },
     };
 
     fetch_spy.mockResolvedValueOnce(new Response(JSON.stringify(api_response), {

@@ -37,7 +37,7 @@ export interface SubscriptionUsageResponse {
 export interface SubscriptionUsageSummary {
   /** Raw API response for callers that want fine-grained data. */
   raw: SubscriptionUsageResponse;
-  /** e.g., "5h: 42% | Weekly: 62% (resets in 2d 4h)" */
+  /** e.g., "5h: 5% | Weekly: 29% (resets in 3d 13h)" */
   summary: string;
 }
 
@@ -125,12 +125,12 @@ function format_usage_summary(data: SubscriptionUsageResponse): string {
   const parts: string[] = [];
 
   if (data.five_hour) {
-    const pct = Math.round(data.five_hour.utilization * 100);
+    const pct = Math.round(data.five_hour.utilization);
     parts.push(`5h: ${String(pct)}%`);
   }
 
   if (data.seven_day) {
-    const pct = Math.round(data.seven_day.utilization * 100);
+    const pct = Math.round(data.seven_day.utilization);
     const resets_label = format_resets_in(data.seven_day.resets_at);
     parts.push(`Weekly: ${String(pct)}%${resets_label}`);
   }
