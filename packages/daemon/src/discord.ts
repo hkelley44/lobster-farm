@@ -2315,23 +2315,30 @@ export class DiscordBot extends EventEmitter {
       return;
     }
 
-    // Deduplicate by name, keeping the most recent (last in sorted-ascending list)
+    // Deduplicate by name, keeping the most recent
     const by_name = new Map<string, RoomArchive>();
     for (const a of archives) {
-      by_name.set(a.name, a);
+      const existing = by_name.get(a.name);
+      const a_ts = a.closed_at || a.archived_at || "";
+      const ex_ts = existing ? (existing.closed_at || existing.archived_at || "") : "";
+      if (!existing || a_ts > ex_ts) by_name.set(a.name, a);
     }
 
     // Sort most recent first
     const sorted = [...by_name.values()].sort(
-      (a, b) => b.closed_at.localeCompare(a.closed_at),
+      (a, b) => (b.closed_at || b.archived_at || "").localeCompare(a.closed_at || a.archived_at || ""),
     );
 
+    const MAX_ENTRIES = 25;
     const lines = ["**Archived Sessions**", ""];
-    for (const a of sorted) {
+    for (const a of sorted.slice(0, MAX_ENTRIES)) {
       const timestamp = a.closed_at || a.archived_at;
       const ago = format_relative_time(timestamp);
       const role = a.archetype ?? "unknown";
       lines.push(`- **${a.name}** -- ${role} -- closed ${ago}`);
+    }
+    if (sorted.length > MAX_ENTRIES) {
+      lines.push(`\n… and ${sorted.length - MAX_ENTRIES} more`);
     }
     lines.push("", "-# Use `/resume <name>` to restore.");
 

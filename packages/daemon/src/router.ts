@@ -153,7 +153,7 @@ export function route_message(msg: RoutedMessage): RouteAction {
       message:
         "I'm not sure what you'd like me to do. Try:\n" +
         "• `/plan <title>` — start planning a feature\n" +
-        "• `/features` ��� list active features\n" +
+        "• `/features` — list active features\n" +
         "• `/status` — check daemon status\n" +
         "• Or describe what you need (e.g., \"build the login page\")",
     };
