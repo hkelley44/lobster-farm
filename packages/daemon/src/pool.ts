@@ -414,6 +414,22 @@ export class BotPool extends EventEmitter {
     }
     console.log(`[pool] Reconciled access.json for ${String(this.bots.length)} bots`);
 
+    // Phase 3: Clean up orphan tmux sessions.
+    // If a bot has live tmux but no persisted metadata, it's an orphan from a
+    // previous crash. Kill the tmux and mark it free — there's nothing to resume.
+    for (const bot of this.bots) {
+      if (bot.state === "assigned" && !bot.channel_id) {
+        console.log(
+          `[pool] Killing orphan tmux for pool-${String(bot.id)} ` +
+          `(no persisted state — leftover from crash)`,
+        );
+        this.kill_tmux(bot.tmux_session);
+        bot.state = "free";
+        bot.last_active = null;
+        bot.assigned_at = null;
+      }
+    }
+
     // Warn once if user_id is missing — rather than on every write_access_json call
     if (!this.config.discord?.user_id) {
       console.warn("[pool] discord.user_id not set in config — pool bot DM allowlist will be empty. Run `lf init` to configure.");

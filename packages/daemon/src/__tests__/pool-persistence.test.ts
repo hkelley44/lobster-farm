@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { join } from "node:path";
-import { mkdtemp, rm, readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile, mkdir, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig, EntityConfig } from "@lobster-farm/shared";
@@ -9,6 +9,8 @@ import type { PoolBot } from "../pool.js";
 import {
   save_pool_state,
   load_pool_state,
+  save_pr_reviews,
+  load_pr_reviews,
 } from "../persistence.js";
 import type { PersistedPoolBot } from "../persistence.js";
 import { EntityRegistry } from "../registry.js";
@@ -1272,5 +1274,311 @@ describe("BotPool persistence", () => {
       const bots = p.get_bots();
       expect(bots[0]!.state).toBe("assigned");
     });
+  });
+
+  // ── Fix #161-A: Orphan tmux cleanup on initialize ──
+
+  describe("orphan tmux cleanup on initialize", () => {
+    it("kills orphan tmux and frees bot when tmux is alive but no persisted state", async () => {
+      const cfg = make_config();
+
+      // Create pool-1 directory
+      const dir = join(temp_dir, "channels", "pool-1");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, ".env"), "DISCORD_BOT_TOKEN=fake-token", "utf-8");
+
+      // NO persisted state — pool-state.json doesn't exist
+
+      const pool = new TestBotPool(cfg);
+      const kill_spy = vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
+        .mockImplementation(() => {});
+      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
+        .mockResolvedValue(undefined);
+
+      // tmux IS alive — this creates the zombie scenario
+      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
+        .mockReturnValue(true);
+
+      await pool.initialize();
+
+      const bots = pool.get_bots();
+      expect(bots).toHaveLength(1);
+      // Bot should be freed — orphan tmux killed
+      expect(bots[0]!.state).toBe("free");
+      expect(bots[0]!.channel_id).toBeNull();
+      expect(bots[0]!.last_active).toBeNull();
+      expect(bots[0]!.assigned_at).toBeNull();
+
+      // kill_tmux should have been called for the orphan
+      expect(kill_spy).toHaveBeenCalledWith("pool-1");
+    });
+
+    it("does not kill tmux when persisted state exists for the bot", async () => {
+      const cfg = make_config();
+
+      const dir = join(temp_dir, "channels", "pool-1");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, ".env"), "DISCORD_BOT_TOKEN=fake-token", "utf-8");
+
+      // Persisted state exists for this bot
+      await save_pool_state([
+        make_persisted_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "test-entity",
+          archetype: "builder",
+          session_id: "sess-live",
+        }),
+      ], cfg);
+
+      const pool = new TestBotPool(cfg);
+      const kill_spy = vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
+        .mockImplementation(() => {});
+      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
+        .mockResolvedValue(undefined);
+
+      // tmux is alive AND persisted state exists — not an orphan
+      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
+        .mockReturnValue(true);
+
+      await pool.initialize();
+
+      const bots = pool.get_bots();
+      expect(bots).toHaveLength(1);
+      // Bot should stay assigned — it has metadata
+      expect(bots[0]!.state).toBe("assigned");
+      expect(bots[0]!.channel_id).toBe("ch-1");
+
+      // kill_tmux should NOT have been called (bot is not an orphan)
+      expect(kill_spy).not.toHaveBeenCalled();
+    });
+
+    it("handles multiple bots with mixed orphan/valid states", async () => {
+      const cfg = make_config();
+
+      // Create directories for 3 bots
+      for (const id of [1, 2, 3]) {
+        const dir = join(temp_dir, "channels", `pool-${String(id)}`);
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, ".env"), "DISCORD_BOT_TOKEN=fake-token", "utf-8");
+      }
+
+      // Only bot 1 has persisted state — bots 2 and 3 are orphans
+      await save_pool_state([
+        make_persisted_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "test-entity",
+          archetype: "builder",
+          session_id: "sess-1",
+        }),
+      ], cfg);
+
+      const pool = new TestBotPool(cfg);
+      const kill_spy = vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
+        .mockImplementation(() => {});
+      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
+        .mockResolvedValue(undefined);
+
+      // All three tmux sessions are alive
+      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
+        .mockReturnValue(true);
+
+      await pool.initialize();
+
+      const bots = pool.get_bots();
+      expect(bots).toHaveLength(3);
+
+      // Bot 1: has persisted state — stays assigned
+      const bot1 = bots.find(b => b.id === 1)!;
+      expect(bot1.state).toBe("assigned");
+      expect(bot1.channel_id).toBe("ch-1");
+
+      // Bots 2 and 3: orphans — freed
+      const bot2 = bots.find(b => b.id === 2)!;
+      expect(bot2.state).toBe("free");
+      expect(bot2.channel_id).toBeNull();
+
+      const bot3 = bots.find(b => b.id === 3)!;
+      expect(bot3.state).toBe("free");
+      expect(bot3.channel_id).toBeNull();
+
+      // kill_tmux called for orphans only (pool-2 and pool-3)
+      expect(kill_spy).toHaveBeenCalledWith("pool-2");
+      expect(kill_spy).toHaveBeenCalledWith("pool-3");
+      expect(kill_spy).not.toHaveBeenCalledWith("pool-1");
+    });
+  });
+
+  // ── Fix #161-D: Health monitor orphan logging ──
+
+  describe("health monitor orphan logging", () => {
+    it("logs when freeing orphan bot with no channel/entity metadata", async () => {
+      const cfg = make_config();
+      const pool = new TestBotPool(cfg);
+
+      // Stub side effects
+      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
+        .mockImplementation(() => {});
+      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
+        .mockResolvedValue(undefined);
+
+      // Inject a zombie bot: assigned but no metadata
+      pool.inject_bots([
+        make_bot({
+          id: 5,
+          state: "assigned",
+          channel_id: null,
+          entity_id: null,
+          session_id: null,
+        }),
+      ]);
+
+      // tmux is dead — health monitor should free it
+      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
+        .mockReturnValue(false);
+
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      // Call check_assigned_health directly
+      await (pool as unknown as { check_assigned_health: () => Promise<void> }).check_assigned_health();
+
+      // Bot should be freed
+      const bots = pool.get_bots();
+      expect(bots[0]!.state).toBe("free");
+
+      // Should log the orphan message (not the session history stash message)
+      const orphan_log = log_spy.mock.calls.find(
+        call => typeof call[0] === "string" && call[0].includes("Freeing orphan pool-5"),
+      );
+      expect(orphan_log).toBeDefined();
+
+      log_spy.mockRestore();
+    });
+
+    it("stashes session history when bot has full metadata", async () => {
+      const cfg = make_config();
+      const pool = new TestBotPool(cfg);
+
+      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
+        .mockImplementation(() => {});
+      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
+        .mockResolvedValue(undefined);
+
+      // Inject a properly-assigned bot
+      pool.inject_bots([
+        make_bot({
+          id: 5,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "test-entity",
+          session_id: "sess-abc123",
+        }),
+      ]);
+
+      // tmux is dead
+      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
+        .mockReturnValue(false);
+
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await (pool as unknown as { check_assigned_health: () => Promise<void> }).check_assigned_health();
+
+      // Should log session history stash (not orphan message)
+      const stash_log = log_spy.mock.calls.find(
+        call => typeof call[0] === "string" && call[0].includes("Stashed session history"),
+      );
+      expect(stash_log).toBeDefined();
+
+      const orphan_log = log_spy.mock.calls.find(
+        call => typeof call[0] === "string" && call[0].includes("Freeing orphan pool-5"),
+      );
+      expect(orphan_log).toBeUndefined();
+
+      log_spy.mockRestore();
+    });
+  });
+});
+
+// ── Fix #161-B: Atomic persistence tests ──
+
+describe("atomic persistence", () => {
+  beforeEach(async () => {
+    temp_dir = await mkdtemp(join(tmpdir(), "pool-atomic-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(temp_dir, { recursive: true, force: true });
+  });
+
+  it("save_pool_state leaves no temp files behind", async () => {
+    const config = make_config();
+    const bots: PersistedPoolBot[] = [
+      make_persisted_bot({ id: 1, session_id: "sess-1" }),
+    ];
+
+    await save_pool_state(bots, config);
+
+    // Check that only the final file exists (no .tmp files)
+    const state_path = join(temp_dir, "state");
+    const files = await readdir(state_path);
+    expect(files).toEqual(["pool-state.json"]);
+    expect(files.some(f => f.endsWith(".tmp"))).toBe(false);
+
+    // Verify data is intact
+    const loaded = await load_pool_state(config);
+    expect(loaded.bots).toHaveLength(1);
+    expect(loaded.bots[0]!.session_id).toBe("sess-1");
+  });
+
+  it("save_pool_state overwrites previous state atomically", async () => {
+    const config = make_config();
+
+    // Write initial state
+    await save_pool_state(
+      [make_persisted_bot({ id: 1, session_id: "sess-first" })],
+      config,
+    );
+
+    // Overwrite with new state
+    await save_pool_state(
+      [make_persisted_bot({ id: 2, session_id: "sess-second" })],
+      config,
+    );
+
+    // Should only have the latest state
+    const loaded = await load_pool_state(config);
+    expect(loaded.bots).toHaveLength(1);
+    expect(loaded.bots[0]!.id).toBe(2);
+    expect(loaded.bots[0]!.session_id).toBe("sess-second");
+
+    // No leftover temp files
+    const files = await readdir(join(temp_dir, "state"));
+    expect(files).toEqual(["pool-state.json"]);
+  });
+
+  it("save_pr_reviews uses atomic write (no temp files left)", async () => {
+    const config = make_config();
+
+    await save_pr_reviews({
+      "e1:42": {
+        entity_id: "e1",
+        pr_number: 42,
+        reviewed_at: "2026-03-29T10:00:00Z",
+        outcome: "approved",
+      },
+    }, config);
+
+    const state_path = join(temp_dir, "state");
+    const files = await readdir(state_path);
+    expect(files).toEqual(["pr-reviews.json"]);
+    expect(files.some(f => f.endsWith(".tmp"))).toBe(false);
+
+    // Verify data is intact
+    const loaded = await load_pr_reviews(config);
+    expect(loaded["e1:42"]).toBeDefined();
+    expect(loaded["e1:42"]!.outcome).toBe("approved");
   });
 });
