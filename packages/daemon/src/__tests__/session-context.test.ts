@@ -96,9 +96,10 @@ describe("session-context", () => {
       expect(result).not.toBeNull();
       // Last turn: input_tokens=5000 + cache_creation=1000 + cache_read=4000 = 10000
       expect(result!.used_tokens).toBe(10_000);
-      expect(result!.total_tokens).toBe(200_000);
-      expect(result!.percent).toBe(5);
-      expect(result!.summary).toBe("10k / 200k (5%)");
+      expect(result!.total_tokens).toBe(1_000_000);
+      expect(result!.percent).toBe(1);
+      expect(result!.summary).toBe("10k / 1m (1%)");
+      expect(result!.compactions).toBe(0);
     });
 
     it("returns null when session file is not found", async () => {
@@ -163,8 +164,8 @@ describe("session-context", () => {
       expect(result).not.toBeNull();
       // Last turn: 50000 + 0 + 100000 = 150000
       expect(result!.used_tokens).toBe(150_000);
-      expect(result!.percent).toBe(75);
-      expect(result!.summary).toBe("150k / 200k (75%)");
+      expect(result!.percent).toBe(15);
+      expect(result!.summary).toBe("150k / 1m (15%)");
     });
 
     it("does not carry cache tokens forward from earlier turns", async () => {
@@ -206,6 +207,76 @@ describe("session-context", () => {
       expect(result!.used_tokens).toBe(5000);
     });
 
+    it("detects compaction events", async () => {
+      const session_id = "compact-ev-1234-5678-9012-123456789012";
+      const file_path = join(tmp_dir, ".claude", "projects", "test-project", `${session_id}.jsonl`);
+
+      // Simulate: context grows, then drops sharply (compaction), grows again,
+      // drops sharply again (second compaction).
+      const lines = [
+        // Turn 1: 100k total
+        JSON.stringify({
+          type: "assistant",
+          message: { usage: { input_tokens: 80000, cache_creation_input_tokens: 10000, cache_read_input_tokens: 10000, output_tokens: 500 } },
+        }),
+        // Turn 2: grows to 200k
+        JSON.stringify({
+          type: "assistant",
+          message: { usage: { input_tokens: 150000, cache_creation_input_tokens: 20000, cache_read_input_tokens: 30000, output_tokens: 600 } },
+        }),
+        // Turn 3: drops to 50k — compaction #1 (50k < 200k * 0.5)
+        JSON.stringify({
+          type: "assistant",
+          message: { usage: { input_tokens: 40000, cache_creation_input_tokens: 5000, cache_read_input_tokens: 5000, output_tokens: 300 } },
+        }),
+        // Turn 4: grows back to 150k
+        JSON.stringify({
+          type: "assistant",
+          message: { usage: { input_tokens: 100000, cache_creation_input_tokens: 20000, cache_read_input_tokens: 30000, output_tokens: 400 } },
+        }),
+        // Turn 5: drops to 30k — compaction #2 (30k < 150k * 0.5)
+        JSON.stringify({
+          type: "assistant",
+          message: { usage: { input_tokens: 20000, cache_creation_input_tokens: 5000, cache_read_input_tokens: 5000, output_tokens: 200 } },
+        }),
+      ];
+      await writeFile(file_path, lines.join("\n"));
+
+      const result = await read_session_context(session_id);
+      expect(result).not.toBeNull();
+      expect(result!.compactions).toBe(2);
+      expect(result!.used_tokens).toBe(30_000);
+    });
+
+    it("does not count minor token decreases as compactions", async () => {
+      const session_id = "no-cmpact-1234-5678-9012-123456789012";
+      const file_path = join(tmp_dir, ".claude", "projects", "test-project", `${session_id}.jsonl`);
+
+      // Simulate minor decreases (10-20%) — not compactions
+      const lines = [
+        // Turn 1: 100k total
+        JSON.stringify({
+          type: "assistant",
+          message: { usage: { input_tokens: 80000, cache_creation_input_tokens: 10000, cache_read_input_tokens: 10000, output_tokens: 500 } },
+        }),
+        // Turn 2: drops to 90k (10% decrease — NOT a compaction)
+        JSON.stringify({
+          type: "assistant",
+          message: { usage: { input_tokens: 70000, cache_creation_input_tokens: 10000, cache_read_input_tokens: 10000, output_tokens: 400 } },
+        }),
+        // Turn 3: drops to 72k (20% decrease — NOT a compaction, still above 50%)
+        JSON.stringify({
+          type: "assistant",
+          message: { usage: { input_tokens: 52000, cache_creation_input_tokens: 10000, cache_read_input_tokens: 10000, output_tokens: 300 } },
+        }),
+      ];
+      await writeFile(file_path, lines.join("\n"));
+
+      const result = await read_session_context(session_id);
+      expect(result).not.toBeNull();
+      expect(result!.compactions).toBe(0);
+    });
+
     it("formats sub-thousand token counts correctly", async () => {
       const session_id = "small-tok-1234-5678-9012-123456789012";
       const file_path = join(tmp_dir, ".claude", "projects", "test-project", `${session_id}.jsonl`);
@@ -220,7 +291,7 @@ describe("session-context", () => {
 
       const result = await read_session_context(session_id);
       expect(result).not.toBeNull();
-      expect(result!.summary).toBe("500 / 200k (0.3%)");
+      expect(result!.summary).toBe("500 / 1m (0.1%)");
     });
   });
 });

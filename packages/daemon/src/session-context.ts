@@ -15,12 +15,14 @@ import * as sentry from "./sentry.js";
 export interface SessionContextUsage {
   /** Total tokens consumed across all assistant turns. */
   used_tokens: number;
-  /** Model context window size (200k for opus/sonnet). */
+  /** Model context window size (1M for opus/sonnet). */
   total_tokens: number;
   /** Percentage of context used, e.g. 22.5 */
   percent: number;
-  /** Formatted summary, e.g. "45k / 200k (22.5%)" */
+  /** Formatted summary, e.g. "45k / 1m (4.5%)" */
   summary: string;
+  /** Number of compaction events detected in this session. */
+  compactions: number;
 }
 
 /** Token usage fields from a single assistant message in the JSONL transcript. */
@@ -34,7 +36,7 @@ interface MessageUsage {
 // ── Constants ──
 
 /** Default context window size for Claude opus/sonnet models. */
-const DEFAULT_CONTEXT_WINDOW = 200_000;
+const DEFAULT_CONTEXT_WINDOW = 1_000_000;
 
 /** Root directory for Claude Code project sessions.
  * Resolved lazily via function so tests can mock homedir(). */
@@ -89,7 +91,7 @@ export async function find_session_file(session_id: string): Promise<string | nu
  * We use the LAST assistant turn's input_tokens as the context fill indicator,
  * since each turn's input_tokens includes all prior context.
  */
-async function parse_session_usage(file_path: string): Promise<{ used_tokens: number; model: string | null }> {
+async function parse_session_usage(file_path: string): Promise<{ used_tokens: number; model: string | null; compactions: number }> {
   const content = await readFile(file_path, "utf-8");
   const lines = content.split("\n").filter(Boolean);
 
@@ -97,6 +99,10 @@ async function parse_session_usage(file_path: string): Promise<{ used_tokens: nu
   let last_cache_creation = 0;
   let last_cache_read = 0;
   let model: string | null = null;
+
+  // Compaction detection: track previous turn's total and count sharp drops.
+  let prev_total = 0;
+  let compactions = 0;
 
   for (const line of lines) {
     try {
@@ -122,6 +128,14 @@ async function parse_session_usage(file_path: string): Promise<{ used_tokens: nu
         last_input_tokens = usage.input_tokens;
         last_cache_creation = usage.cache_creation_input_tokens ?? 0;
         last_cache_read = usage.cache_read_input_tokens ?? 0;
+
+        // Detect compaction: if the current turn's total drops below 50% of
+        // the previous turn's total, Claude compacted the conversation.
+        const current_total = last_input_tokens + last_cache_creation + last_cache_read;
+        if (prev_total > 0 && current_total < prev_total * 0.5) {
+          compactions++;
+        }
+        prev_total = current_total;
       }
     } catch {
       // Skip malformed lines
@@ -132,7 +146,7 @@ async function parse_session_usage(file_path: string): Promise<{ used_tokens: nu
   // input_tokens counts non-cached tokens; cache_creation + cache_read
   // count the cached portion. Together they represent the full prompt.
   const used_tokens = last_input_tokens + last_cache_creation + last_cache_read;
-  return { used_tokens, model };
+  return { used_tokens, model, compactions };
 }
 
 // ── Public API ──
@@ -152,12 +166,12 @@ export async function read_session_context(session_id: string): Promise<SessionC
       return null;
     }
 
-    const { used_tokens, model } = await parse_session_usage(file_path);
+    const { used_tokens, model, compactions } = await parse_session_usage(file_path);
     if (used_tokens === 0) {
       return null;
     }
 
-    // Determine context window from model. Default 200k for opus/sonnet.
+    // Determine context window from model. Default 1M for opus/sonnet.
     const total_tokens = resolve_context_window(model);
     const percent = Math.round((used_tokens / total_tokens) * 1000) / 10; // one decimal
 
@@ -166,6 +180,7 @@ export async function read_session_context(session_id: string): Promise<SessionC
       total_tokens,
       percent,
       summary: format_context_summary(used_tokens, total_tokens, percent),
+      compactions,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
@@ -181,7 +196,7 @@ export async function read_session_context(session_id: string): Promise<SessionC
 // ── Helpers ──
 
 /** Resolve the context window size based on model name.
- * All current Claude models (opus, sonnet) share a 200k window.
+ * All current Claude models (opus, sonnet) share a 1M window.
  * Expand the lookup here when models with different windows ship. */
 function resolve_context_window(_model: string | null): number {
   return DEFAULT_CONTEXT_WINDOW;
