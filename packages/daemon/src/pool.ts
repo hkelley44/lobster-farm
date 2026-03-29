@@ -14,6 +14,7 @@ import { resolve_model_id, resolve_effort } from "./models.js";
 import { sq } from "./shell.js";
 import { resolve_binary } from "./env.js";
 import * as sentry from "./sentry.js";
+import { notify } from "./actions.js";
 
 // ── Types ──
 
@@ -148,6 +149,10 @@ export class BotPool extends EventEmitter {
   /** Entity registry reference — set during initialize(), used by start_tmux()
    * to look up per-entity config (e.g., github_token_ref). */
   private registry: EntityRegistry | null = null;
+  /** Tracks crash timestamps per bot for crash loop detection.
+   * bot_id → array of crash timestamps (epoch ms). Old entries (>1 hour) are
+   * pruned on each health check to prevent unbounded growth. */
+  private crash_history = new Map<number, number[]>();
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -982,41 +987,145 @@ export class BotPool extends EventEmitter {
 
   /**
    * Check all assigned bots for dead tmux sessions.
+   * When a dead session is found, attempts to restart it automatically.
+   * If a bot crashes too often (>3 times in 1 hour), it's released instead
+   * of restarted to prevent crash loops.
    * Protected so tests can call it directly without waiting for the interval.
    */
   protected async check_assigned_health(): Promise<void> {
     if (this._draining) return;
 
-    let changed = false;
+    // Clean up old crash history entries (>1 hour) to prevent memory growth
+    this.cleanup_crash_history();
 
     for (const bot of this.bots) {
       if (bot.state !== "assigned") continue;
       if (this.is_tmux_alive(bot.tmux_session)) continue;
 
-      // Tmux session died — emit event and clean up
-      const event_data = {
-        bot_id: bot.id,
-        channel_id: bot.channel_id,
-        entity_id: bot.entity_id,
-      };
-
-      console.log(
-        `[pool] Detected dead tmux session for pool-${String(bot.id)} ` +
+      // Tmux session died — attempt recovery
+      console.warn(
+        `[pool] pool-${String(bot.id)} tmux crashed — attempting restart ` +
         `(channel: ${bot.channel_id ?? "none"})`,
       );
 
-      // Preserve session_id in history so the channel can resume when reassigned.
-      // This is the safety net for when the health monitor fires before a message
-      // triggers the lazy-resume path in handle_message().
-      if (bot.session_id && bot.channel_id && bot.entity_id) {
-        const key = `${bot.entity_id}:${bot.channel_id}`;
-        this.session_history.set(key, bot.session_id);
+      // Record this crash for loop detection
+      this.record_crash(bot.id);
+
+      // Check for crash loop before attempting restart
+      if (this.is_crash_loop(bot.id)) {
+        await this.handle_crash_loop(bot);
+        continue;
+      }
+
+      // Attempt restart
+      await this.restart_crashed_session(bot);
+    }
+  }
+
+  // ── Crash Recovery ──
+
+  /**
+   * Attempt to restart a crashed bot's tmux session. Preserves the existing
+   * session_id for --resume when available, otherwise spawns a fresh session.
+   * Posts to the entity's #alerts channel on success.
+   */
+  private async restart_crashed_session(bot: PoolBot): Promise<void> {
+    // Snapshot assignment state before we attempt anything — if restart fails
+    // we still need these for cleanup.
+    const entity_id = bot.entity_id;
+    const channel_id = bot.channel_id;
+    const archetype = bot.archetype;
+    const session_id = bot.session_id;
+
+    if (!entity_id || !archetype) {
+      console.error(
+        `[pool] Cannot restart pool-${String(bot.id)}: missing entity_id or archetype`,
+      );
+      return;
+    }
+
+    // Look up entity config for alerting and GH_TOKEN resolution
+    const entity_config = this.registry?.get(entity_id);
+
+    try {
+      // Resolve per-entity GitHub token (if configured)
+      const extra_env: Record<string, string> = {};
+      const github_token_ref = this.resolve_github_token_ref(entity_id);
+      if (github_token_ref) {
+        try {
+          extra_env.GH_TOKEN = await this.resolve_op_secret(github_token_ref);
+        } catch (err) {
+          console.warn(`[pool] Failed to resolve GH_TOKEN for ${entity_id}: ${String(err)}`);
+        }
+      }
+
+      // Write access.json so the Discord plugin listens on this channel
+      if (channel_id) {
+        await this.write_access_json(bot.state_dir, channel_id);
+      }
+
+      // Restart tmux — use --resume if we have a session_id
+      const working_dir = entity_dir(this.config.paths, entity_id);
+      const resume_id = session_id ?? randomUUID();
+      const is_resume = !!session_id;
+      await this.start_tmux(bot, archetype, entity_id, working_dir, resume_id, is_resume, extra_env);
+
+      // Update state — bot stays assigned with refreshed timestamps
+      bot.session_id = resume_id;
+      bot.last_active = new Date();
+      bot.assigned_at = new Date();
+
+      // Bridge a nudge message so the restarted session knows it was auto-recovered
+      try {
+        const pending_path = `/tmp/lf-pending-pool-${String(bot.id)}.txt`;
+        await writeFile(
+          pending_path,
+          "Your previous session crashed and was auto-restarted by the daemon. " +
+          "Resume where you left off.",
+          "utf-8",
+        );
+      } catch {
+        // Non-fatal — the nudge is a nice-to-have
+      }
+
+      await this.persist();
+
+      console.log(
+        `[pool] Restarted pool-${String(bot.id)} after crash ` +
+        `(${is_resume ? `resumed session: ${resume_id.slice(0, 8)}` : "fresh session"})`,
+      );
+
+      // Alert the entity's #alerts channel
+      await notify(
+        "alerts",
+        `\u26a0\ufe0f Pool bot ${String(bot.id)} (${archetype}) crashed and was auto-restarted for ${entity_id}`,
+        entity_config,
+      );
+
+      this.emit("bot:crash_restarted", {
+        bot_id: bot.id,
+        channel_id,
+        entity_id,
+        resumed: is_resume,
+      });
+    } catch (err) {
+      console.error(
+        `[pool] Failed to restart pool-${String(bot.id)} after crash: ${String(err)}`,
+      );
+      sentry.captureException(err, {
+        tags: { module: "pool", bot_id: String(bot.id), action: "crash_restart" },
+        contexts: { crash: { entity_id, session_id, channel_id } },
+      });
+
+      // Restart failed — fall back to the old behavior: stash session history and free the bot
+      if (session_id && channel_id && entity_id) {
+        const key = `${entity_id}:${channel_id}`;
+        this.session_history.set(key, session_id);
         console.log(
-          `[pool] Stashed session history for ${key}: ${bot.session_id.slice(0, 8)}`,
+          `[pool] Stashed session history for ${key}: ${session_id.slice(0, 8)}`,
         );
       }
 
-      // Reset bot to free state
       bot.state = "free";
       bot.channel_id = null;
       bot.entity_id = null;
@@ -1027,13 +1136,87 @@ export class BotPool extends EventEmitter {
       bot.effort = null;
       bot.last_active = null;
       bot.assigned_at = null;
-      changed = true;
 
-      this.emit("bot:session_ended", event_data);
+      await this.persist();
+
+      this.emit("bot:session_ended", {
+        bot_id: bot.id,
+        channel_id,
+        entity_id,
+      });
       this.emit("bot:released", { bot_id: bot.id });
     }
+  }
 
-    if (changed) await this.persist();
+  /**
+   * Handle a crash loop — release the bot and alert.
+   * Called when a bot has crashed >3 times in the last hour.
+   */
+  private async handle_crash_loop(bot: PoolBot): Promise<void> {
+    const entity_id = bot.entity_id;
+    const channel_id = bot.channel_id;
+    const archetype = bot.archetype;
+
+    console.error(
+      `[pool] Crash loop detected for pool-${String(bot.id)} — releasing`,
+    );
+
+    // Look up entity config for alerting
+    const entity_config = entity_id ? this.registry?.get(entity_id) : undefined;
+
+    // Stash session history before release so the channel can resume later
+    if (bot.session_id && channel_id && entity_id) {
+      const key = `${entity_id}:${channel_id}`;
+      this.session_history.set(key, bot.session_id);
+    }
+
+    // Release the bot — this kills tmux, frees the bot, clears access.json
+    if (channel_id) {
+      await this.release(channel_id);
+    }
+
+    // Alert the entity's #alerts channel
+    await notify(
+      "alerts",
+      `\ud83d\udd34 Pool bot ${String(bot.id)} crash loop detected for ${entity_id ?? "unknown"} — released. Check daemon logs.`,
+      entity_config,
+    );
+
+    this.emit("bot:crash_loop", {
+      bot_id: bot.id,
+      channel_id,
+      entity_id,
+      archetype,
+    });
+  }
+
+  /** Record a crash event for a bot. */
+  private record_crash(bot_id: number): void {
+    const timestamps = this.crash_history.get(bot_id) ?? [];
+    timestamps.push(Date.now());
+    this.crash_history.set(bot_id, timestamps);
+  }
+
+  /** Check if a bot is in a crash loop (>3 crashes in the last hour). */
+  private is_crash_loop(bot_id: number): boolean {
+    const timestamps = this.crash_history.get(bot_id);
+    if (!timestamps) return false;
+    const one_hour_ago = Date.now() - 60 * 60 * 1000;
+    const recent = timestamps.filter(t => t > one_hour_ago);
+    return recent.length > 3;
+  }
+
+  /** Remove crash history entries older than 1 hour to prevent memory growth. */
+  private cleanup_crash_history(): void {
+    const one_hour_ago = Date.now() - 60 * 60 * 1000;
+    for (const [bot_id, timestamps] of this.crash_history) {
+      const recent = timestamps.filter(t => t > one_hour_ago);
+      if (recent.length === 0) {
+        this.crash_history.delete(bot_id);
+      } else {
+        this.crash_history.set(bot_id, recent);
+      }
+    }
   }
 
   /** Stop all pool bot sessions. Used during daemon shutdown. */

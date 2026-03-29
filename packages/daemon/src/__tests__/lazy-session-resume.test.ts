@@ -228,8 +228,8 @@ describe("lazy session resume (issue #72)", () => {
 
   // ── check_assigned_health() preserves session_id ──
 
-  describe("check_assigned_health() preserves session_id", () => {
-    it("stashes session_id in history when tmux dies", async () => {
+  describe("check_assigned_health() auto-restarts crashed sessions", () => {
+    it("auto-restarts bot with --resume when tmux dies", async () => {
       const bot = make_bot({
         id: 1,
         state: "assigned",
@@ -243,13 +243,18 @@ describe("lazy session resume (issue #72)", () => {
 
       await pool.run_health_check();
 
-      // Session should be stashed before cleanup
-      expect(pool.get_session_history().get("e1:ch-1")).toBe("sess-health-check");
+      // Bot should still be assigned (auto-restarted, not freed)
+      const restarted_bot = pool.get_bots().find(b => b.id === 1)!;
+      expect(restarted_bot.state).toBe("assigned");
+      expect(restarted_bot.session_id).toBe("sess-health-check");
 
-      // Bot should be freed
-      const cleaned_bot = pool.get_bots().find(b => b.id === 1)!;
-      expect(cleaned_bot.state).toBe("free");
-      expect(cleaned_bot.session_id).toBeNull();
+      // start_tmux should have been called with is_resume=true
+      const start_tmux_spy = pool["start_tmux" as keyof typeof pool] as unknown as {
+        mock: { calls: unknown[][] };
+      };
+      const last_call = start_tmux_spy.mock.calls[start_tmux_spy.mock.calls.length - 1]!;
+      expect(last_call[4]).toBe("sess-health-check"); // session_id
+      expect(last_call[5]).toBe(true); // is_resume
     });
 
     it("does not stash for bots with no session_id", async () => {
@@ -292,7 +297,7 @@ describe("lazy session resume (issue #72)", () => {
       expect(alive_bot.session_id).toBe("sess-alive");
     });
 
-    it("emits bot:session_ended for dead bots", async () => {
+    it("emits bot:crash_restarted for dead bots", async () => {
       const bot = make_bot({
         id: 1,
         state: "assigned",
@@ -305,15 +310,16 @@ describe("lazy session resume (issue #72)", () => {
       pool.set_tmux_alive("pool-1", false);
 
       const events: unknown[] = [];
-      pool.on("bot:session_ended", (info: unknown) => events.push(info));
+      pool.on("bot:crash_restarted", (info: unknown) => events.push(info));
 
       await pool.run_health_check();
 
       expect(events).toHaveLength(1);
-      expect(events[0]).toEqual({
+      expect(events[0]).toMatchObject({
         bot_id: 1,
         channel_id: "ch-1",
         entity_id: "e1",
+        resumed: true,
       });
     });
   });
@@ -361,7 +367,7 @@ describe("lazy session resume (issue #72)", () => {
       expect(last_call[5]).toBe(true); // is_resume arg
     });
 
-    it("health monitor stash followed by assign also resumes", async () => {
+    it("health monitor auto-restarts bot — no manual reassign needed", async () => {
       const bot = make_bot({
         id: 1,
         state: "assigned",
@@ -373,17 +379,15 @@ describe("lazy session resume (issue #72)", () => {
       pool.inject_bots([bot]);
       pool.set_tmux_alive("pool-1", false);
 
-      // Step 1: Health monitor fires, detects dead tmux
+      // Health monitor fires — bot is auto-restarted, stays assigned
       await pool.run_health_check();
 
-      expect(pool.get_session_history().get("e1:ch-1")).toBe("sess-health-resume");
-      expect(pool.get_bots().find(b => b.id === 1)!.state).toBe("free");
+      const restarted_bot = pool.get_bots().find(b => b.id === 1)!;
+      expect(restarted_bot.state).toBe("assigned");
+      expect(restarted_bot.session_id).toBe("sess-health-resume");
+      expect(restarted_bot.channel_id).toBe("ch-1");
 
-      // Step 2: Next message triggers assign
-      const result = await pool.assign("ch-1", "e1", "planner", undefined, "general");
-
-      expect(result).not.toBeNull();
-      expect(result!.session_id).toBe("sess-health-resume");
+      // No session history stash needed — the bot was restarted in place
       expect(pool.get_session_history().has("e1:ch-1")).toBe(false);
     });
   });
@@ -416,7 +420,7 @@ describe("lazy session resume (issue #72)", () => {
       expect(pool.get_session_history().get("e1:ch-1")).toBe("sess-race");
     });
 
-    it("health monitor fires first, then message triggers assign with resume", async () => {
+    it("health monitor auto-restarts before message arrives — no race", async () => {
       const bot = make_bot({
         id: 1,
         state: "assigned",
@@ -428,20 +432,13 @@ describe("lazy session resume (issue #72)", () => {
       pool.inject_bots([bot]);
       pool.set_tmux_alive("pool-1", false);
 
-      // Health monitor fires first
+      // Health monitor fires — auto-restarts the bot
       await pool.run_health_check();
 
-      expect(pool.get_session_history().get("e1:ch-1")).toBe("sess-monitor-first");
-
-      // Message arrives — get_assignment returns undefined (bot was freed).
-      // In discord.ts, this means assignment is falsy and we go to auto-assign.
+      // Bot is still assigned — message path sees a live assignment
       const assignment = pool.get_assignment("ch-1");
-      expect(assignment).toBeUndefined();
-
-      // Auto-assign picks up history
-      const result = await pool.assign("ch-1", "e1", "builder", undefined, "general");
-      expect(result).not.toBeNull();
-      expect(result!.session_id).toBe("sess-monitor-first");
+      expect(assignment).toBeDefined();
+      expect(assignment!.session_id).toBe("sess-monitor-first");
     });
   });
 });
