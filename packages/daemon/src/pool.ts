@@ -1047,6 +1047,27 @@ export class BotPool extends EventEmitter {
           continue;
         }
 
+        // Orphan bot — no assignment metadata to restart with.
+        // Free immediately and log so crash recovery is visible.
+        if (!bot.entity_id || !bot.channel_id) {
+          console.log(
+            `[pool] Freeing orphan pool-${String(bot.id)} (no metadata — cannot restart)`,
+          );
+          bot.state = "free";
+          bot.channel_id = null;
+          bot.entity_id = null;
+          bot.archetype = null;
+          bot.channel_type = null;
+          bot.session_id = null;
+          bot.model = null;
+          bot.effort = null;
+          bot.last_active = null;
+          bot.assigned_at = null;
+          await this.persist();
+          this.emit("bot:released", { bot_id: bot.id });
+          continue;
+        }
+
         // Attempt restart
         await this.restart_crashed_session(bot);
       }
@@ -1074,6 +1095,17 @@ export class BotPool extends EventEmitter {
       console.error(
         `[pool] Cannot restart pool-${String(bot.id)}: missing fields — force-freeing`,
       );
+
+      // Stash session history when possible — allows a future assignment on
+      // this channel to resume the session even though we can't restart now.
+      if (session_id && channel_id && entity_id) {
+        const key = `${entity_id}:${channel_id}`;
+        this.session_history.set(key, session_id);
+        console.log(
+          `[pool] Stashed session history for ${key}: ${session_id.slice(0, 8)}`,
+        );
+      }
+
       bot.state = "free";
       bot.channel_id = null;
       bot.entity_id = null;
