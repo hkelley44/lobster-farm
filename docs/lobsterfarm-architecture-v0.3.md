@@ -590,7 +590,7 @@ phases:
 The build phase supports asynchronous collaboration:
 
 ```
-You (work-room-1, 9:00am): "Build the candlestick chart. Spec in #42."
+You (work-room-candlestick, 9:00am): "Build the candlestick chart. Spec in #42."
 
 Agent (alerts, 9:15am): "Starting #42. Reading spec, creating worktree.
   Question: Should indicators be pluggable or fixed set? Affects module architecture."
@@ -635,9 +635,7 @@ LobsterFarm (Server)
 │
 ├── ENTITY: Trading Platform [alpha]
 │   ├── #general             # Entity-level: PM conversations, project mgmt
-│   ├── #work-room-1         # Feature workspace (dynamically assigned)
-│   ├── #work-room-2         # Feature workspace
-│   ├── #work-room-3         # Feature workspace
+│   ├── #work-room-{name}    # Created on demand by daemon for feature work
 │   └── #alerts              # Approvals, blockers, questions from agents
 │
 ├── ENTITY: SaaS Product [beta]
@@ -646,7 +644,7 @@ LobsterFarm (Server)
 └── ... (one category per entity)
 ```
 
-**Work room management:** Daemon assigns features to empty work rooms and posts a header. When feature ships, room is released. If all rooms occupied, new features queue.
+**Work room management:** Daemon creates work rooms on demand (e.g. `#work-room-candlestick`) and assigns agents. When the feature ships, the room is archived.
 
 **No gateway restart needed for routing changes.** Unlike OpenClaw, the daemon manages session-to-channel mappings at runtime. Adding entities, assigning rooms, and changing configurations are all hot operations.
 
@@ -655,9 +653,9 @@ LobsterFarm (Server)
 Claude Code Channels (v2.1.80+) are MCP servers that push events into running sessions. The daemon manages which sessions are running and where:
 
 ```
-Discord message in #work-room-1
+Discord message in #work-room-candlestick
   → Claude Code Channels plugin (MCP, outbound polling)
-    → Delivers to the Claude Code session assigned to work-room-1
+    → Delivers to the Claude Code session assigned to work-room-candlestick
       → Agent processes, responds
         → Response sent back to Discord via Channels
 
@@ -1002,7 +1000,7 @@ Worktrees:
 | Feature stage | Phase | plan, design, build, review, ship |
 | Model + think config | Tier | opus-high, sonnet-standard |
 | Discord entity channel | General | #general |
-| Discord feature workspace | Work Room | #work-room-1 |
+| Discord feature workspace | Work Room | #work-room-{name} |
 | Human attention needed | Alerts | #alerts |
 
 ---
