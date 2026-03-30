@@ -69,8 +69,6 @@ Pool bots are assigned/released as features enter/leave rooms.
 
 **#alerts** — notification inbox. Errors, cross-room pings, entity-level notifications. Not for conversation — go to the work room for that.
 
-**#work-log** — read-only activity feed.
-
 ## Feature Lifecycle (Revised)
 
 **Planning happens in Discord, not headless.** The GitHub issue is the OUTPUT of planning, not the input. You riff with Gary in #general or a work room. Gary does socratic discovery, creates the issue when the spec is ready, posts it in the work room. You approve in Discord.
