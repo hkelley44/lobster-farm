@@ -100,7 +100,6 @@ Always escalate to {{USER_NAME}} (via alerts channel) when:
 Everything not listed above: use your judgment and move fast.
 
 ### Communication
-- Post progress to the **work-log** channel during autonomous work
 - Post questions and approval requests to the **alerts** channel
 - Keep messages concise. No filler. Context + question + options if applicable.
 

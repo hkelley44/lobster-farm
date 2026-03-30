@@ -385,7 +385,6 @@ entity:
       work_room_1: { id: "...", purpose: "Feature workspace", assigned_feature: null }
       work_room_2: { id: "...", purpose: "Feature workspace", assigned_feature: null }
       work_room_3: { id: "...", purpose: "Feature workspace", assigned_feature: null }
-      work_log: { id: "...", purpose: "Agent activity feed" }
       alerts: { id: "...", purpose: "Approvals, blockers, questions" }
 
   agent_mode: "hybrid"  # dedicated | generalist | hybrid
@@ -464,9 +463,6 @@ phases:
           labels: ["planning", "entity:{entity.id}"]
       - assign-work-room:
           entity: "{entity.id}"
-      - notify:
-          channel: work_log
-          message: "Planning started: {feature.title}"
     agent:
       archetype: gary
       dna: [planning-dna]
@@ -489,9 +485,6 @@ phases:
       - create-worktree:
           branch: "feature/{feature.github_issue}-{feature.slug}"
       - compile-context
-      - notify:
-          channel: work_log
-          message: "Design phase started: #{feature.github_issue}"
     agent:
       archetype: pearl
       dna: [design-dna, coding-dna]
@@ -599,22 +592,16 @@ The build phase supports asynchronous collaboration:
 ```
 You (work-room-1, 9:00am): "Build the candlestick chart. Spec in #42."
 
-Agent (work-log): "Starting #42. Reading spec, creating worktree."
-Agent (work-log): "Setting up component structure."
-
-Agent (alerts, 9:15am): "Question on #42: Should indicators be
-  pluggable or fixed set? Affects module architecture."
+Agent (alerts, 9:15am): "Starting #42. Reading spec, creating worktree.
+  Question: Should indicators be pluggable or fixed set? Affects module architecture."
 
 [You respond when available — minutes or hours]
 
 You (alerts, 10:30am): "Pluggable. Register functions that receive
   OHLCV, return overlay data."
 
-Agent (work-log): "Implementing plugin architecture."
-Agent (work-log): "Complete. 12 tests, 94% coverage."
-
-Agent (alerts, 11:00am): "Build done for #42. Preview at localhost:3001.
-  Ready for review?"
+Agent (alerts, 11:00am): "Build done for #42. 12 tests, 94% coverage.
+  Preview at localhost:3001. Ready for review?"
 ```
 
 This works because: worktree persists state, GitHub issue tracks spec, MEMORY.md provides context if session expires, daemon tracks phase and can resume.
@@ -651,7 +638,6 @@ LobsterFarm (Server)
 │   ├── #work-room-1         # Feature workspace (dynamically assigned)
 │   ├── #work-room-2         # Feature workspace
 │   ├── #work-room-3         # Feature workspace
-│   ├── #work-log            # Agent activity feed (all features)
 │   └── #alerts              # Approvals, blockers, questions from agents
 │
 ├── ENTITY: SaaS Product [beta]
@@ -930,7 +916,7 @@ Worktrees:
 - [ ] Test Peekaboo integration (install, permissions, basic automation)
 - [ ] Write context compilation script (entity memory → worktree CLAUDE.md)
 - [ ] Write memory extraction stop hook script
-- [ ] Set up Discord server (entity category + 3 work rooms + work-log + alerts)
+- [ ] Set up Discord server (entity category + 3 work rooms + alerts)
 - [ ] Manual feature lifecycle: plan in Discord → build in worktree → PR → review → merge
 - [ ] Test session resume for feature continuity
 
@@ -1017,7 +1003,6 @@ Worktrees:
 | Model + think config | Tier | opus-high, sonnet-standard |
 | Discord entity channel | General | #general |
 | Discord feature workspace | Work Room | #work-room-1 |
-| Agent activity feed | Work Log | #work-log |
 | Human attention needed | Alerts | #alerts |
 
 ---

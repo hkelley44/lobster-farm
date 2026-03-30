@@ -1328,8 +1328,6 @@ review: [<span class="str">"review-guideline"</span>]        <span class="cm">//
         <span class="key">id</span>: <span class="str">"..."</span>
       - <span class="key">type</span>: <span class="str">work_room</span>
         <span class="key">id</span>: <span class="str">"..."</span>
-      - <span class="key">type</span>: <span class="str">work_log</span>      <span class="cm"># Activity feed</span>
-        <span class="key">id</span>: <span class="str">"..."</span>
       - <span class="key">type</span>: <span class="str">alerts</span>        <span class="cm"># Approvals, questions</span>
         <span class="key">id</span>: <span class="str">"..."</span>
 
@@ -1344,13 +1342,12 @@ review: [<span class="str">"review-guideline"</span>]        <span class="cm">//
   </details>
 
   <h3>Discord channel structure</h3>
-  <p>Each entity gets a Discord category with five channels:</p>
+  <p>Each entity gets a Discord category with these channels:</p>
   <table>
     <thead><tr><th>Channel</th><th>Type</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>#general</code></td><td>general</td><td>Discovery, planning, coordination with the Planner</td></tr>
       <tr><td><code>#work-room-1/2/3</code></td><td>work_room</td><td>Feature workspaces -- one agent at a time, interactive sessions</td></tr>
-      <tr><td><code>#work-log</code></td><td>work_log</td><td>Agent activity feed -- progress updates, session starts/stops</td></tr>
       <tr><td><code>#alerts</code></td><td>alerts</td><td>Approvals, blockers, escalations that need human attention</td></tr>
     </tbody>
   </table>

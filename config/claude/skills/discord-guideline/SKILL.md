@@ -46,7 +46,6 @@ Entity scaffolding is also available via the `/scaffold` slash command in Discor
 Channel structure is defined by the entity's blueprint. For the `software` blueprint:
 - `#general` — entity discussion and coordination
 - `#work-room-1` through `#work-room-3` — feature workspaces
-- `#work-log` — agent activity feed
 - `#alerts` — approvals, blockers, questions
 
 ## discord.js Patterns
@@ -108,7 +107,7 @@ import { ChannelType } from "discord.js";
 ## Naming Conventions
 
 - Categories: `{Entity Name} [{entity-id}]` (e.g. "My SaaS [my-saas]")
-- Channels: lowercase, hyphenated (e.g. `work-room-1`, `work-log`)
+- Channels: lowercase, hyphenated (e.g. `work-room-1`, `alerts`)
 - Global category: `GLOBAL` (uppercase)
 - Webhooks: `LobsterFarm Agent` (shared per channel, agents differentiate via username)
 
