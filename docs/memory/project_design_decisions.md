@@ -61,11 +61,7 @@ This means pool size is a soft limit. Sessions are preserved on disk — parking
 
 **#general** — Gary (planner) owns this channel. Discovery, brainstorming, "what should we build." Features spin out of conversations here into work rooms. Gary is the entity-level project manager. Gets a dedicated pool bot (persistent, rarely parked).
 
-**#work-room-N** — one feature per room, one active agent at a time. Phase determines which agent. Room has a pinned status message updated by the daemon:
-- `🟢 Available`
-- `🔵 Secret Scanning Hook — Plan`
-- `🟡 Secret Scanning Hook — Build`
-Pool bots are assigned/released as features enter/leave rooms.
+**#work-room-{name}** — created on demand by the daemon for feature work (e.g. `#work-room-doppelganger`). One feature per room, one active agent at a time. Phase determines which agent. Channel topic shows current status. Pool bots are assigned/released as features enter/leave rooms.
 
 **#alerts** — notification inbox. Errors, cross-room pings, entity-level notifications. Not for conversation — go to the work room for that.
 
