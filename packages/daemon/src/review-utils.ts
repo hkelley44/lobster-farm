@@ -421,8 +421,9 @@ export async function check_ci_status(
       failures,
     };
   } catch {
-    // If gh pr checks fails (e.g. no checks configured, API error),
-    // treat as "no checks" and allow merge to proceed
-    return { passed: true, pending: false, failures: [] };
+    // gh pr checks command failed — could be rate limit, auth error, or network issue.
+    // Treat as pending to avoid bypassing CI gates on infrastructure failures.
+    // pr-cron will retry on the next cycle.
+    return { passed: false, pending: true, failures: [] };
   }
 }

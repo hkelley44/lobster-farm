@@ -192,15 +192,15 @@ describe("check_ci_status", () => {
     expect(result.failures).toEqual([]);
   });
 
-  it("returns passed when gh pr checks command fails (no checks configured)", async () => {
+  it("returns pending when gh pr checks command fails (infrastructure error)", async () => {
     route_exec({
-      "gh pr checks": () => new Error("no checks configured for this repository"),
+      "gh pr checks": () => new Error("API rate limit exceeded"),
     });
 
     const result = await check_ci_status(42, "/tmp/test-repo");
 
-    expect(result.passed).toBe(true);
-    expect(result.pending).toBe(false);
+    expect(result.passed).toBe(false);
+    expect(result.pending).toBe(true);
     expect(result.failures).toEqual([]);
   });
 
@@ -502,6 +502,112 @@ describe("webhook handler — workflow_run events", () => {
 
     expect(res._status).toBe(200);
     const discord = ctx.discord as unknown as { send_to_entity: ReturnType<typeof vi.fn> };
+    expect(discord.send_to_entity).not.toHaveBeenCalled();
+  });
+});
+
+// ── Integration tests: review-completion → CI gating ──
+
+describe("webhook handler — CI gating on review completion", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  /**
+   * Helper: send a PR webhook, wait for spawn, then emit session:completed
+   * to trigger handle_review_completion. Returns the context for assertions.
+   */
+  async function trigger_review_completion(
+    ci_route: ExecRoute,
+  ): Promise<{ ctx: WebhookContext; discord: { send_to_entity: ReturnType<typeof vi.fn> } }> {
+    // Route gh pr view (check_pr_merged → not merged) and gh pr checks (CI status)
+    route_exec({
+      "gh pr view": () => ({ stdout: "OPEN" }),
+      "gh pr checks": ci_route,
+    });
+
+    const payload = JSON.stringify({
+      action: "opened",
+      pull_request: {
+        number: 42,
+        title: "feat: test feature",
+        head: { ref: "feature/test" },
+        body: "Test body",
+        user: { login: "test-user" },
+      },
+      repository: { full_name: "test-org/lobster-farm" },
+      installation: { id: 12345 },
+    });
+
+    const ctx = make_context();
+    const req = make_request(payload, {
+      "x-hub-signature-256": sign_payload(payload),
+      "x-github-event": "pull_request",
+    });
+    const res = make_response();
+
+    await handle_github_webhook(req, res, ctx);
+
+    // Wait for spawn_review to set up listeners
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Emit session:completed to trigger handle_review_completion
+    const session_manager = ctx.session_manager as unknown as EventEmitter;
+    session_manager.emit("session:completed", {
+      session_id: "test-session-123",
+      exit_code: 0,
+    });
+
+    // Wait for the async handle_review_completion chain
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const discord = ctx.discord as unknown as { send_to_entity: ReturnType<typeof vi.fn> };
+    return { ctx, discord };
+  }
+
+  it("blocks merge and sends alert when CI checks are failing", async () => {
+    const { discord } = await trigger_review_completion(() => ({
+      stdout: JSON.stringify([
+        { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
+        { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
+      ]),
+    }));
+
+    // Should alert about CI failure, not attempt merge
+    expect(discord.send_to_entity).toHaveBeenCalledWith(
+      "test-entity",
+      "alerts",
+      expect.stringContaining("CI checks failed"),
+      "reviewer",
+    );
+    expect(discord.send_to_entity).toHaveBeenCalledWith(
+      "test-entity",
+      "alerts",
+      expect.stringContaining("Build"),
+      "reviewer",
+    );
+  });
+
+  it("skips merge when CI checks are pending (no alert, retries on next cycle)", async () => {
+    const { discord } = await trigger_review_completion(() => ({
+      stdout: JSON.stringify([
+        { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
+        { name: "Build", state: "IN_PROGRESS", conclusion: "" },
+      ]),
+    }));
+
+    // Should not send any alerts — pending is a silent skip
+    expect(discord.send_to_entity).not.toHaveBeenCalled();
+  });
+
+  it("blocks merge when gh pr checks command fails (infrastructure error)", async () => {
+    const { discord } = await trigger_review_completion(
+      () => new Error("API rate limit exceeded"),
+    );
+
+    // Command failure returns { passed: false, pending: true } — silent skip, no alert
     expect(discord.send_to_entity).not.toHaveBeenCalled();
   });
 });

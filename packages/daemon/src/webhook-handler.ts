@@ -447,8 +447,7 @@ async function handle_review_completion(
         console.log(
           `[webhook] CI checks pending for PR #${String(pr.number)} — skipping merge (will retry)`,
         );
-        // Don't merge yet — webhook will re-trigger when checks complete,
-        // or pr-cron will pick it up on the next cycle
+        // Don't merge yet — pr-cron will pick this up on the next cycle
       } else if (ci.failures.length > 0) {
         await notify_alerts(
           entity_id,
@@ -784,8 +783,9 @@ async function handle_workflow_run(
     return;
   }
 
-  // Only care about failures on main from push events (deploy workflows)
+  // Only care about completed failures on main from push events (deploy workflows)
   if (
+    payload.action !== "completed" ||
     workflow.conclusion !== "failure" ||
     workflow.event !== "push" ||
     workflow.head_branch !== "main"
