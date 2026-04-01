@@ -7,7 +7,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import type { DiscordBot } from "./discord.js";
 import type { GitHubAppAuth } from "./github-app.js";
-import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge } from "./review-utils.js";
+import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status } from "./review-utils.js";
 import { detect_review_outcome } from "./actions.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { PRReviewState } from "./persistence.js";
@@ -388,6 +388,12 @@ export class PRReviewCron {
       `- If the code is genuinely clean with no improvements needed, approve:`,
       `  gh pr review ${String(pr.number)} --approve --body "Looks good."`,
       ``,
+      `Before merging, check CI status:`,
+      `  gh pr checks ${String(pr.number)} --required`,
+      `If any required checks are failing or pending, do NOT merge.`,
+      `Instead, note the failing checks in your review and request changes.`,
+      `If no CI workflows are configured for this repo, proceed with merge normally.`,
+      ``,
       `After posting your review:`,
       `- If you approved, merge the PR:`,
       `  gh pr merge ${String(pr.number)} --squash --delete-branch`,
@@ -551,22 +557,37 @@ export class PRReviewCron {
           );
         }
       } else if (is_internal) {
-        // Internal PR not yet merged — attempt auto-merge with rebase (#166)
-        const result = await attempt_auto_merge(
-          pr.number, pr.headRefName, repo_path, this.gh_bin, gh_token,
-        );
+        // Check CI status before attempting merge (#189)
+        const ci = await check_ci_status(pr.number, repo_path, gh_token);
 
-        if (result.merged) {
-          await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
+        if (ci.pending) {
+          console.log(
+            `[pr-cron] CI checks pending for PR #${String(pr.number)} — skipping merge (will retry next cycle)`,
+          );
+          // Don't merge yet — cron will pick it up again next cycle
+        } else if (ci.failures.length > 0) {
           await this.notify_alerts(
             entity_id,
-            `PR #${String(pr.number)}: ${pr.title} — approved, auto-rebased (${result.method}), and merged to main`,
+            `PR #${String(pr.number)}: ${pr.title} — approved but CI checks failed: ${ci.failures.join(", ")}. Not merging.`,
           );
         } else {
-          await this.notify_alerts(
-            entity_id,
-            `PR #${String(pr.number)}: ${pr.title} — approved but merge failed after rebase attempt. ${result.error ?? "Manual intervention needed."}`,
+          // All checks passed (or none configured) — attempt auto-merge with rebase (#166)
+          const result = await attempt_auto_merge(
+            pr.number, pr.headRefName, repo_path, this.gh_bin, gh_token,
           );
+
+          if (result.merged) {
+            await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
+            await this.notify_alerts(
+              entity_id,
+              `PR #${String(pr.number)}: ${pr.title} — approved, auto-rebased (${result.method}), and merged to main`,
+            );
+          } else {
+            await this.notify_alerts(
+              entity_id,
+              `PR #${String(pr.number)}: ${pr.title} — approved but merge failed after rebase attempt. ${result.error ?? "Manual intervention needed."}`,
+            );
+          }
         }
       } else {
         // External, not yet merged — escalate to human

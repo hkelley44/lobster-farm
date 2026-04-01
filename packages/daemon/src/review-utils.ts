@@ -361,3 +361,68 @@ async function try_local_rebase(
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// ── CI check gating (#189) ──
+
+export interface CICheckStatus {
+  passed: boolean;
+  pending: boolean;
+  failures: string[];
+}
+
+/**
+ * Query the CI check status for a PR.
+ *
+ * Uses `gh pr checks` to get the current state of all status checks.
+ * Returns whether all checks passed, any are pending, or which ones failed.
+ * When no checks are configured, returns { passed: true, pending: false, failures: [] }
+ * so the merge flow proceeds normally.
+ */
+export async function check_ci_status(
+  pr_number: number,
+  repo_path: string,
+  gh_token?: string,
+): Promise<CICheckStatus> {
+  const env = gh_token
+    ? { ...process.env, GH_TOKEN: gh_token }
+    : process.env;
+
+  try {
+    const { stdout } = await exec_async("gh", [
+      "pr", "checks", String(pr_number),
+      "--json", "name,state,conclusion",
+    ], { cwd: repo_path, env, timeout: 15_000 });
+
+    const checks = JSON.parse(stdout) as Array<{
+      name: string;
+      state: string;
+      conclusion: string;
+    }>;
+
+    // No checks configured — proceed with merge normally
+    if (checks.length === 0) {
+      return { passed: true, pending: false, failures: [] };
+    }
+
+    const failures: string[] = [];
+    let has_pending = false;
+
+    for (const check of checks) {
+      if (check.state === "PENDING" || check.state === "QUEUED" || check.state === "IN_PROGRESS") {
+        has_pending = true;
+      } else if (check.conclusion !== "SUCCESS" && check.conclusion !== "NEUTRAL" && check.conclusion !== "SKIPPED") {
+        failures.push(check.name);
+      }
+    }
+
+    return {
+      passed: failures.length === 0 && !has_pending,
+      pending: has_pending,
+      failures,
+    };
+  } catch {
+    // If gh pr checks fails (e.g. no checks configured, API error),
+    // treat as "no checks" and allow merge to proceed
+    return { passed: true, pending: false, failures: [] };
+  }
+}
