@@ -863,6 +863,42 @@ export class BotPool extends EventEmitter {
     return this.is_tmux_alive(bot.tmux_session);
   }
 
+  /** Check if an assigned bot's CLI has a stale OAuth token.
+   * After 18+ hours the Claude CLI OAuth token expires. The CLI process stays alive
+   * but responds with "Not logged in" to every message. The tmux session is still
+   * running, so is_session_alive() returns true — this method catches that case.
+   *
+   * Only called on the message path (not polling) to keep it lightweight.
+   * Returns false if the bot is not found, not assigned, or the pane can't be read. */
+  has_stale_oauth(bot_id: number): boolean {
+    const bot = this.bots.find(b => b.id === bot_id);
+    if (!bot || bot.state !== "assigned") return false;
+    return this.is_pane_stale_oauth(bot.tmux_session);
+  }
+
+  /** Check if a tmux pane contains the "Not logged in" pattern from the Claude CLI.
+   * Protected so tests can override via subclass. */
+  protected is_pane_stale_oauth(session_name: string): boolean {
+    try {
+      const output = execFileSync(
+        "tmux", ["capture-pane", "-t", session_name, "-p"],
+        { encoding: "utf-8", timeout: 2000 },
+      );
+      return output.includes("Not logged in · Please run /login");
+    } catch {
+      return false; // Can't read pane — don't assume stale
+    }
+  }
+
+  /** Kill the tmux session for a bot with a stale OAuth token.
+   * Called by discord.ts before release_with_history() when the CLI is alive
+   * but unresponsive due to expired authentication. */
+  kill_stale_session(bot_id: number): void {
+    const bot = this.bots.find(b => b.id === bot_id);
+    if (!bot) return;
+    this.kill_tmux(bot.tmux_session);
+  }
+
   /** Release a bot while preserving its session_id in history for future resume.
    * Stashes session_id before calling release(), which nulls all bot metadata.
    * Used by discord.ts when a message arrives for a bot with a dead tmux session. */

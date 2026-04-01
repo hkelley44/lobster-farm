@@ -1182,6 +1182,20 @@ export class DiscordBot extends EventEmitter {
         assignment = undefined;
       }
 
+      // If the tmux session is alive but the CLI has a stale OAuth token
+      // ("Not logged in"), kill it and release with history. The re-assign
+      // flow below will spawn a fresh CLI process with a valid token and
+      // --resume the session so conversation context is preserved.
+      if (assignment && this._pool.has_stale_oauth(assignment.id)) {
+        console.warn(
+          `[discord] Stale OAuth detected for pool-${String(assignment.id)} on message ` +
+          `— killing and releasing with history`,
+        );
+        this._pool.kill_stale_session(assignment.id);
+        await this._pool.release_with_history(assignment.id);
+        assignment = undefined;
+      }
+
       if (!assignment) {
         // Default to planner archetype for new auto-assigned sessions
         const archetype: ArchetypeRole = "planner";
