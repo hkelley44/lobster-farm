@@ -561,7 +561,7 @@ export class PRReviewCron {
         }
       } else if (is_internal) {
         // Check CI status before attempting merge (#189)
-        const ci = await check_ci_status(pr.number, repo_path, gh_token);
+        const ci = await check_ci_status(pr.number, repo_path, gh_token, this.gh_bin);
 
         if (ci.pending) {
           console.log(
@@ -674,7 +674,7 @@ export class PRReviewCron {
       }
 
       // Check CI status
-      const ci = await check_ci_status(pr.number, repo_path, gh_token);
+      const ci = await check_ci_status(pr.number, repo_path, gh_token, this.gh_bin);
 
       if (ci.pending) {
         console.log(
@@ -684,10 +684,24 @@ export class PRReviewCron {
       }
 
       if (ci.failures.length > 0) {
+        // Deduplicate: only alert if the failure set changed since last alert.
+        // Keyed on sorted failure names so a fresh alert fires when different checks fail.
+        const failure_key = JSON.stringify([...ci.failures].sort());
+        if (this.processed[key]?.ci_failure_alerted === failure_key) {
+          continue;
+        }
+
         await this.notify_alerts(
           entity_id,
           `PR #${String(pr.number)}: ${pr.title} — approved but CI checks failed: ${ci.failures.join(", ")}. Not merging.`,
         );
+
+        // Track the failure set we alerted about
+        this.processed[key] = {
+          ...(this.processed[key] ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
+          ci_failure_alerted: failure_key,
+        };
+        await save_pr_reviews(this.processed, this.config);
         continue;
       }
 

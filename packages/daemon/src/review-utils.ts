@@ -382,14 +382,16 @@ export async function check_ci_status(
   pr_number: number,
   repo_path: string,
   gh_token?: string,
+  gh_bin: string = "gh",
 ): Promise<CICheckStatus> {
   const env = gh_token
     ? { ...process.env, GH_TOKEN: gh_token }
     : process.env;
 
   try {
-    const { stdout } = await exec_async("gh", [
+    const { stdout } = await exec_async(gh_bin, [
       "pr", "checks", String(pr_number),
+      "--required",
       "--json", "name,state,conclusion",
     ], { cwd: repo_path, env, timeout: 15_000 });
 

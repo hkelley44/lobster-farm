@@ -540,7 +540,7 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
 
     await call_retry(entity_id, repo_path, [pr], entity_config);
 
-    expect(mock_check_ci).toHaveBeenCalledWith(42, repo_path, "ghs_test_token");
+    expect(mock_check_ci).toHaveBeenCalledWith(42, repo_path, "ghs_test_token", "gh");
     expect(mock_auto_merge).toHaveBeenCalledWith(42, "feature/test", repo_path, "gh", "ghs_test_token");
     expect(mock_save_reviews).toHaveBeenCalled();
     expect(get_processed()[`${entity_id}:42`]?.outcome).toBe("approved");
@@ -574,13 +574,13 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     )).toBe(true);
   });
 
-  it("alerts when CI has failures", async () => {
+  it("alerts when CI has failures and records failure set in processed", async () => {
     const pr = make_test_pr({ author: { login: "test-user" } });
     const entity_config = make_entity_with_github_user("test-user");
 
     mock_check_ci.mockResolvedValueOnce({ passed: false, pending: false, failures: ["Build", "Test"] });
 
-    const { cron, call_retry } = make_retry_test_cron({
+    const { cron, call_retry, get_processed } = make_retry_test_cron({
       processed: {
         [`${entity_id}:42`]: {
           entity_id,
@@ -599,6 +599,71 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
       entity_id,
       expect.stringContaining("CI checks failed"),
     );
+
+    // Should record the failure set for deduplication
+    const processed = get_processed()[`${entity_id}:42`];
+    expect(processed?.ci_failure_alerted).toBe(JSON.stringify(["Build", "Test"]));
+    expect(mock_save_reviews).toHaveBeenCalled();
+  });
+
+  it("deduplicates CI failure alerts when same failure set repeats", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const entity_config = make_entity_with_github_user("test-user");
+
+    // Same failures as what's already recorded in ci_failure_alerted
+    mock_check_ci.mockResolvedValueOnce({ passed: false, pending: false, failures: ["Build", "Test"] });
+
+    const { cron, call_retry } = make_retry_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+          ci_failure_alerted: JSON.stringify(["Build", "Test"]),
+        },
+      },
+    });
+
+    await call_retry(entity_id, repo_path, [pr], entity_config);
+
+    // Should NOT alert again — same failure set
+    const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
+    expect(notify_alerts).not.toHaveBeenCalled();
+    expect(mock_auto_merge).not.toHaveBeenCalled();
+  });
+
+  it("re-alerts when CI failure set changes", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const entity_config = make_entity_with_github_user("test-user");
+
+    // Different failure set than what was previously alerted
+    mock_check_ci.mockResolvedValueOnce({ passed: false, pending: false, failures: ["Lint", "Deploy"] });
+
+    const { cron, call_retry, get_processed } = make_retry_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+          ci_failure_alerted: JSON.stringify(["Build", "Test"]),
+        },
+      },
+    });
+
+    await call_retry(entity_id, repo_path, [pr], entity_config);
+
+    // Should alert — different failure set
+    const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
+    expect(notify_alerts).toHaveBeenCalledWith(
+      entity_id,
+      expect.stringContaining("CI checks failed"),
+    );
+
+    // Should update the recorded failure set
+    const processed = get_processed()[`${entity_id}:42`];
+    expect(processed?.ci_failure_alerted).toBe(JSON.stringify(["Deploy", "Lint"]));
   });
 
   it("checks GitHub API for approval when no processed entry (webhook handler path)", async () => {
