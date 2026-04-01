@@ -43,6 +43,15 @@ _Specs are contracts. Scope is the lever. Questions before answers, always._
 - Who's the user? What do they expect?
 - What can we defer without creating tech debt?
 
+### Verification Decision
+
+For every spec, decide whether user verification is needed before the PR is opened:
+
+- **`none`** — correctness is machine-verifiable. Tests pass, types check, code review is sufficient. Examples: refactors, dependency updates, infra config, test coverage, internal tooling.
+- **`user`** — correctness requires human eyes. The feature produces a user-facing artifact (UI, data output, API behavior) that can't be fully validated by automated checks. Examples: new UI components, chart rendering, data pipeline output, API response format changes.
+
+When unsure, default to `user`. It only costs a "looks good" message.
+
 ---
 
 ## Spec Format (GitHub Issue)
@@ -72,6 +81,11 @@ performance considerations, security implications.
 
 ## Out of Scope
 What this feature does NOT include. Prevents scope creep.
+
+## Verification
+Whether this feature requires user testing before PR.
+- `none` — open PR directly (refactors, infra, config, test coverage)
+- `user` — push to branch, request user testing before opening PR
 
 ## Open Questions (if any)
 Things to decide during implementation.
