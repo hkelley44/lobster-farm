@@ -2,6 +2,8 @@ import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { LobsterFarmConfigSchema, EntityConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig, EntityConfig } from "@lobster-farm/shared";
 import { PRReviewCron } from "../pr-cron.js";
+import type { ProcessedPR } from "../persistence.js";
+import type { DiscordBot } from "../discord.js";
 
 // ── Helpers ──
 
@@ -295,6 +297,14 @@ vi.mock("../actions.js", () => ({
   detect_review_outcome: vi.fn().mockResolvedValue("approved"),
 }));
 
+// Mock review-utils for retry_approved_unmerged tests
+vi.mock("../review-utils.js", () => ({
+  fetch_review_comments: vi.fn().mockResolvedValue("review comments"),
+  build_review_fix_prompt: vi.fn().mockReturnValue("fix prompt"),
+  attempt_auto_merge: vi.fn().mockResolvedValue({ merged: true, method: "direct" }),
+  check_ci_status: vi.fn().mockResolvedValue({ passed: true, pending: false, failures: [] }),
+}));
+
 function make_entity_with_repo(repo_path: string): EntityConfig {
   return EntityConfigSchema.parse({
     entity: {
@@ -376,5 +386,369 @@ describe("PRReviewCron — repo path validation", () => {
     expect(log_messages.some(m =>
       typeof m === "string" && m.includes("Resolved gh binary:"),
     )).toBe(true);
+  });
+});
+
+// ── retry_approved_unmerged tests (#189) ──
+
+import { check_ci_status, attempt_auto_merge } from "../review-utils.js";
+import { detect_review_outcome } from "../actions.js";
+import { save_pr_reviews } from "../persistence.js";
+
+const mock_check_ci = vi.mocked(check_ci_status);
+const mock_auto_merge = vi.mocked(attempt_auto_merge);
+const mock_detect_outcome = vi.mocked(detect_review_outcome);
+const mock_save_reviews = vi.mocked(save_pr_reviews);
+
+/** Shape matching the private OpenPR interface in pr-cron.ts. */
+interface TestOpenPR {
+  number: number;
+  title: string;
+  headRefName: string;
+  updatedAt: string;
+  url: string;
+  body: string;
+  author: { login: string };
+}
+
+function make_test_pr(overrides: Partial<TestOpenPR> = {}): TestOpenPR {
+  return {
+    number: 42,
+    title: "feat: test feature",
+    headRefName: "feature/test",
+    updatedAt: "2026-03-27T10:00:00Z",
+    url: "https://github.com/test/test/pull/42",
+    body: "Test PR body",
+    author: { login: "test-user" },
+    ...overrides,
+  };
+}
+
+function make_entity_with_github_user(github_user: string): EntityConfig {
+  return EntityConfigSchema.parse({
+    entity: {
+      id: "test-entity",
+      name: "Test Entity",
+      status: "active",
+      repos: [
+        { name: "test", url: "git@github.com:test/test.git", path: "/tmp/test-repo" },
+      ],
+      accounts: { github: { user: github_user } },
+      channels: { category_id: "cat-1", list: [] },
+      memory: { path: "/tmp/memory" },
+      secrets: { vault: "1password", vault_name: "test" },
+    },
+  });
+}
+
+/**
+ * Create a PRReviewCron instance with private methods patched for testing
+ * the retry_approved_unmerged pass without needing real gh CLI calls.
+ */
+function make_retry_test_cron(opts: {
+  discord?: DiscordBot | null;
+  processed?: Record<string, ProcessedPR>;
+  pr_merged?: Map<number, boolean>;
+} = {}): {
+  cron: PRReviewCron;
+  get_processed: () => Record<string, ProcessedPR>;
+  call_retry: (
+    entity_id: string,
+    repo_path: string,
+    prs: TestOpenPR[],
+    entity_config: EntityConfig,
+  ) => Promise<void>;
+} {
+  const config = make_config();
+  const cron = new PRReviewCron(
+    { get_active: () => [], get: vi.fn() } as never,
+    { spawn: vi.fn(), on: vi.fn(), removeListener: vi.fn() } as never,
+    config,
+    opts.discord ?? null,
+    null,
+  );
+
+  // Patch private methods that require gh CLI or GitHub App auth
+  const cron_any = cron as unknown as Record<string, unknown>;
+
+  // resolve_entity_token — return a dummy token
+  cron_any["resolve_entity_token"] = vi.fn().mockResolvedValue("ghs_test_token");
+
+  // check_pr_merged — controllable per PR number
+  const merge_map = opts.pr_merged ?? new Map();
+  cron_any["check_pr_merged"] = vi.fn().mockImplementation(
+    async (_path: string, pr_number: number) => merge_map.get(pr_number) ?? false,
+  );
+
+  // close_issues_for_merged_pr — no-op
+  cron_any["close_issues_for_merged_pr"] = vi.fn().mockResolvedValue(undefined);
+
+  // notify_alerts — no-op (or spy on discord mock)
+  cron_any["notify_alerts"] = vi.fn().mockResolvedValue(undefined);
+
+  // Seed processed state
+  if (opts.processed) {
+    cron_any["processed"] = { ...opts.processed };
+  }
+
+  return {
+    cron,
+    get_processed: () => cron_any["processed"] as Record<string, ProcessedPR>,
+    call_retry: (entity_id, repo_path, prs, entity_config) =>
+      (cron_any["retry_approved_unmerged"] as (
+        entity_id: string,
+        repo_path: string,
+        prs: TestOpenPR[],
+        entity_config: EntityConfig,
+      ) => Promise<void>).call(cron, entity_id, repo_path, prs, entity_config),
+  };
+}
+
+describe("PRReviewCron.retry_approved_unmerged", () => {
+  let log_spy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    log_spy.mockRestore();
+  });
+
+  const entity_id = "test-entity";
+  const repo_path = "/tmp/test-repo";
+
+  it("merges when processed has approved entry and CI passes", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const entity_config = make_entity_with_github_user("test-user");
+
+    mock_check_ci.mockResolvedValueOnce({ passed: true, pending: false, failures: [] });
+    mock_auto_merge.mockResolvedValueOnce({ merged: true, method: "direct" });
+
+    const { call_retry, get_processed } = make_retry_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+        },
+      },
+    });
+
+    await call_retry(entity_id, repo_path, [pr], entity_config);
+
+    expect(mock_check_ci).toHaveBeenCalledWith(42, repo_path, "ghs_test_token", "gh");
+    expect(mock_auto_merge).toHaveBeenCalledWith(42, "feature/test", repo_path, "gh", "ghs_test_token");
+    expect(mock_save_reviews).toHaveBeenCalled();
+    expect(get_processed()[`${entity_id}:42`]?.outcome).toBe("approved");
+  });
+
+  it("skips merge when CI is still pending", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const entity_config = make_entity_with_github_user("test-user");
+
+    mock_check_ci.mockResolvedValueOnce({ passed: false, pending: true, failures: [] });
+
+    const { call_retry } = make_retry_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+        },
+      },
+    });
+
+    await call_retry(entity_id, repo_path, [pr], entity_config);
+
+    expect(mock_check_ci).toHaveBeenCalled();
+    expect(mock_auto_merge).not.toHaveBeenCalled();
+
+    const logs = log_spy.mock.calls.map(c => c[0]) as string[];
+    expect(logs.some(m =>
+      typeof m === "string" && m.includes("CI still pending") && m.includes("#42"),
+    )).toBe(true);
+  });
+
+  it("alerts when CI has failures and records failure set in processed", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const entity_config = make_entity_with_github_user("test-user");
+
+    mock_check_ci.mockResolvedValueOnce({ passed: false, pending: false, failures: ["Build", "Test"] });
+
+    const { cron, call_retry, get_processed } = make_retry_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+        },
+      },
+    });
+
+    await call_retry(entity_id, repo_path, [pr], entity_config);
+
+    expect(mock_auto_merge).not.toHaveBeenCalled();
+    const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
+    expect(notify_alerts).toHaveBeenCalledWith(
+      entity_id,
+      expect.stringContaining("CI checks failed"),
+    );
+
+    // Should record the failure set for deduplication
+    const processed = get_processed()[`${entity_id}:42`];
+    expect(processed?.ci_failure_alerted).toBe(JSON.stringify(["Build", "Test"]));
+    expect(mock_save_reviews).toHaveBeenCalled();
+  });
+
+  it("deduplicates CI failure alerts when same failure set repeats", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const entity_config = make_entity_with_github_user("test-user");
+
+    // Same failures as what's already recorded in ci_failure_alerted
+    mock_check_ci.mockResolvedValueOnce({ passed: false, pending: false, failures: ["Build", "Test"] });
+
+    const { cron, call_retry } = make_retry_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+          ci_failure_alerted: JSON.stringify(["Build", "Test"]),
+        },
+      },
+    });
+
+    await call_retry(entity_id, repo_path, [pr], entity_config);
+
+    // Should NOT alert again — same failure set
+    const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
+    expect(notify_alerts).not.toHaveBeenCalled();
+    expect(mock_auto_merge).not.toHaveBeenCalled();
+  });
+
+  it("re-alerts when CI failure set changes", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const entity_config = make_entity_with_github_user("test-user");
+
+    // Different failure set than what was previously alerted
+    mock_check_ci.mockResolvedValueOnce({ passed: false, pending: false, failures: ["Lint", "Deploy"] });
+
+    const { cron, call_retry, get_processed } = make_retry_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+          ci_failure_alerted: JSON.stringify(["Build", "Test"]),
+        },
+      },
+    });
+
+    await call_retry(entity_id, repo_path, [pr], entity_config);
+
+    // Should alert — different failure set
+    const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
+    expect(notify_alerts).toHaveBeenCalledWith(
+      entity_id,
+      expect.stringContaining("CI checks failed"),
+    );
+
+    // Should update the recorded failure set
+    const processed = get_processed()[`${entity_id}:42`];
+    expect(processed?.ci_failure_alerted).toBe(JSON.stringify(["Deploy", "Lint"]));
+  });
+
+  it("checks GitHub API for approval when no processed entry (webhook handler path)", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const entity_config = make_entity_with_github_user("test-user");
+
+    // No processed entry — simulate webhook handler path
+    mock_detect_outcome.mockResolvedValueOnce("approved");
+    mock_check_ci.mockResolvedValueOnce({ passed: true, pending: false, failures: [] });
+    mock_auto_merge.mockResolvedValueOnce({ merged: true, method: "direct" });
+
+    const { call_retry } = make_retry_test_cron({
+      processed: {}, // empty — webhook handler doesn't write to processed
+    });
+
+    await call_retry(entity_id, repo_path, [pr], entity_config);
+
+    expect(mock_detect_outcome).toHaveBeenCalledWith(42, repo_path, "ghs_test_token");
+    expect(mock_auto_merge).toHaveBeenCalled();
+  });
+
+  it("skips external PRs (different author than github_user)", async () => {
+    const pr = make_test_pr({ author: { login: "external-contributor" } });
+    const entity_config = make_entity_with_github_user("test-user");
+
+    const { call_retry } = make_retry_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+        },
+      },
+    });
+
+    await call_retry(entity_id, repo_path, [pr], entity_config);
+
+    // Should not even check CI for external PRs
+    expect(mock_check_ci).not.toHaveBeenCalled();
+    expect(mock_auto_merge).not.toHaveBeenCalled();
+  });
+
+  it("skips PRs with changes_requested outcome", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const entity_config = make_entity_with_github_user("test-user");
+
+    const { call_retry } = make_retry_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "changes_requested",
+        },
+      },
+    });
+
+    await call_retry(entity_id, repo_path, [pr], entity_config);
+
+    expect(mock_check_ci).not.toHaveBeenCalled();
+  });
+
+  it("cleans up processed entry when PR was already merged", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const entity_config = make_entity_with_github_user("test-user");
+
+    const { call_retry, get_processed } = make_retry_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+        },
+      },
+      pr_merged: new Map([[42, true]]),
+    });
+
+    await call_retry(entity_id, repo_path, [pr], entity_config);
+
+    // Should clean up the processed entry since PR is already merged
+    expect(get_processed()[`${entity_id}:42`]).toBeUndefined();
+    expect(mock_save_reviews).toHaveBeenCalled();
+    // Should NOT attempt merge
+    expect(mock_auto_merge).not.toHaveBeenCalled();
   });
 });

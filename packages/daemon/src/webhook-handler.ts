@@ -19,7 +19,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager, SessionResult } from "./session.js";
 import type { DiscordBot } from "./discord.js";
 import { detect_review_outcome } from "./actions.js";
-import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge } from "./review-utils.js";
+import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status } from "./review-utils.js";
 import {
   extract_first_linked_issue,
   extract_linked_issues,
@@ -51,9 +51,19 @@ interface WebhookPR {
   merged?: boolean;
 }
 
+/** Minimal workflow_run shape from webhook payload. */
+interface WebhookWorkflowRun {
+  name: string;
+  conclusion: string | null;
+  event: string;
+  head_branch: string;
+  html_url: string;
+}
+
 interface WebhookPayload {
   action: string;
   pull_request?: WebhookPR;
+  workflow_run?: WebhookWorkflowRun;
   repository?: { full_name: string };
   /** GitHub includes the installation that generated the webhook event. */
   installation?: { id: number };
@@ -200,6 +210,12 @@ async function route_event(
   payload: WebhookPayload,
   ctx: WebhookContext,
 ): Promise<void> {
+  // Handle workflow_run events — deploy failure notifications (#189)
+  if (event_type === "workflow_run") {
+    await handle_workflow_run(payload, ctx);
+    return;
+  }
+
   if (event_type !== "pull_request") {
     console.log(`[webhook] Ignoring event: ${event_type}`);
     return;
@@ -424,25 +440,41 @@ async function handle_review_completion(
     const is_merged = await check_pr_merged(repo_path, pr.number, gh_token);
 
     if (!is_merged) {
-      // Attempt auto-merge with rebase fallback (#166)
-      const result = await attempt_auto_merge(
-        pr.number, pr.head.ref, repo_path, undefined, gh_token,
-      );
+      // Check CI status before attempting merge (#189)
+      const ci = await check_ci_status(pr.number, repo_path, gh_token);
 
-      if (result.merged) {
-        // Post-merge cleanup: close linked issues and clean up worktrees
-        await post_auto_merge_cleanup(pr, entity_id, repo_path, ctx, installation_id);
+      if (ci.pending) {
+        console.log(
+          `[webhook] CI checks pending for PR #${String(pr.number)} — skipping merge, pr-cron retry pass will handle`,
+        );
+        // Don't merge yet — pr-cron's retry_approved_unmerged pass will check CI and merge next cycle
+      } else if (ci.failures.length > 0) {
         await notify_alerts(
           entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — approved, auto-rebased (${result.method}), and merged`,
+          `PR #${String(pr.number)}: ${pr.title} — approved but CI checks failed: ${ci.failures.join(", ")}. Not merging.`,
           ctx,
         );
       } else {
-        await notify_alerts(
-          entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — approved but merge failed after rebase attempt. ${result.error ?? "Manual intervention needed."}`,
-          ctx,
+        // All checks passed (or none configured) — proceed with merge
+        const result = await attempt_auto_merge(
+          pr.number, pr.head.ref, repo_path, undefined, gh_token,
         );
+
+        if (result.merged) {
+          // Post-merge cleanup: close linked issues and clean up worktrees
+          await post_auto_merge_cleanup(pr, entity_id, repo_path, ctx, installation_id);
+          await notify_alerts(
+            entity_id,
+            `PR #${String(pr.number)}: ${pr.title} — approved, auto-rebased (${result.method}), and merged`,
+            ctx,
+          );
+        } else {
+          await notify_alerts(
+            entity_id,
+            `PR #${String(pr.number)}: ${pr.title} — approved but merge failed after rebase attempt. ${result.error ?? "Manual intervention needed."}`,
+            ctx,
+          );
+        }
       }
     } else {
       await notify_alerts(
@@ -567,6 +599,12 @@ function build_reviewer_prompt(
     `  gh pr review ${String(pr.number)} --request-changes --body "<your review>"`,
     `- If the code is genuinely clean with no improvements needed, approve:`,
     `  gh pr review ${String(pr.number)} --approve --body "Looks good."`,
+    ``,
+    `Before merging, check CI status:`,
+    `  gh pr checks ${String(pr.number)} --required`,
+    `If any required checks are failing or pending, do NOT merge.`,
+    `Instead, note the failing checks in your review and request changes.`,
+    `If no CI workflows are configured for this repo, proceed with merge normally.`,
     ``,
     `After posting your review:`,
     `- If you approved, merge the PR:`,
@@ -727,6 +765,64 @@ async function post_auto_merge_cleanup(
       contexts: { pr: { number: pr.number, branch: pr.head.ref } },
     });
   }
+}
+
+// ── Workflow run handling (#189) ──
+
+/**
+ * Handle workflow_run webhook events.
+ * Notifies #alerts when a workflow fails on main (likely a deploy failure).
+ *
+ * IMPORTANT: The GitHub App must be subscribed to `workflow_run` events.
+ * This is a manual one-time step in the GitHub App settings:
+ * Settings → Permissions & Events → Subscribe to events → check "Workflow runs".
+ * Without this subscription, this handler will never receive events.
+ */
+async function handle_workflow_run(
+  payload: WebhookPayload,
+  ctx: WebhookContext,
+): Promise<void> {
+  const workflow = payload.workflow_run;
+  if (!workflow) {
+    console.log(`[webhook] workflow_run event missing workflow_run data`);
+    return;
+  }
+
+  // Only care about completed failures on main from push events (deploy workflows)
+  if (
+    payload.action !== "completed" ||
+    workflow.conclusion !== "failure" ||
+    workflow.event !== "push" ||
+    workflow.head_branch !== "main"
+  ) {
+    console.log(
+      `[webhook] Ignoring workflow_run: conclusion=${workflow.conclusion ?? "null"}, ` +
+      `event=${workflow.event}, branch=${workflow.head_branch}`,
+    );
+    return;
+  }
+
+  const repo_full_name = payload.repository?.full_name;
+  if (!repo_full_name) {
+    console.log(`[webhook] workflow_run event missing repository data`);
+    return;
+  }
+
+  const match = find_entity_for_repo(repo_full_name, ctx.registry);
+  if (!match) {
+    console.log(`[webhook] No entity found for repo ${repo_full_name} — ignoring workflow_run`);
+    return;
+  }
+
+  console.log(
+    `[webhook] Workflow "${workflow.name}" failed on main in ${match.entity_id} (${repo_full_name})`,
+  );
+
+  await notify_alerts(
+    match.entity_id,
+    `\u26a0\ufe0f Workflow "${workflow.name}" failed on main (${workflow.html_url})`,
+    ctx,
+  );
 }
 
 // ── Utility helpers ──
