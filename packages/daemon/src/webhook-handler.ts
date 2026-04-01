@@ -445,9 +445,9 @@ async function handle_review_completion(
 
       if (ci.pending) {
         console.log(
-          `[webhook] CI checks pending for PR #${String(pr.number)} — skipping merge (will retry)`,
+          `[webhook] CI checks pending for PR #${String(pr.number)} — skipping merge, pr-cron retry pass will handle`,
         );
-        // Don't merge yet — pr-cron will pick this up on the next cycle
+        // Don't merge yet — pr-cron's retry_approved_unmerged pass will check CI and merge next cycle
       } else if (ci.failures.length > 0) {
         await notify_alerts(
           entity_id,
@@ -772,6 +772,11 @@ async function post_auto_merge_cleanup(
 /**
  * Handle workflow_run webhook events.
  * Notifies #alerts when a workflow fails on main (likely a deploy failure).
+ *
+ * IMPORTANT: The GitHub App must be subscribed to `workflow_run` events.
+ * This is a manual one-time step in the GitHub App settings:
+ * Settings → Permissions & Events → Subscribe to events → check "Workflow runs".
+ * Without this subscription, this handler will never receive events.
  */
 async function handle_workflow_run(
   payload: WebhookPayload,

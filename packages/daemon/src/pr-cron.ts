@@ -245,6 +245,9 @@ export class PRReviewCron {
       // Spawn reviewer
       await this.review_pr(entity_id, repo_path, pr, entity_config);
     }
+
+    // Retry merge for approved-but-unmerged PRs whose CI was pending (#189)
+    await this.retry_approved_unmerged(entity_id, repo_path, prs, entity_config);
   }
 
   /**
@@ -562,9 +565,9 @@ export class PRReviewCron {
 
         if (ci.pending) {
           console.log(
-            `[pr-cron] CI checks pending for PR #${String(pr.number)} — skipping merge (will retry next cycle)`,
+            `[pr-cron] CI checks pending for PR #${String(pr.number)} — skipping merge, retry pass will handle`,
           );
-          // Don't merge yet — cron will pick it up again next cycle
+          // Don't merge yet — retry_approved_unmerged will check again next cycle
         } else if (ci.failures.length > 0) {
           await this.notify_alerts(
             entity_id,
@@ -602,6 +605,122 @@ export class PRReviewCron {
         entity_id,
         `PR #${String(pr.number)} review completed: "${pr.title}"`,
       );
+    }
+  }
+
+  /**
+   * Retry merge for approved-but-unmerged PRs.
+   *
+   * Handles the gap where CI was pending at review completion time:
+   * - PR-cron path: `persist_review_completion` stored the outcome as "approved"
+   *   but the merge was skipped because CI was still running.
+   * - Webhook handler path: the webhook handler skipped merge due to pending CI
+   *   but doesn't write to `processed`, so `should_skip_pr()` blocks re-review.
+   *
+   * This pass runs after the main review loop each cycle. For each open PR:
+   * 1. Check if it has an approved review (from `processed` or GitHub API)
+   * 2. If approved and still open, check CI and attempt merge
+   *
+   * No reviewer sessions are spawned — this is purely a merge-retry mechanism.
+   */
+  private async retry_approved_unmerged(
+    entity_id: string,
+    repo_path: string,
+    prs: OpenPR[],
+    entity_config: EntityConfig,
+  ): Promise<void> {
+    const gh_token = await this.resolve_entity_token(entity_config);
+    const github_user = entity_config.entity.accounts?.github?.user;
+
+    for (const pr of prs) {
+      const key = `${entity_id}:${String(pr.number)}`;
+
+      // Only retry internal PRs — external ones need human merge
+      const is_internal = github_user != null && pr.author.login === github_user;
+      if (!is_internal) continue;
+
+      // Skip PRs with an active review session
+      if (this.active_reviews.has(key)) continue;
+
+      // Determine if this PR is approved but unmerged
+      const processed_entry = this.processed[key];
+      let is_approved = false;
+
+      if (processed_entry?.outcome === "approved") {
+        // PR-cron path: we already know the outcome from the previous review
+        is_approved = true;
+      } else if (!processed_entry) {
+        // Webhook handler path: no processed entry, check GitHub directly
+        const outcome = await detect_review_outcome(pr.number, repo_path, gh_token);
+        if (outcome === "approved") {
+          is_approved = true;
+        }
+      }
+      // If outcome is "changes_requested" or "pending", a review loop or
+      // new review will handle it — don't retry merge here.
+
+      if (!is_approved) continue;
+
+      // Verify the PR hasn't been merged since we last checked
+      const is_merged = await this.check_pr_merged(repo_path, pr.number, gh_token);
+      if (is_merged) {
+        // Clean up: close issues, update processed state
+        await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
+        if (processed_entry) {
+          delete this.processed[key];
+          await save_pr_reviews(this.processed, this.config);
+        }
+        continue;
+      }
+
+      // Check CI status
+      const ci = await check_ci_status(pr.number, repo_path, gh_token);
+
+      if (ci.pending) {
+        console.log(
+          `[pr-cron] CI still pending for approved PR #${String(pr.number)} — will retry next cycle`,
+        );
+        continue;
+      }
+
+      if (ci.failures.length > 0) {
+        await this.notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — approved but CI checks failed: ${ci.failures.join(", ")}. Not merging.`,
+        );
+        continue;
+      }
+
+      // CI passed — attempt merge
+      console.log(
+        `[pr-cron] CI passed for approved PR #${String(pr.number)} — retrying merge`,
+      );
+
+      const result = await attempt_auto_merge(
+        pr.number, pr.headRefName, repo_path, this.gh_bin, gh_token,
+      );
+
+      if (result.merged) {
+        // Update processed state to reflect the merge
+        this.processed[key] = {
+          entity_id,
+          pr_number: pr.number,
+          reviewed_at: new Date().toISOString(),
+          outcome: "approved",
+        };
+        await save_pr_reviews(this.processed, this.config);
+
+        await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
+        await this.notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — CI passed, auto-merged (${result.method})`,
+        );
+      } else {
+        await this.notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — approved, CI passed, but merge failed. ${result.error ?? "Manual intervention needed."}`,
+        );
+      }
     }
   }
 
