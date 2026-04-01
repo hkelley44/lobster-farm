@@ -884,7 +884,7 @@ export class BotPool extends EventEmitter {
         "tmux", ["capture-pane", "-t", session_name, "-p"],
         { encoding: "utf-8", timeout: 2000 },
       );
-      return output.includes("Not logged in");
+      return output.includes("Not logged in · Please run /login");
     } catch {
       return false; // Can't read pane — don't assume stale
     }
