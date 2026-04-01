@@ -595,6 +595,32 @@ LOCAL = True if os.getcwd().split('/')[1] == 'Users' else False
 
 ---
 
+## PR Workflow
+
+### Check the Spec's Verification Requirement
+
+Before opening a PR, check the GitHub issue spec for the `## Verification` section:
+
+**When `verification: none` (or not specified for non-artifact changes):**
+- Build, commit, push, open PR immediately
+- Current behavior — AutoReviewer handles the rest
+
+**When `verification: user`:**
+1. Build the feature, commit, and push to the branch
+2. Do NOT open a PR
+3. Post to the channel:
+   - What was built (brief summary)
+   - How to test locally: `git pull && git checkout <branch> && <run command>`
+   - What to look for (specific things to verify)
+4. Wait for user response:
+   - "Looks good" / "Ship it" → open the PR with full body and `Closes #<issue>`
+   - Feedback / "Fix X" → fix the issue, push, ask again
+   - No response → do NOT open the PR. The user will come back when ready.
+
+The PR gate is about product correctness, not code quality. Code quality is the AutoReviewer's job. The user gate catches "it compiles but does the wrong thing."
+
+---
+
 ## Frontend Standards
 
 _Brief for now — {{DESIGNER_NAME}} drives the design system. We implement faithfully._
