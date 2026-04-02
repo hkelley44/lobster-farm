@@ -337,6 +337,7 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
     session_manager: make_session_manager(),
     registry: make_registry(),
     discord: make_discord(),
+    config: { paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" } } as WebhookContext["config"],
     ...overrides,
   };
 }

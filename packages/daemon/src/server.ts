@@ -130,6 +130,7 @@ const handle_webhook_github: RouteHandler = async (req, res, ctx) => {
     session_manager: ctx.session_manager,
     registry: ctx.registry,
     discord: ctx.discord,
+    config: ctx.config,
   };
 
   await handle_github_webhook(req, res, webhook_ctx);

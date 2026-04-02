@@ -7,7 +7,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import type { DiscordBot } from "./discord.js";
 import type { GitHubAppAuth } from "./github-app.js";
-import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status } from "./review-utils.js";
+import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status, fetch_ci_failure_logs, build_ci_fix_prompt } from "./review-utils.js";
 import { detect_review_outcome } from "./actions.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { PRReviewState } from "./persistence.js";
@@ -71,6 +71,9 @@ const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 /** Buffer in ms to avoid re-reviewing when commit and review timestamps are very close. */
 const TIMESTAMP_BUFFER_MS = 60_000; // 60 seconds
+
+/** Maximum number of CI fix attempts before escalating to a human (#196). */
+const MAX_CI_FIX_ATTEMPTS = 3;
 
 export class PRReviewCron {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -569,10 +572,8 @@ export class PRReviewCron {
           );
           // Don't merge yet — retry_approved_unmerged will check again next cycle
         } else if (ci.failures.length > 0) {
-          await this.notify_alerts(
-            entity_id,
-            `PR #${String(pr.number)}: ${pr.title} — approved but CI checks failed: ${ci.failures.join(", ")}. Not merging.`,
-          );
+          // Spawn builder to fix CI failures (#196)
+          await this.spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, entity_config);
         } else {
           // All checks passed (or none configured) — attempt auto-merge with rebase (#166)
           const result = await attempt_auto_merge(
@@ -684,19 +685,17 @@ export class PRReviewCron {
       }
 
       if (ci.failures.length > 0) {
-        // Deduplicate: only alert if the failure set changed since last alert.
-        // Keyed on sorted failure names so a fresh alert fires when different checks fail.
+        // Deduplicate: only spawn a fix if the failure set changed since last attempt.
+        // Keyed on sorted failure names so a fresh fix fires when different checks fail.
         const failure_key = JSON.stringify([...ci.failures].sort());
         if (this.processed[key]?.ci_failure_alerted === failure_key) {
           continue;
         }
 
-        await this.notify_alerts(
-          entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — approved but CI checks failed: ${ci.failures.join(", ")}. Not merging.`,
-        );
+        // Spawn builder to fix CI failures (#196)
+        await this.spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, entity_config);
 
-        // Track the failure set we alerted about
+        // Track the failure set we attempted to fix
         this.processed[key] = {
           ...(this.processed[key] ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
           ci_failure_alerted: failure_key,
@@ -788,6 +787,102 @@ export class PRReviewCron {
       console.error(`[pr-cron] Failed to spawn builder for external PR #${String(pr.number)}: ${String(err)}`);
       sentry.captureException(err, {
         tags: { module: "pr-cron", entity: entity_id, action: "spawn_fixer" },
+        contexts: { pr: { number: pr.number, title: pr.title } },
+      });
+    }
+  }
+
+  /**
+   * Spawn a builder session to fix CI failures on an approved PR (#196).
+   *
+   * Checks the retry cap (max 3 attempts) before spawning. If the cap is
+   * reached, alerts #alerts and stops. Uses the active_reviews map for
+   * dedup — key is `entity_id:pr_number`.
+   */
+  private async spawn_ci_fixer(
+    entity_id: string,
+    repo_path: string,
+    pr: OpenPR,
+    failed_checks: string[],
+    entity_config?: EntityConfig,
+  ): Promise<void> {
+    const key = `${entity_id}:${String(pr.number)}`;
+
+    // Check retry cap
+    const attempts = this.processed[key]?.ci_fix_attempts ?? 0;
+
+    if (attempts >= MAX_CI_FIX_ATTEMPTS) {
+      await this.notify_alerts(
+        entity_id,
+        `PR #${String(pr.number)}: ${pr.title} — CI fix failed after ${String(MAX_CI_FIX_ATTEMPTS)} attempts. Needs human intervention. Failed checks: ${failed_checks.join(", ")}`,
+      );
+      return;
+    }
+
+    // Dedup: if a review/fix is already in-flight for this PR, skip
+    if (this.active_reviews.has(key)) {
+      console.log(
+        `[pr-cron] CI fix skipped for PR #${String(pr.number)} — review/fix already in-flight`,
+      );
+      return;
+    }
+
+    // Increment attempt counter and persist
+    this.processed[key] = {
+      ...(this.processed[key] ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
+      ci_fix_attempts: attempts + 1,
+    };
+    await save_pr_reviews(this.processed, this.config);
+
+    // Resolve token
+    const config = entity_config ?? this.registry.get(entity_id);
+    const gh_token = config ? await this.resolve_entity_token(config) : undefined;
+
+    // Fetch CI failure logs for context
+    const failure_logs = await fetch_ci_failure_logs(
+      pr.headRefName, repo_path, gh_token, this.gh_bin,
+    );
+
+    const prompt = [
+      `An approved PR has failing CI checks that need fixing.`,
+      `PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}`,
+      `Repository: ${repo_path}`,
+      ``,
+      build_ci_fix_prompt(pr.number, pr.title, pr.headRefName, failure_logs),
+    ].join("\n");
+
+    console.log(
+      `[pr-cron] Spawning CI fix builder for PR #${String(pr.number)} in ${entity_id} (attempt ${String(attempts + 1)}/${String(MAX_CI_FIX_ATTEMPTS)})`,
+    );
+
+    await this.notify_alerts(
+      entity_id,
+      `PR #${String(pr.number)}: ${pr.title} — approved but CI failed (${failed_checks.join(", ")}), spawning builder to fix (attempt ${String(attempts + 1)}/${String(MAX_CI_FIX_ATTEMPTS)})`,
+    );
+
+    let fix_env: Record<string, string> | undefined;
+    if (gh_token) {
+      fix_env = { GH_TOKEN: gh_token };
+    }
+
+    try {
+      await this.session_manager.spawn({
+        entity_id,
+        feature_id: `ci-fix-${String(pr.number)}`,
+        archetype: "builder",
+        dna: ["coding-dna"],
+        model: { model: "opus", think: "high" },
+        worktree_path: repo_path,
+        prompt,
+        interactive: false,
+        env: fix_env,
+      });
+    } catch (err) {
+      console.error(
+        `[pr-cron] Failed to spawn CI fix builder for PR #${String(pr.number)}: ${String(err)}`,
+      );
+      sentry.captureException(err, {
+        tags: { module: "pr-cron", entity: entity_id, action: "spawn_ci_fixer" },
         contexts: { pr: { number: pr.number, title: pr.title } },
       });
     }
