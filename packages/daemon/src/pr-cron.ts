@@ -689,15 +689,19 @@ export class PRReviewCron {
           continue;
         }
 
-        // Spawn builder to fix CI failures (#196)
-        await this.spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, entity_config);
-
-        // Track the failure set we attempted to fix
-        this.processed[key] = {
-          ...(this.processed[key] ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
-          ci_failure_alerted: failure_key,
-        };
-        await save_pr_reviews(this.processed, this.config);
+        // Spawn builder to fix CI failures (#196).
+        // spawn_ci_fixer returns true if the failure was handled (spawned, cap
+        // reached, or dedup hit) — mark ci_failure_alerted so we don't re-process
+        // the same failure set next cycle. Returns false on transient errors
+        // (token resolution) so the next cycle retries.
+        const handled = await this.spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, entity_config);
+        if (handled) {
+          this.processed[key] = {
+            ...(this.processed[key] ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
+            ci_failure_alerted: failure_key,
+          };
+          await save_pr_reviews(this.processed, this.config);
+        }
         continue;
       }
 
@@ -795,6 +799,10 @@ export class PRReviewCron {
    * Checks the retry cap (max 3 attempts) before spawning. If the cap is
    * reached, alerts #alerts and stops. Uses the active_reviews map for
    * dedup — key is `entity_id:pr_number`.
+   *
+   * Returns `true` if the failure was handled (spawn attempted, cap reached,
+   * or dedup hit) — caller should mark `ci_failure_alerted`. Returns `false`
+   * on transient errors (token resolution) so the next cycle retries.
    */
   private async spawn_ci_fixer(
     entity_id: string,
@@ -802,7 +810,7 @@ export class PRReviewCron {
     pr: OpenPR,
     failed_checks: string[],
     entity_config?: EntityConfig,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const key = `${entity_id}:${String(pr.number)}`;
 
     // Check retry cap
@@ -813,7 +821,7 @@ export class PRReviewCron {
         entity_id,
         `PR #${String(pr.number)}: ${pr.title} — CI fix failed after ${String(MAX_CI_FIX_ATTEMPTS)} attempts. Needs human intervention. Failed checks: ${failed_checks.join(", ")}`,
       );
-      return;
+      return true; // handled — cap reached, don't retry this failure set
     }
 
     // Dedup: if a review/fix is already in-flight for this PR, skip
@@ -821,10 +829,27 @@ export class PRReviewCron {
       console.log(
         `[pr-cron] CI fix skipped for PR #${String(pr.number)} — review/fix already in-flight`,
       );
-      return;
+      return true; // handled — fix in-flight, don't retry this failure set
     }
 
-    // Increment attempt counter and set ci_failure_alerted so
+    // Resolve token BEFORE incrementing attempt counter — transient token
+    // errors (cert issues, rate limits) shouldn't consume retry slots.
+    const config = entity_config ?? this.registry.get(entity_id);
+    let gh_token: string | undefined;
+    if (config) {
+      try {
+        gh_token = await this.resolve_entity_token(config);
+      } catch (err) {
+        console.error(`[pr-cron] Failed to get token for CI fix PR #${String(pr.number)}: ${String(err)}`);
+        sentry.captureException(err, {
+          tags: { module: "pr-cron", entity: entity_id, action: "ci_fix_token" },
+          contexts: { pr: { number: pr.number, title: pr.title } },
+        });
+        return false; // transient error — don't mark ci_failure_alerted, retry next cycle
+      }
+    }
+
+    // Now increment attempt counter and set ci_failure_alerted so
     // retry_approved_unmerged doesn't double-spawn for the same failure set.
     const failure_key = JSON.stringify([...failed_checks].sort());
     this.processed[key] = {
@@ -833,10 +858,6 @@ export class PRReviewCron {
       ci_failure_alerted: failure_key,
     };
     await save_pr_reviews(this.processed, this.config);
-
-    // Resolve token
-    const config = entity_config ?? this.registry.get(entity_id);
-    const gh_token = config ? await this.resolve_entity_token(config) : undefined;
 
     // Fetch CI failure logs for context
     const failure_logs = await fetch_ci_failure_logs(
@@ -884,6 +905,8 @@ export class PRReviewCron {
         contexts: { pr: { number: pr.number, title: pr.title } },
       });
     }
+
+    return true;
   }
 
   /** Send a notification to the entity's alerts channel. */

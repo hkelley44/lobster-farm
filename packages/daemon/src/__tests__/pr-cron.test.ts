@@ -769,18 +769,20 @@ const mock_build_ci_prompt = vi.mocked(build_ci_fix_prompt);
  */
 function make_ci_fixer_test_cron(opts: {
   processed?: Record<string, ProcessedPR>;
+  token_error?: Error;
 } = {}): {
   cron: PRReviewCron;
   session_manager: { spawn: ReturnType<typeof vi.fn> };
   get_processed: () => Record<string, ProcessedPR>;
   get_active_reviews: () => Map<string, unknown>;
+  resolve_entity_token: ReturnType<typeof vi.fn>;
   call_spawn_ci_fixer: (
     entity_id: string,
     repo_path: string,
     pr: TestOpenPR,
     failed_checks: string[],
     entity_config?: EntityConfig,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
 } {
   const config = make_config();
   const mock_spawn = vi.fn().mockResolvedValue({
@@ -806,8 +808,11 @@ function make_ci_fixer_test_cron(opts: {
 
   const cron_any = cron as unknown as Record<string, unknown>;
 
-  // resolve_entity_token — return a dummy token
-  cron_any["resolve_entity_token"] = vi.fn().mockResolvedValue("ghs_test_token");
+  // resolve_entity_token — return a dummy token or reject with error
+  const resolve_token_mock = opts.token_error
+    ? vi.fn().mockRejectedValue(opts.token_error)
+    : vi.fn().mockResolvedValue("ghs_test_token");
+  cron_any["resolve_entity_token"] = resolve_token_mock;
 
   // notify_alerts — no-op spy
   cron_any["notify_alerts"] = vi.fn().mockResolvedValue(undefined);
@@ -822,6 +827,7 @@ function make_ci_fixer_test_cron(opts: {
     session_manager,
     get_processed: () => cron_any["processed"] as Record<string, ProcessedPR>,
     get_active_reviews: () => cron_any["active_reviews"] as Map<string, unknown>,
+    resolve_entity_token: resolve_token_mock,
     call_spawn_ci_fixer: (entity_id, repo_path, pr, failed_checks, entity_config) =>
       (cron_any["spawn_ci_fixer"] as (
         entity_id: string,
@@ -829,7 +835,7 @@ function make_ci_fixer_test_cron(opts: {
         pr: TestOpenPR,
         failed_checks: string[],
         entity_config?: EntityConfig,
-      ) => Promise<void>).call(cron, entity_id, repo_path, pr, failed_checks, entity_config),
+      ) => Promise<boolean>).call(cron, entity_id, repo_path, pr, failed_checks, entity_config),
   };
 }
 
@@ -962,5 +968,53 @@ describe("PRReviewCron.spawn_ci_fixer", () => {
     const processed = get_processed()[`${entity_id}:42`];
     // ci_failure_alerted should be set with sorted failure names
     expect(processed?.ci_failure_alerted).toBe(JSON.stringify(["Build", "Lint"]));
+  });
+
+  it("does not consume retry slot on token resolution failure", async () => {
+    const pr = make_test_pr();
+    const entity_config = make_entity_with_github_user("test-user");
+
+    const { session_manager, get_processed, call_spawn_ci_fixer } = make_ci_fixer_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+        },
+      },
+      token_error: new Error("Certificate expired"),
+    });
+
+    const result = await call_spawn_ci_fixer(entity_id, repo_path, pr, ["Build"], entity_config);
+
+    // Should NOT spawn a builder
+    expect(session_manager.spawn).not.toHaveBeenCalled();
+
+    // Should return false so caller doesn't mark ci_failure_alerted
+    expect(result).toBe(false);
+
+    // ci_fix_attempts should NOT have been incremented
+    const processed = get_processed()[`${entity_id}:42`];
+    expect(processed?.ci_fix_attempts ?? 0).toBe(0);
+  });
+
+  it("returns true when spawn succeeds", async () => {
+    const pr = make_test_pr();
+    const entity_config = make_entity_with_github_user("test-user");
+
+    const { call_spawn_ci_fixer } = make_ci_fixer_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+        },
+      },
+    });
+
+    const result = await call_spawn_ci_fixer(entity_id, repo_path, pr, ["Build"], entity_config);
+    expect(result).toBe(true);
   });
 });
