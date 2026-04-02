@@ -431,6 +431,9 @@ export async function check_ci_status(
   }
 }
 
+/** Maximum number of CI fix attempts before escalating to a human (#196). */
+export const MAX_CI_FIX_ATTEMPTS = 3;
+
 // ── CI failure log fetching (#196) ──
 
 /** Max number of lines to keep per failed job's log output. */

@@ -19,7 +19,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager, SessionResult } from "./session.js";
 import type { DiscordBot } from "./discord.js";
 import { detect_review_outcome } from "./actions.js";
-import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status, fetch_ci_failure_logs, build_ci_fix_prompt } from "./review-utils.js";
+import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status, fetch_ci_failure_logs, build_ci_fix_prompt, MAX_CI_FIX_ATTEMPTS } from "./review-utils.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import {
@@ -455,6 +455,16 @@ async function handle_review_completion(
       ctx,
     );
   } else if (outcome === "approved") {
+    // On fresh reviewer approval, reset the CI fix counter so new commits
+    // get fresh attempts. Mirrors what persist_review_completion does
+    // implicitly in the pr-cron path (overwrites with fresh object).
+    const pr_state = await load_pr_reviews(ctx.config);
+    const state_key = review_key(entity_id, pr.number);
+    if (pr_state[state_key]?.ci_fix_attempts) {
+      pr_state[state_key] = { ...pr_state[state_key], ci_fix_attempts: 0 };
+      await save_pr_reviews(pr_state, ctx.config);
+    }
+
     // Check if reviewer already merged
     const is_merged = await check_pr_merged(repo_path, pr.number, gh_token);
 
@@ -593,9 +603,6 @@ async function spawn_fixer(
 
 // ── Builder spawning for CI failures (#196) ──
 
-/** Maximum number of CI fix attempts before escalating to a human. */
-const MAX_CI_FIX_ATTEMPTS = 3;
-
 /**
  * Spawn a builder session to fix CI failures on an approved PR.
  *
@@ -635,14 +642,8 @@ async function spawn_ci_fixer(
     return;
   }
 
-  // Increment attempt counter and persist
-  pr_state[key] = {
-    ...(entry ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
-    ci_fix_attempts: attempts + 1,
-  };
-  await save_pr_reviews(pr_state, ctx.config);
-
-  // Fetch CI failure logs for context
+  // Resolve token BEFORE incrementing attempt counter — transient token
+  // errors (cert issues, rate limits) shouldn't consume retry slots.
   let gh_token: string;
   try {
     gh_token = await resolve_token(ctx.github_app, installation_id);
@@ -655,13 +656,19 @@ async function spawn_ci_fixer(
     return;
   }
 
+  // Increment attempt counter and persist (after token resolution succeeded)
+  pr_state[key] = {
+    ...(entry ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
+    ci_fix_attempts: attempts + 1,
+  };
+  await save_pr_reviews(pr_state, ctx.config);
+
+  // Fetch CI failure logs for context
   const failure_logs = await fetch_ci_failure_logs(
     pr.head.ref, repo_path, gh_token,
   );
 
   const prompt = [
-    `An approved PR has failing CI checks that need fixing.`,
-    `PR #${String(pr.number)}: "${pr.title}" on branch ${pr.head.ref}`,
     `Repository: ${repo_path}`,
     ``,
     build_ci_fix_prompt(pr.number, pr.title, pr.head.ref, failure_logs),

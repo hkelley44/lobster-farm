@@ -297,12 +297,15 @@ vi.mock("../actions.js", () => ({
   detect_review_outcome: vi.fn().mockResolvedValue("approved"),
 }));
 
-// Mock review-utils for retry_approved_unmerged tests
+// Mock review-utils for retry_approved_unmerged and spawn_ci_fixer tests
 vi.mock("../review-utils.js", () => ({
   fetch_review_comments: vi.fn().mockResolvedValue("review comments"),
   build_review_fix_prompt: vi.fn().mockReturnValue("fix prompt"),
   attempt_auto_merge: vi.fn().mockResolvedValue({ merged: true, method: "direct" }),
   check_ci_status: vi.fn().mockResolvedValue({ passed: true, pending: false, failures: [] }),
+  fetch_ci_failure_logs: vi.fn().mockResolvedValue([]),
+  build_ci_fix_prompt: vi.fn().mockReturnValue("ci fix prompt"),
+  MAX_CI_FIX_ATTEMPTS: 3,
 }));
 
 function make_entity_with_repo(repo_path: string): EntityConfig {
@@ -574,7 +577,7 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     )).toBe(true);
   });
 
-  it("alerts when CI has failures and records failure set in processed", async () => {
+  it("spawns CI fixer when CI has failures and records failure set in processed", async () => {
     const pr = make_test_pr({ author: { login: "test-user" } });
     const entity_config = make_entity_with_github_user("test-user");
 
@@ -597,7 +600,7 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
     expect(notify_alerts).toHaveBeenCalledWith(
       entity_id,
-      expect.stringContaining("CI checks failed"),
+      expect.stringContaining("spawning builder to fix"),
     );
 
     // Should record the failure set for deduplication
@@ -633,7 +636,7 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     expect(mock_auto_merge).not.toHaveBeenCalled();
   });
 
-  it("re-alerts when CI failure set changes", async () => {
+  it("re-spawns CI fixer when failure set changes", async () => {
     const pr = make_test_pr({ author: { login: "test-user" } });
     const entity_config = make_entity_with_github_user("test-user");
 
@@ -658,7 +661,7 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
     expect(notify_alerts).toHaveBeenCalledWith(
       entity_id,
-      expect.stringContaining("CI checks failed"),
+      expect.stringContaining("spawning builder to fix"),
     );
 
     // Should update the recorded failure set
@@ -750,5 +753,214 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     expect(mock_save_reviews).toHaveBeenCalled();
     // Should NOT attempt merge
     expect(mock_auto_merge).not.toHaveBeenCalled();
+  });
+});
+
+// ── pr-cron spawn_ci_fixer tests (#196) ──
+
+import { fetch_ci_failure_logs, build_ci_fix_prompt } from "../review-utils.js";
+
+const mock_fetch_ci_logs = vi.mocked(fetch_ci_failure_logs);
+const mock_build_ci_prompt = vi.mocked(build_ci_fix_prompt);
+
+/**
+ * Create a PRReviewCron instance with private methods patched for testing
+ * the spawn_ci_fixer path directly.
+ */
+function make_ci_fixer_test_cron(opts: {
+  processed?: Record<string, ProcessedPR>;
+} = {}): {
+  cron: PRReviewCron;
+  session_manager: { spawn: ReturnType<typeof vi.fn> };
+  get_processed: () => Record<string, ProcessedPR>;
+  get_active_reviews: () => Map<string, unknown>;
+  call_spawn_ci_fixer: (
+    entity_id: string,
+    repo_path: string,
+    pr: TestOpenPR,
+    failed_checks: string[],
+    entity_config?: EntityConfig,
+  ) => Promise<void>;
+} {
+  const config = make_config();
+  const mock_spawn = vi.fn().mockResolvedValue({
+    session_id: "ci-fix-session-123",
+    entity_id: "test-entity",
+    feature_id: "ci-fix-42",
+    archetype: "builder",
+    started_at: new Date(),
+    pid: 99999,
+  });
+  const session_manager = {
+    spawn: mock_spawn,
+    on: vi.fn(),
+    removeListener: vi.fn(),
+  };
+  const cron = new PRReviewCron(
+    { get_active: () => [], get: vi.fn() } as never,
+    session_manager as never,
+    config,
+    null,
+    null,
+  );
+
+  const cron_any = cron as unknown as Record<string, unknown>;
+
+  // resolve_entity_token — return a dummy token
+  cron_any["resolve_entity_token"] = vi.fn().mockResolvedValue("ghs_test_token");
+
+  // notify_alerts — no-op spy
+  cron_any["notify_alerts"] = vi.fn().mockResolvedValue(undefined);
+
+  // Seed processed state
+  if (opts.processed) {
+    cron_any["processed"] = { ...opts.processed };
+  }
+
+  return {
+    cron,
+    session_manager,
+    get_processed: () => cron_any["processed"] as Record<string, ProcessedPR>,
+    get_active_reviews: () => cron_any["active_reviews"] as Map<string, unknown>,
+    call_spawn_ci_fixer: (entity_id, repo_path, pr, failed_checks, entity_config) =>
+      (cron_any["spawn_ci_fixer"] as (
+        entity_id: string,
+        repo_path: string,
+        pr: TestOpenPR,
+        failed_checks: string[],
+        entity_config?: EntityConfig,
+      ) => Promise<void>).call(cron, entity_id, repo_path, pr, failed_checks, entity_config),
+  };
+}
+
+describe("PRReviewCron.spawn_ci_fixer", () => {
+  let log_spy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    log_spy.mockRestore();
+  });
+
+  const entity_id = "test-entity";
+  const repo_path = "/tmp/test-repo";
+
+  it("spawns a builder and increments ci_fix_attempts", async () => {
+    const pr = make_test_pr();
+    const entity_config = make_entity_with_github_user("test-user");
+
+    const { session_manager, get_processed, call_spawn_ci_fixer } = make_ci_fixer_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+        },
+      },
+    });
+
+    await call_spawn_ci_fixer(entity_id, repo_path, pr, ["Build"], entity_config);
+
+    expect(session_manager.spawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id,
+        feature_id: "ci-fix-42",
+        archetype: "builder",
+      }),
+    );
+
+    const processed = get_processed()[`${entity_id}:42`];
+    expect(processed?.ci_fix_attempts).toBe(1);
+  });
+
+  it("stops spawning after MAX_CI_FIX_ATTEMPTS and escalates", async () => {
+    const pr = make_test_pr();
+    const entity_config = make_entity_with_github_user("test-user");
+
+    const { cron, session_manager, call_spawn_ci_fixer } = make_ci_fixer_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+          ci_fix_attempts: 3,
+        },
+      },
+    });
+
+    await call_spawn_ci_fixer(entity_id, repo_path, pr, ["Build"], entity_config);
+
+    // Should NOT spawn a builder
+    expect(session_manager.spawn).not.toHaveBeenCalled();
+
+    // Should alert about max attempts
+    const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
+    expect(notify_alerts).toHaveBeenCalledWith(
+      entity_id,
+      expect.stringContaining("CI fix failed after 3 attempts"),
+    );
+  });
+
+  it("skips when active_reviews has the PR (dedup)", async () => {
+    const pr = make_test_pr();
+    const entity_config = make_entity_with_github_user("test-user");
+
+    const { session_manager, get_active_reviews, call_spawn_ci_fixer } = make_ci_fixer_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+        },
+      },
+    });
+
+    // Simulate an in-flight review for this PR
+    get_active_reviews().set(`${entity_id}:42`, {
+      pr_number: 42,
+      entity_id,
+      repo_url: "https://github.com/test/test/pull/42",
+      status: "reviewing",
+      last_checked: new Date(),
+    });
+
+    await call_spawn_ci_fixer(entity_id, repo_path, pr, ["Build"], entity_config);
+
+    // Should NOT spawn — dedup
+    expect(session_manager.spawn).not.toHaveBeenCalled();
+
+    const logs = log_spy.mock.calls.map(c => c[0]) as string[];
+    expect(logs.some(m =>
+      typeof m === "string" && m.includes("CI fix skipped") && m.includes("already in-flight"),
+    )).toBe(true);
+  });
+
+  it("sets ci_failure_alerted to prevent double-spawn from retry pass", async () => {
+    const pr = make_test_pr();
+    const entity_config = make_entity_with_github_user("test-user");
+
+    const { get_processed, call_spawn_ci_fixer } = make_ci_fixer_test_cron({
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-03-27T10:00:00Z",
+          outcome: "approved",
+        },
+      },
+    });
+
+    await call_spawn_ci_fixer(entity_id, repo_path, pr, ["Lint", "Build"], entity_config);
+
+    const processed = get_processed()[`${entity_id}:42`];
+    // ci_failure_alerted should be set with sorted failure names
+    expect(processed?.ci_failure_alerted).toBe(JSON.stringify(["Build", "Lint"]));
   });
 });

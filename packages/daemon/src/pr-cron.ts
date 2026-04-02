@@ -7,7 +7,7 @@ import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import type { DiscordBot } from "./discord.js";
 import type { GitHubAppAuth } from "./github-app.js";
-import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status, fetch_ci_failure_logs, build_ci_fix_prompt } from "./review-utils.js";
+import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status, fetch_ci_failure_logs, build_ci_fix_prompt, MAX_CI_FIX_ATTEMPTS } from "./review-utils.js";
 import { detect_review_outcome } from "./actions.js";
 import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { PRReviewState } from "./persistence.js";
@@ -71,9 +71,6 @@ const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 /** Buffer in ms to avoid re-reviewing when commit and review timestamps are very close. */
 const TIMESTAMP_BUFFER_MS = 60_000; // 60 seconds
-
-/** Maximum number of CI fix attempts before escalating to a human (#196). */
-const MAX_CI_FIX_ATTEMPTS = 3;
 
 export class PRReviewCron {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -827,10 +824,13 @@ export class PRReviewCron {
       return;
     }
 
-    // Increment attempt counter and persist
+    // Increment attempt counter and set ci_failure_alerted so
+    // retry_approved_unmerged doesn't double-spawn for the same failure set.
+    const failure_key = JSON.stringify([...failed_checks].sort());
     this.processed[key] = {
       ...(this.processed[key] ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
       ci_fix_attempts: attempts + 1,
+      ci_failure_alerted: failure_key,
     };
     await save_pr_reviews(this.processed, this.config);
 
@@ -844,8 +844,6 @@ export class PRReviewCron {
     );
 
     const prompt = [
-      `An approved PR has failing CI checks that need fixing.`,
-      `PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}`,
       `Repository: ${repo_path}`,
       ``,
       build_ci_fix_prompt(pr.number, pr.title, pr.headRefName, failure_logs),

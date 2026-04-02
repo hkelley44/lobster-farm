@@ -487,8 +487,11 @@ describe("webhook handler — CI fix loop", () => {
     expect(entry!.ci_fix_attempts).toBe(1);
   });
 
-  it("stops spawning after MAX_CI_FIX_ATTEMPTS (3) and escalates", async () => {
-    // Pre-set the counter to 3 (already at max)
+  it("resets stale ci_fix_attempts and spawns on fresh approval (webhook always resets)", async () => {
+    // Pre-set the counter to 3 (exhausted from a previous loop).
+    // In the webhook handler path, a fresh reviewer approval always means
+    // new commits arrived, so the counter resets — the builder SHOULD spawn.
+    // The retry cap is enforced by the pr-cron's retry_approved_unmerged path.
     mock_pr_state = {
       "test-entity:42": {
         entity_id: "test-entity",
@@ -499,31 +502,125 @@ describe("webhook handler — CI fix loop", () => {
       },
     };
 
-    const { session_manager, discord } = await trigger_review_completion(() => ({
+    const { session_manager } = await trigger_review_completion(() => ({
       stdout: JSON.stringify([
         { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
       ]),
     }));
 
-    // Should NOT spawn a second builder for CI fix (only the reviewer spawn)
+    // Should spawn a CI fix builder — counter was reset before checking cap
     const spawn_calls = session_manager.spawn.mock.calls;
     const ci_fix_spawns = spawn_calls.filter(
       (call: unknown[]) => (call[0] as { feature_id: string }).feature_id === "ci-fix-42",
     );
-    expect(ci_fix_spawns).toHaveLength(0);
+    expect(ci_fix_spawns).toHaveLength(1);
 
-    // Should alert about max attempts reached
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("CI fix failed after 3 attempts"),
-      "reviewer",
+    // Counter should be 1 (reset to 0, then incremented)
+    const entry = mock_pr_state["test-entity:42"] as { ci_fix_attempts?: number } | undefined;
+    expect(entry?.ci_fix_attempts).toBe(1);
+  });
+
+  it("resets ci_fix_attempts on fresh reviewer approval", async () => {
+    // Pre-set the counter to 3 (exhausted) — simulates a previous fix loop
+    mock_pr_state = {
+      "test-entity:42": {
+        entity_id: "test-entity",
+        pr_number: 42,
+        reviewed_at: new Date().toISOString(),
+        outcome: "approved",
+        ci_fix_attempts: 3,
+      },
+    };
+
+    // CI still failing, but fresh approval should reset the counter first
+    const { session_manager } = await trigger_review_completion(() => ({
+      stdout: JSON.stringify([
+        { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
+      ]),
+    }));
+
+    // Should spawn a CI fix builder because the counter was reset
+    const spawn_calls = session_manager.spawn.mock.calls;
+    const ci_fix_spawns = spawn_calls.filter(
+      (call: unknown[]) => (call[0] as { feature_id: string }).feature_id === "ci-fix-42",
     );
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("human intervention"),
-      "reviewer",
-    );
+    expect(ci_fix_spawns).toHaveLength(1);
+
+    // Counter should be 1 (reset to 0, then incremented)
+    const entry = mock_pr_state["test-entity:42"] as { ci_fix_attempts?: number } | undefined;
+    expect(entry).toBeDefined();
+    expect(entry!.ci_fix_attempts).toBe(1);
+  });
+
+  it("does not consume retry slot on token resolution failure", async () => {
+    mock_pr_state = {};
+
+    // Trigger a review where token resolution will fail on the CI fix path
+    const ctx = make_context();
+
+    // Make get_token succeed for reviewer spawn but fail for CI fix
+    // The reviewer uses get_token_for_installation (installation_id = "12345")
+    // The CI fixer also uses get_token_for_installation
+    let call_count = 0;
+    const github_app = ctx.github_app as unknown as {
+      get_token_for_installation: ReturnType<typeof vi.fn>;
+    };
+    github_app.get_token_for_installation = vi.fn().mockImplementation(() => {
+      call_count++;
+      // First two calls: reviewer spawn (1) + handle_review_completion (2)
+      if (call_count <= 2) return Promise.resolve("ghs_mock_token");
+      // Third call: CI fix token resolution — fail
+      return Promise.reject(new Error("Certificate expired"));
+    });
+
+    route_exec({
+      "gh pr view": () => ({ stdout: "OPEN" }),
+      "gh pr checks": () => ({
+        stdout: JSON.stringify([
+          { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
+        ]),
+      }),
+      "gh run list": () => ({
+        stdout: JSON.stringify([{ databaseId: 100, name: "CI" }]),
+      }),
+      "gh run view": () => ({
+        stdout: "Error: build failed\n",
+      }),
+    });
+
+    const payload = JSON.stringify({
+      action: "opened",
+      pull_request: {
+        number: 42,
+        title: "feat: test feature",
+        head: { ref: "feature/test" },
+        body: "Test body",
+        user: { login: "test-user" },
+      },
+      repository: { full_name: "test-org/lobster-farm" },
+      installation: { id: 12345 },
+    });
+
+    const req = make_request(payload, {
+      "x-hub-signature-256": sign_payload(payload),
+      "x-github-event": "pull_request",
+    });
+    const res = make_response();
+
+    await handle_github_webhook(req, res, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const session_manager = ctx.session_manager as unknown as EventEmitter;
+    session_manager.emit("session:completed", {
+      session_id: "test-session-123",
+      exit_code: 0,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    // ci_fix_attempts should NOT have been incremented since token failed
+    const entry = mock_pr_state["test-entity:42"] as { ci_fix_attempts?: number } | undefined;
+    // Entry may not exist or should have ci_fix_attempts as 0 or undefined
+    expect(entry?.ci_fix_attempts ?? 0).toBe(0);
   });
 });
