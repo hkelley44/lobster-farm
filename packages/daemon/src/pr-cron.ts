@@ -867,7 +867,7 @@ export class PRReviewCron {
     const prompt = [
       `Repository: ${repo_path}`,
       ``,
-      build_ci_fix_prompt(pr.number, pr.title, pr.headRefName, failure_logs),
+      build_ci_fix_prompt(pr.number, pr.title, pr.headRefName, failure_logs, failed_checks),
     ].join("\n");
 
     console.log(

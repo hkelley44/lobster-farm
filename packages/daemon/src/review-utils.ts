@@ -527,6 +527,7 @@ export function build_ci_fix_prompt(
   title: string,
   branch: string,
   failure_logs: CIFailureLog[],
+  failed_check_names?: string[],
 ): string {
   const pr = String(pr_number);
   const lines = [
@@ -547,6 +548,14 @@ export function build_ci_fix_prompt(
         ``,
       );
     }
+  } else if (failed_check_names?.length) {
+    // Log fetching failed but we still know which checks are failing
+    lines.push(
+      `Failing CI checks: ${failed_check_names.join(", ")}`,
+      ``,
+      `(Detailed logs unavailable — run \`gh run list --branch ${branch} --status failure\` to investigate)`,
+      ``,
+    );
   }
 
   lines.push(

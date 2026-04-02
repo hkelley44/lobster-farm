@@ -261,6 +261,26 @@ describe("build_ci_fix_prompt", () => {
     expect(prompt).not.toContain("## CI Failure Logs");
     expect(prompt).toContain("## Instructions");
   });
+
+  it("includes failing check names as fallback when logs are empty", () => {
+    const prompt = build_ci_fix_prompt(42, "Title", "feature/test", [], ["Lint", "Build"]);
+
+    expect(prompt).toContain("Failing CI checks: Lint, Build");
+    expect(prompt).toContain("Detailed logs unavailable");
+    expect(prompt).toContain("gh run list --branch feature/test");
+    expect(prompt).not.toContain("## CI Failure Logs");
+  });
+
+  it("prefers full logs over check name fallback", () => {
+    const logs: CIFailureLog[] = [
+      { check_name: "Lint", log_output: "Error: unexpected semicolon" },
+    ];
+    const prompt = build_ci_fix_prompt(42, "Title", "branch", logs, ["Lint", "Build"]);
+
+    expect(prompt).toContain("## CI Failure Logs");
+    expect(prompt).not.toContain("Failing CI checks:");
+    expect(prompt).not.toContain("Detailed logs unavailable");
+  });
 });
 
 // ── Integration tests: webhook handler spawns CI fix builder ──
@@ -487,41 +507,25 @@ describe("webhook handler — CI fix loop", () => {
     expect(entry!.ci_fix_attempts).toBe(1);
   });
 
-  it("resets stale ci_fix_attempts and spawns on fresh approval (webhook always resets)", async () => {
-    // Pre-set the counter to 3 (exhausted from a previous loop).
-    // In the webhook handler path, a fresh reviewer approval always means
-    // new commits arrived, so the counter resets — the builder SHOULD spawn.
-    // The retry cap is enforced by the pr-cron's retry_approved_unmerged path.
-    mock_pr_state = {
-      "test-entity:42": {
-        entity_id: "test-entity",
-        pr_number: 42,
-        reviewed_at: new Date().toISOString(),
-        outcome: "approved",
-        ci_fix_attempts: 3,
-      },
-    };
-
-    const { session_manager } = await trigger_review_completion(() => ({
+  it("sets ci_failure_alerted to prevent pr-cron double-spawn", async () => {
+    await trigger_review_completion(() => ({
       stdout: JSON.stringify([
         { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
+        { name: "Lint", state: "COMPLETED", conclusion: "FAILURE" },
       ]),
     }));
 
-    // Should spawn a CI fix builder — counter was reset before checking cap
-    const spawn_calls = session_manager.spawn.mock.calls;
-    const ci_fix_spawns = spawn_calls.filter(
-      (call: unknown[]) => (call[0] as { feature_id: string }).feature_id === "ci-fix-42",
-    );
-    expect(ci_fix_spawns).toHaveLength(1);
-
-    // Counter should be 1 (reset to 0, then incremented)
-    const entry = mock_pr_state["test-entity:42"] as { ci_fix_attempts?: number } | undefined;
-    expect(entry?.ci_fix_attempts).toBe(1);
+    // ci_failure_alerted should be set with sorted failure names
+    const entry = mock_pr_state["test-entity:42"] as { ci_failure_alerted?: string } | undefined;
+    expect(entry).toBeDefined();
+    expect(entry!.ci_failure_alerted).toBe(JSON.stringify(["Build", "Lint"]));
   });
 
-  it("resets ci_fix_attempts on fresh reviewer approval", async () => {
-    // Pre-set the counter to 3 (exhausted) — simulates a previous fix loop
+  it("does NOT reset ci_fix_attempts on fresh approval — cap is lifetime-of-issue", async () => {
+    // Pre-set the counter to 3 (exhausted from a previous loop).
+    // The retry cap should be lifetime-of-issue, not per-reviewer-cycle.
+    // Resetting on approval would create an infinite loop: builder pushes fix →
+    // new review → approval → reset → CI fails → spawn → repeat.
     mock_pr_state = {
       "test-entity:42": {
         entity_id: "test-entity",
@@ -532,24 +536,62 @@ describe("webhook handler — CI fix loop", () => {
       },
     };
 
-    // CI still failing, but fresh approval should reset the counter first
+    const { session_manager, discord } = await trigger_review_completion(() => ({
+      stdout: JSON.stringify([
+        { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
+      ]),
+    }));
+
+    // Should NOT spawn a CI fix builder — counter is at 3, cap reached
+    const spawn_calls = session_manager.spawn.mock.calls;
+    const ci_fix_spawns = spawn_calls.filter(
+      (call: unknown[]) => (call[0] as { feature_id: string }).feature_id === "ci-fix-42",
+    );
+    expect(ci_fix_spawns).toHaveLength(0);
+
+    // Counter should still be 3 — not reset
+    const entry = mock_pr_state["test-entity:42"] as { ci_fix_attempts?: number } | undefined;
+    expect(entry?.ci_fix_attempts).toBe(3);
+
+    // Should alert about reaching the cap
+    expect(discord.send_to_entity).toHaveBeenCalledWith(
+      "test-entity",
+      "alerts",
+      expect.stringContaining("human intervention"),
+      "reviewer",
+    );
+  });
+
+  it("respects ci_fix_attempts cap even on fresh reviewer approval", async () => {
+    // Pre-set the counter to 2 (below cap) — simulates previous fix attempts
+    mock_pr_state = {
+      "test-entity:42": {
+        entity_id: "test-entity",
+        pr_number: 42,
+        reviewed_at: new Date().toISOString(),
+        outcome: "approved",
+        ci_fix_attempts: 2,
+      },
+    };
+
+    // CI still failing — fresh approval should NOT reset counter
     const { session_manager } = await trigger_review_completion(() => ({
       stdout: JSON.stringify([
         { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
       ]),
     }));
 
-    // Should spawn a CI fix builder because the counter was reset
+    // Should spawn because we're at 2 < 3
     const spawn_calls = session_manager.spawn.mock.calls;
     const ci_fix_spawns = spawn_calls.filter(
       (call: unknown[]) => (call[0] as { feature_id: string }).feature_id === "ci-fix-42",
     );
     expect(ci_fix_spawns).toHaveLength(1);
 
-    // Counter should be 1 (reset to 0, then incremented)
+    // Counter should be 3 (2 + 1, NOT reset to 0 then incremented)
     const entry = mock_pr_state["test-entity:42"] as { ci_fix_attempts?: number } | undefined;
     expect(entry).toBeDefined();
-    expect(entry!.ci_fix_attempts).toBe(1);
+    expect(entry!.ci_fix_attempts).toBe(3);
   });
 
   it("does not consume retry slot on token resolution failure", async () => {

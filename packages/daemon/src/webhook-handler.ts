@@ -455,16 +455,6 @@ async function handle_review_completion(
       ctx,
     );
   } else if (outcome === "approved") {
-    // On fresh reviewer approval, reset the CI fix counter so new commits
-    // get fresh attempts. Mirrors what persist_review_completion does
-    // implicitly in the pr-cron path (overwrites with fresh object).
-    const pr_state = await load_pr_reviews(ctx.config);
-    const state_key = review_key(entity_id, pr.number);
-    if (pr_state[state_key]?.ci_fix_attempts) {
-      pr_state[state_key] = { ...pr_state[state_key], ci_fix_attempts: 0 };
-      await save_pr_reviews(pr_state, ctx.config);
-    }
-
     // Check if reviewer already merged
     const is_merged = await check_pr_merged(repo_path, pr.number, gh_token);
 
@@ -656,10 +646,13 @@ async function spawn_ci_fixer(
     return;
   }
 
-  // Increment attempt counter and persist (after token resolution succeeded)
+  // Increment attempt counter and set ci_failure_alerted so pr-cron's
+  // retry_approved_unmerged doesn't double-spawn for the same failure set.
+  const failure_key = JSON.stringify([...failed_checks].sort());
   pr_state[key] = {
     ...(entry ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
     ci_fix_attempts: attempts + 1,
+    ci_failure_alerted: failure_key,
   };
   await save_pr_reviews(pr_state, ctx.config);
 
@@ -671,7 +664,7 @@ async function spawn_ci_fixer(
   const prompt = [
     `Repository: ${repo_path}`,
     ``,
-    build_ci_fix_prompt(pr.number, pr.title, pr.head.ref, failure_logs),
+    build_ci_fix_prompt(pr.number, pr.title, pr.head.ref, failure_logs, failed_checks),
   ].join("\n");
 
   console.log(
