@@ -19,7 +19,9 @@ import type { EntityRegistry } from "./registry.js";
 import type { ClaudeSessionManager, SessionResult } from "./session.js";
 import type { DiscordBot } from "./discord.js";
 import { detect_review_outcome } from "./actions.js";
-import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status } from "./review-utils.js";
+import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status, fetch_ci_failure_logs, build_ci_fix_prompt, MAX_CI_FIX_ATTEMPTS } from "./review-utils.js";
+import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
+import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import {
   extract_first_linked_issue,
   extract_linked_issues,
@@ -39,6 +41,7 @@ export interface WebhookContext {
   session_manager: ClaudeSessionManager;
   registry: EntityRegistry;
   discord: DiscordBot | null;
+  config: LobsterFarmConfig;
 }
 
 /** Minimal PR shape from webhook payload. */
@@ -465,11 +468,8 @@ async function handle_review_completion(
         );
         // Don't merge yet — pr-cron's retry_approved_unmerged pass will check CI and merge next cycle
       } else if (ci.failures.length > 0) {
-        await notify_alerts(
-          entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — approved but CI checks failed: ${ci.failures.join(", ")}. Not merging.`,
-          ctx,
-        );
+        // Spawn builder to fix CI failures (#196)
+        await spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, ctx, installation_id);
       } else {
         // All checks passed (or none configured) — proceed with merge
         const result = await attempt_auto_merge(
@@ -586,6 +586,115 @@ async function spawn_fixer(
     );
     sentry.captureException(err, {
       tags: { module: "webhook", entity: entity_id, action: "spawn_fixer" },
+      contexts: { pr: { number: pr.number, title: pr.title } },
+    });
+  }
+}
+
+// ── Builder spawning for CI failures (#196) ──
+
+/**
+ * Spawn a builder session to fix CI failures on an approved PR.
+ *
+ * Checks the retry cap (max 3 attempts) before spawning. If the cap is
+ * reached, alerts #alerts and stops.
+ *
+ * Note: does NOT check active_reviews for dedup here. This function is
+ * called from handle_review_completion, which runs while the reviewer's
+ * active_reviews entry is still present (cleaned up in .finally()).
+ * Dedup for overlapping webhook events is handled at the route_event level.
+ * The pr-cron path has its own active_reviews instance with separate dedup.
+ *
+ * The builder gets CI failure logs as context so it can diagnose and fix
+ * lint errors, type errors, test failures, etc.
+ */
+async function spawn_ci_fixer(
+  entity_id: string,
+  repo_path: string,
+  pr: WebhookPR,
+  failed_checks: string[],
+  ctx: WebhookContext,
+  installation_id?: string,
+): Promise<void> {
+  const key = review_key(entity_id, pr.number);
+
+  // Check retry cap
+  const pr_state = await load_pr_reviews(ctx.config);
+  const entry = pr_state[key];
+  const attempts = entry?.ci_fix_attempts ?? 0;
+
+  if (attempts >= MAX_CI_FIX_ATTEMPTS) {
+    await notify_alerts(
+      entity_id,
+      `PR #${String(pr.number)}: ${pr.title} — CI fix failed after ${String(MAX_CI_FIX_ATTEMPTS)} attempts. Needs human intervention. Failed checks: ${failed_checks.join(", ")}`,
+      ctx,
+    );
+    return;
+  }
+
+  // Resolve token BEFORE incrementing attempt counter — transient token
+  // errors (cert issues, rate limits) shouldn't consume retry slots.
+  let gh_token: string;
+  try {
+    gh_token = await resolve_token(ctx.github_app, installation_id);
+  } catch (err) {
+    console.error(`[webhook] Failed to get token for CI fix: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "webhook", entity: entity_id, action: "ci_fix_token" },
+      contexts: { pr: { number: pr.number, title: pr.title } },
+    });
+    return;
+  }
+
+  // Increment attempt counter and set ci_failure_alerted so pr-cron's
+  // retry_approved_unmerged doesn't double-spawn for the same failure set.
+  const failure_key = JSON.stringify([...failed_checks].sort());
+  pr_state[key] = {
+    ...(entry ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
+    ci_fix_attempts: attempts + 1,
+    ci_failure_alerted: failure_key,
+  };
+  await save_pr_reviews(pr_state, ctx.config);
+
+  // Fetch CI failure logs for context
+  const failure_logs = await fetch_ci_failure_logs(
+    pr.head.ref, repo_path, gh_token,
+  );
+
+  const prompt = [
+    `Repository: ${repo_path}`,
+    ``,
+    build_ci_fix_prompt(pr.number, pr.title, pr.head.ref, failure_logs, failed_checks),
+  ].join("\n");
+
+  console.log(
+    `[webhook] Spawning CI fix builder for PR #${String(pr.number)} in ${entity_id} (attempt ${String(attempts + 1)}/${String(MAX_CI_FIX_ATTEMPTS)})`,
+  );
+
+  await notify_alerts(
+    entity_id,
+    `PR #${String(pr.number)}: ${pr.title} — approved but CI failed (${failed_checks.join(", ")}), spawning builder to fix (attempt ${String(attempts + 1)}/${String(MAX_CI_FIX_ATTEMPTS)})`,
+    ctx,
+  );
+
+  try {
+    await ctx.session_manager.spawn({
+      entity_id,
+      feature_id: `ci-fix-${String(pr.number)}`,
+      archetype: "builder",
+      dna: ["coding-dna"],
+      model: { model: "opus", think: "high" },
+      worktree_path: repo_path,
+      prompt,
+      interactive: false,
+      env: { GH_TOKEN: gh_token },
+    });
+  } catch (err) {
+    console.error(
+      `[webhook] Failed to spawn CI fix builder for PR #${String(pr.number)}: ${String(err)}`,
+    );
+    sentry.captureException(err, {
+      tags: { module: "webhook", entity: entity_id, action: "spawn_ci_fixer" },
       contexts: { pr: { number: pr.number, title: pr.title } },
     });
   }

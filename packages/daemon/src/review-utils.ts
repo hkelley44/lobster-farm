@@ -6,6 +6,7 @@
  *
  * Extracted from features.ts during feature lifecycle removal (#100).
  * Auto-merge with rebase added in #166.
+ * CI failure log fetching and CI fix prompts added in #196.
  */
 
 import { execFile } from "node:child_process";
@@ -428,4 +429,147 @@ export async function check_ci_status(
     // pr-cron will retry on the next cycle.
     return { passed: false, pending: true, failures: [] };
   }
+}
+
+/** Maximum number of CI fix attempts before escalating to a human (#196). */
+export const MAX_CI_FIX_ATTEMPTS = 3;
+
+// ── CI failure log fetching (#196) ──
+
+/** Max number of lines to keep per failed job's log output. */
+const CI_LOG_TAIL_LINES = 100;
+
+export interface CIFailureLog {
+  check_name: string;
+  log_output: string;
+}
+
+/**
+ * Fetch failure logs for failed CI runs on a branch.
+ *
+ * Strategy:
+ * 1. List failed workflow runs for the branch via `gh run list`
+ * 2. For each failed run, fetch the failed log output via `gh run view --log-failed`
+ * 3. Truncate each log to the last ~100 lines to keep prompts manageable
+ *
+ * Returns an array of { check_name, log_output } for each failed run.
+ * Returns an empty array if no failed runs are found or fetching fails.
+ */
+export async function fetch_ci_failure_logs(
+  branch: string,
+  repo_path: string,
+  gh_token?: string,
+  gh_bin: string = "gh",
+): Promise<CIFailureLog[]> {
+  const env = gh_token
+    ? { ...process.env, GH_TOKEN: gh_token }
+    : process.env;
+  const exec_opts = { cwd: repo_path, env, timeout: 30_000 };
+
+  // Step 1: Find failed runs on this branch
+  let runs: Array<{ databaseId: number; name: string }>;
+  try {
+    const { stdout } = await exec_async(gh_bin, [
+      "run", "list",
+      "--branch", branch,
+      "--status", "failure",
+      "--json", "databaseId,name",
+      "--limit", "5",
+    ], exec_opts);
+
+    runs = JSON.parse(stdout) as Array<{ databaseId: number; name: string }>;
+  } catch {
+    console.log(`[ci-fix] Could not list failed runs for branch ${branch}`);
+    return [];
+  }
+
+  if (runs.length === 0) return [];
+
+  // Step 2: Fetch failed log output for each run
+  const logs: CIFailureLog[] = [];
+
+  for (const run of runs) {
+    try {
+      const { stdout } = await exec_async(gh_bin, [
+        "run", "view", String(run.databaseId),
+        "--log-failed",
+      ], { ...exec_opts, timeout: 60_000 });
+
+      // Truncate to last N lines — CI logs can be enormous
+      const lines = stdout.split("\n");
+      const truncated = lines.length > CI_LOG_TAIL_LINES
+        ? `... (${String(lines.length - CI_LOG_TAIL_LINES)} lines truncated)\n` +
+          lines.slice(-CI_LOG_TAIL_LINES).join("\n")
+        : stdout;
+
+      logs.push({
+        check_name: run.name,
+        log_output: truncated.trim(),
+      });
+    } catch {
+      // Log fetch failed — include the run name with a note
+      logs.push({
+        check_name: run.name,
+        log_output: `(Could not fetch failure logs for run ${String(run.databaseId)}. Run \`gh run view ${String(run.databaseId)} --log-failed\` manually.)`,
+      });
+    }
+  }
+
+  return logs;
+}
+
+/**
+ * Build the prompt given to a builder when fixing CI failures.
+ * Used by both the webhook handler and PR cron CI fix paths.
+ */
+export function build_ci_fix_prompt(
+  pr_number: number,
+  title: string,
+  branch: string,
+  failure_logs: CIFailureLog[],
+  failed_check_names?: string[],
+): string {
+  const pr = String(pr_number);
+  const lines = [
+    `PR #${pr}: "${title}" on branch ${branch} was approved but CI checks are failing.`,
+    ``,
+  ];
+
+  if (failure_logs.length > 0) {
+    lines.push(`## CI Failure Logs`, ``);
+
+    for (const log of failure_logs) {
+      lines.push(
+        `### ${log.check_name}`,
+        ``,
+        "```",
+        log.log_output,
+        "```",
+        ``,
+      );
+    }
+  } else if (failed_check_names?.length) {
+    // Log fetching failed but we still know which checks are failing
+    lines.push(
+      `Failing CI checks: ${failed_check_names.join(", ")}`,
+      ``,
+      `(Detailed logs unavailable — run \`gh run list --branch ${branch} --status failure\` to investigate)`,
+      ``,
+    );
+  }
+
+  lines.push(
+    `## Instructions`,
+    ``,
+    `1. Check out the branch: git checkout ${branch}`,
+    `2. Read the CI failure logs above carefully`,
+    `3. Fix the issues causing CI failures (lint errors, type errors, test failures, etc.)`,
+    `4. Run the test suite locally to verify your fixes`,
+    `5. Commit and push your changes`,
+    ``,
+    `Keep changes minimal and targeted — only fix what CI is complaining about.`,
+    `Do NOT merge the PR.`,
+  );
+
+  return lines.join("\n");
 }

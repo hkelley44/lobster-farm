@@ -87,6 +87,12 @@ vi.mock("../issue-utils.js", () => ({
   nwo_from_url: vi.fn(() => "test-org/lobster-farm"),
 }));
 
+// Mock persistence — the CI fix loop uses load/save_pr_reviews (#196)
+vi.mock("../persistence.js", () => ({
+  load_pr_reviews: vi.fn(async () => ({})),
+  save_pr_reviews: vi.fn(async () => {}),
+}));
+
 // Import after mocks are registered
 import { check_ci_status } from "../review-utils.js";
 import {
@@ -337,6 +343,7 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
     session_manager: make_session_manager(),
     registry: make_registry(),
     discord: make_discord(),
+    config: { paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" } } as WebhookContext["config"],
     ...overrides,
   };
 }
@@ -522,10 +529,13 @@ describe("webhook handler — CI gating on review completion", () => {
   async function trigger_review_completion(
     ci_route: ExecRoute,
   ): Promise<{ ctx: WebhookContext; discord: { send_to_entity: ReturnType<typeof vi.fn> } }> {
-    // Route gh pr view (check_pr_merged → not merged) and gh pr checks (CI status)
+    // Route gh pr view (check_pr_merged → not merged), gh pr checks (CI status),
+    // and gh run list/view for CI fix log fetching (#196)
     route_exec({
       "gh pr view": () => ({ stdout: "OPEN" }),
       "gh pr checks": ci_route,
+      "gh run list": () => ({ stdout: JSON.stringify([]) }),
+      "gh run view": () => ({ stdout: "" }),
     });
 
     const payload = JSON.stringify({
@@ -567,7 +577,7 @@ describe("webhook handler — CI gating on review completion", () => {
     return { ctx, discord };
   }
 
-  it("blocks merge and sends alert when CI checks are failing", async () => {
+  it("blocks merge and spawns CI fixer when CI checks are failing", async () => {
     const { discord } = await trigger_review_completion(() => ({
       stdout: JSON.stringify([
         { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
@@ -575,11 +585,11 @@ describe("webhook handler — CI gating on review completion", () => {
       ]),
     }));
 
-    // Should alert about CI failure, not attempt merge
+    // Should alert about CI failure and spawn builder to fix (#196)
     expect(discord.send_to_entity).toHaveBeenCalledWith(
       "test-entity",
       "alerts",
-      expect.stringContaining("CI checks failed"),
+      expect.stringContaining("spawning builder to fix"),
       "reviewer",
     );
     expect(discord.send_to_entity).toHaveBeenCalledWith(

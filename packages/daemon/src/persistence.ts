@@ -30,6 +30,10 @@ export interface ProcessedPR {
   /** JSON-stringified sorted failure names — used to deduplicate CI failure alerts.
    * Only set when a CI failure alert has been sent for this PR. */
   ci_failure_alerted?: string;
+  /** Number of CI fix attempts spawned for this PR.
+   * Incremented each time a builder is spawned to fix CI failures.
+   * Reset when new commits arrive from a non-builder source. (#196) */
+  ci_fix_attempts?: number;
 }
 
 /** Keyed by "entity_id:pr_number" */
