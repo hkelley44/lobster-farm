@@ -2,54 +2,64 @@
 
 Autonomous orchestration platform built on Claude Code. Turns a single machine into a structured consultancy with specialized agents, deterministic workflows, and project isolation.
 
-## Quick Start
+## Install
 
 ```bash
-# Prerequisites: Node.js 22+, npm
-npm install -g pnpm
+curl -fsSL https://raw.githubusercontent.com/ultim88888888/lobster-farm/main/install.sh | bash
+```
 
-# Clone and build
-git clone https://github.com/ultim88888888/lobster-farm.git
-cd lobster-farm
+Then run the setup wizard:
+
+```bash
+lf init
+```
+
+The wizard checks for prerequisites (Claude Code, 1Password, sudo), configures your user profile and agent names, sets up Discord, and generates all config files.
+
+### Manual install
+
+```bash
+git clone https://github.com/ultim88888888/lobster-farm.git ~/.lobsterfarm/src
+cd ~/.lobsterfarm/src
 pnpm install && pnpm build
-
-# Run the setup wizard (handles everything)
-node packages/cli/dist/index.js init
+chmod +x $(pwd)/packages/cli/dist/index.js
+ln -sf $(pwd)/packages/cli/dist/index.js ~/.local/bin/lf
+lf init
 ```
 
-The setup wizard will:
-- Check for Claude Code, 1Password, and sudo access
-- Configure your user profile and agent names
-- Set up Discord bot token
-- Generate all config files and directory structure
+**Prerequisites:** Node.js 22+, pnpm, Claude Code, 1Password CLI
 
-## After Setup
+## Usage
 
 ```bash
-# Start the daemon
-node packages/cli/dist/index.js start
-
-# Or run directly (see logs in terminal)
-node packages/daemon/dist/index.js
+lf start          # Start the daemon
+lf stop           # Stop the daemon
+lf restart        # Hot-restart (preserves sessions)
+lf status         # Show daemon status
 ```
 
-Then in Discord, use slash commands:
-```
-/scaffold entity:alpha name:"Trading Platform"
-/plan entity:alpha title:"First feature"
-/status
-/help
-```
+Discord slash commands (after setup):
+
+| Command | Description |
+|---------|-------------|
+| `/status` | Daemon and session status |
+| `/scaffold` | Create entity with Discord channels |
+| `/swap` | Switch agent archetype in a work room |
+| `/room` | Create a new work room |
+| `/close` | Close and archive a work room session |
+| `/resume` | Restore an archived session |
+| `/archives` | List archived sessions |
+| `/reset` | Release current bot, fresh assignment on next message |
 
 ## Architecture
 
 ```
-CLI (lobsterfarm)          Daemon (always-on)              Claude Code CLI
+CLI (lf)                   Daemon (always-on)              Claude Code CLI
   init                       HTTP API (:7749)                Agents (Gary, Pearl, Bob...)
-  entity create/list         Session Manager                 Skills (DNA profiles)
-  start/stop/status          Task Queue                      Hooks (SOP enforcement)
-                             Feature Lifecycle                CLAUDE.md hierarchy
-                             Discord Bot + Router
+  start/stop/restart         Session Manager                 Skills (DNA profiles)
+  entity create/list         Task Queue                      Hooks (SOP enforcement)
+                             Discord Bot + Pool              CLAUDE.md hierarchy
+                             AutoReviewer (GitHub App)
                              Persistence
 ```
 
@@ -59,46 +69,19 @@ CLI (lobsterfarm)          Daemon (always-on)              Claude Code CLI
 
 **DNA** — composable domain expertise (coding standards, design principles, review criteria)
 
-**SOPs** — deterministic workflows executed by the daemon (feature lifecycle, PR review)
+**AutoReviewer** — GitHub App that auto-reviews PRs, auto-merges on approval, and spawns fix sessions on rejection
 
 ## Project Structure
 
 ```
 packages/
   shared/     Config schemas, path resolver, template engine, YAML loader
-  cli/        lobsterfarm init, entity create/list, start/stop/status
-  daemon/     HTTP server, session manager, task queue, feature lifecycle,
-              Discord bot, deterministic router, persistence
+  cli/        lf init, entity create/list, start/stop/restart/status
+  daemon/     HTTP server, session manager, task queue, Discord bot,
+              pool manager, AutoReviewer, webhook handler, persistence
 config/       Default templates (agents, skills, user/tools configs)
 docs/         Architecture specs
 ```
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `lobsterfarm init` | Setup wizard — first-time configuration |
-| `lobsterfarm entity create` | Create a new entity (project) |
-| `lobsterfarm entity list` | List configured entities |
-| `lobsterfarm start` | Start the daemon |
-| `lobsterfarm stop` | Stop the daemon |
-| `lobsterfarm status` | Show daemon status |
-
-## Discord Slash Commands
-
-| Command | Description |
-|---------|-------------|
-| `/help` | Show all commands |
-| `/status` | Daemon and session status |
-| `/scaffold` | Create entity with Discord channels |
-| `/plan` | Create a feature |
-| `/features` | List features |
-| `/swap` | Switch agent archetype in a work room |
-| `/room` | Create a new work room |
-| `/close` | Close and archive a work room session |
-| `/resume` | Restore an archived session |
-| `/archives` | List archived sessions |
-| `/reset` | Release current bot, fresh assignment on next message |
 
 ## License
 
