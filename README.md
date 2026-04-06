@@ -22,6 +22,7 @@ The wizard checks for prerequisites (Claude Code, 1Password, sudo), configures y
 git clone https://github.com/ultim88888888/lobster-farm.git ~/.lobsterfarm/src
 cd ~/.lobsterfarm/src
 pnpm install && pnpm build
+chmod +x $(pwd)/packages/cli/dist/index.js
 ln -sf $(pwd)/packages/cli/dist/index.js ~/.local/bin/lf
 lf init
 ```

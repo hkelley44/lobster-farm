@@ -23,7 +23,7 @@ NODE_MAJOR=$(node -e "console.log(process.versions.node.split('.')[0])")
 
 command -v pnpm >/dev/null 2>&1 || {
   warn "pnpm not found — installing via corepack..."
-  corepack enable && corepack prepare pnpm@latest --activate
+  corepack enable && corepack prepare pnpm@9 --activate
 }
 
 command -v claude >/dev/null 2>&1 || warn "Claude Code CLI not found. Install it before running 'lf init'."
@@ -50,6 +50,7 @@ info "Installing dependencies and building..."
 cd "$INSTALL_DIR"
 pnpm install --frozen-lockfile 2>/dev/null || pnpm install
 pnpm build
+chmod +x "$INSTALL_DIR/packages/cli/dist/index.js"
 
 # ── Symlink CLI ──
 
