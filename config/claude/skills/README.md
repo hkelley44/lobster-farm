@@ -14,7 +14,7 @@ Skills fall into three categories:
 - `database-dna/` -- Database design, schema architecture, query optimization. PostgreSQL/Prisma/SQLAlchemy patterns.
 - `design-dna/` -- Visual systems, UI implementation, animation, and design-in-code principles.
 - `planning-dna/` -- Spec writing, scope management, socratic discovery methodology.
-- `review-guideline/` -- Code review priority order, comment format, quality bars.
+- `review-dna/` -- Code review standards, priority order, frontend criteria, CI awareness.
 - `secrets-guideline/` -- 1Password-based secret management. The "never handle raw secrets" rule.
 - `readme-guideline/` -- Directory documentation standards. When and how to write READMEs.
 - `discord-guideline/` -- Discord server management. Channel scaffolding, bot architecture, webhook patterns.

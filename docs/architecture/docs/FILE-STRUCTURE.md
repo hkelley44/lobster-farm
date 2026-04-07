@@ -67,7 +67,7 @@ Agent profiles and DNA skills, loaded natively by Claude Code.
     ├── coding-dna/SKILL.md              # Engineering standards (~710 lines)
     ├── design-dna/SKILL.md              # Design standards (~778 lines)
     ├── planning-dna/SKILL.md            # Spec writing standards
-    ├── review-guideline/SKILL.md              # Code review standards
+    ├── review-dna/SKILL.md                    # Code review standards
     └── database-dna/SKILL.md            # Schema/query standards
 ```
 

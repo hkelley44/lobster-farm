@@ -85,7 +85,7 @@ This means pool size is a soft limit. Sessions are preserved on disk — parking
 
 **Triggered by cron** — daemon polls repos for open PRs. When found, spawns reviewer. Review → fix → re-review loop until clean. Merge with squash. Escalate conflicts if non-trivial rebase.
 
-**Leverages Claude Code's built-in /review and /simplify** commands. Bob runs /simplify before pushing (less noise for reviewer). Reviewer uses /review for comprehensive analysis plus review-guideline for our standards.
+**Leverages Claude Code's built-in /review and /simplify** commands. Bob runs /simplify before pushing (less noise for reviewer). Reviewer uses /review for comprehensive analysis plus review-dna for our standards.
 
 ## Work Room Management
 
@@ -108,12 +108,12 @@ Five types, each with a distinct loading behavior:
 | Type | Loading | Purpose | Example |
 |------|---------|---------|---------|
 | **DNA** | Auto-load by task match | Creative/expertise lenses | coding-dna, design-dna, planning-dna |
-| **Guidelines** | Auto-load by task match | Operational requirements | secrets-guideline, review-guideline, readme-guideline, discord-guideline |
+| **Guidelines** | Auto-load by task match | Operational requirements | secrets-guideline, readme-guideline, discord-guideline |
 | **SOPs** | Auto-load by task match | Step-by-step procedures with gates | entity-scaffold, feature-lifecycle, pr-review-merge |
 | **Rules** | Always loaded | Universal constraints | secrets rules, git rules, escalation rules |
 | **Commands** | Explicitly invoked with / | Specific actions | (future, as patterns emerge) |
 
-**review-dna was renamed to review-guideline** — review standards are operational requirements, not a creative lens. DNA is for style/expertise that would change if the tech stack changed. Guidelines are operational requirements that apply regardless of stack.
+**review-guideline was renamed back to review-dna** — with the addition of frontend-specific criteria (component states, accessibility, responsive behavior) and CI awareness, review standards are now domain expertise, not just operational requirements. The reviewer needs different lenses depending on the tech stack (React vs backend), which is the hallmark of DNA.
 
 **Rules live in `~/.claude/rules/`** (global) or `.claude/rules/` (per-repo). Always loaded, no auto-match needed. For constraints that should NEVER be skipped — secrets handling, git conventions, escalation policy. Currently these live in CLAUDE.md — should be extracted to rules for modularity.
 

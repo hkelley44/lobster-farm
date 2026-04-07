@@ -129,7 +129,7 @@ describe("ClaudeSessionManager", () => {
         entity_id: "alpha",
         feature_id: "alpha-1",
         archetype: "reviewer",
-        dna: ["review-guideline"],
+        dna: ["review-dna"],
         model: { model: "sonnet", think: "standard" },
         worktree_path: "/repos/alpha",
         prompt: "Review PR #1",
