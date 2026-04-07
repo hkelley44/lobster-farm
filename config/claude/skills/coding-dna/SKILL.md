@@ -281,6 +281,8 @@ async def get_user(user_id: str, conn: asyncpg.Connection) -> User:
     try:
         row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
     except asyncpg.PostgresError as e:
+        # Assumes transient failure — callers using `retryable` for retry logic should
+        # handle specific non-transient cases (e.g. SyntaxOrAccessError) separately.
         raise DatabaseError(f"Failed to fetch user {user_id}: {e}", retryable=True)
     if row is None:
         raise NotFoundError(f"User {user_id} not found")
@@ -319,7 +321,7 @@ Errors should be logged with enough context to diagnose without reproducing:
 except Exception as e:
     logger.warning(f"Failed: {e}")
 
-# ✅ GOOD
+# ✅ GOOD — structlog (keyword args as context)
 except ExternalAPIError as e:
     logger.warning(
         "exchange_api_failed",
@@ -328,9 +330,24 @@ except ExternalAPIError as e:
         error_type=type(e).__name__,
         error_message=str(e),
         retryable=e.retryable,
+    )
+
+# ✅ GOOD — stdlib logging (context via `extra={}`)
+except ExternalAPIError as e:
+    logger.warning(
+        "exchange_api_failed: %s",
+        str(e),
+        extra={
+            "exchange": exchange_id,
+            "symbol": symbol,
+            "error_type": type(e).__name__,
+            "retryable": e.retryable,
+        },
         exc_info=True,
     )
 ```
+
+> **Note:** The structlog example passes context as keyword args directly. stdlib `logging` only accepts `exc_info`, `stack_info`, `stacklevel`, and `extra` as kwargs — pass context via `extra={...}` instead, or you'll get a `TypeError` at runtime.
 
 Always include: **what** was being done, **which** input/entity triggered it, **what type** of error, and **whether it's retryable**.
 
