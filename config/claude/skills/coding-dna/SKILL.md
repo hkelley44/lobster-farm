@@ -165,41 +165,6 @@ df["time"] = pd.to_datetime(df.time, unit="ms", utc=True)
 
 **Section comments are fine** for organizing longer functions (`# config`, `# query`, `# enrich`). Keep them lowercase, brief.
 
-### Error Handling
-
-**Never use bare `except:`.** This catches `KeyboardInterrupt`, `SystemExit`, and other things you absolutely do not want to silently swallow.
-
-```python
-# ✅ Good — specific, contextual
-except (ValueError, KeyError) as e:
-    if errors == ErrorAction.WARN:
-        logger.warning(f"Failed to process {symbol}: {e}")
-        return pd.DataFrame()
-
-# ❌ Bad — catches everything, hides bugs
-except:
-    return pd.DataFrame()
-```
-
-**The `ErrorAction` pattern is strong.** `IGNORE` / `WARN` / `RAISE` covers the universe of error handling needs for data pipelines:
-
-```python
-class ErrorAction(StrEnum):
-    IGNORE = "ignore"   # silently return empty/default
-    WARN = "warn"       # log warning, return empty/default
-    RAISE = "raise"     # raise the exception
-```
-
-Use `logging` instead of `print()` for warnings. Loggers are configurable, filterable, and don't pollute stdout.
-
-**Guard inputs early, fail fast:**
-```python
-def fetch_data(symbols: list[str] | str) -> pd.DataFrame:
-    symbols = ensure_list(symbols)  # normalize immediately
-    if not symbols:
-        return pd.DataFrame()      # nothing to fetch — don't waste an API call
-```
-
 ### Input Normalization
 
 Accept flexible inputs, normalize immediately. This pattern shows up constantly:
@@ -211,6 +176,207 @@ def ensure_list(x: T | list[T]) -> list[T]:
 ```
 
 This belongs in shared utils. Name it clearly — `ensure_list` over `check_cast_list`.
+
+---
+
+## Error Handling
+
+### Philosophy
+
+Errors are data. They should be:
+- **Typed** — callers can catch specific failures and handle them differently
+- **Informative** — include what was being done, what input caused it, whether it's retryable
+- **Bounded** — each layer catches what it can handle and lets the rest propagate
+- **Visible** — silent failures are bugs; if you catch it, log it with context
+
+Never catch an exception just to make the stack trace go away. If you can't do something useful with it (retry, fallback, translate to a better error), let it propagate.
+
+### Exception Hierarchies
+
+Every non-trivial project should define a base exception and domain-specific subclasses:
+
+```python
+class AppError(Exception):
+    """Base exception for this application."""
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+class DataLoadError(AppError):
+    """Failed to load or fetch data from an external source."""
+    pass
+
+class ExternalAPIError(AppError):
+    """An external API returned an unexpected response."""
+    def __init__(self, message: str, *, status_code: int | None = None, retryable: bool = False):
+        super().__init__(message, retryable=retryable)
+        self.status_code = status_code
+
+class ValidationError(AppError):
+    """Input validation failed — caller provided bad data."""
+    pass
+
+class NotFoundError(AppError):
+    """Requested resource does not exist."""
+    pass
+
+class ConflictError(AppError):
+    """Resource conflict — duplicate entry or state violation."""
+    pass
+
+class DatabaseError(AppError):
+    """Database operation failed."""
+    pass
+```
+
+**Why:** `except ExternalAPIError` is infinitely more useful than `except Exception`. Callers can handle a timeout differently from invalid input. The `retryable` flag lets orchestration layers decide whether to retry automatically.
+
+### HTTP API Error Mapping
+
+API routes are error boundaries — they translate domain exceptions into HTTP responses. Never let raw exceptions leak to clients.
+
+```python
+# ❌ BAD — generic 500 for everything
+@router.get("/items/{id}")
+async def get_item(id: str):
+    try:
+        return await service.get_item(id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ✅ GOOD — specific status codes, informative responses
+@router.get("/items/{id}")
+async def get_item(id: str):
+    try:
+        return await service.get_item(id)
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Item {id} not found")
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ExternalAPIError as e:
+        status = 503 if e.retryable else 502
+        raise HTTPException(status_code=status, detail=str(e))
+    # Let unexpected errors propagate — FastAPI returns 500, Sentry captures
+```
+
+**Status code guide:**
+- **400** — caller's fault (bad input, missing params, invalid format)
+- **404** — resource doesn't exist
+- **409** — conflict (duplicate, state violation)
+- **422** — structurally valid but semantically wrong (invalid enum, out-of-range)
+- **502** — upstream API returned an error (permanent)
+- **503** — upstream API is temporarily unavailable (retryable)
+- **500** — our bug (let it propagate, Sentry captures it)
+
+**Never return 500 with `detail=str(e)`.** That leaks internal state to clients. Let unexpected exceptions propagate as unhandled — the framework returns a generic 500 and Sentry captures the full traceback.
+
+### Database Error Handling
+
+Map database exceptions to domain exceptions at the repository/query layer:
+
+```python
+import asyncpg
+
+async def get_user(user_id: str, conn: asyncpg.Connection) -> User:
+    try:
+        row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+    except asyncpg.PostgresError as e:
+        # Assumes transient failure — callers using `retryable` for retry logic should
+        # handle specific non-transient cases (e.g. SyntaxOrAccessError) separately.
+        raise DatabaseError(f"Failed to fetch user {user_id}: {e}", retryable=True)
+    if row is None:
+        raise NotFoundError(f"User {user_id} not found")
+    return User(**dict(row))
+
+async def create_order(order: Order, conn: asyncpg.Connection) -> None:
+    try:
+        await conn.execute("INSERT INTO orders ...", ...)
+    except asyncpg.UniqueViolationError:
+        raise ConflictError(f"Order {order.id} already exists")
+    except asyncpg.ForeignKeyViolationError as e:
+        raise ValidationError(f"Invalid reference: {e}")
+    except asyncpg.PostgresError as e:
+        raise DatabaseError(f"Failed to create order: {e}", retryable=True)
+```
+
+**Key principle:** The service layer should never see `asyncpg.PostgresError`. It should see `NotFoundError`, `ConflictError`, `DatabaseError` — domain concepts, not driver internals.
+
+### Catch Specificity Rules
+
+1. **Catch the narrowest exception you can name.** If you know it's a `ValueError`, catch `ValueError`, not `Exception`.
+2. **Group related exceptions:** `except (ValueError, KeyError, TypeError) as e:` is fine.
+3. **`except Exception` is a code smell.** Valid uses:
+   - Top-level error boundaries (API routes, task runners, CLI entry points)
+   - Best-effort operations where ANY failure is acceptable (metrics, analytics, non-critical logging)
+   - Must ALWAYS log with full context and `exc_info=True`
+4. **Never bare `except:`.** It catches `KeyboardInterrupt`, `SystemExit`, `GeneratorExit`. Always `except Exception` minimum.
+5. **Never `except Exception: pass`.** If it's worth catching, it's worth logging.
+
+### Structured Error Logging
+
+Errors should be logged with enough context to diagnose without reproducing:
+
+```python
+# ❌ BAD
+except Exception as e:
+    logger.warning(f"Failed: {e}")
+
+# ✅ GOOD — structlog (keyword args as context)
+except ExternalAPIError as e:
+    logger.warning(
+        "exchange_api_failed",
+        exchange=exchange_id,
+        symbol=symbol,
+        error_type=type(e).__name__,
+        error_message=str(e),
+        retryable=e.retryable,
+    )
+
+# ✅ GOOD — stdlib logging (context via `extra={}`)
+except ExternalAPIError as e:
+    logger.warning(
+        "exchange_api_failed: %s",
+        str(e),
+        extra={
+            "exchange": exchange_id,
+            "symbol": symbol,
+            "error_type": type(e).__name__,
+            "retryable": e.retryable,
+        },
+        exc_info=True,
+    )
+```
+
+> **Note:** The structlog example passes context as keyword args directly. stdlib `logging` only accepts `exc_info`, `stack_info`, `stacklevel`, and `extra` as kwargs — pass context via `extra={...}` instead, or you'll get a `TypeError` at runtime.
+
+Always include: **what** was being done, **which** input/entity triggered it, **what type** of error, and **whether it's retryable**.
+
+### The ErrorAction Pattern (Data Pipelines)
+
+For batch processing where individual item failures shouldn't abort the pipeline:
+
+```python
+class ErrorAction(StrEnum):
+    IGNORE = "ignore"   # Return default, no log
+    WARN = "warn"       # Return default, log warning
+    RAISE = "raise"     # Propagate exception
+
+async def fetch_candles(
+    symbol: str,
+    *,
+    errors: ErrorAction = ErrorAction.WARN,
+) -> pd.DataFrame:
+    try:
+        return await self._get(f"/candles/{symbol}")
+    except ExternalAPIError as e:
+        if errors == ErrorAction.RAISE:
+            raise
+        if errors == ErrorAction.WARN:
+            logger.warning("candle_fetch_failed", symbol=symbol, error=str(e))
+        return pd.DataFrame()
+```
+
+Use this pattern for any function that processes items in a collection where partial success is acceptable. The **caller** decides the error tolerance, not the callee.
 
 ---
 
@@ -702,7 +868,9 @@ Loggers are configurable per-environment. In prod you want structured logs. In d
 
 | Don't | Do Instead |
 |-------|-----------|
-| Bare `except:` | Catch specific exceptions |
+| Bare `except:` | `except SpecificError` or `except Exception` minimum |
+| `except Exception: pass` | Log with context, or don't catch |
+| `except Exception as e: raise HTTPException(500, str(e))` | Map domain exceptions to specific status codes |
 | `type(x) == str` | `isinstance(x, str)` |
 | `print()` for logging | `logging.getLogger(__name__)` |
 | `from typing import List, Dict` | `list[str]`, `dict[str, int]` (3.11+) |
