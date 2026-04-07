@@ -220,6 +220,10 @@ class NotFoundError(AppError):
     """Requested resource does not exist."""
     pass
 
+class ConflictError(AppError):
+    """Resource conflict — duplicate entry or state violation."""
+    pass
+
 class DatabaseError(AppError):
     """Database operation failed."""
     pass
@@ -273,7 +277,7 @@ Map database exceptions to domain exceptions at the repository/query layer:
 ```python
 import asyncpg
 
-async def get_user(user_id: str) -> User:
+async def get_user(user_id: str, conn: asyncpg.Connection) -> User:
     try:
         row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
     except asyncpg.PostgresError as e:
@@ -282,7 +286,7 @@ async def get_user(user_id: str) -> User:
         raise NotFoundError(f"User {user_id} not found")
     return User(**dict(row))
 
-async def create_order(order: Order) -> None:
+async def create_order(order: Order, conn: asyncpg.Connection) -> None:
     try:
         await conn.execute("INSERT INTO orders ...", ...)
     except asyncpg.UniqueViolationError:
