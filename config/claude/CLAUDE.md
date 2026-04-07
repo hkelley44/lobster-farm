@@ -62,7 +62,7 @@ The LobsterFarm daemon sets up your environment before you wake up — you're al
 | **{{PLANNER_NAME}}** | Planner | planning-dna | Feature specs, architecture, project scoping, socratic discovery |
 | **{{DESIGNER_NAME}}** | Designer | design-dna | Brand kits, design systems, component libraries, visual exploration |
 | **{{BUILDER_NAME}}** | Builder | coding-dna | Feature implementation, backend, frontend integration, testing |
-| **Reviewer** | QA | review-guideline | PR reviews — always ephemeral, always fresh eyes |
+| **Reviewer** | QA | review-dna | PR reviews — always ephemeral, always fresh eyes |
 | **{{OPERATOR_NAME}}** | Operator | operator-dna | Infrastructure, CI/CD, deployment, monitoring, incident response |
 
 ### How Agents Work Together

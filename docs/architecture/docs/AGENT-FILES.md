@@ -19,7 +19,7 @@ Complete inventory of archetype definitions and DNA profiles. These files have b
     ├── coding-dna/SKILL.md      # ~710 lines
     ├── design-dna/SKILL.md      # ~778 lines
     ├── planning-dna/SKILL.md    # ~94 lines
-    ├── review-guideline/SKILL.md      # ~88 lines
+    ├── review-dna/SKILL.md            # ~37 lines
     └── database-dna/SKILL.md    # ~113 lines
 ```
 
@@ -64,8 +64,8 @@ Ported from battle-tested DESIGN-DNA.md. Covers: philosophy (alive not busy, res
 ### planning-dna (~94 lines)
 Spec writing and discovery standards. Covers: philosophy, socratic discovery flow, spec format (GitHub Issue template with context, spec, acceptance criteria, technical notes, out of scope), anti-patterns.
 
-### review-guideline (~88 lines)
-Code review standards. Covers: review priority order (correctness → security → robustness → performance → maintainability), comment format (blocking/suggestion/praise), standards, reviewer anti-patterns.
+### review-dna (~37 lines)
+Code review standards. Covers: review priority order (correctness → security → robustness → performance → maintainability), severity levels (must fix/should address/praise), comment format, anti-patterns. Frontend criteria and CI awareness defined in the reviewer soul.
 
 ### database-dna (~113 lines)
 Schema and query optimization standards. Covers: philosophy (schema decisions are permanent), primary keys (UUID), timestamps (UTC), naming conventions, types, relationships, indexing strategy, query patterns, ORM standards (Prisma + SQLAlchemy), anti-patterns.

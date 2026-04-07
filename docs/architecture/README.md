@@ -83,7 +83,7 @@ See [docs/TERMINOLOGY.md](docs/TERMINOLOGY.md) for the complete reference. Quick
 | Planner | Gary | planning-dna | Specs, architecture, project scoping, socratic discovery |
 | Designer | Pearl | design-dna | Brand kits, design systems, component libraries, visual exploration |
 | Builder | Bob | coding-dna | Feature implementation, backend, frontend, testing |
-| Reviewer | (unnamed) | review-guideline | Code review — always ephemeral, always fresh eyes |
+| Reviewer | (unnamed) | review-dna | Code review — always ephemeral, always fresh eyes |
 | Operator | Ray | operator-dna | Infrastructure, CI/CD, deployment, monitoring |
 
 DNA is composable. The builder can load `coding-dna + design-dna` for frontend work, or `coding-dna + database-dna` for schema work.

@@ -34,7 +34,7 @@ export const DEFAULT_ARCHETYPES: Record<ArchetypeRole, ArchetypeDefaults> = {
     default_name: "Reviewer",
     model: "sonnet",
     think: "standard",
-    primary_dna: "review-guideline",
+    primary_dna: "review-dna",
     additional_dna: [],
   },
   operator: {

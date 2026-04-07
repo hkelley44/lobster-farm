@@ -452,7 +452,7 @@ export class PRReviewCron {
         entity_id,
         feature_id: `pr-review-${String(pr.number)}`,
         archetype: "reviewer",
-        dna: ["review-guideline"],
+        dna: ["review-dna"],
         model: { model: "sonnet", think: "standard" },
         worktree_path: repo_path,
         prompt,
