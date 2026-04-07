@@ -1,6 +1,6 @@
-import { readFile, writeFile, appendFile, mkdir } from "node:fs/promises";
-import { join, dirname } from "node:path";
 import { execFile } from "node:child_process";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { entity_daily_dir, lobsterfarm_dir } from "@lobster-farm/shared";
@@ -32,11 +32,7 @@ export async function append_to_daily_log(
   try {
     await readFile(log_path, "utf-8");
   } catch {
-    await writeFile(
-      log_path,
-      `# Daily Log — ${today_str()}\n\n`,
-      "utf-8",
-    );
+    await writeFile(log_path, `# Daily Log — ${today_str()}\n\n`, "utf-8");
   }
 
   const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
@@ -80,14 +76,12 @@ export async function extract_session_learnings(
   ].join("\n");
 
   try {
-    const claude_bin = process.env["CLAUDE_BIN"] ?? "claude";
-    const { stdout } = await exec(claude_bin, [
-      "-p",
-      "--model", "haiku",
-      "--no-session-persistence",
-      "--print",
-      prompt,
-    ], { timeout: 30_000 });
+    const claude_bin = process.env.CLAUDE_BIN ?? "claude";
+    const { stdout } = await exec(
+      claude_bin,
+      ["-p", "--model", "haiku", "--no-session-persistence", "--print", prompt],
+      { timeout: 30_000 },
+    );
 
     const summary = stdout.trim();
     if (summary) {
@@ -146,11 +140,7 @@ export async function append_global_learning(
   }
 
   const timestamp = new Date().toISOString().split("T")[0];
-  await appendFile(
-    path,
-    `\n### ${timestamp} (from ${source_entity})\n\n${content}\n`,
-    "utf-8",
-  );
+  await appendFile(path, `\n### ${timestamp} (from ${source_entity})\n\n${content}\n`, "utf-8");
 
   console.log(`[hooks] Global learning recorded from ${source_entity}`);
 }

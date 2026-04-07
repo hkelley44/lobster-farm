@@ -1,11 +1,18 @@
-import * as p from "@clack/prompts";
 import { spawnSync } from "node:child_process";
-import { writeFile, readFile, mkdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import * as p from "@clack/prompts";
 import { exec_command } from "../../lib/process.js";
 import {
-  check_tailscale, check_docker, check_vercel, check_supabase, check_sentry,
-  type TailscaleCheckResult, type DockerCheckResult, type VercelCheckResult,
-  type SupabaseCheckResult, type SentryCheckResult,
+  type DockerCheckResult,
+  type SentryCheckResult,
+  type SupabaseCheckResult,
+  type TailscaleCheckResult,
+  type VercelCheckResult,
+  check_docker,
+  check_sentry,
+  check_supabase,
+  check_tailscale,
+  check_vercel,
 } from "./detect.js";
 
 // Tool names used as keys throughout the module.
@@ -93,8 +100,10 @@ function default_selections(detection: ToolDetectionResults): ToolName[] {
 
   // Not-installed or not-authenticated tools are checked by default.
   // Already fully configured tools are unchecked (user can still re-enable).
-  if (!detection.tailscale.installed || !detection.tailscale.authenticated) selected.push("tailscale");
-  if (!detection.docker.docker_installed || !detection.docker.colima_installed) selected.push("docker");
+  if (!detection.tailscale.installed || !detection.tailscale.authenticated)
+    selected.push("tailscale");
+  if (!detection.docker.docker_installed || !detection.docker.colima_installed)
+    selected.push("docker");
   if (!detection.vercel.installed || !detection.vercel.authenticated) selected.push("vercel");
   if (!detection.supabase.installed || !detection.supabase.authenticated) selected.push("supabase");
   if (!detection.sentry.installed || !detection.sentry.authenticated) selected.push("sentry");
@@ -116,11 +125,14 @@ async function setup_tailscale(
   if (detection.gui_app_detected && !non_interactive) {
     p.log.warning(
       "Tailscale.app (GUI) detected. The App Store version conflicts with the CLI daemon\n" +
-      "and doesn't support Tailscale SSH.\n" +
-      "Please quit and uninstall Tailscale.app via Finder, then press Enter to continue.",
+        "and doesn't support Tailscale SSH.\n" +
+        "Please quit and uninstall Tailscale.app via Finder, then press Enter to continue.",
     );
     const proceed = await p.confirm({ message: "Tailscale.app removed?" });
-    if (p.isCancel(proceed)) { p.cancel("Setup cancelled."); process.exit(0); }
+    if (p.isCancel(proceed)) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
 
     // Re-check
     const recheck = await check_tailscale();
@@ -176,7 +188,9 @@ async function setup_tailscale(
   spin.start("Configuring Tailscale daemon...");
 
   // Create state directory and write plist
-  const mkdir_result = spawnSync("sudo", ["mkdir", "-p", "/var/lib/tailscale"], { stdio: "inherit" });
+  const mkdir_result = spawnSync("sudo", ["mkdir", "-p", "/var/lib/tailscale"], {
+    stdio: "inherit",
+  });
   if (mkdir_result.status !== 0) {
     spin.stop("Failed to create /var/lib/tailscale");
     p.log.warning("Tailscale daemon setup requires sudo access.");
@@ -249,10 +263,13 @@ async function setup_docker(
   if (detection.docker_desktop_detected && !non_interactive) {
     p.log.warning(
       "Docker Desktop detected. For headless operation, we'll use Colima instead.\n" +
-      "Please uninstall Docker Desktop via Finder, then press Enter to continue.",
+        "Please uninstall Docker Desktop via Finder, then press Enter to continue.",
     );
     const proceed = await p.confirm({ message: "Docker Desktop removed?" });
-    if (p.isCancel(proceed)) { p.cancel("Setup cancelled."); process.exit(0); }
+    if (p.isCancel(proceed)) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
   }
 
   // Install missing components
@@ -276,7 +293,7 @@ async function setup_docker(
   }
 
   // Configure docker-compose CLI plugin path
-  const home = process.env["HOME"] ?? "";
+  const home = process.env.HOME ?? "";
   const docker_config_path = `${home}/.docker/config.json`;
   try {
     await mkdir(`${home}/.docker`, { recursive: true });
@@ -284,10 +301,12 @@ async function setup_docker(
     try {
       const existing = await readFile(docker_config_path, "utf-8");
       docker_config = JSON.parse(existing);
-    } catch { /* file doesn't exist yet */ }
+    } catch {
+      /* file doesn't exist yet */
+    }
 
-    docker_config["cliPluginsExtraDirs"] = ["/opt/homebrew/lib/docker/cli-plugins"];
-    await writeFile(docker_config_path, JSON.stringify(docker_config, null, 2) + "\n");
+    docker_config.cliPluginsExtraDirs = ["/opt/homebrew/lib/docker/cli-plugins"];
+    await writeFile(docker_config_path, `${JSON.stringify(docker_config, null, 2)}\n`);
   } catch (err) {
     p.log.warning(`Failed to configure docker-compose plugin: ${String(err)}`);
   }
@@ -322,7 +341,9 @@ async function setup_docker(
 
   // Get version info for summary
   const recheck = await check_docker();
-  p.log.success(`Docker ready (Colima v${recheck.colima_version ?? "?"}, Docker v${recheck.docker_version ?? "?"})`);
+  p.log.success(
+    `Docker ready (Colima v${recheck.colima_version ?? "?"}, Docker v${recheck.docker_version ?? "?"})`,
+  );
 
   return { installed: true, runtime: "colima" };
 }
@@ -408,11 +429,14 @@ async function setup_supabase(
         // Fallback: prompt for token
         p.note(
           "Supabase requires a token for non-interactive auth.\n" +
-          "Generate one at: https://supabase.com/dashboard/account/tokens",
+            "Generate one at: https://supabase.com/dashboard/account/tokens",
           "Supabase Token",
         );
         const manual_token = await p.password({ message: "Paste your Supabase access token:" });
-        if (p.isCancel(manual_token)) { p.cancel("Setup cancelled."); process.exit(0); }
+        if (p.isCancel(manual_token)) {
+          p.cancel("Setup cancelled.");
+          process.exit(0);
+        }
 
         if (manual_token?.trim()) {
           spin.start("Authenticating Supabase...");
@@ -470,18 +494,21 @@ async function setup_sentry(
 
     p.note(
       "Generate a Sentry auth token at:\n" +
-      "https://sentry.io/settings/account/api/auth-tokens/\n\n" +
-      "Required scopes: project:write, org:read",
+        "https://sentry.io/settings/account/api/auth-tokens/\n\n" +
+        "Required scopes: project:write, org:read",
       "Sentry Token",
     );
     const prompted_token = await p.password({ message: "Paste your Sentry auth token:" });
-    if (p.isCancel(prompted_token)) { p.cancel("Setup cancelled."); process.exit(0); }
+    if (p.isCancel(prompted_token)) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
     auth_token = prompted_token?.trim() || undefined;
   }
 
   if (auth_token) {
     // Write token to ~/.sentryclirc
-    const home = process.env["HOME"] ?? "";
+    const home = process.env.HOME ?? "";
     const sentryclirc_path = `${home}/.sentryclirc`;
 
     let org: string | undefined;
@@ -498,11 +525,16 @@ async function setup_sentry(
 
       if (orgs_result.exitCode === 0 && orgs_result.stdout.trim()) {
         // Parse org list — each line has org slug
-        const lines = orgs_result.stdout.trim().split("\n").filter((l) => l.trim() && !l.startsWith("-"));
+        const lines = orgs_result.stdout
+          .trim()
+          .split("\n")
+          .filter((l) => l.trim() && !l.startsWith("-"));
         // Filter header lines — org lines typically don't start with "Name" or have dashes
         const org_slugs = lines
           .map((l) => l.trim().split(/\s+/)[0])
-          .filter((s): s is string => Boolean(s) && s !== "Name" && s !== "Slug" && !s?.startsWith("|"));
+          .filter(
+            (s): s is string => Boolean(s) && s !== "Name" && s !== "Slug" && !s?.startsWith("|"),
+          );
 
         if (org_slugs.length === 1) {
           org = org_slugs[0];
@@ -511,7 +543,10 @@ async function setup_sentry(
             message: "Select default Sentry organization:",
             options: org_slugs.map((s) => ({ value: s, label: s })),
           });
-          if (p.isCancel(selected)) { p.cancel("Setup cancelled."); process.exit(0); }
+          if (p.isCancel(selected)) {
+            p.cancel("Setup cancelled.");
+            process.exit(0);
+          }
           org = selected;
         }
       }
@@ -564,9 +599,10 @@ export async function setup_tool_integrations(
 
   if (options.tools) {
     // Parse --tools flag
-    selected_tools = options.tools.split(",").map((t) => t.trim()).filter(
-      (t): t is ToolName => TOOL_NAMES.includes(t as ToolName),
-    );
+    selected_tools = options.tools
+      .split(",")
+      .map((t) => t.trim())
+      .filter((t): t is ToolName => TOOL_NAMES.includes(t as ToolName));
     if (selected_tools.length === 0) {
       p.log.warning(`No valid tools in --tools flag. Valid options: ${TOOL_NAMES.join(", ")}`);
       return undefined;
@@ -587,7 +623,10 @@ export async function setup_tool_integrations(
       required: false,
     });
 
-    if (p.isCancel(choices)) { p.cancel("Setup cancelled."); process.exit(0); }
+    if (p.isCancel(choices)) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
     selected_tools = (choices as ToolName[]) ?? [];
   }
 
@@ -604,7 +643,12 @@ export async function setup_tool_integrations(
     try {
       switch (tool) {
         case "tailscale": {
-          const result = await setup_tailscale(spin, detection.tailscale, non_interactive, options.tailscaleAuthkey);
+          const result = await setup_tailscale(
+            spin,
+            detection.tailscale,
+            non_interactive,
+            options.tailscaleAuthkey,
+          );
           if (result) tools_config.tailscale = result;
           break;
         }
@@ -619,12 +663,22 @@ export async function setup_tool_integrations(
           break;
         }
         case "supabase": {
-          const result = await setup_supabase(spin, detection.supabase, non_interactive, options.supabaseToken);
+          const result = await setup_supabase(
+            spin,
+            detection.supabase,
+            non_interactive,
+            options.supabaseToken,
+          );
           if (result) tools_config.supabase = result;
           break;
         }
         case "sentry": {
-          const result = await setup_sentry(spin, detection.sentry, non_interactive, options.sentryToken);
+          const result = await setup_sentry(
+            spin,
+            detection.sentry,
+            non_interactive,
+            options.sentryToken,
+          );
           if (result) tools_config.sentry = result;
           break;
         }

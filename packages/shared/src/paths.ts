@@ -113,33 +113,54 @@ export function entity_dir(config: Partial<PathConfig> | undefined, entity_id: s
   return join(entities_dir(config), entity_id);
 }
 
-export function entity_config_path(config: Partial<PathConfig> | undefined, entity_id: string): string {
+export function entity_config_path(
+  config: Partial<PathConfig> | undefined,
+  entity_id: string,
+): string {
   return join(entity_dir(config, entity_id), "config.yaml");
 }
 
-export function entity_memory_path(config: Partial<PathConfig> | undefined, entity_id: string): string {
+export function entity_memory_path(
+  config: Partial<PathConfig> | undefined,
+  entity_id: string,
+): string {
   return join(entity_dir(config, entity_id), "MEMORY.md");
 }
 
-export function entity_daily_dir(config: Partial<PathConfig> | undefined, entity_id: string): string {
+export function entity_daily_dir(
+  config: Partial<PathConfig> | undefined,
+  entity_id: string,
+): string {
   return join(entity_dir(config, entity_id), "daily");
 }
 
-export function entity_context_dir(config: Partial<PathConfig> | undefined, entity_id: string): string {
+export function entity_context_dir(
+  config: Partial<PathConfig> | undefined,
+  entity_id: string,
+): string {
   return join(entity_dir(config, entity_id), "context");
 }
 
-export function entity_files_dir(config: Partial<PathConfig> | undefined, entity_id: string): string {
+export function entity_files_dir(
+  config: Partial<PathConfig> | undefined,
+  entity_id: string,
+): string {
   return join(entity_dir(config, entity_id), "files");
 }
 
-export function entity_logs_dir(config: Partial<PathConfig> | undefined, entity_id: string): string {
+export function entity_logs_dir(
+  config: Partial<PathConfig> | undefined,
+  entity_id: string,
+): string {
   return join(logs_dir(config), "entities", entity_id);
 }
 
 // ── Per-entity repo paths ──
 
-export function entity_repos_dir(config: Partial<PathConfig> | undefined, entity_id: string): string {
+export function entity_repos_dir(
+  config: Partial<PathConfig> | undefined,
+  entity_id: string,
+): string {
   return join(entity_dir(config, entity_id), "repos");
 }
 

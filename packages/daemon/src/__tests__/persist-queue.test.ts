@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PersistQueue } from "../persist-queue.js";
 
 /** Zero-delay retries for tests that exercise retry logic. */
@@ -23,7 +23,10 @@ describe("PersistQueue", () => {
     // persist_fn takes time so we can stack up enqueues while it's writing.
     let resolve_write: (() => void) | null = null;
     const persist_fn = vi.fn().mockImplementation(
-      () => new Promise<void>((resolve) => { resolve_write = resolve; }),
+      () =>
+        new Promise<void>((resolve) => {
+          resolve_write = resolve;
+        }),
     );
 
     const queue = new PersistQueue(persist_fn);
@@ -54,7 +57,8 @@ describe("PersistQueue", () => {
   });
 
   it("retries on failure then succeeds", async () => {
-    const persist_fn = vi.fn()
+    const persist_fn = vi
+      .fn()
       .mockRejectedValueOnce(new Error("disk full"))
       .mockRejectedValueOnce(new Error("disk full"))
       .mockResolvedValue(undefined);
@@ -104,7 +108,8 @@ describe("PersistQueue", () => {
 
     // First enqueue: all retries fail (4 calls).
     // Second enqueue: succeeds on first try.
-    const persist_fn = vi.fn()
+    const persist_fn = vi
+      .fn()
       .mockRejectedValueOnce(new Error("fail"))
       .mockRejectedValueOnce(new Error("fail"))
       .mockRejectedValueOnce(new Error("fail"))
@@ -127,7 +132,10 @@ describe("PersistQueue", () => {
   it("drain resolves after pending writes complete", async () => {
     let resolve_write: (() => void) | null = null;
     const persist_fn = vi.fn().mockImplementation(
-      () => new Promise<void>((resolve) => { resolve_write = resolve; }),
+      () =>
+        new Promise<void>((resolve) => {
+          resolve_write = resolve;
+        }),
     );
 
     const queue = new PersistQueue(persist_fn);
@@ -135,7 +143,9 @@ describe("PersistQueue", () => {
     queue.enqueue();
 
     let drained = false;
-    const drain_promise = queue.drain().then(() => { drained = true; });
+    const drain_promise = queue.drain().then(() => {
+      drained = true;
+    });
 
     // drain should not have resolved yet — write is in progress.
     await tick();
@@ -161,7 +171,10 @@ describe("PersistQueue", () => {
   it("drain waits for coalesced write too", async () => {
     let resolve_write: (() => void) | null = null;
     const persist_fn = vi.fn().mockImplementation(
-      () => new Promise<void>((resolve) => { resolve_write = resolve; }),
+      () =>
+        new Promise<void>((resolve) => {
+          resolve_write = resolve;
+        }),
     );
 
     const queue = new PersistQueue(persist_fn);
@@ -170,7 +183,9 @@ describe("PersistQueue", () => {
     queue.enqueue(); // coalesced
 
     let drained = false;
-    const drain_promise = queue.drain().then(() => { drained = true; });
+    const drain_promise = queue.drain().then(() => {
+      drained = true;
+    });
 
     // Complete the first write — coalesced write should start.
     resolve_write!();

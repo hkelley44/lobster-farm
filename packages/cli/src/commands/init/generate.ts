@@ -1,28 +1,28 @@
 import { statSync } from "node:fs";
-import { mkdir, readdir, copyFile, writeFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { copyFile, mkdir, readdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  type LobsterFarmConfig,
+  type PathConfig,
+  type TemplateVariables,
+  agents_dir,
+  claude_md_path,
+  claude_settings_path,
+  dna_versions_dir,
+  entities_dir,
+  global_config_path,
+  lobsterfarm_dir,
+  logs_dir,
+  queue_dir,
+  scripts_dir,
+  skills_dir,
+  sop_dir,
+  templates_dir,
+  tools_md_path,
+  user_md_path,
   write_resolved,
   write_yaml,
-  lobsterfarm_dir,
-  agents_dir,
-  skills_dir,
-  claude_settings_path,
-  claude_md_path,
-  user_md_path,
-  tools_md_path,
-  entities_dir,
-  sop_dir,
-  queue_dir,
-  logs_dir,
-  scripts_dir,
-  templates_dir,
-  dna_versions_dir,
-  global_config_path,
-  type LobsterFarmConfig,
-  type TemplateVariables,
-  type PathConfig,
 } from "@lobster-farm/shared";
 
 /** Resolve the monorepo config/ directory from the CLI source location. */
@@ -136,27 +136,35 @@ export async function generate_settings(path_overrides?: Partial<PathConfig>): P
       PreToolUse: [
         {
           matcher: "Edit|Write",
-          hooks: [{
-            type: "command",
-            command: `bash -c 'REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; FILE=$(echo "$TOOL_INPUT" | jq -r ".file_path // empty"); case "$FILE" in "$REPO_ROOT"/*) ;; *) exit 0;; esac; BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0; if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then echo "BLOCK: Direct edits to $BRANCH are not allowed. Create a feature branch first." >&2; exit 2; fi'`,
-          }],
+          hooks: [
+            {
+              type: "command",
+              command: `bash -c 'REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; FILE=$(echo "$TOOL_INPUT" | jq -r ".file_path // empty"); case "$FILE" in "$REPO_ROOT"/*) ;; *) exit 0;; esac; BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0; if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then echo "BLOCK: Direct edits to $BRANCH are not allowed. Create a feature branch first." >&2; exit 2; fi'`,
+            },
+          ],
         },
         {
           matcher: "Edit|Write",
-          hooks: [{
-            type: "command",
-            command: "bash -c 'if echo \"$TOOL_INPUT\" | grep -qiE \"(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36,}|AKIA[A-Z0-9]{16}|xox[bpras]-[a-zA-Z0-9-]+|-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----)\"; then echo \"BLOCK: Detected potential hardcoded secret in tool input.\" >&2; exit 2; fi'",
-          }],
+          hooks: [
+            {
+              type: "command",
+              command:
+                'bash -c \'if echo "$TOOL_INPUT" | grep -qiE "(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{36,}|AKIA[A-Z0-9]{16}|xox[bpras]-[a-zA-Z0-9-]+|-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----)"; then echo "BLOCK: Detected potential hardcoded secret in tool input." >&2; exit 2; fi\'',
+            },
+          ],
         },
       ],
       Stop: [
         {
           matcher: "",
-          hooks: [{
-            type: "command",
-            command: "curl -s -X POST http://localhost:7749/hooks/stop -H 'Content-Type: application/json' -d '{\"session_id\": \"'\"$CLAUDE_SESSION_ID\"'\", \"working_dir\": \"'\"$(pwd)\"'\"}' || true",
-            timeout: 10,
-          }],
+          hooks: [
+            {
+              type: "command",
+              command:
+                'curl -s -X POST http://localhost:7749/hooks/stop -H \'Content-Type: application/json\' -d \'{"session_id": "\'"$CLAUDE_SESSION_ID"\'", "working_dir": "\'"$(pwd)"\'"}\' || true',
+              timeout: 10,
+            },
+          ],
         },
       ],
     },
@@ -164,12 +172,14 @@ export async function generate_settings(path_overrides?: Partial<PathConfig>): P
 
   const out = claude_settings_path(path_overrides);
   await mkdir(dirname(out), { recursive: true });
-  await writeFile(out, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+  await writeFile(out, `${JSON.stringify(settings, null, 2)}\n`, "utf-8");
   return out;
 }
 
 /** Create the directory structure under ~/.lobsterfarm/. */
-export async function create_directory_structure(path_overrides?: Partial<PathConfig>): Promise<string[]> {
+export async function create_directory_structure(
+  path_overrides?: Partial<PathConfig>,
+): Promise<string[]> {
   const dirs = [
     lobsterfarm_dir(path_overrides),
     entities_dir(path_overrides),

@@ -5,7 +5,7 @@
  * Pure housekeeping: no AI, no summarization, no token cost.
  */
 
-import { readdir, rename, mkdir } from "node:fs/promises";
+import { mkdir, readdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { entities_dir } from "@lobster-farm/shared";

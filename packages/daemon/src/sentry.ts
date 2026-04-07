@@ -22,10 +22,7 @@ interface CaptureContext {
  * Capture an exception with tags and structured context.
  * Safe to call even if Sentry is not initialized.
  */
-export function captureException(
-  err: unknown,
-  ctx?: CaptureContext,
-): void {
+export function captureException(err: unknown, ctx?: CaptureContext): void {
   Sentry.captureException(err, {
     tags: ctx?.tags,
     contexts: ctx?.contexts,
@@ -82,14 +79,8 @@ interface CronMonitorConfig {
 /**
  * Start a cron check-in. Returns the checkInId for completion.
  */
-export function cronCheckInStart(
-  monitorSlug: string,
-  monitorConfig: CronMonitorConfig,
-): string {
-  return Sentry.captureCheckIn(
-    { monitorSlug, status: "in_progress" },
-    monitorConfig,
-  );
+export function cronCheckInStart(monitorSlug: string, monitorConfig: CronMonitorConfig): string {
+  return Sentry.captureCheckIn({ monitorSlug, status: "in_progress" }, monitorConfig);
 }
 
 /**
@@ -108,6 +99,6 @@ export function cronCheckInFinish(
 /**
  * Flush pending Sentry events. Call during graceful shutdown.
  */
-export async function flush(timeout_ms: number = 2000): Promise<void> {
+export async function flush(timeout_ms = 2000): Promise<void> {
   await Sentry.flush(timeout_ms);
 }

@@ -12,7 +12,7 @@
 
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { load_pr_watches, save_pr_watches } from "./persistence.js";
-import type { PersistedPRWatch, PRWatchState } from "./persistence.js";
+import type { PRWatchState, PersistedPRWatch } from "./persistence.js";
 
 export const PR_WATCH_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -95,7 +95,9 @@ export class PRWatchStore {
       if (age > ttl_ms) {
         this.watches.delete(key);
         expired++;
-        console.log(`[pr-watches] Expired stale watch: ${key} (age: ${String(Math.round(age / 3600000))}h)`);
+        console.log(
+          `[pr-watches] Expired stale watch: ${key} (age: ${String(Math.round(age / 3600000))}h)`,
+        );
       }
     }
     if (expired > 0) {

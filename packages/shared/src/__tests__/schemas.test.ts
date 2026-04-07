@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
-  LobsterFarmConfigSchema,
-  EntityConfigSchema,
-  TemplateVariablesSchema,
   ArchetypeRoleSchema,
   ChannelTypeSchema,
+  EntityConfigSchema,
+  LobsterFarmConfigSchema,
+  TemplateVariablesSchema,
 } from "../schemas/index.js";
 
 describe("enums", () => {
@@ -147,7 +147,11 @@ describe("EntityConfigSchema", () => {
         ...MINIMAL_ENTITY.entity,
         repos: [
           { name: "alpha", url: "git@github.com:org/alpha.git", path: "/repos/alpha" },
-          { name: "alpha-dashboard", url: "git@github.com:org/alpha-dashboard.git", path: "/repos/alpha-dashboard" },
+          {
+            name: "alpha-dashboard",
+            url: "git@github.com:org/alpha-dashboard.git",
+            path: "/repos/alpha-dashboard",
+          },
         ],
       },
     });
@@ -225,8 +229,6 @@ describe("TemplateVariablesSchema", () => {
 
   it("rejects missing required fields", () => {
     expect(() => TemplateVariablesSchema.parse({})).toThrow();
-    expect(() =>
-      TemplateVariablesSchema.parse({ USER_NAME: "Jax" }),
-    ).toThrow(); // missing MACHINE_NAME, MACHINE_HARDWARE
+    expect(() => TemplateVariablesSchema.parse({ USER_NAME: "Jax" })).toThrow(); // missing MACHINE_NAME, MACHINE_HARDWARE
   });
 });

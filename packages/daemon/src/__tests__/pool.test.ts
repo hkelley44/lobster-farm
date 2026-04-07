@@ -1,9 +1,9 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 
@@ -84,22 +84,36 @@ describe("BotPool", () => {
 
     // Stub out assign's side effects (tmux start, access.json, nickname)
     // by mocking the private methods via prototype
-    vi.spyOn(pool as unknown as { kill_tmux: (s: string) => void }, "kill_tmux" as never)
-      .mockImplementation(() => {});
-    vi.spyOn(pool as unknown as { write_access_json: (d: string, c: string | null) => Promise<void> }, "write_access_json" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as { set_bot_nickname: (d: string, a: string) => Promise<void> }, "set_bot_nickname" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as { set_bot_avatar: (b: PoolBot, a: string) => Promise<void> }, "set_bot_avatar" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as { start_tmux: (...args: unknown[]) => Promise<void> }, "start_tmux" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as { is_tmux_alive: (s: string) => boolean }, "is_tmux_alive" as never)
-      .mockReturnValue(false);
-    vi.spyOn(pool as unknown as { park_bot: (b: PoolBot) => Promise<void> }, "park_bot" as never)
-      .mockImplementation(async (bot: PoolBot) => {
-        bot.state = "parked";
-      });
+    vi.spyOn(
+      pool as unknown as { kill_tmux: (s: string) => void },
+      "kill_tmux" as never,
+    ).mockImplementation(() => {});
+    vi.spyOn(
+      pool as unknown as { write_access_json: (d: string, c: string | null) => Promise<void> },
+      "write_access_json" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as { set_bot_nickname: (d: string, a: string) => Promise<void> },
+      "set_bot_nickname" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as { set_bot_avatar: (b: PoolBot, a: string) => Promise<void> },
+      "set_bot_avatar" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as { start_tmux: (...args: unknown[]) => Promise<void> },
+      "start_tmux" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as { is_tmux_alive: (s: string) => boolean },
+      "is_tmux_alive" as never,
+    ).mockReturnValue(false);
+    vi.spyOn(
+      pool as unknown as { park_bot: (b: PoolBot) => Promise<void> },
+      "park_bot" as never,
+    ).mockImplementation(async (bot: PoolBot) => {
+      bot.state = "parked";
+    });
   });
 
   afterEach(async () => {
@@ -195,7 +209,13 @@ describe("BotPool", () => {
     it("assigns a free bot without eviction", async () => {
       pool.inject_bots([
         make_bot({ id: 1, state: "free" }),
-        make_bot({ id: 2, state: "assigned", channel_id: "ch-x", entity_id: "e1", last_active: minutes_ago(5) }),
+        make_bot({
+          id: 2,
+          state: "assigned",
+          channel_id: "ch-x",
+          entity_id: "e1",
+          last_active: minutes_ago(5),
+        }),
       ]);
 
       const result = await pool.assign("ch-new", "e1", "planner", undefined, "general");
@@ -205,8 +225,22 @@ describe("BotPool", () => {
 
     it("evicts parked bot before idle assigned", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "parked", channel_id: "ch-1", entity_id: "e1", last_active: minutes_ago(60), channel_type: "general" }),
-        make_bot({ id: 2, state: "assigned", channel_id: "ch-2", entity_id: "e1", last_active: minutes_ago(60), channel_type: "general" }),
+        make_bot({
+          id: 1,
+          state: "parked",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          last_active: minutes_ago(60),
+          channel_type: "general",
+        }),
+        make_bot({
+          id: 2,
+          state: "assigned",
+          channel_id: "ch-2",
+          entity_id: "e1",
+          last_active: minutes_ago(60),
+          channel_type: "general",
+        }),
       ]);
       pool.set_bot_idle(2, true);
 
@@ -217,8 +251,22 @@ describe("BotPool", () => {
 
     it("evicts idle assigned before waiting_for_human", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "assigned", channel_id: "ch-1", entity_id: "e1", last_active: minutes_ago(45), channel_type: "general" }),
-        make_bot({ id: 2, state: "assigned", channel_id: "ch-2", entity_id: "e1", last_active: minutes_ago(10), channel_type: "general" }),
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          last_active: minutes_ago(45),
+          channel_type: "general",
+        }),
+        make_bot({
+          id: 2,
+          state: "assigned",
+          channel_id: "ch-2",
+          entity_id: "e1",
+          last_active: minutes_ago(10),
+          channel_type: "general",
+        }),
       ]);
       pool.set_bot_idle(1, true); // idle (>30 min)
       pool.set_bot_idle(2, true); // waiting_for_human (3-30 min)
@@ -230,8 +278,22 @@ describe("BotPool", () => {
 
     it("evicts waiting_for_human when no idle bots remain", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "assigned", channel_id: "ch-1", entity_id: "e1", last_active: minutes_ago(10), channel_type: "general" }),
-        make_bot({ id: 2, state: "assigned", channel_id: "ch-2", entity_id: "e1", last_active: new Date(), channel_type: "general" }),
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          last_active: minutes_ago(10),
+          channel_type: "general",
+        }),
+        make_bot({
+          id: 2,
+          state: "assigned",
+          channel_id: "ch-2",
+          entity_id: "e1",
+          last_active: new Date(),
+          channel_type: "general",
+        }),
       ]);
       pool.set_bot_idle(1, true); // waiting_for_human
       pool.set_bot_idle(2, false); // working
@@ -243,8 +305,20 @@ describe("BotPool", () => {
 
     it("hits floor when all bots are working — returns null", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "assigned", channel_id: "ch-1", entity_id: "e1", last_active: new Date() }),
-        make_bot({ id: 2, state: "assigned", channel_id: "ch-2", entity_id: "e1", last_active: new Date() }),
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          last_active: new Date(),
+        }),
+        make_bot({
+          id: 2,
+          state: "assigned",
+          channel_id: "ch-2",
+          entity_id: "e1",
+          last_active: new Date(),
+        }),
       ]);
       pool.set_bot_idle(1, false); // working
       pool.set_bot_idle(2, false); // working
@@ -255,8 +329,20 @@ describe("BotPool", () => {
 
     it("hits floor when all bots are in active_conversation — returns null", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "assigned", channel_id: "ch-1", entity_id: "e1", last_active: minutes_ago(1) }),
-        make_bot({ id: 2, state: "assigned", channel_id: "ch-2", entity_id: "e1", last_active: minutes_ago(2) }),
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          last_active: minutes_ago(1),
+        }),
+        make_bot({
+          id: 2,
+          state: "assigned",
+          channel_id: "ch-2",
+          entity_id: "e1",
+          last_active: minutes_ago(2),
+        }),
       ]);
       pool.set_bot_idle(1, true); // active_conversation
       pool.set_bot_idle(2, true); // active_conversation
@@ -267,8 +353,22 @@ describe("BotPool", () => {
 
     it("idle general evicted before idle work_room", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "assigned", channel_id: "ch-1", entity_id: "e1", last_active: minutes_ago(45), channel_type: "work_room" }),
-        make_bot({ id: 2, state: "assigned", channel_id: "ch-2", entity_id: "e1", last_active: minutes_ago(45), channel_type: "general" }),
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          last_active: minutes_ago(45),
+          channel_type: "work_room",
+        }),
+        make_bot({
+          id: 2,
+          state: "assigned",
+          channel_id: "ch-2",
+          entity_id: "e1",
+          last_active: minutes_ago(45),
+          channel_type: "general",
+        }),
       ]);
       pool.set_bot_idle(1, true);
       pool.set_bot_idle(2, true);
@@ -280,8 +380,22 @@ describe("BotPool", () => {
 
     it("within same tier and channel type, LRU ordering applies", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "assigned", channel_id: "ch-1", entity_id: "e1", last_active: minutes_ago(60), channel_type: "general" }),
-        make_bot({ id: 2, state: "assigned", channel_id: "ch-2", entity_id: "e1", last_active: minutes_ago(45), channel_type: "general" }),
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          last_active: minutes_ago(60),
+          channel_type: "general",
+        }),
+        make_bot({
+          id: 2,
+          state: "assigned",
+          channel_id: "ch-2",
+          entity_id: "e1",
+          last_active: minutes_ago(45),
+          channel_type: "general",
+        }),
       ]);
       pool.set_bot_idle(1, true);
       pool.set_bot_idle(2, true);
@@ -293,7 +407,14 @@ describe("BotPool", () => {
 
     it("emits bot:parked_with_context when waiting_for_human bot is evicted", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "assigned", channel_id: "ch-1", entity_id: "e1", last_active: minutes_ago(10), channel_type: "general" }),
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          last_active: minutes_ago(10),
+          channel_type: "general",
+        }),
       ]);
       pool.set_bot_idle(1, true); // waiting_for_human
 
@@ -312,7 +433,14 @@ describe("BotPool", () => {
 
     it("does NOT emit bot:parked_with_context for idle assigned eviction", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "assigned", channel_id: "ch-1", entity_id: "e1", last_active: minutes_ago(45), channel_type: "general" }),
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          last_active: minutes_ago(45),
+          channel_type: "general",
+        }),
       ]);
       pool.set_bot_idle(1, true); // idle
 
@@ -326,7 +454,14 @@ describe("BotPool", () => {
 
     it("does NOT emit bot:parked_with_context for parked bot eviction", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "parked", channel_id: "ch-1", entity_id: "e1", last_active: minutes_ago(60), channel_type: "general" }),
+        make_bot({
+          id: 1,
+          state: "parked",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          last_active: minutes_ago(60),
+          channel_type: "general",
+        }),
       ]);
 
       const events: unknown[] = [];
@@ -340,10 +475,7 @@ describe("BotPool", () => {
 
   describe("has_active_work() with is_bot_idle() extraction", () => {
     it("returns active: false when no bots are assigned", () => {
-      pool.inject_bots([
-        make_bot({ id: 1, state: "free" }),
-        make_bot({ id: 2, state: "parked" }),
-      ]);
+      pool.inject_bots([make_bot({ id: 1, state: "free" }), make_bot({ id: 2, state: "parked" })]);
 
       const result = pool.has_active_work();
       expect(result.active).toBe(false);
@@ -384,7 +516,7 @@ describe("BotPool", () => {
   describe("pre_assign_generals removed", () => {
     it("BotPool does not have pre_assign_generals method", () => {
       // Verify the method was removed
-      expect((pool as unknown as Record<string, unknown>)["pre_assign_generals"]).toBeUndefined();
+      expect((pool as unknown as Record<string, unknown>).pre_assign_generals).toBeUndefined();
     });
   });
 
@@ -413,15 +545,43 @@ describe("BotPool", () => {
 
     it("mixed states: working + active_conversation + waiting + idle — evicts idle", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "assigned", channel_id: "ch-1", entity_id: "e1", last_active: new Date(), channel_type: "general" }),       // working
-        make_bot({ id: 2, state: "assigned", channel_id: "ch-2", entity_id: "e1", last_active: minutes_ago(1), channel_type: "general" }),   // active_conversation
-        make_bot({ id: 3, state: "assigned", channel_id: "ch-3", entity_id: "e1", last_active: minutes_ago(10), channel_type: "general" }),  // waiting_for_human
-        make_bot({ id: 4, state: "assigned", channel_id: "ch-4", entity_id: "e1", last_active: minutes_ago(45), channel_type: "general" }),  // idle
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          last_active: new Date(),
+          channel_type: "general",
+        }), // working
+        make_bot({
+          id: 2,
+          state: "assigned",
+          channel_id: "ch-2",
+          entity_id: "e1",
+          last_active: minutes_ago(1),
+          channel_type: "general",
+        }), // active_conversation
+        make_bot({
+          id: 3,
+          state: "assigned",
+          channel_id: "ch-3",
+          entity_id: "e1",
+          last_active: minutes_ago(10),
+          channel_type: "general",
+        }), // waiting_for_human
+        make_bot({
+          id: 4,
+          state: "assigned",
+          channel_id: "ch-4",
+          entity_id: "e1",
+          last_active: minutes_ago(45),
+          channel_type: "general",
+        }), // idle
       ]);
       pool.set_bot_idle(1, false); // working
-      pool.set_bot_idle(2, true);  // active_conversation
-      pool.set_bot_idle(3, true);  // waiting_for_human
-      pool.set_bot_idle(4, true);  // idle
+      pool.set_bot_idle(2, true); // active_conversation
+      pool.set_bot_idle(3, true); // waiting_for_human
+      pool.set_bot_idle(4, true); // idle
 
       const result = await pool.assign("ch-new", "e1", "planner", undefined, "general");
       expect(result).not.toBeNull();
@@ -450,14 +610,13 @@ describe("BotPool", () => {
 
   describe("concurrent assign() race condition", () => {
     it("second concurrent assign for same channel returns null, not a duplicate bot", async () => {
-      pool.inject_bots([
-        make_bot({ id: 1, state: "free" }),
-        make_bot({ id: 2, state: "free" }),
-      ]);
+      pool.inject_bots([make_bot({ id: 1, state: "free" }), make_bot({ id: 2, state: "free" })]);
 
       // Slow down start_tmux to simulate an async gap where the race occurs
-      vi.spyOn(pool as unknown as { start_tmux: (...args: unknown[]) => Promise<void> }, "start_tmux" as never)
-        .mockImplementation(() => new Promise(resolve => setTimeout(resolve, 50)));
+      vi.spyOn(
+        pool as unknown as { start_tmux: (...args: unknown[]) => Promise<void> },
+        "start_tmux" as never,
+      ).mockImplementation(() => new Promise((resolve) => setTimeout(resolve, 50)));
 
       // Fire two assigns concurrently for the same channel
       const [result_a, result_b] = await Promise.all([
@@ -467,8 +626,8 @@ describe("BotPool", () => {
 
       // Exactly one should succeed, the other should get null (in-flight lock)
       const results = [result_a, result_b];
-      const successes = results.filter(r => r !== null);
-      const nulls = results.filter(r => r === null);
+      const successes = results.filter((r) => r !== null);
+      const nulls = results.filter((r) => r === null);
 
       expect(successes).toHaveLength(1);
       expect(nulls).toHaveLength(1);
@@ -476,9 +635,7 @@ describe("BotPool", () => {
     });
 
     it("in-flight lock is released after assign completes, allowing re-assignment", async () => {
-      pool.inject_bots([
-        make_bot({ id: 1, state: "free" }),
-      ]);
+      pool.inject_bots([make_bot({ id: 1, state: "free" })]);
 
       // First assign succeeds
       const first = await pool.assign("ch-seq", "e1", "builder", undefined, "work_room");
@@ -491,22 +648,22 @@ describe("BotPool", () => {
     });
 
     it("in-flight lock is released even if assign throws", async () => {
-      pool.inject_bots([
-        make_bot({ id: 1, state: "free" }),
-        make_bot({ id: 2, state: "free" }),
-      ]);
+      pool.inject_bots([make_bot({ id: 1, state: "free" }), make_bot({ id: 2, state: "free" })]);
 
       // Make start_tmux throw on first call, succeed on second
       let call_count = 0;
-      vi.spyOn(pool as unknown as { start_tmux: (...args: unknown[]) => Promise<void> }, "start_tmux" as never)
-        .mockImplementation(async () => {
-          call_count++;
-          if (call_count === 1) throw new Error("tmux failed");
-        });
+      vi.spyOn(
+        pool as unknown as { start_tmux: (...args: unknown[]) => Promise<void> },
+        "start_tmux" as never,
+      ).mockImplementation(async () => {
+        call_count++;
+        if (call_count === 1) throw new Error("tmux failed");
+      });
 
       // First assign should throw
-      await expect(pool.assign("ch-err", "e1", "builder", undefined, "work_room"))
-        .rejects.toThrow("tmux failed");
+      await expect(pool.assign("ch-err", "e1", "builder", undefined, "work_room")).rejects.toThrow(
+        "tmux failed",
+      );
 
       // Lock should be released — second assign should proceed (not return null from lock)
       const result = await pool.assign("ch-err", "e1", "builder", undefined, "work_room");
@@ -517,21 +674,26 @@ describe("BotPool", () => {
   describe("concurrent release() race condition", () => {
     it("second concurrent release for same channel is a no-op", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "assigned", channel_id: "ch-rel", entity_id: "e1", archetype: "builder" }),
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-rel",
+          entity_id: "e1",
+          archetype: "builder",
+        }),
       ]);
 
       // Slow down write_access_json to create an async gap
-      vi.spyOn(pool as unknown as { write_access_json: (d: string, c: string | null) => Promise<void> }, "write_access_json" as never)
-        .mockImplementation(() => new Promise(resolve => setTimeout(resolve, 50)));
+      vi.spyOn(
+        pool as unknown as { write_access_json: (d: string, c: string | null) => Promise<void> },
+        "write_access_json" as never,
+      ).mockImplementation(() => new Promise((resolve) => setTimeout(resolve, 50)));
 
       const events: unknown[] = [];
       pool.on("bot:released", (info: unknown) => events.push(info));
 
       // Fire two releases concurrently for the same channel
-      await Promise.all([
-        pool.release("ch-rel"),
-        pool.release("ch-rel"),
-      ]);
+      await Promise.all([pool.release("ch-rel"), pool.release("ch-rel")]);
 
       // Only one bot:released event should fire (not two)
       expect(events).toHaveLength(1);

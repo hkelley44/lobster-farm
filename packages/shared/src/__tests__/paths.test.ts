@@ -1,18 +1,18 @@
-import { describe, expect, it } from "vitest";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { describe, expect, it } from "vitest";
 import {
-  expand_home,
-  lobsterfarm_dir,
+  agents_dir,
   claude_dir,
-  projects_dir,
+  entity_daily_dir,
   entity_dir,
   entity_memory_path,
-  entity_daily_dir,
   entity_repo_path,
   entity_worktree_path,
+  expand_home,
+  lobsterfarm_dir,
   pid_file_path,
-  agents_dir,
+  projects_dir,
   skills_dir,
   sop_dir,
 } from "../paths.js";
@@ -65,9 +65,7 @@ describe("global paths with custom config", () => {
 
 describe("entity paths", () => {
   it("computes entity directory", () => {
-    expect(entity_dir(undefined, "alpha")).toBe(
-      join(home, ".lobsterfarm", "entities", "alpha"),
-    );
+    expect(entity_dir(undefined, "alpha")).toBe(join(home, ".lobsterfarm", "entities", "alpha"));
   });
 
   it("computes entity memory path", () => {
@@ -89,10 +87,17 @@ describe("entity paths", () => {
   });
 
   it("computes entity worktree path", () => {
-    expect(
-      entity_worktree_path(undefined, "alpha", "alpha-platform", "42-chart"),
-    ).toBe(
-      join(home, ".lobsterfarm", "entities", "alpha", "repos", "alpha-platform", "worktrees", "42-chart"),
+    expect(entity_worktree_path(undefined, "alpha", "alpha-platform", "42-chart")).toBe(
+      join(
+        home,
+        ".lobsterfarm",
+        "entities",
+        "alpha",
+        "repos",
+        "alpha-platform",
+        "worktrees",
+        "42-chart",
+      ),
     );
   });
 });

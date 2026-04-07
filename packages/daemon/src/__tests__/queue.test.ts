@@ -1,11 +1,11 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { writeFile, mkdir, rm, chmod } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
-import { ClaudeSessionManager } from "../session.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { TaskQueue } from "../queue.js";
+import { ClaudeSessionManager } from "../session.js";
 
 function make_config(overrides?: Record<string, unknown>): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
@@ -24,7 +24,7 @@ describe("TaskQueue", () => {
 
   afterEach(async () => {
     await rm(tmp, { recursive: true, force: true });
-    delete process.env["CLAUDE_BIN"];
+    delete process.env.CLAUDE_BIN;
   });
 
   it("submits a task and returns an ID", () => {
@@ -51,7 +51,7 @@ describe("TaskQueue", () => {
     const mock_claude = join(tmp, "mock-claude");
     await writeFile(mock_claude, "#!/bin/bash\necho done\nexit 0\n", "utf-8");
     await chmod(mock_claude, 0o755);
-    process.env["CLAUDE_BIN"] = mock_claude;
+    process.env.CLAUDE_BIN = mock_claude;
 
     const config = make_config();
     const mgr = new ClaudeSessionManager(config);
@@ -85,7 +85,7 @@ describe("TaskQueue", () => {
     const mock_claude = join(tmp, "mock-claude-slow");
     await writeFile(mock_claude, "#!/bin/bash\nsleep 10\n", "utf-8");
     await chmod(mock_claude, 0o755);
-    process.env["CLAUDE_BIN"] = mock_claude;
+    process.env.CLAUDE_BIN = mock_claude;
 
     const config = make_config({
       concurrency: { max_active_sessions: 2, max_queue_depth: 20 },
@@ -121,13 +121,9 @@ describe("TaskQueue", () => {
 
   it("processes queued tasks when slots open", async () => {
     const mock_claude = join(tmp, "mock-claude-fast");
-    await writeFile(
-      mock_claude,
-      '#!/bin/bash\necho \'{"done":true}\'\nexit 0\n',
-      "utf-8",
-    );
+    await writeFile(mock_claude, "#!/bin/bash\necho '{\"done\":true}'\nexit 0\n", "utf-8");
     await chmod(mock_claude, 0o755);
-    process.env["CLAUDE_BIN"] = mock_claude;
+    process.env.CLAUDE_BIN = mock_claude;
 
     const config = make_config({
       concurrency: { max_active_sessions: 1, max_queue_depth: 20 },
@@ -168,7 +164,7 @@ describe("TaskQueue", () => {
     const mock_claude = join(tmp, "mock-claude-slow");
     await writeFile(mock_claude, "#!/bin/bash\nsleep 10\n", "utf-8");
     await chmod(mock_claude, 0o755);
-    process.env["CLAUDE_BIN"] = mock_claude;
+    process.env.CLAUDE_BIN = mock_claude;
 
     const config = make_config({
       concurrency: { max_active_sessions: 1, max_queue_depth: 20 },
@@ -221,7 +217,7 @@ describe("TaskQueue", () => {
     const mock_claude = join(tmp, "mock-claude-slow");
     await writeFile(mock_claude, "#!/bin/bash\nsleep 10\n", "utf-8");
     await chmod(mock_claude, 0o755);
-    process.env["CLAUDE_BIN"] = mock_claude;
+    process.env.CLAUDE_BIN = mock_claude;
 
     const config = make_config({
       concurrency: { max_active_sessions: 1, max_queue_depth: 20 },

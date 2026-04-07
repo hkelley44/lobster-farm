@@ -1,9 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
+  type DashboardData,
+  format_cross_entity_dashboard,
   format_duration,
   format_uptime,
-  format_cross_entity_dashboard,
-  type DashboardData,
 } from "../discord.js";
 
 // ── format_duration ──
@@ -90,21 +90,23 @@ describe("format_cross_entity_dashboard", () => {
   });
 
   it("shows active sessions grouped by entity", () => {
-    const result = format_cross_entity_dashboard(make_data({
-      entities: [
-        {
-          id: "lobster-farm",
-          sessions: [
-            { channel_name: "#general", agent_label: "Gary (planner)", duration: "2h 14m" },
-            { channel_name: "#work-room-1", agent_label: "Bob (builder)", duration: "12m" },
-          ],
-        },
-        {
-          id: "my-client",
-          sessions: [],
-        },
-      ],
-    }));
+    const result = format_cross_entity_dashboard(
+      make_data({
+        entities: [
+          {
+            id: "lobster-farm",
+            sessions: [
+              { channel_name: "#general", agent_label: "Gary (planner)", duration: "2h 14m" },
+              { channel_name: "#work-room-1", agent_label: "Bob (builder)", duration: "12m" },
+            ],
+          },
+          {
+            id: "my-client",
+            sessions: [],
+          },
+        ],
+      }),
+    );
 
     expect(result).toContain("--- lobster-farm ---");
     expect(result).toContain("Sessions:");
@@ -115,12 +117,14 @@ describe("format_cross_entity_dashboard", () => {
   });
 
   it("shows 'No active work.' for entities with no sessions", () => {
-    const result = format_cross_entity_dashboard(make_data({
-      entities: [
-        { id: "idle-project", sessions: [] },
-        { id: "another-idle", sessions: [] },
-      ],
-    }));
+    const result = format_cross_entity_dashboard(
+      make_data({
+        entities: [
+          { id: "idle-project", sessions: [] },
+          { id: "another-idle", sessions: [] },
+        ],
+      }),
+    );
 
     expect(result).toContain("--- idle-project ---\nNo active work.");
     expect(result).toContain("--- another-idle ---\nNo active work.");
@@ -147,11 +151,13 @@ describe("format_cross_entity_dashboard", () => {
       ],
     }));
 
-    const result = format_cross_entity_dashboard(make_data({
-      pool_assigned: 50,
-      pool_total: 50,
-      entities,
-    }));
+    const result = format_cross_entity_dashboard(
+      make_data({
+        pool_assigned: 50,
+        pool_total: 50,
+        entities,
+      }),
+    );
 
     expect(result.length).toBeLessThanOrEqual(2000);
     expect(result).toContain("\u2026 and ");
@@ -159,29 +165,33 @@ describe("format_cross_entity_dashboard", () => {
   });
 
   it("does not truncate when response fits within limit", () => {
-    const result = format_cross_entity_dashboard(make_data({
-      entities: [
-        { id: "small", sessions: [] },
-      ],
-    }));
+    const result = format_cross_entity_dashboard(
+      make_data({
+        entities: [{ id: "small", sessions: [] }],
+      }),
+    );
 
     expect(result).not.toContain("\u2026 and ");
     expect(result).toContain("--- small ---");
   });
 
   it("computes pool free count correctly", () => {
-    const result = format_cross_entity_dashboard(make_data({
-      pool_assigned: 0,
-      pool_total: 10,
-    }));
+    const result = format_cross_entity_dashboard(
+      make_data({
+        pool_assigned: 0,
+        pool_total: 10,
+      }),
+    );
     expect(result).toContain("**Pool:** 0/10 assigned, 10 free");
   });
 
   it("handles all bots assigned", () => {
-    const result = format_cross_entity_dashboard(make_data({
-      pool_assigned: 10,
-      pool_total: 10,
-    }));
+    const result = format_cross_entity_dashboard(
+      make_data({
+        pool_assigned: 10,
+        pool_total: 10,
+      }),
+    );
     expect(result).toContain("**Pool:** 10/10 assigned, 0 free");
   });
 });

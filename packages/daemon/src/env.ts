@@ -68,9 +68,7 @@ function default_tmux_setter(key: string, value: string): boolean {
  * Exits the process with a clear error message if any are missing.
  * Logs a warning for missing recommended binaries.
  */
-export function check_required_binaries(
-  checker: BinaryChecker = default_binary_checker,
-): void {
+export function check_required_binaries(checker: BinaryChecker = default_binary_checker): void {
   const missing_required: string[] = [];
   const missing_recommended: string[] = [];
 
@@ -87,14 +85,18 @@ export function check_required_binaries(
   }
 
   if (missing_required.length > 0) {
-    console.error(`[env] FATAL: Required binaries not found in PATH: ${missing_required.join(", ")}`);
-    console.error(`[env] Current PATH: ${process.env["PATH"] ?? "(unset)"}`);
+    console.error(
+      `[env] FATAL: Required binaries not found in PATH: ${missing_required.join(", ")}`,
+    );
+    console.error(`[env] Current PATH: ${process.env.PATH ?? "(unset)"}`);
     console.error("[env] Fix ~/.lobsterfarm/env.sh and restart.");
     process.exit(1);
   }
 
   if (missing_recommended.length > 0) {
-    console.warn(`[env] Warning: Recommended binaries not found: ${missing_recommended.join(", ")}`);
+    console.warn(
+      `[env] Warning: Recommended binaries not found: ${missing_recommended.join(", ")}`,
+    );
   }
 
   console.log(`[env] All required binaries found: ${REQUIRED_BINARIES.join(", ")}`);

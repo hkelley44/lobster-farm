@@ -1,9 +1,9 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 
@@ -85,29 +85,41 @@ describe("lazy session resume (issue #72)", () => {
     pool = new TestBotPool(config);
 
     // Stub out side effects that touch the filesystem and tmux
-    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-      .mockImplementation(() => {});
-    vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "park_bot" as never)
-      .mockImplementation(async (bot: PoolBot) => {
+    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+      () => {},
+    );
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "write_access_json" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "set_bot_nickname" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "set_bot_avatar" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never).mockResolvedValue(
+      undefined,
+    );
+    vi.spyOn(pool as unknown as Record<string, unknown>, "park_bot" as never).mockImplementation(
+      async (bot: PoolBot) => {
         bot.state = "parked";
-      });
+      },
+    );
 
     // Default: tmux is dead (individual tests override per-session as needed)
-    vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-      .mockImplementation((session_name: string) => {
-        return pool["tmux_alive_overrides" as keyof typeof pool]
-          ? (pool as unknown as { tmux_alive_overrides: Map<string, boolean> })
-              .tmux_alive_overrides.get(session_name) ?? false
-          : false;
-      });
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "is_tmux_alive" as never,
+    ).mockImplementation((session_name: string) => {
+      return pool["tmux_alive_overrides" as keyof typeof pool]
+        ? ((
+            pool as unknown as { tmux_alive_overrides: Map<string, boolean> }
+          ).tmux_alive_overrides.get(session_name) ?? false)
+        : false;
+    });
   });
 
   afterEach(async () => {
@@ -155,9 +167,7 @@ describe("lazy session resume (issue #72)", () => {
     });
 
     it("returns false when bot is parked", () => {
-      pool.inject_bots([
-        make_bot({ id: 1, state: "parked", channel_id: "ch-1", entity_id: "e1" }),
-      ]);
+      pool.inject_bots([make_bot({ id: 1, state: "parked", channel_id: "ch-1", entity_id: "e1" })]);
 
       expect(pool.is_session_alive(1)).toBe(false);
     });
@@ -189,7 +199,7 @@ describe("lazy session resume (issue #72)", () => {
       expect(pool.get_session_history().get("e1:ch-1")).toBe("sess-stash-me");
 
       // Bot should be freed (release was called)
-      const released_bot = pool.get_bots().find(b => b.id === 1)!;
+      const released_bot = pool.get_bots().find((b) => b.id === 1)!;
       expect(released_bot.state).toBe("free");
       expect(released_bot.session_id).toBeNull();
       expect(released_bot.channel_id).toBeNull();
@@ -211,7 +221,7 @@ describe("lazy session resume (issue #72)", () => {
       expect(pool.get_session_history().size).toBe(0);
 
       // Bot should still be released
-      const released_bot = pool.get_bots().find(b => b.id === 1)!;
+      const released_bot = pool.get_bots().find((b) => b.id === 1)!;
       expect(released_bot.state).toBe("free");
     });
 
@@ -256,7 +266,7 @@ describe("lazy session resume (issue #72)", () => {
       await pool.run_health_check();
 
       // Bot should still be assigned (auto-restarted, not freed)
-      const restarted_bot = pool.get_bots().find(b => b.id === 1)!;
+      const restarted_bot = pool.get_bots().find((b) => b.id === 1)!;
       expect(restarted_bot.state).toBe("assigned");
       expect(restarted_bot.session_id).toBe("sess-health-check");
 
@@ -304,7 +314,7 @@ describe("lazy session resume (issue #72)", () => {
       expect(pool.get_session_history().size).toBe(0);
 
       // Bot stays assigned
-      const alive_bot = pool.get_bots().find(b => b.id === 1)!;
+      const alive_bot = pool.get_bots().find((b) => b.id === 1)!;
       expect(alive_bot.state).toBe("assigned");
       expect(alive_bot.session_id).toBe("sess-alive");
     });
@@ -358,7 +368,7 @@ describe("lazy session resume (issue #72)", () => {
       expect(pool.get_session_history().get("e1:ch-1")).toBe("sess-original");
 
       // Bot is now free
-      expect(pool.get_bots().find(b => b.id === 1)!.state).toBe("free");
+      expect(pool.get_bots().find((b) => b.id === 1)!.state).toBe("free");
 
       // Step 2: discord.ts re-assigns (like the auto-assign branch)
       const result = await pool.assign("ch-1", "e1", "builder", undefined, "general");
@@ -394,7 +404,7 @@ describe("lazy session resume (issue #72)", () => {
       // Health monitor fires — bot is auto-restarted, stays assigned
       await pool.run_health_check();
 
-      const restarted_bot = pool.get_bots().find(b => b.id === 1)!;
+      const restarted_bot = pool.get_bots().find((b) => b.id === 1)!;
       expect(restarted_bot.state).toBe("assigned");
       expect(restarted_bot.session_id).toBe("sess-health-resume");
       expect(restarted_bot.channel_id).toBe("ch-1");
@@ -423,7 +433,7 @@ describe("lazy session resume (issue #72)", () => {
       await pool.release_with_history(1);
 
       expect(pool.get_session_history().get("e1:ch-1")).toBe("sess-race");
-      expect(pool.get_bots().find(b => b.id === 1)!.state).toBe("free");
+      expect(pool.get_bots().find((b) => b.id === 1)!.state).toBe("free");
 
       // Then health check runs — bot is already free, so it skips it
       await pool.run_health_check();

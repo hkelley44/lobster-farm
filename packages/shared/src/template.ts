@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { TemplateVariables } from "./schemas/template.js";
 
@@ -9,23 +9,17 @@ import type { TemplateVariables } from "./schemas/template.js";
  * - If the variable has content, the region is replaced with that content
  * - If the variable is empty/missing, the entire region (including markers) is removed
  */
-export function resolve_template(
-  template: string,
-  variables: Partial<TemplateVariables>,
-): string {
+export function resolve_template(template: string, variables: Partial<TemplateVariables>): string {
   let result = template;
 
   // Handle block regions first: {{#KEY}}...{{/KEY}}
-  result = result.replace(
-    /\{\{#(\w+)\}\}[\s\S]*?\{\{\/\1\}\}/g,
-    (_match, key: string) => {
-      const value = variables[key as keyof TemplateVariables];
-      if (value && String(value).trim().length > 0) {
-        return String(value);
-      }
-      return "";
-    },
-  );
+  result = result.replace(/\{\{#(\w+)\}\}[\s\S]*?\{\{\/\1\}\}/g, (_match, key: string) => {
+    const value = variables[key as keyof TemplateVariables];
+    if (value && String(value).trim().length > 0) {
+      return String(value);
+    }
+    return "";
+  });
 
   // Handle simple placeholders: {{KEY}}
   result = result.replace(/\{\{(\w+)\}\}/g, (_match, key: string) => {

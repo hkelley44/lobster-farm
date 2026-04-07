@@ -7,5 +7,5 @@
  * in POSIX shells treat every character literally except the single quote itself.
  */
 export function sq(value: string): string {
-  return "'" + value.replace(/'/g, "'\\''") + "'";
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }

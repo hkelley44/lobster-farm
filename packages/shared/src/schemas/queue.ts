@@ -1,14 +1,8 @@
 import { z } from "zod";
-import { ArchetypeRoleSchema, PrioritySchema } from "./enums.js";
 import { ModelTierSchema } from "./config.js";
+import { ArchetypeRoleSchema, PrioritySchema } from "./enums.js";
 
-export const TaskStatusSchema = z.enum([
-  "queued",
-  "active",
-  "completed",
-  "failed",
-  "cancelled",
-]);
+export const TaskStatusSchema = z.enum(["queued", "active", "completed", "failed", "cancelled"]);
 export type TaskStatus = z.infer<typeof TaskStatusSchema>;
 
 export const QueuedTaskSchema = z.object({

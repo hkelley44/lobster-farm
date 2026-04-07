@@ -11,10 +11,10 @@
  * Uses the same command-routing mock pattern as ci-gating.test.ts.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Command routing ──
 
@@ -99,20 +99,13 @@ vi.mock("../persistence.js", () => ({
   }),
 }));
 
-// Import after mocks are registered
-import {
-  fetch_ci_failure_logs,
-  build_ci_fix_prompt,
-  type CIFailureLog,
-} from "../review-utils.js";
-import {
-  handle_github_webhook,
-  type WebhookContext,
-} from "../webhook-handler.js";
+import type { DiscordBot } from "../discord.js";
 import type { GitHubAppAuth } from "../github-app.js";
 import type { EntityRegistry } from "../registry.js";
+// Import after mocks are registered
+import { type CIFailureLog, build_ci_fix_prompt, fetch_ci_failure_logs } from "../review-utils.js";
 import type { ClaudeSessionManager } from "../session.js";
-import type { DiscordBot } from "../discord.js";
+import { type WebhookContext, handle_github_webhook } from "../webhook-handler.js";
 
 // ── fetch_ci_failure_logs tests ──
 
@@ -125,9 +118,7 @@ describe("fetch_ci_failure_logs", () => {
   it("returns failure logs for failed runs", async () => {
     route_exec({
       "gh run list": () => ({
-        stdout: JSON.stringify([
-          { databaseId: 123, name: "CI" },
-        ]),
+        stdout: JSON.stringify([{ databaseId: 123, name: "CI" }]),
       }),
       "gh run view": () => ({
         stdout: "Error: lint failed\n  src/foo.ts(10): unexpected token\n",
@@ -168,9 +159,7 @@ describe("fetch_ci_failure_logs", () => {
 
     route_exec({
       "gh run list": () => ({
-        stdout: JSON.stringify([
-          { databaseId: 456, name: "Build" },
-        ]),
+        stdout: JSON.stringify([{ databaseId: 456, name: "Build" }]),
       }),
       "gh run view": () => ({
         stdout: long_output,
@@ -188,9 +177,7 @@ describe("fetch_ci_failure_logs", () => {
   it("includes fallback message when log fetch fails for a run", async () => {
     route_exec({
       "gh run list": () => ({
-        stdout: JSON.stringify([
-          { databaseId: 789, name: "Test" },
-        ]),
+        stdout: JSON.stringify([{ databaseId: 789, name: "Test" }]),
       }),
       "gh run view": () => new Error("Not found"),
     });
@@ -208,7 +195,7 @@ describe("fetch_ci_failure_logs", () => {
 
     route_exec({
       "gh run list": (_args, opts) => {
-        captured_env = opts["env"] as Record<string, unknown>;
+        captured_env = opts.env as Record<string, unknown>;
         return { stdout: JSON.stringify([]) };
       },
     });
@@ -216,7 +203,7 @@ describe("fetch_ci_failure_logs", () => {
     await fetch_ci_failure_logs("feature/test", "/tmp/test-repo", "ghs_test_token");
 
     expect(captured_env).toBeDefined();
-    expect(captured_env!["GH_TOKEN"]).toBe("ghs_test_token");
+    expect(captured_env!.GH_TOKEN).toBe("ghs_test_token");
   });
 });
 
@@ -292,10 +279,7 @@ function sign_payload(payload: string): string {
   return `sha256=${hmac}`;
 }
 
-function make_request(
-  body: string,
-  headers: Record<string, string> = {},
-): IncomingMessage {
+function make_request(body: string, headers: Record<string, string> = {}): IncomingMessage {
   const emitter = new EventEmitter();
   const req = emitter as unknown as IncomingMessage;
   req.headers = { ...headers };
@@ -330,9 +314,9 @@ function make_github_app(): GitHubAppAuth {
       return sig === `sha256=${expected}`;
     }),
     get_token: vi.fn().mockResolvedValue("ghs_mock_token"),
-    get_token_for_installation: vi.fn().mockImplementation(
-      (id: string) => Promise.resolve(`ghs_install_${id}`),
-    ),
+    get_token_for_installation: vi
+      .fn()
+      .mockImplementation((id: string) => Promise.resolve(`ghs_install_${id}`)),
   } as unknown as GitHubAppAuth;
 }
 
@@ -383,7 +367,9 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
     session_manager: make_session_manager(),
     registry: make_registry(),
     discord: make_discord(),
-    config: { paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" } } as WebhookContext["config"],
+    config: {
+      paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" },
+    } as WebhookContext["config"],
     pool: null,
     pr_watches: null,
     ...overrides,
@@ -397,7 +383,11 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
 async function trigger_review_completion(
   ci_route: ExecRoute,
   extra_routes: Record<string, ExecRoute> = {},
-): Promise<{ ctx: WebhookContext; discord: { send_to_entity: ReturnType<typeof vi.fn> }; session_manager: { spawn: ReturnType<typeof vi.fn> } }> {
+): Promise<{
+  ctx: WebhookContext;
+  discord: { send_to_entity: ReturnType<typeof vi.fn> };
+  session_manager: { spawn: ReturnType<typeof vi.fn> };
+}> {
   route_exec({
     // check_pr_merged returns not merged
     "gh pr view": () => ({ stdout: "OPEN" }),
@@ -405,12 +395,11 @@ async function trigger_review_completion(
     "gh pr checks": ci_route,
     // fetch_ci_failure_logs
     "gh run list": () => ({
-      stdout: JSON.stringify([
-        { databaseId: 100, name: "CI" },
-      ]),
+      stdout: JSON.stringify([{ databaseId: 100, name: "CI" }]),
     }),
     "gh run view": () => ({
-      stdout: "Error: type check failed\n  src/foo.ts(10): Type 'string' not assignable to 'number'\n",
+      stdout:
+        "Error: type check failed\n  src/foo.ts(10): Type 'string' not assignable to 'number'\n",
     }),
     ...extra_routes,
   });
@@ -498,9 +487,7 @@ describe("webhook handler — CI fix loop", () => {
 
   it("increments ci_fix_attempts counter", async () => {
     await trigger_review_completion(() => ({
-      stdout: JSON.stringify([
-        { name: "Test", state: "COMPLETED", conclusion: "FAILURE" },
-      ]),
+      stdout: JSON.stringify([{ name: "Test", state: "COMPLETED", conclusion: "FAILURE" }]),
     }));
 
     // Check that the persisted state has ci_fix_attempts = 1
@@ -539,9 +526,7 @@ describe("webhook handler — CI fix loop", () => {
     };
 
     const { session_manager, discord } = await trigger_review_completion(() => ({
-      stdout: JSON.stringify([
-        { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
-      ]),
+      stdout: JSON.stringify([{ name: "Build", state: "COMPLETED", conclusion: "FAILURE" }]),
     }));
 
     // Should NOT spawn a CI fix builder — counter is at 3, cap reached
@@ -578,9 +563,7 @@ describe("webhook handler — CI fix loop", () => {
 
     // CI still failing — fresh approval should NOT reset counter
     const { session_manager } = await trigger_review_completion(() => ({
-      stdout: JSON.stringify([
-        { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
-      ]),
+      stdout: JSON.stringify([{ name: "Build", state: "COMPLETED", conclusion: "FAILURE" }]),
     }));
 
     // Should spawn because we're at 2 < 3
@@ -620,9 +603,7 @@ describe("webhook handler — CI fix loop", () => {
     route_exec({
       "gh pr view": () => ({ stdout: "OPEN" }),
       "gh pr checks": () => ({
-        stdout: JSON.stringify([
-          { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
-        ]),
+        stdout: JSON.stringify([{ name: "Build", state: "COMPLETED", conclusion: "FAILURE" }]),
       }),
       "gh run list": () => ({
         stdout: JSON.stringify([{ databaseId: 100, name: "CI" }]),

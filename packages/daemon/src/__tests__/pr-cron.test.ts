@@ -1,9 +1,9 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { LobsterFarmConfigSchema, EntityConfigSchema } from "@lobster-farm/shared";
-import type { LobsterFarmConfig, EntityConfig } from "@lobster-farm/shared";
-import { PRReviewCron } from "../pr-cron.js";
-import type { ProcessedPR } from "../persistence.js";
+import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
+import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DiscordBot } from "../discord.js";
+import type { ProcessedPR } from "../persistence.js";
+import { PRReviewCron } from "../pr-cron.js";
 
 // ── Helpers ──
 
@@ -15,10 +15,10 @@ function make_config(): LobsterFarmConfig {
 
 /** ISO timestamps for test scenarios. Spaced apart to be clearly outside the 60s buffer. */
 const T = {
-  review:       "2026-03-27T10:00:00Z",
-  commit_old:   "2026-03-27T09:00:00Z",  // 1h before review
-  commit_new:   "2026-03-27T11:00:00Z",  // 1h after review
-  commit_close: "2026-03-27T10:00:30Z",  // 30s after review (within 60s buffer)
+  review: "2026-03-27T10:00:00Z",
+  commit_old: "2026-03-27T09:00:00Z", // 1h before review
+  commit_new: "2026-03-27T11:00:00Z", // 1h after review
+  commit_close: "2026-03-27T10:00:30Z", // 30s after review (within 60s buffer)
 };
 
 /** Shape matching the private PRFeedbackData interface. */
@@ -35,16 +35,16 @@ function make_pr_data(opts: {
   commits?: Array<{ committedDate: string }>;
 }): FeedbackData {
   return {
-    reviews: (opts.reviews ?? []).map(r => ({
+    reviews: (opts.reviews ?? []).map((r) => ({
       submittedAt: r.submittedAt,
       author: { login: r.login ?? "reviewer-bot" },
       state: r.state ?? "COMMENTED",
     })),
-    comments: (opts.comments ?? []).map(c => ({
+    comments: (opts.comments ?? []).map((c) => ({
       createdAt: c.createdAt,
       author: { login: c.login ?? "reviewer-bot" },
     })),
-    commits: (opts.commits ?? []).map(c => ({
+    commits: (opts.commits ?? []).map((c) => ({
       committedDate: c.committedDate,
     })),
   };
@@ -112,47 +112,56 @@ describe("PRReviewCron.should_skip_pr", () => {
   });
 
   it("does not skip PR with no reviews or comments (never reviewed)", async () => {
-    cron.set_feedback(42, make_pr_data({
-      reviews: [],
-      comments: [],
-      commits: [{ committedDate: T.commit_new }],
-    }));
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [],
+        commits: [{ committedDate: T.commit_new }],
+      }),
+    );
 
     const skip = await cron.test_should_skip_pr(42);
     expect(skip).toBe(false);
   });
 
   it("skips PR with review and no new commits", async () => {
-    cron.set_feedback(42, make_pr_data({
-      reviews: [{ submittedAt: T.review }],
-      comments: [],
-      commits: [{ committedDate: T.commit_old }],
-    }));
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [{ submittedAt: T.review }],
+        comments: [],
+        commits: [{ committedDate: T.commit_old }],
+      }),
+    );
 
     const skip = await cron.test_should_skip_pr(42);
     expect(skip).toBe(true);
   });
 
   it("does not skip PR with review followed by new commits", async () => {
-    cron.set_feedback(42, make_pr_data({
-      reviews: [{ submittedAt: T.review }],
-      comments: [],
-      commits: [
-        { committedDate: T.commit_old },
-        { committedDate: T.commit_new },
-      ],
-    }));
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [{ submittedAt: T.review }],
+        comments: [],
+        commits: [{ committedDate: T.commit_old }, { committedDate: T.commit_new }],
+      }),
+    );
 
     const skip = await cron.test_should_skip_pr(42);
     expect(skip).toBe(false);
   });
 
   it("skips when commit is within the 60s timestamp buffer", async () => {
-    cron.set_feedback(42, make_pr_data({
-      reviews: [{ submittedAt: T.review }],
-      comments: [],
-      commits: [{ committedDate: T.commit_close }],
-    }));
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [{ submittedAt: T.review }],
+        comments: [],
+        commits: [{ committedDate: T.commit_close }],
+      }),
+    );
 
     const skip = await cron.test_should_skip_pr(42);
     expect(skip).toBe(true);
@@ -161,22 +170,28 @@ describe("PRReviewCron.should_skip_pr", () => {
   it("does not skip when commit is just past the 60s buffer", async () => {
     // 61s after review — just past the buffer
     const commit_past_buffer = "2026-03-27T10:01:01Z";
-    cron.set_feedback(42, make_pr_data({
-      reviews: [{ submittedAt: T.review }],
-      comments: [],
-      commits: [{ committedDate: commit_past_buffer }],
-    }));
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [{ submittedAt: T.review }],
+        comments: [],
+        commits: [{ committedDate: commit_past_buffer }],
+      }),
+    );
 
     const skip = await cron.test_should_skip_pr(42);
     expect(skip).toBe(false);
   });
 
   it("uses comment timestamps when no formal reviews exist", async () => {
-    cron.set_feedback(42, make_pr_data({
-      reviews: [],
-      comments: [{ createdAt: T.review }],
-      commits: [{ committedDate: T.commit_old }],
-    }));
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [{ createdAt: T.review }],
+        commits: [{ committedDate: T.commit_old }],
+      }),
+    );
 
     const skip = await cron.test_should_skip_pr(42);
     expect(skip).toBe(true);
@@ -187,11 +202,14 @@ describe("PRReviewCron.should_skip_pr", () => {
     const late_comment = "2026-03-27T12:00:00Z";
     const mid_commit = "2026-03-27T11:00:00Z";
 
-    cron.set_feedback(42, make_pr_data({
-      reviews: [{ submittedAt: early_review }],
-      comments: [{ createdAt: late_comment }],
-      commits: [{ committedDate: mid_commit }],
-    }));
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [{ submittedAt: early_review }],
+        comments: [{ createdAt: late_comment }],
+        commits: [{ committedDate: mid_commit }],
+      }),
+    );
 
     // Latest feedback (comment at 12:00) is after latest commit (11:00) — skip
     const skip = await cron.test_should_skip_pr(42);
@@ -199,23 +217,20 @@ describe("PRReviewCron.should_skip_pr", () => {
   });
 
   it("handles multiple review rounds — compares against latest", async () => {
-    cron.set_feedback(42, make_pr_data({
-      // Round 1: review + comment, then fix
-      // Round 2: re-review + comment, then another fix
-      reviews: [
-        { submittedAt: "2026-03-27T08:00:00Z" },
-        { submittedAt: "2026-03-27T10:00:00Z" },
-      ],
-      comments: [
-        { createdAt: "2026-03-27T08:30:00Z" },
-        { createdAt: "2026-03-27T10:30:00Z" },
-      ],
-      commits: [
-        { committedDate: "2026-03-27T07:00:00Z" },
-        { committedDate: "2026-03-27T09:00:00Z" },
-        { committedDate: "2026-03-27T11:30:00Z" }, // newest, after all feedback
-      ],
-    }));
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        // Round 1: review + comment, then fix
+        // Round 2: re-review + comment, then another fix
+        reviews: [{ submittedAt: "2026-03-27T08:00:00Z" }, { submittedAt: "2026-03-27T10:00:00Z" }],
+        comments: [{ createdAt: "2026-03-27T08:30:00Z" }, { createdAt: "2026-03-27T10:30:00Z" }],
+        commits: [
+          { committedDate: "2026-03-27T07:00:00Z" },
+          { committedDate: "2026-03-27T09:00:00Z" },
+          { committedDate: "2026-03-27T11:30:00Z" }, // newest, after all feedback
+        ],
+      }),
+    );
 
     const skip = await cron.test_should_skip_pr(42);
     expect(skip).toBe(false); // newest commit is after latest feedback (10:30)
@@ -235,44 +250,57 @@ describe("PRReviewCron.should_skip_pr", () => {
   });
 
   it("does not skip when commits array is empty", async () => {
-    cron.set_feedback(42, make_pr_data({
-      reviews: [{ submittedAt: T.review }],
-      comments: [],
-      commits: [],
-    }));
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [{ submittedAt: T.review }],
+        comments: [],
+        commits: [],
+      }),
+    );
 
     const skip = await cron.test_should_skip_pr(42);
     expect(skip).toBe(false);
   });
 
   it("logs re-review reason when commits are newer", async () => {
-    cron.set_feedback(42, make_pr_data({
-      reviews: [{ submittedAt: T.review }],
-      comments: [],
-      commits: [{ committedDate: T.commit_new }],
-    }));
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [{ submittedAt: T.review }],
+        comments: [],
+        commits: [{ committedDate: T.commit_new }],
+      }),
+    );
 
     await cron.test_should_skip_pr(42);
 
-    const log_messages = log_spy.mock.calls.map(c => c[0]) as string[];
-    expect(log_messages.some(m =>
-      typeof m === "string" && m.includes("PR #42") && m.includes("needs re-review"),
-    )).toBe(true);
+    const log_messages = log_spy.mock.calls.map((c) => c[0]) as string[];
+    expect(
+      log_messages.some(
+        (m) => typeof m === "string" && m.includes("PR #42") && m.includes("needs re-review"),
+      ),
+    ).toBe(true);
   });
 
   it("logs skip reason when already reviewed", async () => {
-    cron.set_feedback(42, make_pr_data({
-      reviews: [{ submittedAt: T.review }],
-      comments: [],
-      commits: [{ committedDate: T.commit_old }],
-    }));
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [{ submittedAt: T.review }],
+        comments: [],
+        commits: [{ committedDate: T.commit_old }],
+      }),
+    );
 
     await cron.test_should_skip_pr(42);
 
-    const log_messages = log_spy.mock.calls.map(c => c[0]) as string[];
-    expect(log_messages.some(m =>
-      typeof m === "string" && m.includes("PR #42") && m.includes("already reviewed"),
-    )).toBe(true);
+    const log_messages = log_spy.mock.calls.map((c) => c[0]) as string[];
+    expect(
+      log_messages.some(
+        (m) => typeof m === "string" && m.includes("PR #42") && m.includes("already reviewed"),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -314,9 +342,7 @@ function make_entity_with_repo(repo_path: string): EntityConfig {
       id: "test-entity",
       name: "Test Entity",
       status: "active",
-      repos: [
-        { name: "test", url: "git@github.com:test/test.git", path: repo_path },
-      ],
+      repos: [{ name: "test", url: "git@github.com:test/test.git", path: repo_path }],
       accounts: {},
       channels: { category_id: "cat-1", list: [] },
       memory: { path: "/tmp/memory" },
@@ -355,17 +381,22 @@ describe("PRReviewCron — repo path validation", () => {
     cron.stop();
 
     // Give the immediate poll a tick to execute
-    await new Promise(resolve => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const log_messages = log_spy.mock.calls.map(c => c[0]) as string[];
-    expect(log_messages.some(m =>
-      typeof m === "string" && m.includes("Repo path does not exist") && m.includes("test-entity"),
-    )).toBe(true);
+    const log_messages = log_spy.mock.calls.map((c) => c[0]) as string[];
+    expect(
+      log_messages.some(
+        (m) =>
+          typeof m === "string" &&
+          m.includes("Repo path does not exist") &&
+          m.includes("test-entity"),
+      ),
+    ).toBe(true);
 
     // Should NOT have "Could not list PRs" — we should skip before calling gh
-    expect(log_messages.some(m =>
-      typeof m === "string" && m.includes("Could not list PRs"),
-    )).toBe(false);
+    expect(
+      log_messages.some((m) => typeof m === "string" && m.includes("Could not list PRs")),
+    ).toBe(false);
   });
 
   it("resolves gh binary to absolute path on start", async () => {
@@ -385,18 +416,18 @@ describe("PRReviewCron — repo path validation", () => {
     await cron.start(999_999_999);
     cron.stop();
 
-    const log_messages = log_spy.mock.calls.map(c => c[0]) as string[];
-    expect(log_messages.some(m =>
-      typeof m === "string" && m.includes("Resolved gh binary:"),
-    )).toBe(true);
+    const log_messages = log_spy.mock.calls.map((c) => c[0]) as string[];
+    expect(
+      log_messages.some((m) => typeof m === "string" && m.includes("Resolved gh binary:")),
+    ).toBe(true);
   });
 });
 
 // ── retry_approved_unmerged tests (#189) ──
 
-import { check_ci_status, attempt_auto_merge } from "../review-utils.js";
 import { detect_review_outcome } from "../actions.js";
 import { save_pr_reviews } from "../persistence.js";
+import { attempt_auto_merge, check_ci_status } from "../review-utils.js";
 
 const mock_check_ci = vi.mocked(check_ci_status);
 const mock_auto_merge = vi.mocked(attempt_auto_merge);
@@ -433,9 +464,7 @@ function make_entity_with_github_user(github_user: string): EntityConfig {
       id: "test-entity",
       name: "Test Entity",
       status: "active",
-      repos: [
-        { name: "test", url: "git@github.com:test/test.git", path: "/tmp/test-repo" },
-      ],
+      repos: [{ name: "test", url: "git@github.com:test/test.git", path: "/tmp/test-repo" }],
       accounts: { github: { user: github_user } },
       channels: { category_id: "cat-1", list: [] },
       memory: { path: "/tmp/memory" },
@@ -448,11 +477,13 @@ function make_entity_with_github_user(github_user: string): EntityConfig {
  * Create a PRReviewCron instance with private methods patched for testing
  * the retry_approved_unmerged pass without needing real gh CLI calls.
  */
-function make_retry_test_cron(opts: {
-  discord?: DiscordBot | null;
-  processed?: Record<string, ProcessedPR>;
-  pr_merged?: Map<number, boolean>;
-} = {}): {
+function make_retry_test_cron(
+  opts: {
+    discord?: DiscordBot | null;
+    processed?: Record<string, ProcessedPR>;
+    pr_merged?: Map<number, boolean>;
+  } = {},
+): {
   cron: PRReviewCron;
   get_processed: () => Record<string, ProcessedPR>;
   call_retry: (
@@ -475,35 +506,39 @@ function make_retry_test_cron(opts: {
   const cron_any = cron as unknown as Record<string, unknown>;
 
   // resolve_entity_token — return a dummy token
-  cron_any["resolve_entity_token"] = vi.fn().mockResolvedValue("ghs_test_token");
+  cron_any.resolve_entity_token = vi.fn().mockResolvedValue("ghs_test_token");
 
   // check_pr_merged — controllable per PR number
   const merge_map = opts.pr_merged ?? new Map();
-  cron_any["check_pr_merged"] = vi.fn().mockImplementation(
-    async (_path: string, pr_number: number) => merge_map.get(pr_number) ?? false,
-  );
+  cron_any.check_pr_merged = vi
+    .fn()
+    .mockImplementation(
+      async (_path: string, pr_number: number) => merge_map.get(pr_number) ?? false,
+    );
 
   // close_issues_for_merged_pr — no-op
-  cron_any["close_issues_for_merged_pr"] = vi.fn().mockResolvedValue(undefined);
+  cron_any.close_issues_for_merged_pr = vi.fn().mockResolvedValue(undefined);
 
   // notify_alerts — no-op (or spy on discord mock)
-  cron_any["notify_alerts"] = vi.fn().mockResolvedValue(undefined);
+  cron_any.notify_alerts = vi.fn().mockResolvedValue(undefined);
 
   // Seed processed state
   if (opts.processed) {
-    cron_any["processed"] = { ...opts.processed };
+    cron_any.processed = { ...opts.processed };
   }
 
   return {
     cron,
-    get_processed: () => cron_any["processed"] as Record<string, ProcessedPR>,
+    get_processed: () => cron_any.processed as Record<string, ProcessedPR>,
     call_retry: (entity_id, repo_path, prs, entity_config) =>
-      (cron_any["retry_approved_unmerged"] as (
-        entity_id: string,
-        repo_path: string,
-        prs: TestOpenPR[],
-        entity_config: EntityConfig,
-      ) => Promise<void>).call(cron, entity_id, repo_path, prs, entity_config),
+      (
+        cron_any.retry_approved_unmerged as (
+          entity_id: string,
+          repo_path: string,
+          prs: TestOpenPR[],
+          entity_config: EntityConfig,
+        ) => Promise<void>
+      ).call(cron, entity_id, repo_path, prs, entity_config),
   };
 }
 
@@ -544,7 +579,13 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     await call_retry(entity_id, repo_path, [pr], entity_config);
 
     expect(mock_check_ci).toHaveBeenCalledWith(42, repo_path, "ghs_test_token", "gh");
-    expect(mock_auto_merge).toHaveBeenCalledWith(42, "feature/test", repo_path, "gh", "ghs_test_token");
+    expect(mock_auto_merge).toHaveBeenCalledWith(
+      42,
+      "feature/test",
+      repo_path,
+      "gh",
+      "ghs_test_token",
+    );
     expect(mock_save_reviews).toHaveBeenCalled();
     expect(get_processed()[`${entity_id}:42`]?.outcome).toBe("approved");
   });
@@ -571,17 +612,23 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     expect(mock_check_ci).toHaveBeenCalled();
     expect(mock_auto_merge).not.toHaveBeenCalled();
 
-    const logs = log_spy.mock.calls.map(c => c[0]) as string[];
-    expect(logs.some(m =>
-      typeof m === "string" && m.includes("CI still pending") && m.includes("#42"),
-    )).toBe(true);
+    const logs = log_spy.mock.calls.map((c) => c[0]) as string[];
+    expect(
+      logs.some(
+        (m) => typeof m === "string" && m.includes("CI still pending") && m.includes("#42"),
+      ),
+    ).toBe(true);
   });
 
   it("spawns CI fixer when CI has failures and records failure set in processed", async () => {
     const pr = make_test_pr({ author: { login: "test-user" } });
     const entity_config = make_entity_with_github_user("test-user");
 
-    mock_check_ci.mockResolvedValueOnce({ passed: false, pending: false, failures: ["Build", "Test"] });
+    mock_check_ci.mockResolvedValueOnce({
+      passed: false,
+      pending: false,
+      failures: ["Build", "Test"],
+    });
 
     const { cron, call_retry, get_processed } = make_retry_test_cron({
       processed: {
@@ -597,7 +644,9 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     await call_retry(entity_id, repo_path, [pr], entity_config);
 
     expect(mock_auto_merge).not.toHaveBeenCalled();
-    const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
+    const notify_alerts = (cron as unknown as Record<string, unknown>).notify_alerts as ReturnType<
+      typeof vi.fn
+    >;
     expect(notify_alerts).toHaveBeenCalledWith(
       entity_id,
       expect.stringContaining("spawning builder to fix"),
@@ -614,7 +663,11 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     const entity_config = make_entity_with_github_user("test-user");
 
     // Same failures as what's already recorded in ci_failure_alerted
-    mock_check_ci.mockResolvedValueOnce({ passed: false, pending: false, failures: ["Build", "Test"] });
+    mock_check_ci.mockResolvedValueOnce({
+      passed: false,
+      pending: false,
+      failures: ["Build", "Test"],
+    });
 
     const { cron, call_retry } = make_retry_test_cron({
       processed: {
@@ -631,7 +684,9 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     await call_retry(entity_id, repo_path, [pr], entity_config);
 
     // Should NOT alert again — same failure set
-    const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
+    const notify_alerts = (cron as unknown as Record<string, unknown>).notify_alerts as ReturnType<
+      typeof vi.fn
+    >;
     expect(notify_alerts).not.toHaveBeenCalled();
     expect(mock_auto_merge).not.toHaveBeenCalled();
   });
@@ -641,7 +696,11 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     const entity_config = make_entity_with_github_user("test-user");
 
     // Different failure set than what was previously alerted
-    mock_check_ci.mockResolvedValueOnce({ passed: false, pending: false, failures: ["Lint", "Deploy"] });
+    mock_check_ci.mockResolvedValueOnce({
+      passed: false,
+      pending: false,
+      failures: ["Lint", "Deploy"],
+    });
 
     const { cron, call_retry, get_processed } = make_retry_test_cron({
       processed: {
@@ -658,7 +717,9 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     await call_retry(entity_id, repo_path, [pr], entity_config);
 
     // Should alert — different failure set
-    const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
+    const notify_alerts = (cron as unknown as Record<string, unknown>).notify_alerts as ReturnType<
+      typeof vi.fn
+    >;
     expect(notify_alerts).toHaveBeenCalledWith(
       entity_id,
       expect.stringContaining("spawning builder to fix"),
@@ -758,7 +819,7 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
 
 // ── pr-cron spawn_ci_fixer tests (#196) ──
 
-import { fetch_ci_failure_logs, build_ci_fix_prompt } from "../review-utils.js";
+import { build_ci_fix_prompt, fetch_ci_failure_logs } from "../review-utils.js";
 
 const mock_fetch_ci_logs = vi.mocked(fetch_ci_failure_logs);
 const mock_build_ci_prompt = vi.mocked(build_ci_fix_prompt);
@@ -767,10 +828,12 @@ const mock_build_ci_prompt = vi.mocked(build_ci_fix_prompt);
  * Create a PRReviewCron instance with private methods patched for testing
  * the spawn_ci_fixer path directly.
  */
-function make_ci_fixer_test_cron(opts: {
-  processed?: Record<string, ProcessedPR>;
-  token_error?: Error;
-} = {}): {
+function make_ci_fixer_test_cron(
+  opts: {
+    processed?: Record<string, ProcessedPR>;
+    token_error?: Error;
+  } = {},
+): {
   cron: PRReviewCron;
   session_manager: { spawn: ReturnType<typeof vi.fn> };
   get_processed: () => Record<string, ProcessedPR>;
@@ -812,30 +875,32 @@ function make_ci_fixer_test_cron(opts: {
   const resolve_token_mock = opts.token_error
     ? vi.fn().mockRejectedValue(opts.token_error)
     : vi.fn().mockResolvedValue("ghs_test_token");
-  cron_any["resolve_entity_token"] = resolve_token_mock;
+  cron_any.resolve_entity_token = resolve_token_mock;
 
   // notify_alerts — no-op spy
-  cron_any["notify_alerts"] = vi.fn().mockResolvedValue(undefined);
+  cron_any.notify_alerts = vi.fn().mockResolvedValue(undefined);
 
   // Seed processed state
   if (opts.processed) {
-    cron_any["processed"] = { ...opts.processed };
+    cron_any.processed = { ...opts.processed };
   }
 
   return {
     cron,
     session_manager,
-    get_processed: () => cron_any["processed"] as Record<string, ProcessedPR>,
-    get_active_reviews: () => cron_any["active_reviews"] as Map<string, unknown>,
+    get_processed: () => cron_any.processed as Record<string, ProcessedPR>,
+    get_active_reviews: () => cron_any.active_reviews as Map<string, unknown>,
     resolve_entity_token: resolve_token_mock,
     call_spawn_ci_fixer: (entity_id, repo_path, pr, failed_checks, entity_config) =>
-      (cron_any["spawn_ci_fixer"] as (
-        entity_id: string,
-        repo_path: string,
-        pr: TestOpenPR,
-        failed_checks: string[],
-        entity_config?: EntityConfig,
-      ) => Promise<boolean>).call(cron, entity_id, repo_path, pr, failed_checks, entity_config),
+      (
+        cron_any.spawn_ci_fixer as (
+          entity_id: string,
+          repo_path: string,
+          pr: TestOpenPR,
+          failed_checks: string[],
+          entity_config?: EntityConfig,
+        ) => Promise<boolean>
+      ).call(cron, entity_id, repo_path, pr, failed_checks, entity_config),
   };
 }
 
@@ -906,7 +971,9 @@ describe("PRReviewCron.spawn_ci_fixer", () => {
     expect(session_manager.spawn).not.toHaveBeenCalled();
 
     // Should alert about max attempts
-    const notify_alerts = (cron as unknown as Record<string, unknown>)["notify_alerts"] as ReturnType<typeof vi.fn>;
+    const notify_alerts = (cron as unknown as Record<string, unknown>).notify_alerts as ReturnType<
+      typeof vi.fn
+    >;
     expect(notify_alerts).toHaveBeenCalledWith(
       entity_id,
       expect.stringContaining("CI fix failed after 3 attempts"),
@@ -942,10 +1009,13 @@ describe("PRReviewCron.spawn_ci_fixer", () => {
     // Should NOT spawn — dedup
     expect(session_manager.spawn).not.toHaveBeenCalled();
 
-    const logs = log_spy.mock.calls.map(c => c[0]) as string[];
-    expect(logs.some(m =>
-      typeof m === "string" && m.includes("CI fix skipped") && m.includes("already in-flight"),
-    )).toBe(true);
+    const logs = log_spy.mock.calls.map((c) => c[0]) as string[];
+    expect(
+      logs.some(
+        (m) =>
+          typeof m === "string" && m.includes("CI fix skipped") && m.includes("already in-flight"),
+      ),
+    ).toBe(true);
   });
 
   it("sets ci_failure_alerted to prevent double-spawn from retry pass", async () => {

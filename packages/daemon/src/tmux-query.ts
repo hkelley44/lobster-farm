@@ -34,10 +34,10 @@ export interface SubscriptionUsage {
  */
 function is_session_at_prompt(tmux_session: string): boolean {
   try {
-    const output = execFileSync(
-      "tmux", ["capture-pane", "-t", tmux_session, "-p"],
-      { encoding: "utf-8", timeout: 2000 },
-    );
+    const output = execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
+      encoding: "utf-8",
+      timeout: 2000,
+    });
     const lines = output.trim().split("\n");
     const last_line = lines[lines.length - 1] ?? "";
     return last_line.includes("\u276F"); // ❯ prompt character
@@ -62,7 +62,7 @@ function is_session_at_prompt(tmux_session: string): boolean {
 export async function query_session_slash_command(
   tmux_session: string,
   command: string,
-  wait_ms: number = 2000,
+  wait_ms = 2000,
 ): Promise<string | null> {
   // Guard: only inject when session is idle at the prompt
   if (!is_session_at_prompt(tmux_session)) {
@@ -76,13 +76,13 @@ export async function query_session_slash_command(
     });
 
     // Wait for the command to produce output
-    await new Promise(resolve => setTimeout(resolve, wait_ms));
+    await new Promise((resolve) => setTimeout(resolve, wait_ms));
 
     // Capture the pane content
-    const output = execFileSync(
-      "tmux", ["capture-pane", "-t", tmux_session, "-p", "-S", "-100"],
-      { encoding: "utf-8", timeout: 2000 },
-    );
+    const output = execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p", "-S", "-100"], {
+      encoding: "utf-8",
+      timeout: 2000,
+    });
 
     return output;
   } catch {
@@ -102,7 +102,9 @@ export async function query_session_slash_command(
  */
 export function parse_context_usage(output: string): ContextUsage | null {
   // Look for the token summary line: "Tokens: <used> / <total> (<percent>%)"
-  const token_line = output.match(/Tokens:\s*([0-9,.]+[km]?)\s*\/\s*([0-9,.]+[km]?)\s*\(([0-9.]+)%\)/i);
+  const token_line = output.match(
+    /Tokens:\s*([0-9,.]+[km]?)\s*\/\s*([0-9,.]+[km]?)\s*\(([0-9.]+)%\)/i,
+  );
   if (!token_line) return null;
 
   const [, used_str, total_str, percent_str] = token_line;
@@ -112,7 +114,7 @@ export function parse_context_usage(output: string): ContextUsage | null {
     summary: `${used_str} / ${total_str} (${percent_str}%)`,
     used_tokens: parse_token_count(used_str),
     total_tokens: parse_token_count(total_str),
-    percent: parseFloat(percent_str),
+    percent: Number.parseFloat(percent_str),
   };
 }
 
@@ -129,7 +131,7 @@ export function parse_subscription_usage(output: string): SubscriptionUsage | nu
   // Try "Usage: XX% of weekly" or "Weekly usage: XX%"
   const weekly_match = output.match(/(?:weekly\s+usage|usage).*?(\d+(?:\.\d+)?)%/i);
   if (weekly_match?.[1]) {
-    const percent = parseFloat(weekly_match[1]);
+    const percent = Number.parseFloat(weekly_match[1]);
     return {
       summary: `${String(percent)}% weekly`,
       weekly_percent: percent,
@@ -140,7 +142,7 @@ export function parse_subscription_usage(output: string): SubscriptionUsage | nu
   // (e.g., "62.3%  of your Opus limit")
   const pct_match = output.match(/(\d+(?:\.\d+)?)%\s*(?:of\s+(?:your|the)|weekly|limit)/i);
   if (pct_match?.[1]) {
-    const percent = parseFloat(pct_match[1]);
+    const percent = Number.parseFloat(pct_match[1]);
     return {
       summary: `${String(percent)}% weekly`,
       weekly_percent: percent,
@@ -156,15 +158,15 @@ export function parse_subscription_usage(output: string): SubscriptionUsage | nu
 export function parse_token_count(s: string): number | null {
   const clean = s.replace(/,/g, "").trim().toLowerCase();
   if (clean.endsWith("k")) {
-    const n = parseFloat(clean.slice(0, -1));
-    return isNaN(n) ? null : Math.round(n * 1000);
+    const n = Number.parseFloat(clean.slice(0, -1));
+    return Number.isNaN(n) ? null : Math.round(n * 1000);
   }
   if (clean.endsWith("m")) {
-    const n = parseFloat(clean.slice(0, -1));
-    return isNaN(n) ? null : Math.round(n * 1_000_000);
+    const n = Number.parseFloat(clean.slice(0, -1));
+    return Number.isNaN(n) ? null : Math.round(n * 1_000_000);
   }
-  const n = parseFloat(clean);
-  return isNaN(n) ? null : Math.round(n);
+  const n = Number.parseFloat(clean);
+  return Number.isNaN(n) ? null : Math.round(n);
 }
 
 // ── High-level queries ──
@@ -173,9 +175,7 @@ export function parse_token_count(s: string): number | null {
  * Query a Claude Code session's context usage via /context.
  * Returns null if the session is busy or the query fails.
  */
-export async function query_context_usage(
-  tmux_session: string,
-): Promise<ContextUsage | null> {
+export async function query_context_usage(tmux_session: string): Promise<ContextUsage | null> {
   const output = await query_session_slash_command(tmux_session, "/context");
   if (!output) return null;
   return parse_context_usage(output);

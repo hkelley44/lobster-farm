@@ -1,7 +1,12 @@
-import { execFile, exec as execCb } from "node:child_process";
+import { exec as execCb, execFile } from "node:child_process";
 import { rm } from "node:fs/promises";
 import { promisify } from "node:util";
-import type { EntityConfig, ChannelType, ArchetypeRole, ChannelMapping } from "@lobster-farm/shared";
+import type {
+  ArchetypeRole,
+  ChannelMapping,
+  ChannelType,
+  EntityConfig,
+} from "@lobster-farm/shared";
 
 /**
  * Minimal feature data shape used by action functions.
@@ -20,7 +25,7 @@ export interface FeatureData {
   prNumber: number | null;
   phase?: string;
 }
-import { expand_home, entity_config_path, write_yaml } from "@lobster-farm/shared";
+import { entity_config_path, expand_home, write_yaml } from "@lobster-farm/shared";
 import { is_discord_snowflake } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
 import type { BotPool } from "./pool.js";
@@ -62,11 +67,7 @@ export async function create_worktree(
     });
 
     // Create worktree
-    await run(
-      "git",
-      ["worktree", "add", worktree_path, feature.branch],
-      repo_path,
-    );
+    await run("git", ["worktree", "add", worktree_path, feature.branch], repo_path);
     console.log(`[actions] Created worktree at ${worktree_path}`);
   } catch (err) {
     // Worktree may already exist
@@ -117,28 +118,33 @@ export async function create_pr(
   const repo_path = expand_home(entity_config.entity.repos[0]?.path ?? ".");
   const cwd = feature.worktreePath ?? repo_path;
 
-  const output = await run("gh", [
-    "pr",
-    "create",
-    "--base", "main",
-    "--head", feature.branch,
-    "--title", feature.title,
-    "--body", `Closes #${String(feature.githubIssue)}`,
-  ], cwd);
+  const output = await run(
+    "gh",
+    [
+      "pr",
+      "create",
+      "--base",
+      "main",
+      "--head",
+      feature.branch,
+      "--title",
+      feature.title,
+      "--body",
+      `Closes #${String(feature.githubIssue)}`,
+    ],
+    cwd,
+  );
 
   // gh pr create outputs the PR URL, extract the number
   const match = output.match(/\/pull\/(\d+)/);
-  const pr_number = match ? parseInt(match[1]!, 10) : 0;
+  const pr_number = match ? Number.parseInt(match[1]!, 10) : 0;
 
   console.log(`[actions] Created PR #${String(pr_number)} for ${feature.id}`);
   return pr_number;
 }
 
 /** Merge a pull request. Idempotent — treats "already merged" as success. */
-export async function merge_pr(
-  feature: FeatureData,
-  _entity_config: EntityConfig,
-): Promise<void> {
+export async function merge_pr(feature: FeatureData, _entity_config: EntityConfig): Promise<void> {
   if (!feature.prNumber) {
     throw new Error(`Feature ${feature.id} has no PR number`);
   }
@@ -146,13 +152,7 @@ export async function merge_pr(
   const cwd = feature.worktreePath ?? ".";
 
   try {
-    await run("gh", [
-      "pr",
-      "merge",
-      String(feature.prNumber),
-      "--squash",
-      "--delete-branch",
-    ], cwd);
+    await run("gh", ["pr", "merge", String(feature.prNumber), "--squash", "--delete-branch"], cwd);
     console.log(`[actions] Merged PR #${String(feature.prNumber)} for ${feature.id}`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -166,10 +166,7 @@ export async function merge_pr(
 }
 
 /** Run tests in a worktree. Returns true if tests pass. */
-export async function run_tests(
-  feature: FeatureData,
-  command: string = "npm test",
-): Promise<boolean> {
+export async function run_tests(feature: FeatureData, command = "npm test"): Promise<boolean> {
   if (!feature.worktreePath) {
     console.log(`[actions] No worktree path for ${feature.id}, skipping tests`);
     return true;
@@ -232,9 +229,7 @@ export async function notify(
 // ── Entity config persistence ──
 
 /** Persist an entity's config back to YAML. Used after modifying dynamic channels. */
-export async function persist_entity_config(
-  entity_config: EntityConfig,
-): Promise<void> {
+export async function persist_entity_config(entity_config: EntityConfig): Promise<void> {
   // The config object contains the full entity config; write it back to its YAML path.
   // entity_config_path needs the paths config — extract from the path convention.
   const config_path = entity_config_path(undefined, entity_config.entity.id);
@@ -291,9 +286,7 @@ export async function assign_work_room(
       return null;
     }
 
-    channel_id = await _discord.create_channel(
-      category_id, name, `Overflow for ${feature.id}`,
-    );
+    channel_id = await _discord.create_channel(category_id, name, `Overflow for ${feature.id}`);
     if (!channel_id) return null;
 
     // Register in entity config
@@ -377,30 +370,37 @@ export async function detect_review_outcome(
 
   try {
     // Check if PR is already merged
-    const state = await run("gh", [
-      "pr", "view", String(pr_number),
-      "--json", "state",
-      "--jq", ".state",
-    ], repo_path, env);
+    const state = await run(
+      "gh",
+      ["pr", "view", String(pr_number), "--json", "state", "--jq", ".state"],
+      repo_path,
+      env,
+    );
 
     if (state === "MERGED") {
       return "approved";
     }
 
     // Check review decision
-    const decision = await run("gh", [
-      "pr", "view", String(pr_number),
-      "--json", "reviewDecision",
-      "--jq", ".reviewDecision",
-    ], repo_path, env);
+    const decision = await run(
+      "gh",
+      ["pr", "view", String(pr_number), "--json", "reviewDecision", "--jq", ".reviewDecision"],
+      repo_path,
+      env,
+    );
 
     switch (decision.toUpperCase()) {
-      case "APPROVED": return "approved";
-      case "CHANGES_REQUESTED": return "changes_requested";
-      default: return "pending";
+      case "APPROVED":
+        return "approved";
+      case "CHANGES_REQUESTED":
+        return "changes_requested";
+      default:
+        return "pending";
     }
   } catch (err) {
-    console.error(`[actions] Failed to detect review outcome for PR #${String(pr_number)}: ${String(err)}`);
+    console.error(
+      `[actions] Failed to detect review outcome for PR #${String(pr_number)}: ${String(err)}`,
+    );
     sentry.captureException(err, {
       tags: { module: "actions", action: "detect_review_outcome" },
       contexts: { pr: { number: pr_number } },
@@ -435,4 +435,3 @@ export function classify_merge_error(error: string): MergeErrorKind {
   }
   return "other";
 }
-

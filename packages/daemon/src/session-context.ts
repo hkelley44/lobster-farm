@@ -6,8 +6,8 @@
  * We sum all usage entries to approximate total context consumed.
  */
 import { readFile, readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import * as sentry from "./sentry.js";
 
 // ── Types ──
@@ -91,7 +91,9 @@ export async function find_session_file(session_id: string): Promise<string | nu
  * We use the LAST assistant turn's input_tokens as the context fill indicator,
  * since each turn's input_tokens includes all prior context.
  */
-async function parse_session_usage(file_path: string): Promise<{ used_tokens: number; model: string | null; compactions: number }> {
+async function parse_session_usage(
+  file_path: string,
+): Promise<{ used_tokens: number; model: string | null; compactions: number }> {
   const content = await readFile(file_path, "utf-8");
   const lines = content.split("\n").filter(Boolean);
 
@@ -107,17 +109,17 @@ async function parse_session_usage(file_path: string): Promise<{ used_tokens: nu
   for (const line of lines) {
     try {
       const entry = JSON.parse(line) as Record<string, unknown>;
-      if (entry["type"] !== "assistant") continue;
+      if (entry.type !== "assistant") continue;
 
-      const message = entry["message"] as Record<string, unknown> | undefined;
+      const message = entry.message as Record<string, unknown> | undefined;
       if (!message) continue;
 
       // Track model if available
-      if (typeof message["model"] === "string") {
-        model = message["model"];
+      if (typeof message.model === "string") {
+        model = message.model;
       }
 
-      const usage = message["usage"] as MessageUsage | undefined;
+      const usage = message.usage as MessageUsage | undefined;
       if (!usage) continue;
 
       // Each assistant turn's input_tokens is cumulative — the last one
@@ -159,7 +161,9 @@ async function parse_session_usage(file_path: string): Promise<{ used_tokens: nu
  *
  * @param session_id - The Claude Code session UUID
  */
-export async function read_session_context(session_id: string): Promise<SessionContextUsage | null> {
+export async function read_session_context(
+  session_id: string,
+): Promise<SessionContextUsage | null> {
   try {
     const file_path = await find_session_file(session_id);
     if (!file_path) {
@@ -184,7 +188,9 @@ export async function read_session_context(session_id: string): Promise<SessionC
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
-    console.error(`[session-context] Failed to read context for session ${session_id.slice(0, 8)}: ${msg}`);
+    console.error(
+      `[session-context] Failed to read context for session ${session_id.slice(0, 8)}: ${msg}`,
+    );
     sentry.captureException(err, {
       tags: { module: "session-context" },
       contexts: { session: { session_id: session_id.slice(0, 8) } },

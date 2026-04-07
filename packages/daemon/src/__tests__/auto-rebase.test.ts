@@ -9,7 +9,7 @@
  * module-level variable that the promisified function reads at call time.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Command routing ──
 
@@ -24,10 +24,7 @@ type ExecRoute = (
  */
 const routes: Record<string, ExecRoute> = {};
 
-function find_route_key(
-  cmd: string,
-  args: string[],
-): string | null {
+function find_route_key(cmd: string, args: string[]): string | null {
   const tokens = [cmd, ...args.slice(0, 3)];
   for (let len = tokens.length; len > 0; len--) {
     const candidate = tokens.slice(0, len).join(" ");
@@ -114,7 +111,7 @@ describe("attempt_auto_merge", () => {
       },
       "gh repo view": () => ({ stdout: "test-org/test-repo" }),
       "gh api": (args) => {
-        if (args.some(a => a.includes("update-branch"))) {
+        if (args.some((a) => a.includes("update-branch"))) {
           update_branch_called = true;
           return { stdout: "" };
         }
@@ -143,7 +140,7 @@ describe("attempt_auto_merge", () => {
       "gh repo view": () => ({ stdout: "test-org/test-repo" }),
       "gh api": () => new Error("Merge conflict"),
       "gh pr view": () => ({ stdout: "MERGEABLE" }),
-      "mktemp": () => ({ stdout: "/tmp/test-rebase-dir" }),
+      mktemp: () => ({ stdout: "/tmp/test-rebase-dir" }),
       "git remote": () => ({ stdout: "https://github.com/test/repo.git" }),
       "git clone": () => ({ stdout: "" }),
       "git fetch": () => ({ stdout: "" }),
@@ -153,7 +150,7 @@ describe("attempt_auto_merge", () => {
         return { stdout: "" };
       },
       "git push": () => ({ stdout: "" }),
-      "rm": () => ({ stdout: "" }),
+      rm: () => ({ stdout: "" }),
     });
 
     const result = await attempt_auto_merge(42, "feature/test", "/repo", "gh");
@@ -170,7 +167,7 @@ describe("attempt_auto_merge", () => {
       "gh repo view": () => ({ stdout: "test-org/test-repo" }),
       "gh api": () => new Error("Merge conflict"),
       "gh pr view": () => ({ stdout: "CONFLICTING" }),
-      "mktemp": () => ({ stdout: "/tmp/test-rebase-dir" }),
+      mktemp: () => ({ stdout: "/tmp/test-rebase-dir" }),
       "git remote": () => ({ stdout: "https://github.com/test/repo.git" }),
       "git clone": () => ({ stdout: "" }),
       "git fetch": () => ({ stdout: "" }),
@@ -181,7 +178,7 @@ describe("attempt_auto_merge", () => {
         }
         return new Error("CONFLICT (content): Merge conflict in file.ts");
       },
-      "rm": () => ({ stdout: "" }),
+      rm: () => ({ stdout: "" }),
     });
 
     const result = await attempt_auto_merge(42, "feature/test", "/repo", "gh");
@@ -239,7 +236,7 @@ describe("attempt_auto_merge", () => {
     await attempt_auto_merge(42, "feature/test", "/repo", "gh", "ghs_test_token_123");
 
     expect(captured_env).toBeDefined();
-    expect(captured_env!["GH_TOKEN"]).toBe("ghs_test_token_123");
+    expect(captured_env!.GH_TOKEN).toBe("ghs_test_token_123");
   });
 
   it("cleans up temp directory even when rebase fails", async () => {
@@ -251,14 +248,14 @@ describe("attempt_auto_merge", () => {
       "gh api": () => new Error("Merge conflict"),
       "gh pr view": () => ({ stdout: "CONFLICTING" }),
       "git remote": () => ({ stdout: "https://github.com/test/repo.git" }),
-      "mktemp": () => ({ stdout: "/tmp/auto-rebase-test-42" }),
+      mktemp: () => ({ stdout: "/tmp/auto-rebase-test-42" }),
       "git clone": () => ({ stdout: "" }),
       "git fetch": () => ({ stdout: "" }),
       "git rebase": (args) => {
         if (args.includes("--abort")) return { stdout: "" };
         return new Error("CONFLICT");
       },
-      "rm": (args) => {
+      rm: (args) => {
         rm_args = args;
         return { stdout: "" };
       },
@@ -283,7 +280,7 @@ describe("attempt_auto_merge", () => {
       "gh repo view": () => ({ stdout: "test-org/test-repo" }),
       "gh api": () => ({ stdout: "" }), // update-branch succeeds
       "gh pr view": () => ({ stdout: "MERGEABLE" }),
-      "mktemp": () => ({ stdout: "/tmp/test-dir" }),
+      mktemp: () => ({ stdout: "/tmp/test-dir" }),
       "git remote": () => ({ stdout: "https://github.com/test/repo.git" }),
       "git clone": () => ({ stdout: "" }),
       "git fetch": () => ({ stdout: "" }),
@@ -293,7 +290,7 @@ describe("attempt_auto_merge", () => {
         return { stdout: "" };
       },
       "git push": () => ({ stdout: "" }),
-      "rm": () => ({ stdout: "" }),
+      rm: () => ({ stdout: "" }),
     });
 
     const result = await attempt_auto_merge(42, "feature/test", "/repo", "gh");

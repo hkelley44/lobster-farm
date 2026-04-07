@@ -1,15 +1,15 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import {
-  handle_github_webhook,
-  get_active_webhook_reviews,
-  type WebhookContext,
-} from "../webhook-handler.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GitHubAppAuth } from "../github-app.js";
 import type { EntityRegistry } from "../registry.js";
 import type { ClaudeSessionManager } from "../session.js";
+import {
+  type WebhookContext,
+  get_active_webhook_reviews,
+  handle_github_webhook,
+} from "../webhook-handler.js";
 
 // Mock worktree-cleanup to avoid real git operations
 vi.mock("../worktree-cleanup.js", () => ({
@@ -55,9 +55,9 @@ function sign_payload(payload: string, secret: string = WEBHOOK_SECRET): string 
 }
 
 function make_pr_payload(
-  action: string = "opened",
-  pr_number: number = 42,
-  repo_full_name: string = "test-org/lobster-farm",
+  action = "opened",
+  pr_number = 42,
+  repo_full_name = "test-org/lobster-farm",
   overrides: Record<string, unknown> = {},
   options: { installation_id?: number } = {},
 ): string {
@@ -75,17 +75,14 @@ function make_pr_payload(
   };
 
   if (options.installation_id != null) {
-    payload["installation"] = { id: options.installation_id };
+    payload.installation = { id: options.installation_id };
   }
 
   return JSON.stringify(payload);
 }
 
 /** Create a mock IncomingMessage that emits body data. */
-function make_request(
-  body: string,
-  headers: Record<string, string> = {},
-): IncomingMessage {
+function make_request(body: string, headers: Record<string, string> = {}): IncomingMessage {
   const emitter = new EventEmitter();
   const req = emitter as unknown as IncomingMessage;
   req.headers = {
@@ -129,9 +126,9 @@ function make_github_app(): GitHubAppAuth {
       return sig === `sha256=${expected}`;
     }),
     get_token: vi.fn().mockResolvedValue("ghs_mock_token"),
-    get_token_for_installation: vi.fn().mockImplementation(
-      (id: string) => Promise.resolve(`ghs_install_${id}`),
-    ),
+    get_token_for_installation: vi
+      .fn()
+      .mockImplementation((id: string) => Promise.resolve(`ghs_install_${id}`)),
   } as unknown as GitHubAppAuth;
 }
 
@@ -178,7 +175,9 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
     session_manager: make_session_manager(),
     registry: make_registry(),
     discord: null,
-    config: { paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" } } as WebhookContext["config"],
+    config: {
+      paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" },
+    } as WebhookContext["config"],
     pool: null,
     pr_watches: null,
     ...overrides,
@@ -292,14 +291,17 @@ describe("handle_github_webhook", () => {
         await handle_github_webhook(req, res, ctx);
 
         // Give async route_event time to process
-        await vi.waitFor(() => {
-          expect(close_linked_issues).toHaveBeenCalledWith(
-            "test-org/lobster-farm",
-            300,
-            [10],
-            "ghs_mock_token",
-          );
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect(close_linked_issues).toHaveBeenCalledWith(
+              "test-org/lobster-farm",
+              300,
+              [10],
+              "ghs_mock_token",
+            );
+          },
+          { timeout: 2000 },
+        );
 
         expect(res._status).toBe(200);
         // No reviewer spawned for merged PRs
@@ -325,9 +327,12 @@ describe("handle_github_webhook", () => {
       expect(res._status).toBe(200);
 
       // Wait for async spawn chain (get_token + spawn)
-      await vi.waitFor(() => {
-        expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
-      }, { timeout: 2000 });
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
 
       const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
       expect(spawn_args.entity_id).toBe("lobster-farm");
@@ -346,9 +351,12 @@ describe("handle_github_webhook", () => {
 
       await handle_github_webhook(req, res, ctx);
 
-      await vi.waitFor(() => {
-        expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
-      }, { timeout: 2000 });
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
     });
 
     it("ignores unknown repos (returns 200, no spawn)", async () => {
@@ -425,12 +433,12 @@ describe("handle_github_webhook", () => {
 
         expect(res._status).toBe(200);
 
-        await vi.waitFor(() => {
-          expect(cleanup_after_merge).toHaveBeenCalledWith(
-            "/tmp/test-repo",
-            "feature/55-cool",
-          );
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect(cleanup_after_merge).toHaveBeenCalledWith("/tmp/test-repo", "feature/55-cool");
+          },
+          { timeout: 2000 },
+        );
       } finally {
         log_spy.mockRestore();
       }
@@ -487,14 +495,17 @@ describe("handle_github_webhook", () => {
 
         await handle_github_webhook(req, res, ctx);
 
-        await vi.waitFor(() => {
-          expect(close_linked_issues).toHaveBeenCalledWith(
-            "test-org/lobster-farm",
-            77,
-            [10, 20],
-            "ghs_mock_token",
-          );
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect(close_linked_issues).toHaveBeenCalledWith(
+              "test-org/lobster-farm",
+              77,
+              [10, 20],
+              "ghs_mock_token",
+            );
+          },
+          { timeout: 2000 },
+        );
       } finally {
         log_spy.mockRestore();
         (extract_linked_issues as ReturnType<typeof vi.fn>).mockReturnValue([]);
@@ -527,15 +538,15 @@ describe("handle_github_webhook", () => {
 
         await handle_github_webhook(req, res, ctx);
 
-        await vi.waitFor(() => {
-          // Issue closing should NOT have been called (token failed)
-          expect(close_linked_issues).not.toHaveBeenCalled();
-          // But worktree cleanup should still have been called
-          expect(cleanup_after_merge).toHaveBeenCalledWith(
-            "/tmp/test-repo",
-            "feature/88-thing",
-          );
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            // Issue closing should NOT have been called (token failed)
+            expect(close_linked_issues).not.toHaveBeenCalled();
+            // But worktree cleanup should still have been called
+            expect(cleanup_after_merge).toHaveBeenCalledWith("/tmp/test-repo", "feature/88-thing");
+          },
+          { timeout: 2000 },
+        );
       } finally {
         log_spy.mockRestore();
         error_spy.mockRestore();
@@ -650,9 +661,12 @@ describe("handle_github_webhook", () => {
       await handle_github_webhook(req1, res1, ctx);
 
       // Wait for spawn to be called
-      await vi.waitFor(() => {
-        expect((hanging_manager as any).spawn).toHaveBeenCalledTimes(1);
-      }, { timeout: 2000 });
+      await vi.waitFor(
+        () => {
+          expect((hanging_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
 
       // Second request: synchronize event for same PR
       const body2 = make_pr_payload("synchronize", 600, "test-org/lobster-farm");
@@ -672,9 +686,7 @@ describe("handle_github_webhook", () => {
 
       // The active review should be marked for requeue
       const active = get_active_webhook_reviews();
-      const review = active.find(
-        (r) => r.entity_id === "lobster-farm" && r.pr_number === 600,
-      );
+      const review = active.find((r) => r.entity_id === "lobster-farm" && r.pr_number === 600);
       expect(review).toBeDefined();
       expect(review!.needs_requeue).toBe(true);
     });
@@ -701,11 +713,14 @@ describe("handle_github_webhook", () => {
 
         expect(res._status).toBe(200);
 
-        await vi.waitFor(() => {
-          expect(error_spy).toHaveBeenCalledWith(
-            expect.stringContaining("Failed to get installation token"),
-          );
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect(error_spy).toHaveBeenCalledWith(
+              expect.stringContaining("Failed to get installation token"),
+            );
+          },
+          { timeout: 2000 },
+        );
 
         // Should not have spawned a reviewer
         expect((ctx.session_manager as any).spawn).not.toHaveBeenCalled();
@@ -721,9 +736,7 @@ describe("handle_github_webhook", () => {
 
     it("handles session spawn failure gracefully", async () => {
       const ctx = make_context();
-      (ctx.session_manager as any).spawn.mockRejectedValue(
-        new Error("tmux not available"),
-      );
+      (ctx.session_manager as any).spawn.mockRejectedValue(new Error("tmux not available"));
 
       const error_spy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -739,11 +752,14 @@ describe("handle_github_webhook", () => {
 
         expect(res._status).toBe(200);
 
-        await vi.waitFor(() => {
-          expect(error_spy).toHaveBeenCalledWith(
-            expect.stringContaining("Failed to spawn reviewer"),
-          );
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect(error_spy).toHaveBeenCalledWith(
+              expect.stringContaining("Failed to spawn reviewer"),
+            );
+          },
+          { timeout: 2000 },
+        );
 
         // Active review tracking should be cleaned up
         const active = get_active_webhook_reviews();
@@ -769,9 +785,12 @@ describe("handle_github_webhook", () => {
 
       expect(res._status).toBe(200);
 
-      await vi.waitFor(() => {
-        expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
-      }, { timeout: 2000 });
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
 
       const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
       expect(spawn_args.archetype).toBe("reviewer");
@@ -780,9 +799,15 @@ describe("handle_github_webhook", () => {
 
   describe("multi-installation support", () => {
     it("uses get_token_for_installation when payload includes installation.id", async () => {
-      const body = make_pr_payload("opened", 900, "test-org/lobster-farm", {}, {
-        installation_id: 55555,
-      });
+      const body = make_pr_payload(
+        "opened",
+        900,
+        "test-org/lobster-farm",
+        {},
+        {
+          installation_id: 55555,
+        },
+      );
       const req = make_request(body, {
         "x-github-event": "pull_request",
         "x-hub-signature-256": sign_payload(body),
@@ -792,9 +817,12 @@ describe("handle_github_webhook", () => {
 
       await handle_github_webhook(req, res, ctx);
 
-      await vi.waitFor(() => {
-        expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
-      }, { timeout: 2000 });
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
 
       // Should have called get_token_for_installation, not get_token
       expect(ctx.github_app.get_token_for_installation).toHaveBeenCalledWith("55555");
@@ -816,9 +844,12 @@ describe("handle_github_webhook", () => {
 
       await handle_github_webhook(req, res, ctx);
 
-      await vi.waitFor(() => {
-        expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
-      }, { timeout: 2000 });
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
 
       // Should have called get_token, not get_token_for_installation
       expect(ctx.github_app.get_token).toHaveBeenCalled();
@@ -837,11 +868,17 @@ describe("handle_github_webhook", () => {
       const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
 
       try {
-        const body = make_pr_payload("closed", 902, "test-org/lobster-farm", {
-          merged: true,
-        }, {
-          installation_id: 77777,
-        });
+        const body = make_pr_payload(
+          "closed",
+          902,
+          "test-org/lobster-farm",
+          {
+            merged: true,
+          },
+          {
+            installation_id: 77777,
+          },
+        );
         const req = make_request(body, {
           "x-github-event": "pull_request",
           "x-hub-signature-256": sign_payload(body),
@@ -851,14 +888,17 @@ describe("handle_github_webhook", () => {
 
         await handle_github_webhook(req, res, ctx);
 
-        await vi.waitFor(() => {
-          expect(close_linked_issues).toHaveBeenCalledWith(
-            "test-org/lobster-farm",
-            902,
-            [30],
-            "ghs_install_77777",
-          );
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect(close_linked_issues).toHaveBeenCalledWith(
+              "test-org/lobster-farm",
+              902,
+              [30],
+              "ghs_install_77777",
+            );
+          },
+          { timeout: 2000 },
+        );
 
         expect(ctx.github_app.get_token_for_installation).toHaveBeenCalledWith("77777");
         expect(ctx.github_app.get_token).not.toHaveBeenCalled();
@@ -876,9 +916,15 @@ describe("handle_github_webhook", () => {
 
       try {
         // Use installation_id to test cross-account token threading
-        const body = make_pr_payload("opened", 950, "test-org/lobster-farm", {}, {
-          installation_id: 88888,
-        });
+        const body = make_pr_payload(
+          "opened",
+          950,
+          "test-org/lobster-farm",
+          {},
+          {
+            installation_id: 88888,
+          },
+        );
         const req = make_request(body, {
           "x-github-event": "pull_request",
           "x-hub-signature-256": sign_payload(body),
@@ -889,9 +935,12 @@ describe("handle_github_webhook", () => {
         await handle_github_webhook(req, res, ctx);
 
         // Wait for reviewer to be spawned
-        await vi.waitFor(() => {
-          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+          },
+          { timeout: 2000 },
+        );
 
         // Simulate reviewer session completion
         const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
@@ -901,9 +950,12 @@ describe("handle_github_webhook", () => {
         });
 
         // Wait for post-review handling (resolve_token + detect_review_outcome)
-        await vi.waitFor(() => {
-          expect(detect_review_outcome).toHaveBeenCalled();
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect(detect_review_outcome).toHaveBeenCalled();
+          },
+          { timeout: 2000 },
+        );
 
         // detect_review_outcome should have been called with the installation token
         // get_token_for_installation("88888") returns "ghs_install_88888"
@@ -932,9 +984,12 @@ describe("handle_github_webhook", () => {
 
         await handle_github_webhook(req, res, ctx);
 
-        await vi.waitFor(() => {
-          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+          },
+          { timeout: 2000 },
+        );
 
         // Simulate reviewer session completion
         const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
@@ -943,16 +998,15 @@ describe("handle_github_webhook", () => {
           exit_code: 0,
         });
 
-        await vi.waitFor(() => {
-          expect(detect_review_outcome).toHaveBeenCalled();
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect(detect_review_outcome).toHaveBeenCalled();
+          },
+          { timeout: 2000 },
+        );
 
         // Default token from get_token() is "ghs_mock_token"
-        expect(detect_review_outcome).toHaveBeenCalledWith(
-          951,
-          "/tmp/test-repo",
-          "ghs_mock_token",
-        );
+        expect(detect_review_outcome).toHaveBeenCalledWith(951, "/tmp/test-repo", "ghs_mock_token");
       } finally {
         log_spy.mockRestore();
       }
@@ -982,9 +1036,12 @@ describe("handle_github_webhook", () => {
 
         await handle_github_webhook(req, res, ctx);
 
-        await vi.waitFor(() => {
-          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+          },
+          { timeout: 2000 },
+        );
 
         // Simulate reviewer session completion
         const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
@@ -994,16 +1051,15 @@ describe("handle_github_webhook", () => {
         });
 
         // Wait for detect_review_outcome — should still be called (with undefined token)
-        await vi.waitFor(() => {
-          expect(detect_review_outcome).toHaveBeenCalled();
-        }, { timeout: 2000 });
+        await vi.waitFor(
+          () => {
+            expect(detect_review_outcome).toHaveBeenCalled();
+          },
+          { timeout: 2000 },
+        );
 
         // Token should be undefined since resolution failed
-        expect(detect_review_outcome).toHaveBeenCalledWith(
-          952,
-          "/tmp/test-repo",
-          undefined,
-        );
+        expect(detect_review_outcome).toHaveBeenCalledWith(952, "/tmp/test-repo", undefined);
       } finally {
         log_spy.mockRestore();
         error_spy.mockRestore();

@@ -1,9 +1,5 @@
-import { describe, it, expect } from "vitest";
-import {
-  parse_context_usage,
-  parse_subscription_usage,
-  parse_token_count,
-} from "../tmux-query.js";
+import { describe, expect, it } from "vitest";
+import { parse_context_usage, parse_subscription_usage, parse_token_count } from "../tmux-query.js";
 
 describe("parse_token_count", () => {
   it("parses k suffix", () => {

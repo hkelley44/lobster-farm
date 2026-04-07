@@ -1,9 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { stringify } from "yaml";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { stringify } from "yaml";
 import { EntityRegistry } from "../registry.js";
 
 function make_config(lobsterfarm_dir: string): LobsterFarmConfig {
@@ -41,19 +41,25 @@ function make_config(lobsterfarm_dir: string): LobsterFarmConfig {
   };
 }
 
-function valid_entity_yaml(id: string, name: string, status: "active" | "paused" | "archived" = "active"): string {
+function valid_entity_yaml(
+  id: string,
+  name: string,
+  status: "active" | "paused" | "archived" = "active",
+): string {
   return stringify({
     entity: {
       id,
       name,
       description: `Test entity ${name}`,
       status,
-      repos: [{
-        name: id,
-        url: `https://github.com/test/${id}`,
-        path: `/tmp/projects/${id}`,
-        structure: "monorepo",
-      }],
+      repos: [
+        {
+          name: id,
+          url: `https://github.com/test/${id}`,
+          path: `/tmp/projects/${id}`,
+          structure: "monorepo",
+        },
+      ],
       memory: {
         path: `~/.lobsterfarm/entities/${id}/MEMORY.md`,
         auto_extract: true,
@@ -107,14 +113,8 @@ describe("EntityRegistry", () => {
     await mkdir(join(entities_path, "one"), { recursive: true });
     await mkdir(join(entities_path, "two"), { recursive: true });
 
-    await writeFile(
-      join(entities_path, "one", "config.yaml"),
-      valid_entity_yaml("one", "One"),
-    );
-    await writeFile(
-      join(entities_path, "two", "config.yaml"),
-      valid_entity_yaml("two", "Two"),
-    );
+    await writeFile(join(entities_path, "one", "config.yaml"), valid_entity_yaml("one", "One"));
+    await writeFile(join(entities_path, "two", "config.yaml"), valid_entity_yaml("two", "Two"));
 
     const config = make_config(tmp_dir);
     const registry = new EntityRegistry(config);

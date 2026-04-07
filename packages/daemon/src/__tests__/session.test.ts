@@ -1,11 +1,11 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { writeFile, mkdir, rm, chmod } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
-import { ClaudeSessionManager } from "../session.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { build_model_flags } from "../models.js";
+import { ClaudeSessionManager } from "../session.js";
 
 function make_config(overrides?: Partial<LobsterFarmConfig>): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
@@ -156,7 +156,7 @@ describe("ClaudeSessionManager", () => {
       const mgr = new ClaudeSessionManager(config);
 
       // Override the claude binary via env
-      process.env["CLAUDE_BIN"] = mock_claude;
+      process.env.CLAUDE_BIN = mock_claude;
 
       const completed = new Promise<void>((resolve) => {
         mgr.on("session:completed", () => resolve());
@@ -183,7 +183,7 @@ describe("ClaudeSessionManager", () => {
       // After completion, session should be cleaned up
       expect(mgr.get_active()).toHaveLength(0);
 
-      delete process.env["CLAUDE_BIN"];
+      delete process.env.CLAUDE_BIN;
     });
 
     it("rejects interactive mode", async () => {
@@ -211,7 +211,7 @@ describe("ClaudeSessionManager", () => {
 
       const config = make_config();
       const mgr = new ClaudeSessionManager(config);
-      process.env["CLAUDE_BIN"] = mock_claude;
+      process.env.CLAUDE_BIN = mock_claude;
 
       const failed = new Promise<string>((resolve) => {
         mgr.on("session:failed", (_id: string, error: string) => resolve(error));
@@ -232,7 +232,7 @@ describe("ClaudeSessionManager", () => {
       expect(error).toContain("exited with code 1");
       expect(mgr.get_active()).toHaveLength(0);
 
-      delete process.env["CLAUDE_BIN"];
+      delete process.env.CLAUDE_BIN;
     });
   });
 
@@ -245,7 +245,7 @@ describe("ClaudeSessionManager", () => {
 
       const config = make_config();
       const mgr = new ClaudeSessionManager(config);
-      process.env["CLAUDE_BIN"] = mock_claude;
+      process.env.CLAUDE_BIN = mock_claude;
 
       const session = await mgr.spawn({
         entity_id: "alpha",
@@ -268,7 +268,7 @@ describe("ClaudeSessionManager", () => {
       await mgr.kill(session.session_id);
       expect(mgr.get_active()).toHaveLength(0);
 
-      delete process.env["CLAUDE_BIN"];
+      delete process.env.CLAUDE_BIN;
     });
   });
 });

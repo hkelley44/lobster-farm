@@ -8,10 +8,10 @@
  * Uses the same command-routing mock pattern as auto-rebase.test.ts.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Command routing for check_ci_status tests ──
 
@@ -93,16 +93,13 @@ vi.mock("../persistence.js", () => ({
   save_pr_reviews: vi.fn(async () => {}),
 }));
 
-// Import after mocks are registered
-import { check_ci_status } from "../review-utils.js";
-import {
-  handle_github_webhook,
-  type WebhookContext,
-} from "../webhook-handler.js";
+import type { DiscordBot } from "../discord.js";
 import type { GitHubAppAuth } from "../github-app.js";
 import type { EntityRegistry } from "../registry.js";
+// Import after mocks are registered
+import { check_ci_status } from "../review-utils.js";
 import type { ClaudeSessionManager } from "../session.js";
-import type { DiscordBot } from "../discord.js";
+import { type WebhookContext, handle_github_webhook } from "../webhook-handler.js";
 
 // ── check_ci_status tests ──
 
@@ -215,7 +212,7 @@ describe("check_ci_status", () => {
 
     route_exec({
       "gh pr checks": (_args, opts) => {
-        captured_env = opts["env"] as Record<string, unknown>;
+        captured_env = opts.env as Record<string, unknown>;
         return { stdout: JSON.stringify([]) };
       },
     });
@@ -223,15 +220,13 @@ describe("check_ci_status", () => {
     await check_ci_status(42, "/tmp/test-repo", "ghs_test_token");
 
     expect(captured_env).toBeDefined();
-    expect(captured_env!["GH_TOKEN"]).toBe("ghs_test_token");
+    expect(captured_env!.GH_TOKEN).toBe("ghs_test_token");
   });
 
   it("handles QUEUED state as pending", async () => {
     route_exec({
       "gh pr checks": () => ({
-        stdout: JSON.stringify([
-          { name: "Build", state: "QUEUED", conclusion: "" },
-        ]),
+        stdout: JSON.stringify([{ name: "Build", state: "QUEUED", conclusion: "" }]),
       }),
     });
 
@@ -252,10 +247,7 @@ function sign_payload(payload: string): string {
   return `sha256=${hmac}`;
 }
 
-function make_request(
-  body: string,
-  headers: Record<string, string> = {},
-): IncomingMessage {
+function make_request(body: string, headers: Record<string, string> = {}): IncomingMessage {
   const emitter = new EventEmitter();
   const req = emitter as unknown as IncomingMessage;
   req.headers = { ...headers };
@@ -290,9 +282,9 @@ function make_github_app(): GitHubAppAuth {
       return sig === `sha256=${expected}`;
     }),
     get_token: vi.fn().mockResolvedValue("ghs_mock_token"),
-    get_token_for_installation: vi.fn().mockImplementation(
-      (id: string) => Promise.resolve(`ghs_install_${id}`),
-    ),
+    get_token_for_installation: vi
+      .fn()
+      .mockImplementation((id: string) => Promise.resolve(`ghs_install_${id}`)),
   } as unknown as GitHubAppAuth;
 }
 
@@ -343,7 +335,9 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
     session_manager: make_session_manager(),
     registry: make_registry(),
     discord: make_discord(),
-    config: { paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" } } as WebhookContext["config"],
+    config: {
+      paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" },
+    } as WebhookContext["config"],
     pool: null,
     pr_watches: null,
     ...overrides,
@@ -615,9 +609,7 @@ describe("webhook handler — CI gating on review completion", () => {
   });
 
   it("blocks merge when gh pr checks command fails (infrastructure error)", async () => {
-    const { discord } = await trigger_review_completion(
-      () => new Error("API rate limit exceeded"),
-    );
+    const { discord } = await trigger_review_completion(() => new Error("API rate limit exceeded"));
 
     // Command failure returns { passed: false, pending: true } — silent skip, no alert
     expect(discord.send_to_entity).not.toHaveBeenCalled();

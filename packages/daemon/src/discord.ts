@@ -1,43 +1,43 @@
-import { EventEmitter } from "node:events";
 import { execFileSync } from "node:child_process";
-import {
-  Client,
-  ChannelType as DiscordChannelType,
-  GatewayIntentBits,
-  SlashCommandBuilder,
-  type TextChannel,
-  type Message,
-  type Webhook,
-  type Guild,
-  type CategoryChannel,
-  type ChatInputCommandInteraction,
-  type AutocompleteInteraction,
-} from "discord.js";
+import { EventEmitter } from "node:events";
+import { access, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type {
-  LobsterFarmConfig,
-  ChannelType,
-  ChannelMapping,
   ArchetypeRole,
+  ChannelMapping,
+  ChannelType,
+  LobsterFarmConfig,
 } from "@lobster-farm/shared";
 import {
-  entity_dir,
-  entity_daily_dir,
-  entity_context_dir,
-  entity_files_dir,
   entity_config_path,
+  entity_context_dir,
+  entity_daily_dir,
+  entity_dir,
+  entity_files_dir,
   entity_memory_path,
   write_yaml,
 } from "@lobster-farm/shared";
-import { access, mkdir, writeFile, readFile, readdir, rename, unlink } from "node:fs/promises";
-import { join } from "node:path";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
+import {
+  type AutocompleteInteraction,
+  type CategoryChannel,
+  type ChatInputCommandInteraction,
+  Client,
+  ChannelType as DiscordChannelType,
+  GatewayIntentBits,
+  type Guild,
+  type Message,
+  SlashCommandBuilder,
+  type TextChannel,
+  type Webhook,
+} from "discord.js";
+import type { BotPool, PoolBot } from "./pool.js";
+import type { TaskQueue } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
 import type { RoutedMessage } from "./router.js";
-import type { TaskQueue } from "./queue.js";
-import type { BotPool, PoolBot } from "./pool.js";
-import { fetch_subscription_usage } from "./usage-api.js";
-import { read_session_context } from "./session-context.js";
 import * as sentry from "./sentry.js";
+import { read_session_context } from "./session-context.js";
+import { fetch_subscription_usage } from "./usage-api.js";
 
 /** Discord snowflake IDs are numeric strings, 17-20 digits. */
 export function is_discord_snowflake(id: string): boolean {
@@ -101,7 +101,9 @@ export function format_cross_entity_dashboard(data: DashboardData): string {
   const lines: string[] = ["**LobsterFarm Status**", ""];
 
   lines.push(`**Daemon:** running (uptime: ${data.uptime})`);
-  lines.push(`**Pool:** ${String(data.pool_assigned)}/${String(data.pool_total)} assigned, ${String(data.pool_total - data.pool_assigned)} free`);
+  lines.push(
+    `**Pool:** ${String(data.pool_assigned)}/${String(data.pool_total)} assigned, ${String(data.pool_total - data.pool_assigned)} free`,
+  );
   lines.push("");
 
   let truncated_count = 0;
@@ -112,7 +114,9 @@ export function format_cross_entity_dashboard(data: DashboardData): string {
     if (entity.sessions.length > 0) {
       section_lines.push("Sessions:");
       for (const s of entity.sessions) {
-        section_lines.push(`  \u2022 ${s.channel_name} \u2014 ${s.agent_label} \u2014 ${s.duration}`);
+        section_lines.push(
+          `  \u2022 ${s.channel_name} \u2014 ${s.agent_label} \u2014 ${s.duration}`,
+        );
       }
     } else {
       section_lines.push("No active work.");
@@ -120,7 +124,7 @@ export function format_cross_entity_dashboard(data: DashboardData): string {
     section_lines.push("");
 
     // Check if adding this section would exceed the limit
-    const candidate = lines.join("\n") + "\n" + section_lines.join("\n");
+    const candidate = `${lines.join("\n")}\n${section_lines.join("\n")}`;
     if (candidate.length > DISCORD_MAX - TRUNCATION_RESERVE) {
       truncated_count = data.entities.length - i;
       break;
@@ -175,61 +179,67 @@ export interface CommandTarget {
 
 export function build_slash_commands(): SlashCommandBuilder[] {
   return [
-    new SlashCommandBuilder()
-      .setName("help")
-      .setDescription("Show available LobsterFarm commands"),
+    new SlashCommandBuilder().setName("help").setDescription("Show available LobsterFarm commands"),
 
     new SlashCommandBuilder()
       .setName("status")
       .setDescription("Show session and entity status")
-      .addStringOption(opt =>
-        opt.setName("scope").setDescription("Scope").addChoices(
-          { name: "entity", value: "entity" },
-          { name: "all", value: "all" },
-        ),
+      .addStringOption((opt) =>
+        opt
+          .setName("scope")
+          .setDescription("Scope")
+          .addChoices({ name: "entity", value: "entity" }, { name: "all", value: "all" }),
       ) as SlashCommandBuilder,
 
     new SlashCommandBuilder()
       .setName("swap")
       .setDescription("Swap the active agent in this channel")
-      .addStringOption(opt =>
-        opt.setName("agent").setDescription("Agent to swap to").setRequired(true).addChoices(
-          { name: "Gary (planner)", value: "planner" },
-          { name: "Bob (builder)", value: "builder" },
-          { name: "Pearl (designer)", value: "designer" },
-          { name: "Ray (operator)", value: "operator" },
-        ),
+      .addStringOption((opt) =>
+        opt
+          .setName("agent")
+          .setDescription("Agent to swap to")
+          .setRequired(true)
+          .addChoices(
+            { name: "Gary (planner)", value: "planner" },
+            { name: "Bob (builder)", value: "builder" },
+            { name: "Pearl (designer)", value: "designer" },
+            { name: "Ray (operator)", value: "operator" },
+          ),
       ) as SlashCommandBuilder,
 
     new SlashCommandBuilder()
       .setName("scaffold")
       .setDescription("Scaffold Discord channels")
-      .addStringOption(opt =>
+      .addStringOption((opt) =>
         opt.setName("name").setDescription("Entity ID or 'server'").setRequired(true),
       )
-      .addStringOption(opt =>
+      .addStringOption((opt) =>
         opt.setName("blueprint").setDescription("Blueprint name (default: software)"),
       ) as SlashCommandBuilder,
 
     new SlashCommandBuilder()
       .setName("room")
       .setDescription("Create an on-demand work room with a pool bot")
-      .addStringOption(opt =>
+      .addStringOption((opt) =>
         opt.setName("name").setDescription("Room name").setRequired(true),
       ) as SlashCommandBuilder,
 
     new SlashCommandBuilder()
       .setName("close")
       .setDescription("Archive and close the current work room")
-      .addBooleanOption(opt =>
+      .addBooleanOption((opt) =>
         opt.setName("force").setDescription("Force close even if a feature is active"),
       ) as SlashCommandBuilder,
 
     new SlashCommandBuilder()
       .setName("resume")
       .setDescription("Restore an archived work room session")
-      .addStringOption(opt =>
-        opt.setName("name").setDescription("Archived room name").setRequired(true).setAutocomplete(true),
+      .addStringOption((opt) =>
+        opt
+          .setName("name")
+          .setDescription("Archived room name")
+          .setRequired(true)
+          .setAutocomplete(true),
       ) as SlashCommandBuilder,
 
     new SlashCommandBuilder()
@@ -307,7 +317,10 @@ export function extract_slash_args(interaction: SlashInteractionLike): string[] 
 }
 
 /** Create a CommandTarget from a Discord text message. */
-function target_from_message(message: Message, send_fallback: (channel_id: string, content: string) => Promise<void>): CommandTarget {
+function target_from_message(
+  message: Message,
+  send_fallback: (channel_id: string, content: string) => Promise<void>,
+): CommandTarget {
   return {
     channel_id: message.channelId,
     author_name: message.author.displayName,
@@ -319,13 +332,21 @@ function target_from_message(message: Message, send_fallback: (channel_id: strin
       }
     },
     async react(emoji: string) {
-      try { await message.react(emoji); } catch { /* ignore */ }
+      try {
+        await message.react(emoji);
+      } catch {
+        /* ignore */
+      }
     },
   };
 }
 
 /** Create a CommandTarget from a slash command interaction. */
-function target_from_interaction(interaction: ChatInputCommandInteraction, ephemeral: boolean, deferred = false): CommandTarget {
+function target_from_interaction(
+  interaction: ChatInputCommandInteraction,
+  ephemeral: boolean,
+  deferred = false,
+): CommandTarget {
   let replied = false;
   return {
     channel_id: interaction.channelId,
@@ -371,10 +392,7 @@ function avatars_dir(): string {
  * @param state_dir - The pool bot's channel directory (contains .env with token)
  * @param agent_name - Lowercase agent name (e.g., "gary") used to find the avatar file
  */
-export async function set_bot_profile_avatar(
-  state_dir: string,
-  agent_name: string,
-): Promise<void> {
+export async function set_bot_profile_avatar(state_dir: string, agent_name: string): Promise<void> {
   // Read bot token from .env file
   const env_content = await readFile(join(state_dir, ".env"), "utf-8");
   const token_match = env_content.match(/DISCORD_BOT_TOKEN=(.+)/);
@@ -392,9 +410,7 @@ export async function set_bot_profile_avatar(
       await access(candidate);
       avatar_path = candidate;
       break;
-    } catch {
-      continue;
-    }
+    } catch {}
   }
 
   if (!avatar_path) {
@@ -416,7 +432,7 @@ export async function set_bot_profile_avatar(
     const response = await fetch("https://discord.com/api/v10/users/@me", {
       method: "PATCH",
       headers: {
-        "Authorization": `Bot ${token}`,
+        Authorization: `Bot ${token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ avatar: data_uri }),
@@ -462,7 +478,7 @@ export class DiscordBot extends EventEmitter {
   async connect(token: string): Promise<void> {
     this.build_channel_map();
 
-    const ready = new Promise<void>(resolve => {
+    const ready = new Promise<void>((resolve) => {
       this.client.once("ready", () => {
         const tag = this.client.user?.tag ?? "unknown";
         console.log(`[discord] Connected as ${tag}`);
@@ -622,11 +638,7 @@ export class DiscordBot extends EventEmitter {
   // ── Channel management ──
 
   /** Create a text channel under a category. Returns the channel ID, or null on failure. */
-  async create_channel(
-    category_id: string,
-    name: string,
-    reason?: string,
-  ): Promise<string | null> {
+  async create_channel(category_id: string, name: string, reason?: string): Promise<string | null> {
     const guild = await this.get_guild();
     if (!guild) return null;
     try {
@@ -667,7 +679,10 @@ export class DiscordBot extends EventEmitter {
 
   // ── Agent identity ──
 
-  resolve_agent_identity(archetype: ArchetypeRole | "system"): { name: string; avatar_url: string | undefined } {
+  resolve_agent_identity(archetype: ArchetypeRole | "system"): {
+    name: string;
+    avatar_url: string | undefined;
+  } {
     if (archetype === "system") {
       const system_url = this.avatar_urls.get("lobsterfarm");
       return { name: "LobsterFarm", avatar_url: system_url };
@@ -835,7 +850,9 @@ export class DiscordBot extends EventEmitter {
     const text_channel = channel as TextChannel;
     const message = await text_channel.send({
       content: `Avatar: ${name}`,
-      files: [{ attachment: file_path, name: `${name}${file_path.slice(file_path.lastIndexOf("."))}` }],
+      files: [
+        { attachment: file_path, name: `${name}${file_path.slice(file_path.lastIndexOf("."))}` },
+      ],
     });
 
     const attachment = message.attachments.first();
@@ -1012,7 +1029,10 @@ export class DiscordBot extends EventEmitter {
   async scaffold_entity(
     entity_id: string,
     entity_name: string,
-  ): Promise<{ category_id: string; channels: Array<{ type: string; id: string; purpose: string }> }> {
+  ): Promise<{
+    category_id: string;
+    channels: Array<{ type: string; id: string; purpose: string }>;
+  }> {
     const guild = await this.get_guild();
     if (!guild) return { category_id: "", channels: [] };
 
@@ -1085,7 +1105,7 @@ export class DiscordBot extends EventEmitter {
         if (!is_discord_snowflake(channel.id)) {
           console.log(
             `[discord] Skipping invalid channel ID "${channel.id}" ` +
-            `in entity "${entity_id}" — not a Discord snowflake`,
+              `in entity "${entity_id}" — not a Discord snowflake`,
           );
           continue;
         }
@@ -1137,15 +1157,18 @@ export class DiscordBot extends EventEmitter {
     });
 
     // When a waiting-for-human bot is evicted, notify the channel
-    pool.on("bot:parked_with_context", (info: { bot_id: number; channel_id: string | null; entity_id: string | null }) => {
-      if (info.channel_id) {
-        void this.send(
-          info.channel_id,
-          "This session was parked to free up a bot slot. " +
-          "Your conversation is saved — it will resume when you send a new message.",
-        );
-      }
-    });
+    pool.on(
+      "bot:parked_with_context",
+      (info: { bot_id: number; channel_id: string | null; entity_id: string | null }) => {
+        if (info.channel_id) {
+          void this.send(
+            info.channel_id,
+            "This session was parked to free up a bot slot. " +
+              "Your conversation is saved — it will resume when you send a new message.",
+          );
+        }
+      },
+    );
   }
 
   // ── Internal message handling ──
@@ -1171,7 +1194,9 @@ export class DiscordBot extends EventEmitter {
         this._pool.clear_session_history(entry.entity_id, message.channelId);
         await this._pool.release(message.channelId);
         const target = target_from_message(message, (ch, c) => this.send(ch, c));
-        await target.reply("Session reset. Send a message to start fresh.\n-# Tip: use `/reset` instead of `!reset`");
+        await target.reply(
+          "Session reset. Send a message to start fresh.\n-# Tip: use `/reset` instead of `!reset`",
+        );
       }
       return;
     }
@@ -1186,8 +1211,7 @@ export class DiscordBot extends EventEmitter {
       // reassignment with session resume, so the user never sees a gap.
       if (assignment && !this._pool.is_session_alive(assignment.id)) {
         console.log(
-          `[discord] Dead tmux detected for pool-${String(assignment.id)} on message ` +
-          `— releasing with history`,
+          `[discord] Dead tmux detected for pool-${String(assignment.id)} on message — releasing with history`,
         );
         await this._pool.release_with_history(assignment.id);
         assignment = undefined;
@@ -1199,8 +1223,7 @@ export class DiscordBot extends EventEmitter {
       // --resume the session so conversation context is preserved.
       if (assignment && this._pool.has_stale_oauth(assignment.id)) {
         console.warn(
-          `[discord] Stale OAuth detected for pool-${String(assignment.id)} on message ` +
-          `— killing and releasing with history`,
+          `[discord] Stale OAuth detected for pool-${String(assignment.id)} on message — killing and releasing with history`,
         );
         this._pool.kill_stale_session(assignment.id);
         await this._pool.release_with_history(assignment.id);
@@ -1212,7 +1235,11 @@ export class DiscordBot extends EventEmitter {
         const archetype: ArchetypeRole = "planner";
 
         // Show the user we're working on it
-        try { await message.react("⏳"); } catch { /* ignore */ }
+        try {
+          await message.react("⏳");
+        } catch {
+          /* ignore */
+        }
 
         const result = await this._pool.assign(
           message.channelId,
@@ -1223,19 +1250,32 @@ export class DiscordBot extends EventEmitter {
         );
         if (result) {
           // Bridge the first message: write to file, wait for bot, send via tmux
-          await this.bridge_first_message(result.tmux_session, message.content, message.author.displayName);
+          await this.bridge_first_message(
+            result.tmux_session,
+            message.content,
+            message.author.displayName,
+          );
           try {
             await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
             await message.react("👀");
-          } catch { /* ignore */ }
+          } catch {
+            /* ignore */
+          }
         } else {
           try {
             await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
-          } catch { /* ignore */ }
-          try {
-            await message.reply("All bots are busy right now. Your message will be picked up when a slot opens.");
           } catch {
-            await this.send(message.channelId, "All bots are busy right now. Your message will be picked up when a slot opens.");
+            /* ignore */
+          }
+          try {
+            await message.reply(
+              "All bots are busy right now. Your message will be picked up when a slot opens.",
+            );
+          } catch {
+            await this.send(
+              message.channelId,
+              "All bots are busy right now. Your message will be picked up when a slot opens.",
+            );
           }
         }
       } else {
@@ -1350,21 +1390,11 @@ export class DiscordBot extends EventEmitter {
 
   /** Format the full session status block for a channel with an assigned bot.
    * Fetches context and subscription usage on demand from live data sources. */
-  private async format_session_status(
-    bot: PoolBot,
-    _routed: RoutedMessage,
-  ): Promise<string[]> {
-    const identity = bot.archetype
-      ? this.resolve_agent_identity(bot.archetype)
-      : null;
-    const agent_label = identity
-      ? `${identity.name} (${bot.archetype})`
-      : "unknown";
+  private async format_session_status(bot: PoolBot, _routed: RoutedMessage): Promise<string[]> {
+    const identity = bot.archetype ? this.resolve_agent_identity(bot.archetype) : null;
+    const agent_label = identity ? `${identity.name} (${bot.archetype})` : "unknown";
 
-    const lines = [
-      "**Session Status**",
-      `Agent: ${agent_label}`,
-    ];
+    const lines = ["**Session Status**", `Agent: ${agent_label}`];
 
     if (bot.session_id) {
       lines.push(`Session: \`${bot.session_id.slice(0, 8)}\``);
@@ -1422,7 +1452,7 @@ export class DiscordBot extends EventEmitter {
     const assigned_bots = pool?.get_assigned_bots() ?? [];
 
     // Group assigned bots by entity
-    const bots_by_entity = new Map<string, typeof assigned_bots[number][]>();
+    const bots_by_entity = new Map<string, (typeof assigned_bots)[number][]>();
     for (const bot of assigned_bots) {
       if (!bot.entity_id) continue;
       const list = bots_by_entity.get(bot.entity_id) ?? [];
@@ -1431,20 +1461,16 @@ export class DiscordBot extends EventEmitter {
     }
 
     // Build dashboard data with all names/labels pre-resolved
-    const dashboard_entities: DashboardEntity[] = entities.map(entity_config => {
+    const dashboard_entities: DashboardEntity[] = entities.map((entity_config) => {
       const eid = entity_config.entity.id;
       const entity_bots = bots_by_entity.get(eid) ?? [];
       return {
         id: eid,
-        sessions: entity_bots.map(bot => {
-          const identity = bot.archetype
-            ? this.resolve_agent_identity(bot.archetype)
-            : null;
+        sessions: entity_bots.map((bot) => {
+          const identity = bot.archetype ? this.resolve_agent_identity(bot.archetype) : null;
           return {
             channel_name: this.resolve_channel_display_name(bot.channel_id),
-            agent_label: identity
-              ? `${identity.name} (${bot.archetype})`
-              : "unknown",
+            agent_label: identity ? `${identity.name} (${bot.archetype})` : "unknown",
             duration: bot.assigned_at ? format_duration(bot.assigned_at) : "?",
           };
         }),
@@ -1491,7 +1517,9 @@ export class DiscordBot extends EventEmitter {
       // Usage: /scaffold name:<id>
       const entity_id = args[1];
       if (!entity_id || !/^[a-z0-9-]+$/.test(entity_id)) {
-        await target.reply("Usage: `/scaffold <id>`\nID must be lowercase alphanumeric with hyphens.");
+        await target.reply(
+          "Usage: `/scaffold <id>`\nID must be lowercase alphanumeric with hyphens.",
+        );
         return;
       }
 
@@ -1544,12 +1572,14 @@ export class DiscordBot extends EventEmitter {
           description: "",
           status: "active",
           blueprint,
-          repos: [{
-            name: entity_id,
-            url: repo_url || `git@github.com:org/${entity_id}.git`,
-            path: `~/.lobsterfarm/entities/${entity_id}/repos/${entity_id}`,
-            structure: "monorepo",
-          }],
+          repos: [
+            {
+              name: entity_id,
+              url: repo_url || `git@github.com:org/${entity_id}.git`,
+              path: `~/.lobsterfarm/entities/${entity_id}/repos/${entity_id}`,
+              structure: "monorepo",
+            },
+          ],
           accounts: {},
           channels: {
             category_id,
@@ -1598,12 +1628,7 @@ export class DiscordBot extends EventEmitter {
       // 6. Report
       const channel_lines = channels.map((c) => `  • #${c.purpose} → ${c.type}`);
       await target.reply(
-        `Entity **${entity_id}** fully scaffolded:\n` +
-          `• Config: \`${config_path}\`\n` +
-          `• Memory: \`${mem_path}\`\n` +
-          `• Discord: ${String(channels.length)} channels\n` +
-          channel_lines.join("\n") + "\n\n" +
-          `Ready to use. Try \`/room "your-first-room"\``,
+        `Entity **${entity_id}** fully scaffolded:\n• Config: \`${config_path}\`\n• Memory: \`${mem_path}\`\n• Discord: ${String(channels.length)} channels\n${channel_lines.join("\n")}\n\nReady to use. Try \`/room "your-first-room"\``,
       );
     } else if (sub === "server") {
       await target.reply("Scaffolding global Discord structure...");
@@ -1636,26 +1661,30 @@ export class DiscordBot extends EventEmitter {
       const timeout = 20000;
       let ready = false;
       while (Date.now() - start < timeout) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise((resolve) => setTimeout(resolve, 1000));
         try {
-          const output = execFileSync(
-            "tmux", ["capture-pane", "-t", tmux_session, "-p"],
-            { encoding: "utf-8", timeout: 2000 },
-          );
+          const output = execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
+            encoding: "utf-8",
+            timeout: 2000,
+          });
           if (output.includes("Listening for channel messages") && output.includes("❯")) {
             ready = true;
             break;
           }
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
 
       if (!ready) {
-        console.log(`[discord] Bot ${tmux_session} not ready after ${String(timeout)}ms — message not bridged`);
+        console.log(
+          `[discord] Bot ${tmux_session} not ready after ${String(timeout)}ms — message not bridged`,
+        );
         return;
       }
 
       // Small extra delay for the plugin to fully connect
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise((resolve) => setTimeout(resolve, 2000));
 
       // Send the prompt to the bot's tmux session
       const prompt = `A user just messaged you in Discord. Read ${pending_path} for their message and respond to them.`;
@@ -1667,7 +1696,9 @@ export class DiscordBot extends EventEmitter {
       console.log(`[discord] Bridged first message to ${tmux_session}`);
 
       // Clean up after a delay
-      setTimeout(() => { void unlink(pending_path).catch(() => {}); }, 30000);
+      setTimeout(() => {
+        void unlink(pending_path).catch(() => {});
+      }, 30000);
     } catch (err) {
       console.error(`[discord] Bridge failed: ${String(err)}`);
       sentry.captureException(err, {
@@ -1685,17 +1716,19 @@ export class DiscordBot extends EventEmitter {
     // Usage: /swap agent:<archetype>
     const archetype_name = args[0]?.toLowerCase();
     const archetype_map: Record<string, ArchetypeRole> = {
-      gary: "planner", planner: "planner",
-      bob: "builder", builder: "builder",
-      pearl: "designer", designer: "designer",
-      ray: "operator", operator: "operator",
+      gary: "planner",
+      planner: "planner",
+      bob: "builder",
+      builder: "builder",
+      pearl: "designer",
+      designer: "designer",
+      ray: "operator",
+      operator: "operator",
     };
 
     const archetype = archetype_map[archetype_name ?? ""];
     if (!archetype) {
-      await target.reply(
-        "Usage: `/swap <agent>` — planner, builder, designer, or operator",
-      );
+      await target.reply("Usage: `/swap <agent>` — planner, builder, designer, or operator");
       return;
     }
 
@@ -1711,7 +1744,8 @@ export class DiscordBot extends EventEmitter {
     const result = await this._pool.assign(channel_id, entry.entity_id, archetype);
 
     if (result) {
-      const agent_display = this.config.agents[archetype === "reviewer" ? "planner" : archetype]?.name ?? archetype;
+      const agent_display =
+        this.config.agents[archetype === "reviewer" ? "planner" : archetype]?.name ?? archetype;
       await target.reply(`Swapping to ${agent_display}...`);
     } else {
       await target.reply("No pool bots available for swap.");
@@ -1824,11 +1858,7 @@ export class DiscordBot extends EventEmitter {
 
       // Bridge initial context if provided
       if (context) {
-        await this.bridge_first_message(
-          assignment.tmux_session,
-          context,
-          target.author_name,
-        );
+        await this.bridge_first_message(assignment.tmux_session, context, target.author_name);
       }
     }
   }
@@ -1868,9 +1898,11 @@ export class DiscordBot extends EventEmitter {
 
     // Guard: warn if there's an active feature lifecycle in this room
     if (this._features) {
-      const active_features = this._features.get_features_by_entity(routed.entity_id).filter(
-        f => f.discordWorkRoom === channel_id && !["done", "cancelled"].includes(f.phase),
-      );
+      const active_features = this._features
+        .get_features_by_entity(routed.entity_id)
+        .filter(
+          (f) => f.discordWorkRoom === channel_id && !["done", "cancelled"].includes(f.phase),
+        );
       if (active_features.length > 0 && !args.includes("--force")) {
         const title = active_features[0]!.title ?? active_features[0]!.id;
         await target.reply(
@@ -1978,15 +2010,15 @@ export class DiscordBot extends EventEmitter {
 
     // Look up archives
     const archives = await load_room_archives(routed.entity_id, this.config.paths);
-    const matches = archives.filter(a => a.name === search_name);
+    const matches = archives.filter((a) => a.name === search_name);
 
     if (matches.length === 0) {
-      const available = [...new Set(archives.map(a => a.name))];
+      const available = [...new Set(archives.map((a) => a.name))];
       if (available.length === 0) {
-        await target.reply(`No archived sessions found for this entity.`);
+        await target.reply("No archived sessions found for this entity.");
       } else {
         await target.reply(
-          `No archived session found with name **${search_name}**.\nAvailable: ${available.map(n => `\`${n}\``).join(", ")}`,
+          `No archived session found with name **${search_name}**.\nAvailable: ${available.map((n) => `\`${n}\``).join(", ")}`,
         );
       }
       return;
@@ -1994,8 +2026,8 @@ export class DiscordBot extends EventEmitter {
 
     if (matches.length > 1) {
       // Multiple matches — list them with timestamps for disambiguation
-      const lines = matches.map((a, i) =>
-        `${String(i + 1)}. \`${a.name}\` — closed ${a.closed_at}`,
+      const lines = matches.map(
+        (a, i) => `${String(i + 1)}. \`${a.name}\` — closed ${a.closed_at}`,
       );
       await target.reply(
         `Multiple archived sessions named **${search_name}**:\n${lines.join("\n")}\n\nMost recent will be used. To specify, re-close to create distinct names.`,
@@ -2053,14 +2085,18 @@ export class DiscordBot extends EventEmitter {
       await this.send(channel_id, `Session \`${search_name}\` resumed.`);
       await target.reply(`Session **${search_name}** resumed in <#${channel_id}>.`);
     } else {
-      await target.reply(`Room created but no pool bots available. Send a message in <#${channel_id}> to auto-assign.`);
+      await target.reply(
+        `Room created but no pool bots available. Send a message in <#${channel_id}> to auto-assign.`,
+      );
     }
   }
 
   // ── Helpers ──
 
   /** Persist an entity's config back to YAML. */
-  private async persist_entity_config(entity_config: { entity: { id: string } } & Record<string, unknown>): Promise<void> {
+  private async persist_entity_config(
+    entity_config: { entity: { id: string } } & Record<string, unknown>,
+  ): Promise<void> {
     const config_path = entity_config_path(this.config.paths, entity_config.entity.id);
     await write_yaml(config_path, entity_config);
     console.log(`[discord] Persisted entity config for ${entity_config.entity.id}`);
@@ -2071,9 +2107,7 @@ export class DiscordBot extends EventEmitter {
     channels: { list: ChannelMapping[] },
     name: string,
   ): ChannelMapping | undefined {
-    return channels.list.find(
-      (c: ChannelMapping) => c.type === "work_room" && c.purpose === name,
-    );
+    return channels.list.find((c: ChannelMapping) => c.type === "work_room" && c.purpose === name);
   }
 
   // ── Slash command handling ──
@@ -2140,9 +2174,9 @@ export class DiscordBot extends EventEmitter {
       }
 
       const choices = [...name_map.values()]
-        .filter(a => a.name.toLowerCase().includes(focused.toLowerCase()))
+        .filter((a) => a.name.toLowerCase().includes(focused.toLowerCase()))
         .slice(0, 25) // Discord limit
-        .map(a => ({ name: a.name, value: a.name }));
+        .map((a) => ({ name: a.name, value: a.name }));
 
       await interaction.respond(choices);
     } catch {
@@ -2151,9 +2185,14 @@ export class DiscordBot extends EventEmitter {
   }
 
   /** Handle /archives — list all archived work room sessions for the entity. */
-  private async handle_archives_command(routed: RoutedMessage, target: CommandTarget): Promise<void> {
+  private async handle_archives_command(
+    routed: RoutedMessage,
+    target: CommandTarget,
+  ): Promise<void> {
     if (routed.entity_id === "_global") {
-      await target.reply("Run `/archives` in an entity channel to see that entity's archived sessions.");
+      await target.reply(
+        "Run `/archives` in an entity channel to see that entity's archived sessions.",
+      );
       return;
     }
 
@@ -2168,13 +2207,13 @@ export class DiscordBot extends EventEmitter {
     for (const a of archives) {
       const existing = by_name.get(a.name);
       const a_ts = a.closed_at || a.archived_at || "";
-      const ex_ts = existing ? (existing.closed_at || existing.archived_at || "") : "";
+      const ex_ts = existing ? existing.closed_at || existing.archived_at || "" : "";
       if (!existing || a_ts > ex_ts) by_name.set(a.name, a);
     }
 
     // Sort most recent first
-    const sorted = [...by_name.values()].sort(
-      (a, b) => (b.closed_at || b.archived_at || "").localeCompare(a.closed_at || a.archived_at || ""),
+    const sorted = [...by_name.values()].sort((a, b) =>
+      (b.closed_at || b.archived_at || "").localeCompare(a.closed_at || a.archived_at || ""),
     );
 
     const MAX_ENTRIES = 25;
@@ -2219,10 +2258,10 @@ export class DiscordBot extends EventEmitter {
 export function sanitize_channel_name(name: string): string {
   return name
     .toLowerCase()
-    .replace(/[^a-z0-9-]/g, "-")  // Replace non-alphanumeric with hyphens
-    .replace(/-+/g, "-")           // Collapse multiple hyphens
-    .replace(/^-|-$/g, "")         // Trim leading/trailing hyphens
-    .slice(0, 100);                // Discord channel name limit
+    .replace(/[^a-z0-9-]/g, "-") // Replace non-alphanumeric with hyphens
+    .replace(/-+/g, "-") // Collapse multiple hyphens
+    .replace(/^-|-$/g, "") // Trim leading/trailing hyphens
+    .slice(0, 100); // Discord channel name limit
 }
 
 // ── Room archive types and I/O ──
@@ -2317,11 +2356,9 @@ export async function load_room_archives(
  * If a 1Password reference is configured but the token isn't in the
  * environment, logs guidance on using `op run` to inject it safely.
  */
-export async function resolve_bot_token(
-  config: LobsterFarmConfig,
-): Promise<string | null> {
+export async function resolve_bot_token(config: LobsterFarmConfig): Promise<string | null> {
   // 1. Environment variable
-  const env_token = process.env["DISCORD_BOT_TOKEN"];
+  const env_token = process.env.DISCORD_BOT_TOKEN;
   if (env_token) {
     console.log("[discord] Using bot token from DISCORD_BOT_TOKEN env var");
     return env_token;
@@ -2350,8 +2387,7 @@ export async function resolve_bot_token(
   const op_ref = config.discord?.bot_token_ref;
   if (op_ref) {
     console.log(
-      `[discord] 1Password reference configured (${op_ref}) but DISCORD_BOT_TOKEN is not set. ` +
-      `Ensure env.sh or the daemon launcher uses 'op run --env-file .env.op' to inject the token.`,
+      `[discord] 1Password reference configured (${op_ref}) but DISCORD_BOT_TOKEN is not set. Ensure env.sh or the daemon launcher uses 'op run --env-file .env.op' to inject the token.`,
     );
   }
 

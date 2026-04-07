@@ -1,9 +1,9 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 
@@ -36,9 +36,7 @@ class TestBotPool extends BotPool {
 
   /** Returns the ordered list of operations (persist/kill) for sequence assertions. */
   get_operation_order(): string[] {
-    return [...this.persist_order, ...this.kill_order].length > 0
-      ? this.interleaved_order
-      : [];
+    return [...this.persist_order, ...this.kill_order].length > 0 ? this.interleaved_order : [];
   }
 
   private interleaved_order: string[] = [];
@@ -97,20 +95,34 @@ describe("shutdown() persists state before killing tmux", () => {
     const operation_order: string[] = [];
 
     // Spy on persist (private) — track order
-    vi.spyOn(pool as unknown as Record<string, unknown>, "persist" as never)
-      .mockImplementation(async () => {
+    vi.spyOn(pool as unknown as Record<string, unknown>, "persist" as never).mockImplementation(
+      async () => {
         operation_order.push("persist");
-      });
+      },
+    );
 
     // Spy on kill_tmux (private) — track order
-    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-      .mockImplementation((session: string) => {
+    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+      (session: string) => {
         operation_order.push(`kill:${session}`);
-      });
+      },
+    );
 
     pool.inject_bots([
-      make_bot({ id: 0, state: "assigned", channel_id: "ch-1", entity_id: "e1", archetype: "builder" }),
-      make_bot({ id: 1, state: "assigned", channel_id: "ch-2", entity_id: "e1", archetype: "planner" }),
+      make_bot({
+        id: 0,
+        state: "assigned",
+        channel_id: "ch-1",
+        entity_id: "e1",
+        archetype: "builder",
+      }),
+      make_bot({
+        id: 1,
+        state: "assigned",
+        channel_id: "ch-2",
+        entity_id: "e1",
+        archetype: "planner",
+      }),
       make_bot({ id: 2, state: "free" }),
     ]);
 
@@ -123,24 +135,38 @@ describe("shutdown() persists state before killing tmux", () => {
 
     // Verify persist happened exactly once and before all kills
     const persist_index = operation_order.indexOf("persist");
-    const first_kill_index = operation_order.findIndex(op => op.startsWith("kill:"));
+    const first_kill_index = operation_order.findIndex((op) => op.startsWith("kill:"));
     expect(persist_index).toBeLessThan(first_kill_index);
   });
 
   it("does not kill free bots during shutdown", async () => {
     const killed: string[] = [];
 
-    vi.spyOn(pool as unknown as Record<string, unknown>, "persist" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-      .mockImplementation((session: string) => {
+    vi.spyOn(pool as unknown as Record<string, unknown>, "persist" as never).mockResolvedValue(
+      undefined,
+    );
+    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+      (session: string) => {
         killed.push(session);
-      });
+      },
+    );
 
     pool.inject_bots([
       make_bot({ id: 0, state: "free" }),
-      make_bot({ id: 1, state: "assigned", channel_id: "ch-1", entity_id: "e1", archetype: "builder" }),
-      make_bot({ id: 2, state: "parked", channel_id: "ch-2", entity_id: "e1", archetype: "planner" }),
+      make_bot({
+        id: 1,
+        state: "assigned",
+        channel_id: "ch-1",
+        entity_id: "e1",
+        archetype: "builder",
+      }),
+      make_bot({
+        id: 2,
+        state: "parked",
+        channel_id: "ch-2",
+        entity_id: "e1",
+        archetype: "planner",
+      }),
     ]);
 
     await pool.shutdown();
@@ -160,12 +186,15 @@ describe("check_assigned_health() drain guard", () => {
     pool = new TestBotPool(config);
 
     // Stub side effects
-    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-      .mockImplementation(() => {});
-    vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-      .mockReturnValue(false);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "persist" as never)
-      .mockResolvedValue(undefined);
+    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+      () => {},
+    );
+    vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never).mockReturnValue(
+      false,
+    );
+    vi.spyOn(pool as unknown as Record<string, unknown>, "persist" as never).mockResolvedValue(
+      undefined,
+    );
   });
 
   afterEach(async () => {
@@ -189,7 +218,9 @@ describe("check_assigned_health() drain guard", () => {
     pool.set_draining(true);
 
     // Health check should be a no-op
-    await (pool as unknown as { check_assigned_health: () => Promise<void> }).check_assigned_health();
+    await (
+      pool as unknown as { check_assigned_health: () => Promise<void> }
+    ).check_assigned_health();
 
     // Bot should still be assigned — drain guard prevented cleanup
     const bots = pool.get_bots();
@@ -215,7 +246,9 @@ describe("check_assigned_health() drain guard", () => {
     ]);
 
     // is_tmux_alive returns false (mocked above) — session is dead
-    await (pool as unknown as { check_assigned_health: () => Promise<void> }).check_assigned_health();
+    await (
+      pool as unknown as { check_assigned_health: () => Promise<void> }
+    ).check_assigned_health();
 
     // Bot should have been cleaned up
     const bots = pool.get_bots();

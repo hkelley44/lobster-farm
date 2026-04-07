@@ -1,9 +1,9 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 
@@ -91,29 +91,41 @@ describe("stale OAuth detection and restart (issue #184)", () => {
     pool = new TestBotPool(config);
 
     // Stub out side effects that touch the filesystem and tmux
-    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-      .mockImplementation(() => {});
-    vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "park_bot" as never)
-      .mockImplementation(async (bot: PoolBot) => {
+    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+      () => {},
+    );
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "write_access_json" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "set_bot_nickname" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "set_bot_avatar" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never).mockResolvedValue(
+      undefined,
+    );
+    vi.spyOn(pool as unknown as Record<string, unknown>, "park_bot" as never).mockImplementation(
+      async (bot: PoolBot) => {
         bot.state = "parked";
-      });
+      },
+    );
 
     // Default: tmux is alive (we're testing the stale-but-alive case)
-    vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-      .mockImplementation((session_name: string) => {
-        return pool["tmux_alive_overrides" as keyof typeof pool]
-          ? (pool as unknown as { tmux_alive_overrides: Map<string, boolean> })
-              .tmux_alive_overrides.get(session_name) ?? true
-          : true;
-      });
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "is_tmux_alive" as never,
+    ).mockImplementation((session_name: string) => {
+      return pool["tmux_alive_overrides" as keyof typeof pool]
+        ? ((
+            pool as unknown as { tmux_alive_overrides: Map<string, boolean> }
+          ).tmux_alive_overrides.get(session_name) ?? true)
+        : true;
+    });
   });
 
   afterEach(async () => {
@@ -163,9 +175,7 @@ describe("stale OAuth detection and restart (issue #184)", () => {
     });
 
     it("returns false when bot is parked", () => {
-      pool.inject_bots([
-        make_bot({ id: 1, state: "parked", channel_id: "ch-1", entity_id: "e1" }),
-      ]);
+      pool.inject_bots([make_bot({ id: 1, state: "parked", channel_id: "ch-1", entity_id: "e1" })]);
 
       expect(pool.has_stale_oauth(1)).toBe(false);
     });
@@ -191,10 +201,7 @@ describe("stale OAuth detection and restart (issue #184)", () => {
       });
       pool.inject_bots([bot]);
 
-      const kill_spy = vi.spyOn(
-        pool as unknown as Record<string, unknown>,
-        "kill_tmux" as never,
-      );
+      const kill_spy = vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never);
 
       pool.kill_stale_session(1);
 
@@ -204,10 +211,7 @@ describe("stale OAuth detection and restart (issue #184)", () => {
     it("is a no-op for a bot_id that does not exist", () => {
       pool.inject_bots([]);
 
-      const kill_spy = vi.spyOn(
-        pool as unknown as Record<string, unknown>,
-        "kill_tmux" as never,
-      );
+      const kill_spy = vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never);
 
       pool.kill_stale_session(999);
 
@@ -242,7 +246,7 @@ describe("stale OAuth detection and restart (issue #184)", () => {
 
       expect(pool.get_session_history().get("e1:ch-1")).toBe("sess-stale-oauth");
 
-      const released_bot = pool.get_bots().find(b => b.id === 1)!;
+      const released_bot = pool.get_bots().find((b) => b.id === 1)!;
       expect(released_bot.state).toBe("free");
       expect(released_bot.session_id).toBeNull();
 

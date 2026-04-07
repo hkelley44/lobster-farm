@@ -1,16 +1,13 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { join } from "node:path";
-import { mkdtemp, rm, readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
-import type { LobsterFarmConfig, EntityConfig } from "@lobster-farm/shared";
+import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { load_pool_state } from "../persistence.js";
+import type { PersistedPoolBot } from "../persistence.js";
 import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
-import {
-  save_pool_state,
-  load_pool_state,
-} from "../persistence.js";
-import type { PersistedPoolBot } from "../persistence.js";
 
 // ── Test helpers ──
 
@@ -25,7 +22,9 @@ function make_config(lobsterfarm_dir_override?: string): LobsterFarmConfig {
   });
 }
 
-function make_persisted_bot(overrides: Partial<PersistedPoolBot> & { id: number }): PersistedPoolBot {
+function make_persisted_bot(
+  overrides: Partial<PersistedPoolBot> & { id: number },
+): PersistedPoolBot {
   return {
     state: "assigned",
     channel_id: "ch-100",
@@ -58,10 +57,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
   };
 }
 
-function make_entity_config(
-  entity_id: string,
-  channel_ids: string[],
-): EntityConfig {
+function make_entity_config(entity_id: string, channel_ids: string[]): EntityConfig {
   return {
     entity: {
       id: entity_id,
@@ -72,7 +68,7 @@ function make_entity_config(
       accounts: {},
       channels: {
         category_id: "",
-        list: channel_ids.map(id => ({
+        list: channel_ids.map((id) => ({
           type: "general" as const,
           id,
         })),
@@ -122,22 +118,32 @@ describe("session history preservation", () => {
     pool = new TestBotPool(config);
 
     // Stub out side effects
-    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-      .mockImplementation(() => {});
-    vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-      .mockReturnValue(false);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "park_bot" as never)
-      .mockImplementation(async (bot: PoolBot) => {
+    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+      () => {},
+    );
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "write_access_json" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "set_bot_nickname" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "set_bot_avatar" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never).mockResolvedValue(
+      undefined,
+    );
+    vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never).mockReturnValue(
+      false,
+    );
+    vi.spyOn(pool as unknown as Record<string, unknown>, "park_bot" as never).mockImplementation(
+      async (bot: PoolBot) => {
         bot.state = "parked";
-      });
+      },
+    );
   });
 
   afterEach(async () => {
@@ -245,10 +251,7 @@ describe("session history preservation", () => {
 
   describe("session history is consumed on reassignment", () => {
     it("uses history entry as resume_session_id when channel gets a new bot", async () => {
-      pool.inject_bots([
-        make_bot({ id: 1, state: "free" }),
-        make_bot({ id: 2, state: "free" }),
-      ]);
+      pool.inject_bots([make_bot({ id: 1, state: "free" }), make_bot({ id: 2, state: "free" })]);
 
       // Manually seed session history (as if an eviction happened earlier)
       pool.get_session_history().set("e1:ch-returning", "sess-history-789");
@@ -335,16 +338,26 @@ describe("session history preservation", () => {
       await writeFile(join(channels_dir, ".env"), "DISCORD_BOT_TOKEN=fake-token", "utf-8");
 
       const fresh_pool = new TestBotPool(config);
-      vi.spyOn(fresh_pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
-      vi.spyOn(fresh_pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-        .mockImplementation(() => {});
-      vi.spyOn(fresh_pool as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
+      vi.spyOn(
+        fresh_pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
+      vi.spyOn(
+        fresh_pool as unknown as Record<string, unknown>,
+        "kill_tmux" as never,
+      ).mockImplementation(() => {});
+      vi.spyOn(
+        fresh_pool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
 
       const registry = {
-        get: (id: string) => id === "e1" ? make_entity_config("e1", ["ch-old", "ch-new"]) :
-          id === "e2" ? make_entity_config("e2", ["ch-new"]) : undefined,
+        get: (id: string) =>
+          id === "e1"
+            ? make_entity_config("e1", ["ch-old", "ch-new"])
+            : id === "e2"
+              ? make_entity_config("e2", ["ch-new"])
+              : undefined,
         get_all: () => [],
         get_active: () => [],
         count: () => 2,
@@ -363,9 +376,7 @@ describe("session history preservation", () => {
       await mkdir(state_path, { recursive: true });
 
       // Write old-format file: plain array of bots
-      const old_format = [
-        make_persisted_bot({ id: 1, session_id: "sess-old-format" }),
-      ];
+      const old_format = [make_persisted_bot({ id: 1, session_id: "sess-old-format" })];
       await writeFile(join(state_path, "pool-state.json"), JSON.stringify(old_format), "utf-8");
 
       const result = await load_pool_state(config);
@@ -411,9 +422,7 @@ describe("session history preservation", () => {
 
   describe("end-to-end: evict -> reassign with history", () => {
     it("full cycle: assign -> evict -> reassign resumes old session", async () => {
-      pool.inject_bots([
-        make_bot({ id: 1, state: "free" }),
-      ]);
+      pool.inject_bots([make_bot({ id: 1, state: "free" })]);
 
       // Step 1: Assign bot 1 to channel A
       const first = await pool.assign("ch-A", "e1", "builder", "sess-first", "work_room");
@@ -421,7 +430,7 @@ describe("session history preservation", () => {
       expect(first!.session_id).toBe("sess-first");
 
       // Step 2: Bot finishes working, becomes parked (simulated)
-      const bot1 = pool.get_bots().find(b => b.id === 1)!;
+      const bot1 = pool.get_bots().find((b) => b.id === 1)!;
       bot1.state = "parked";
 
       // Step 3: Channel B needs a bot -- evicts bot 1 from channel A
@@ -448,7 +457,9 @@ describe("session history preservation", () => {
       expect(pool.get_session_history().has("e1:ch-A")).toBe(false);
 
       // Verify start_tmux was called with is_resume=true for the last assignment
-      const start_tmux_spy = pool["start_tmux" as keyof typeof pool] as unknown as { mock: { calls: unknown[][] } };
+      const start_tmux_spy = pool["start_tmux" as keyof typeof pool] as unknown as {
+        mock: { calls: unknown[][] };
+      };
       const last_call = start_tmux_spy.mock.calls[start_tmux_spy.mock.calls.length - 1]!;
       // session_id arg (index 4) should be the history session
       expect(last_call[4]).toBe("sess-first");

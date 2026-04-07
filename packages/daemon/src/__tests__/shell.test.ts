@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { sq } from "../shell.js";
 
 describe("sq (shell quote)", () => {
@@ -20,11 +20,11 @@ describe("sq (shell quote)", () => {
 
   it("handles shell metacharacters safely", () => {
     // All of these are inert inside single quotes
-    expect(sq('$(rm -rf /)')).toBe("'$(rm -rf /)'");
-    expect(sq('`whoami`')).toBe("'`whoami`'");
-    expect(sq('foo; bar')).toBe("'foo; bar'");
-    expect(sq('a && b')).toBe("'a && b'");
-    expect(sq('$HOME')).toBe("'$HOME'");
+    expect(sq("$(rm -rf /)")).toBe("'$(rm -rf /)'");
+    expect(sq("`whoami`")).toBe("'`whoami`'");
+    expect(sq("foo; bar")).toBe("'foo; bar'");
+    expect(sq("a && b")).toBe("'a && b'");
+    expect(sq("$HOME")).toBe("'$HOME'");
   });
 
   it("handles multiple single quotes", () => {

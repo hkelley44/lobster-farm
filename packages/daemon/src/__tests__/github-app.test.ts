@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
 import { createHmac, generateKeyPairSync } from "node:crypto";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { GitHubAppAuth, init_github_app_from_env } from "../github-app.js";
 
 // Generate a real RSA key pair for testing JWT signing
@@ -21,9 +21,7 @@ describe("GitHubAppAuth", () => {
     it("accepts a valid HMAC-SHA256 signature", () => {
       const auth = new GitHubAppAuth(TEST_CONFIG);
       const payload = '{"action":"opened","pull_request":{}}';
-      const hmac = createHmac("sha256", TEST_CONFIG.webhook_secret)
-        .update(payload)
-        .digest("hex");
+      const hmac = createHmac("sha256", TEST_CONFIG.webhook_secret).update(payload).digest("hex");
       const signature = `sha256=${hmac}`;
 
       expect(auth.verify_signature(payload, signature)).toBe(true);
@@ -40,9 +38,7 @@ describe("GitHubAppAuth", () => {
     it("rejects a signature without sha256= prefix", () => {
       const auth = new GitHubAppAuth(TEST_CONFIG);
       const payload = "test";
-      const hmac = createHmac("sha256", TEST_CONFIG.webhook_secret)
-        .update(payload)
-        .digest("hex");
+      const hmac = createHmac("sha256", TEST_CONFIG.webhook_secret).update(payload).digest("hex");
 
       expect(auth.verify_signature(payload, hmac)).toBe(false);
     });
@@ -55,9 +51,7 @@ describe("GitHubAppAuth", () => {
     it("accepts Buffer payloads", () => {
       const auth = new GitHubAppAuth(TEST_CONFIG);
       const payload = Buffer.from('{"test":true}');
-      const hmac = createHmac("sha256", TEST_CONFIG.webhook_secret)
-        .update(payload)
-        .digest("hex");
+      const hmac = createHmac("sha256", TEST_CONFIG.webhook_secret).update(payload).digest("hex");
       const signature = `sha256=${hmac}`;
 
       expect(auth.verify_signature(payload, signature)).toBe(true);
@@ -92,7 +86,7 @@ describe("GitHubAppAuth", () => {
 
       // Verify Authorization header is a Bearer JWT
       const call_opts = mock_fetch.mock.calls[0]![1] as { headers: Record<string, string> };
-      expect(call_opts.headers["Authorization"]).toMatch(/^Bearer eyJ/);
+      expect(call_opts.headers.Authorization).toMatch(/^Bearer eyJ/);
 
       vi.unstubAllGlobals();
     });
@@ -138,7 +132,9 @@ describe("GitHubAppAuth", () => {
       const expires_at = new Date(Date.now() + 3600_000).toISOString();
 
       let resolve_fetch!: (value: unknown) => void;
-      const fetch_promise = new Promise((r) => { resolve_fetch = r; });
+      const fetch_promise = new Promise((r) => {
+        resolve_fetch = r;
+      });
 
       const mock_fetch = vi.fn().mockReturnValue(fetch_promise);
       vi.stubGlobal("fetch", mock_fetch);
@@ -286,9 +282,7 @@ describe("GitHubAppAuth", () => {
       await auth.get_token_for_installation("99999");
 
       const call_url = mock_fetch.mock.calls[0]![0] as string;
-      expect(call_url).toBe(
-        "https://api.github.com/app/installations/99999/access_tokens",
-      );
+      expect(call_url).toBe("https://api.github.com/app/installations/99999/access_tokens");
 
       vi.unstubAllGlobals();
     });
@@ -299,11 +293,12 @@ describe("init_github_app_from_env", () => {
   const ORIGINAL_ENV = { ...process.env };
 
   beforeEach(() => {
-    // Clean env for each test
-    delete process.env["GITHUB_APP_ID"];
-    delete process.env["GITHUB_APP_PRIVATE_KEY"];
-    delete process.env["GITHUB_APP_INSTALLATION_ID"];
-    delete process.env["GITHUB_APP_WEBHOOK_SECRET"];
+    // Clean env for each test — must use delete, not = undefined
+    // (process.env coerces undefined to the string "undefined")
+    delete process.env.GITHUB_APP_ID;
+    delete process.env.GITHUB_APP_PRIVATE_KEY;
+    delete process.env.GITHUB_APP_INSTALLATION_ID;
+    delete process.env.GITHUB_APP_WEBHOOK_SECRET;
   });
 
   // Restore env after tests
@@ -317,8 +312,8 @@ describe("init_github_app_from_env", () => {
   });
 
   it("returns null when only some env vars are set", () => {
-    process.env["GITHUB_APP_ID"] = "123";
-    process.env["GITHUB_APP_PRIVATE_KEY"] = privateKey;
+    process.env.GITHUB_APP_ID = "123";
+    process.env.GITHUB_APP_PRIVATE_KEY = privateKey;
     // Missing INSTALLATION_ID and WEBHOOK_SECRET
 
     const result = init_github_app_from_env();
@@ -326,10 +321,10 @@ describe("init_github_app_from_env", () => {
   });
 
   it("returns GitHubAppAuth when all env vars are set", () => {
-    process.env["GITHUB_APP_ID"] = "123";
-    process.env["GITHUB_APP_PRIVATE_KEY"] = privateKey;
-    process.env["GITHUB_APP_INSTALLATION_ID"] = "456";
-    process.env["GITHUB_APP_WEBHOOK_SECRET"] = "secret";
+    process.env.GITHUB_APP_ID = "123";
+    process.env.GITHUB_APP_PRIVATE_KEY = privateKey;
+    process.env.GITHUB_APP_INSTALLATION_ID = "456";
+    process.env.GITHUB_APP_WEBHOOK_SECRET = "secret";
 
     const result = init_github_app_from_env();
     expect(result).toBeInstanceOf(GitHubAppAuth);

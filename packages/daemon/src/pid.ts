@@ -1,4 +1,4 @@
-import { readFile, writeFile, unlink } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { pid_file_path } from "@lobster-farm/shared";
 
@@ -25,7 +25,7 @@ export async function read_pid(config: LobsterFarmConfig): Promise<number | null
   const path = pid_file_path(config.paths);
   try {
     const content = await readFile(path, "utf-8");
-    const pid = parseInt(content.trim(), 10);
+    const pid = Number.parseInt(content.trim(), 10);
     return Number.isNaN(pid) ? null : pid;
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {

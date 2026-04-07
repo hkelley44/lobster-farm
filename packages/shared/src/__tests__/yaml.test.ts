@@ -1,7 +1,7 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { mkdir, rm, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { load_yaml, parse_yaml, write_yaml } from "../yaml.js";
 
@@ -63,8 +63,6 @@ describe("file operations", () => {
   });
 
   it("load_yaml throws on non-existent file", async () => {
-    await expect(
-      load_yaml(join(tmp, "nope.yaml"), TestSchema),
-    ).rejects.toThrow();
+    await expect(load_yaml(join(tmp, "nope.yaml"), TestSchema)).rejects.toThrow();
   });
 });

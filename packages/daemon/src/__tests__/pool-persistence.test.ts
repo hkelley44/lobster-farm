@@ -1,19 +1,19 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { join } from "node:path";
-import { mkdtemp, rm, readFile, writeFile, mkdir, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
-import type { LobsterFarmConfig, EntityConfig } from "@lobster-farm/shared";
-import { BotPool } from "../pool.js";
-import type { PoolBot } from "../pool.js";
+import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  save_pool_state,
   load_pool_state,
-  save_pr_reviews,
   load_pr_reviews,
+  save_pool_state,
+  save_pr_reviews,
 } from "../persistence.js";
 import type { PersistedPoolBot } from "../persistence.js";
-import { EntityRegistry } from "../registry.js";
+import { BotPool } from "../pool.js";
+import type { PoolBot } from "../pool.js";
+import type { EntityRegistry } from "../registry.js";
 
 // ── Test helpers ──
 
@@ -28,7 +28,9 @@ function make_config(lobsterfarm_dir_override?: string): LobsterFarmConfig {
   });
 }
 
-function make_persisted_bot(overrides: Partial<PersistedPoolBot> & { id: number }): PersistedPoolBot {
+function make_persisted_bot(
+  overrides: Partial<PersistedPoolBot> & { id: number },
+): PersistedPoolBot {
   return {
     state: "assigned",
     channel_id: "ch-100",
@@ -92,10 +94,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
   };
 }
 
-function make_entity_config(
-  entity_id: string,
-  channel_ids: string[],
-): EntityConfig {
+function make_entity_config(entity_id: string, channel_ids: string[]): EntityConfig {
   return {
     entity: {
       id: entity_id,
@@ -106,7 +105,7 @@ function make_entity_config(
       accounts: {},
       channels: {
         category_id: "",
-        list: channel_ids.map(id => ({
+        list: channel_ids.map((id) => ({
           type: "general" as const,
           id,
         })),
@@ -126,7 +125,7 @@ function make_registry(entities: EntityConfig[]): EntityRegistry {
   return {
     get: (id: string) => map.get(id),
     get_all: () => [...map.values()],
-    get_active: () => [...map.values()].filter(e => e.entity.status === "active"),
+    get_active: () => [...map.values()].filter((e) => e.entity.status === "active"),
     count: () => map.size,
   } as unknown as EntityRegistry;
 }
@@ -145,8 +144,18 @@ describe("save_pool_state / load_pool_state", () => {
   it("writes valid JSON and reads it back", async () => {
     const config = make_config();
     const bots: PersistedPoolBot[] = [
-      make_persisted_bot({ id: 1, state: "assigned", session_id: "sess-abc", last_active: "2026-03-26T10:00:00.000Z" }),
-      make_persisted_bot({ id: 3, state: "parked", channel_id: "ch-200", channel_type: "work_room" }),
+      make_persisted_bot({
+        id: 1,
+        state: "assigned",
+        session_id: "sess-abc",
+        last_active: "2026-03-26T10:00:00.000Z",
+      }),
+      make_persisted_bot({
+        id: 3,
+        state: "parked",
+        channel_id: "ch-200",
+        channel_type: "work_room",
+      }),
     ];
 
     await save_pool_state(bots, config);
@@ -156,8 +165,8 @@ describe("save_pool_state / load_pool_state", () => {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     expect(parsed).toHaveProperty("bots");
     expect(parsed).toHaveProperty("session_history");
-    expect(Array.isArray(parsed["bots"])).toBe(true);
-    expect(parsed["bots"]).toHaveLength(2);
+    expect(Array.isArray(parsed.bots)).toBe(true);
+    expect(parsed.bots).toHaveLength(2);
 
     // Load it back
     const loaded = await load_pool_state(config);
@@ -223,22 +232,32 @@ describe("BotPool persistence", () => {
     pool = new TestBotPool(config);
 
     // Stub out side effects
-    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-      .mockImplementation(() => {});
-    vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-      .mockReturnValue(false);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "park_bot" as never)
-      .mockImplementation(async (bot: PoolBot) => {
+    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+      () => {},
+    );
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "write_access_json" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "set_bot_nickname" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "set_bot_avatar" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never).mockResolvedValue(
+      undefined,
+    );
+    vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never).mockReturnValue(
+      false,
+    );
+    vi.spyOn(pool as unknown as Record<string, unknown>, "park_bot" as never).mockImplementation(
+      async (bot: PoolBot) => {
         bot.state = "parked";
-      });
+      },
+    );
   });
 
   afterEach(async () => {
@@ -251,8 +270,26 @@ describe("BotPool persistence", () => {
       pool.inject_bots([
         make_bot({ id: 1, state: "free" }),
         make_bot({ id: 2, state: "free" }),
-        make_bot({ id: 3, state: "assigned", channel_id: "ch-1", entity_id: "e1", archetype: "builder", channel_type: "general", session_id: "sess-1", last_active: new Date("2026-03-26T10:00:00Z") }),
-        make_bot({ id: 4, state: "parked", channel_id: "ch-2", entity_id: "e2", archetype: "planner", channel_type: "work_room", session_id: "sess-2", last_active: new Date("2026-03-26T09:00:00Z") }),
+        make_bot({
+          id: 3,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          archetype: "builder",
+          channel_type: "general",
+          session_id: "sess-1",
+          last_active: new Date("2026-03-26T10:00:00Z"),
+        }),
+        make_bot({
+          id: 4,
+          state: "parked",
+          channel_id: "ch-2",
+          entity_id: "e2",
+          archetype: "planner",
+          channel_type: "work_room",
+          session_id: "sess-2",
+          last_active: new Date("2026-03-26T09:00:00Z"),
+        }),
       ]);
 
       // Trigger a persist by assigning — bot 1 (first free) gets assigned
@@ -260,7 +297,7 @@ describe("BotPool persistence", () => {
 
       const saved = await load_pool_state(config);
       // Bot 2 is still free — should NOT appear in persisted state
-      const ids = saved.bots.map(b => b.id);
+      const ids = saved.bots.map((b) => b.id);
       expect(ids).not.toContain(2); // free bot excluded
 
       // Bots 1 (now assigned), 3 (assigned), 4 (parked) should be persisted
@@ -285,7 +322,7 @@ describe("BotPool persistence", () => {
       // Verify state was written to disk
       const saved = await load_pool_state(config);
       expect(saved.bots.length).toBeGreaterThanOrEqual(1);
-      const assigned = saved.bots.find(b => b.channel_id === "ch-1");
+      const assigned = saved.bots.find((b) => b.channel_id === "ch-1");
       expect(assigned).toBeDefined();
       expect(assigned!.state).toBe("assigned");
       expect(assigned!.entity_id).toBe("e1");
@@ -294,39 +331,58 @@ describe("BotPool persistence", () => {
 
     it("release() triggers persist", async () => {
       pool.inject_bots([
-        make_bot({ id: 1, state: "assigned", channel_id: "ch-1", entity_id: "e1", archetype: "builder" }),
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          archetype: "builder",
+        }),
       ]);
 
       // Release the bot — park_bot is mocked so we need to use the real release
       vi.restoreAllMocks();
-      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-        .mockImplementation(() => {});
-      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
+      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+        () => {},
+      );
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
 
       await pool.release("ch-1");
 
       const saved = await load_pool_state(config);
       // After release, bot should be free — not in persisted state
-      const released = saved.bots.find(b => b.id === 1);
+      const released = saved.bots.find((b) => b.id === 1);
       expect(released).toBeUndefined();
     });
 
     it("park_bot() triggers persist (via eviction in assign)", async () => {
       // Use real park_bot for this test
       vi.restoreAllMocks();
-      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-        .mockImplementation(() => {});
-      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+        () => {},
+      );
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "set_bot_nickname" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "set_bot_avatar" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never).mockResolvedValue(
+        undefined,
+      );
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
       pool.inject_bots([
         make_bot({
@@ -346,7 +402,7 @@ describe("BotPool persistence", () => {
 
       const saved = await load_pool_state(config);
       // The bot should now be assigned to ch-new
-      const bot = saved.bots.find(b => b.id === 1);
+      const bot = saved.bots.find((b) => b.id === 1);
       expect(bot).toBeDefined();
       expect(bot!.channel_id).toBe("ch-new");
       expect(bot!.state).toBe("assigned");
@@ -356,18 +412,21 @@ describe("BotPool persistence", () => {
   describe("initialize() restores persisted state", () => {
     it("restores assigned bots as parked when tmux is dead", async () => {
       // Pre-seed persisted state
-      await save_pool_state([
-        make_persisted_bot({
-          id: 1,
-          state: "assigned",
-          channel_id: "ch-1",
-          entity_id: "test-entity",
-          archetype: "builder",
-          session_id: "sess-abc123",
-          channel_type: "general",
-          last_active: "2026-03-26T10:00:00.000Z",
-        }),
-      ], config);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "builder",
+            session_id: "sess-abc123",
+            channel_type: "general",
+            last_active: "2026-03-26T10:00:00.000Z",
+          }),
+        ],
+        config,
+      );
 
       // Set up pool bot directories so initialize() discovers them
       const channels_dir = join(temp_dir, "channels", "pool-1");
@@ -376,12 +435,12 @@ describe("BotPool persistence", () => {
 
       const fresh_pool = new TestBotPool(config);
       // tmux is dead (default mock returns false)
-      vi.spyOn(fresh_pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(
+        fresh_pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
-      const registry = make_registry([
-        make_entity_config("test-entity", ["ch-1"]),
-      ]);
+      const registry = make_registry([make_entity_config("test-entity", ["ch-1"])]);
 
       await fresh_pool.initialize(registry);
 
@@ -396,17 +455,20 @@ describe("BotPool persistence", () => {
     });
 
     it("restores assigned bots with running tmux as assigned", async () => {
-      await save_pool_state([
-        make_persisted_bot({
-          id: 1,
-          state: "assigned",
-          channel_id: "ch-1",
-          entity_id: "test-entity",
-          archetype: "designer",
-          session_id: "sess-live",
-          last_active: "2026-03-26T12:00:00.000Z",
-        }),
-      ], config);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "designer",
+            session_id: "sess-live",
+            last_active: "2026-03-26T12:00:00.000Z",
+          }),
+        ],
+        config,
+      );
 
       const channels_dir = join(temp_dir, "channels", "pool-1");
       await mkdir(channels_dir, { recursive: true });
@@ -414,12 +476,12 @@ describe("BotPool persistence", () => {
 
       const fresh_pool = new TestBotPool(config);
       // tmux IS alive (survived restart)
-      vi.spyOn(fresh_pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(true);
+      vi.spyOn(
+        fresh_pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(true);
 
-      const registry = make_registry([
-        make_entity_config("test-entity", ["ch-1"]),
-      ]);
+      const registry = make_registry([make_entity_config("test-entity", ["ch-1"])]);
 
       await fresh_pool.initialize(registry);
 
@@ -432,28 +494,31 @@ describe("BotPool persistence", () => {
     });
 
     it("skips entries for removed entities", async () => {
-      await save_pool_state([
-        make_persisted_bot({
-          id: 1,
-          state: "assigned",
-          channel_id: "ch-1",
-          entity_id: "deleted-entity",
-          archetype: "builder",
-        }),
-      ], config);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "deleted-entity",
+            archetype: "builder",
+          }),
+        ],
+        config,
+      );
 
       const channels_dir = join(temp_dir, "channels", "pool-1");
       await mkdir(channels_dir, { recursive: true });
       await writeFile(join(channels_dir, ".env"), "DISCORD_BOT_TOKEN=fake-token", "utf-8");
 
       const fresh_pool = new TestBotPool(config);
-      vi.spyOn(fresh_pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(
+        fresh_pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
       // Registry does NOT have "deleted-entity"
-      const registry = make_registry([
-        make_entity_config("other-entity", ["ch-99"]),
-      ]);
+      const registry = make_registry([make_entity_config("other-entity", ["ch-99"])]);
 
       await fresh_pool.initialize(registry);
 
@@ -464,28 +529,31 @@ describe("BotPool persistence", () => {
     });
 
     it("skips entries for removed channels", async () => {
-      await save_pool_state([
-        make_persisted_bot({
-          id: 1,
-          state: "assigned",
-          channel_id: "ch-deleted",
-          entity_id: "test-entity",
-          archetype: "builder",
-        }),
-      ], config);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-deleted",
+            entity_id: "test-entity",
+            archetype: "builder",
+          }),
+        ],
+        config,
+      );
 
       const channels_dir = join(temp_dir, "channels", "pool-1");
       await mkdir(channels_dir, { recursive: true });
       await writeFile(join(channels_dir, ".env"), "DISCORD_BOT_TOKEN=fake-token", "utf-8");
 
       const fresh_pool = new TestBotPool(config);
-      vi.spyOn(fresh_pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(
+        fresh_pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
       // Entity exists but does NOT have "ch-deleted"
-      const registry = make_registry([
-        make_entity_config("test-entity", ["ch-other"]),
-      ]);
+      const registry = make_registry([make_entity_config("test-entity", ["ch-other"])]);
 
       await fresh_pool.initialize(registry);
 
@@ -495,9 +563,10 @@ describe("BotPool persistence", () => {
     });
 
     it("skips entries for bot IDs that no longer have directories", async () => {
-      await save_pool_state([
-        make_persisted_bot({ id: 99, channel_id: "ch-1", entity_id: "test-entity" }),
-      ], config);
+      await save_pool_state(
+        [make_persisted_bot({ id: 99, channel_id: "ch-1", entity_id: "test-entity" })],
+        config,
+      );
 
       // Only create pool-1 directory, not pool-99
       const channels_dir = join(temp_dir, "channels", "pool-1");
@@ -505,12 +574,12 @@ describe("BotPool persistence", () => {
       await writeFile(join(channels_dir, ".env"), "DISCORD_BOT_TOKEN=fake-token", "utf-8");
 
       const fresh_pool = new TestBotPool(config);
-      vi.spyOn(fresh_pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(
+        fresh_pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
-      const registry = make_registry([
-        make_entity_config("test-entity", ["ch-1"]),
-      ]);
+      const registry = make_registry([make_entity_config("test-entity", ["ch-1"])]);
 
       await fresh_pool.initialize(registry);
 
@@ -521,24 +590,29 @@ describe("BotPool persistence", () => {
     });
 
     it("works without registry (skips validation)", async () => {
-      await save_pool_state([
-        make_persisted_bot({
-          id: 1,
-          state: "assigned",
-          channel_id: "ch-1",
-          entity_id: "any-entity",
-          archetype: "builder",
-          session_id: "sess-123",
-        }),
-      ], config);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "any-entity",
+            archetype: "builder",
+            session_id: "sess-123",
+          }),
+        ],
+        config,
+      );
 
       const channels_dir = join(temp_dir, "channels", "pool-1");
       await mkdir(channels_dir, { recursive: true });
       await writeFile(join(channels_dir, ".env"), "DISCORD_BOT_TOKEN=fake-token", "utf-8");
 
       const fresh_pool = new TestBotPool(config);
-      vi.spyOn(fresh_pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(
+        fresh_pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
       // No registry passed — validation skipped
       await fresh_pool.initialize();
@@ -551,10 +625,13 @@ describe("BotPool persistence", () => {
 
     it("cleans up persisted state after restore (removes stale entries)", async () => {
       // Save two entries — one valid, one stale
-      await save_pool_state([
-        make_persisted_bot({ id: 1, channel_id: "ch-1", entity_id: "test-entity" }),
-        make_persisted_bot({ id: 2, channel_id: "ch-2", entity_id: "deleted-entity" }),
-      ], config);
+      await save_pool_state(
+        [
+          make_persisted_bot({ id: 1, channel_id: "ch-1", entity_id: "test-entity" }),
+          make_persisted_bot({ id: 2, channel_id: "ch-2", entity_id: "deleted-entity" }),
+        ],
+        config,
+      );
 
       // Create directories for both bots
       for (const id of [1, 2]) {
@@ -564,12 +641,12 @@ describe("BotPool persistence", () => {
       }
 
       const fresh_pool = new TestBotPool(config);
-      vi.spyOn(fresh_pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(
+        fresh_pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
-      const registry = make_registry([
-        make_entity_config("test-entity", ["ch-1"]),
-      ]);
+      const registry = make_registry([make_entity_config("test-entity", ["ch-1"])]);
 
       await fresh_pool.initialize(registry);
 
@@ -585,22 +662,38 @@ describe("BotPool persistence", () => {
     it("session ID survives restart and enables auto-resume", async () => {
       // Phase 1: Assign a bot with a session ID
       vi.restoreAllMocks();
-      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-        .mockImplementation(() => {});
-      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+        () => {},
+      );
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "set_bot_nickname" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "set_bot_avatar" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never).mockResolvedValue(
+        undefined,
+      );
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
       pool.inject_bots([make_bot({ id: 1, state: "free" })]);
 
-      const assignment = await pool.assign("ch-1", "test-entity", "builder", "sess-original-123", "general");
+      const assignment = await pool.assign(
+        "ch-1",
+        "test-entity",
+        "builder",
+        "sess-original-123",
+        "general",
+      );
       expect(assignment).not.toBeNull();
       expect(assignment!.session_id).toBe("sess-original-123");
 
@@ -615,22 +708,32 @@ describe("BotPool persistence", () => {
       await writeFile(join(channels_dir, ".env"), "DISCORD_BOT_TOKEN=fake-token", "utf-8");
 
       const restarted_pool = new TestBotPool(config);
-      vi.spyOn(restarted_pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false); // tmux is dead after restart
-      vi.spyOn(restarted_pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-        .mockImplementation(() => {});
-      vi.spyOn(restarted_pool as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(restarted_pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(restarted_pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(restarted_pool as unknown as Record<string, unknown>, "start_tmux" as never)
-        .mockResolvedValue(undefined);
+      vi.spyOn(
+        restarted_pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false); // tmux is dead after restart
+      vi.spyOn(
+        restarted_pool as unknown as Record<string, unknown>,
+        "kill_tmux" as never,
+      ).mockImplementation(() => {});
+      vi.spyOn(
+        restarted_pool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        restarted_pool as unknown as Record<string, unknown>,
+        "set_bot_nickname" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        restarted_pool as unknown as Record<string, unknown>,
+        "set_bot_avatar" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        restarted_pool as unknown as Record<string, unknown>,
+        "start_tmux" as never,
+      ).mockResolvedValue(undefined);
 
-      const registry = make_registry([
-        make_entity_config("test-entity", ["ch-1"]),
-      ]);
+      const registry = make_registry([make_entity_config("test-entity", ["ch-1"])]);
 
       await restarted_pool.initialize(registry);
 
@@ -642,14 +745,22 @@ describe("BotPool persistence", () => {
       expect(bots[0]!.channel_id).toBe("ch-1");
 
       // Phase 3: New message to the same channel — should auto-resume
-      const resumed = await restarted_pool.assign("ch-1", "test-entity", "builder", undefined, "general");
+      const resumed = await restarted_pool.assign(
+        "ch-1",
+        "test-entity",
+        "builder",
+        undefined,
+        "general",
+      );
       expect(resumed).not.toBeNull();
       expect(resumed!.bot_id).toBe(1);
       // The session_id should be preserved from the parked bot
       expect(resumed!.session_id).toBe("sess-original-123");
 
       // Verify start_tmux was called with the resume session ID
-      const start_tmux_spy = restarted_pool["start_tmux" as keyof typeof restarted_pool] as unknown as { mock: { calls: unknown[][] } };
+      const start_tmux_spy = restarted_pool[
+        "start_tmux" as keyof typeof restarted_pool
+      ] as unknown as { mock: { calls: unknown[][] } };
       const last_call = start_tmux_spy.mock.calls[start_tmux_spy.mock.calls.length - 1]!;
       // resume_session_id is the 5th argument (index 4)
       expect(last_call[4]).toBe("sess-original-123");
@@ -666,32 +777,37 @@ describe("BotPool persistence", () => {
       }
 
       // Seed persisted state: 1 assigned, 1 parked, (bot 3 was free — not persisted)
-      await save_pool_state([
-        make_persisted_bot({
-          id: 1,
-          state: "assigned",
-          channel_id: "ch-1",
-          entity_id: "entity-a",
-          archetype: "builder",
-          session_id: "sess-1",
-          channel_type: "work_room",
-          last_active: "2026-03-26T10:00:00.000Z",
-        }),
-        make_persisted_bot({
-          id: 2,
-          state: "parked",
-          channel_id: "ch-2",
-          entity_id: "entity-b",
-          archetype: "planner",
-          session_id: "sess-2",
-          channel_type: "general",
-          last_active: "2026-03-26T09:00:00.000Z",
-        }),
-      ], config);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "entity-a",
+            archetype: "builder",
+            session_id: "sess-1",
+            channel_type: "work_room",
+            last_active: "2026-03-26T10:00:00.000Z",
+          }),
+          make_persisted_bot({
+            id: 2,
+            state: "parked",
+            channel_id: "ch-2",
+            entity_id: "entity-b",
+            archetype: "planner",
+            session_id: "sess-2",
+            channel_type: "general",
+            last_active: "2026-03-26T09:00:00.000Z",
+          }),
+        ],
+        config,
+      );
 
       const fresh_pool = new TestBotPool(config);
-      vi.spyOn(fresh_pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(
+        fresh_pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
       const registry = make_registry([
         make_entity_config("entity-a", ["ch-1"]),
@@ -704,20 +820,20 @@ describe("BotPool persistence", () => {
       expect(bots).toHaveLength(3);
 
       // Bot 1: was assigned, tmux dead -> parked
-      const bot1 = bots.find(b => b.id === 1)!;
+      const bot1 = bots.find((b) => b.id === 1)!;
       expect(bot1.state).toBe("parked");
       expect(bot1.channel_id).toBe("ch-1");
       expect(bot1.session_id).toBe("sess-1");
       expect(bot1.channel_type).toBe("work_room");
 
       // Bot 2: was parked, stays parked
-      const bot2 = bots.find(b => b.id === 2)!;
+      const bot2 = bots.find((b) => b.id === 2)!;
       expect(bot2.state).toBe("parked");
       expect(bot2.channel_id).toBe("ch-2");
       expect(bot2.session_id).toBe("sess-2");
 
       // Bot 3: no persisted state -> free
-      const bot3 = bots.find(b => b.id === 3)!;
+      const bot3 = bots.find((b) => b.id === 3)!;
       expect(bot3.state).toBe("free");
       expect(bot3.channel_id).toBeNull();
     });
@@ -735,10 +851,25 @@ describe("BotPool persistence", () => {
       }
 
       // Persist state: pool-50 and pool-51 both claim the same channel (from a prior race)
-      await save_pool_state([
-        make_persisted_bot({ id: 50, state: "parked", channel_id: "ch-duped", entity_id: "e1", archetype: "planner" }),
-        make_persisted_bot({ id: 51, state: "parked", channel_id: "ch-duped", entity_id: "e1", archetype: "planner" }),
-      ], config);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 50,
+            state: "parked",
+            channel_id: "ch-duped",
+            entity_id: "e1",
+            archetype: "planner",
+          }),
+          make_persisted_bot({
+            id: 51,
+            state: "parked",
+            channel_id: "ch-duped",
+            entity_id: "e1",
+            archetype: "planner",
+          }),
+        ],
+        config,
+      );
 
       const pool = new TestBotPool(config);
       await pool.initialize();
@@ -746,12 +877,12 @@ describe("BotPool persistence", () => {
       const bots = pool.get_bots();
 
       // Pool-50 (lower ID, seen first) keeps the channel
-      const bot0 = bots.find(b => b.id === 50)!;
+      const bot0 = bots.find((b) => b.id === 50)!;
       expect(bot0.state).toBe("parked");
       expect(bot0.channel_id).toBe("ch-duped");
 
       // Pool-51 (duplicate) is freed
-      const bot1 = bots.find(b => b.id === 51)!;
+      const bot1 = bots.find((b) => b.id === 51)!;
       expect(bot1.state).toBe("free");
       expect(bot1.channel_id).toBeNull();
     });
@@ -765,19 +896,34 @@ describe("BotPool persistence", () => {
         await writeFile(join(dir, ".env"), `DISCORD_BOT_TOKEN=fake-token-${String(id)}`);
       }
 
-      await save_pool_state([
-        make_persisted_bot({ id: 50, state: "parked", channel_id: "ch-a", entity_id: "e1", archetype: "planner" }),
-        make_persisted_bot({ id: 51, state: "parked", channel_id: "ch-b", entity_id: "e1", archetype: "builder" }),
-      ], config);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 50,
+            state: "parked",
+            channel_id: "ch-a",
+            entity_id: "e1",
+            archetype: "planner",
+          }),
+          make_persisted_bot({
+            id: 51,
+            state: "parked",
+            channel_id: "ch-b",
+            entity_id: "e1",
+            archetype: "builder",
+          }),
+        ],
+        config,
+      );
 
       const pool = new TestBotPool(config);
       await pool.initialize();
 
       const bots = pool.get_bots();
-      expect(bots.find(b => b.id === 50)!.state).toBe("parked");
-      expect(bots.find(b => b.id === 50)!.channel_id).toBe("ch-a");
-      expect(bots.find(b => b.id === 51)!.state).toBe("parked");
-      expect(bots.find(b => b.id === 51)!.channel_id).toBe("ch-b");
+      expect(bots.find((b) => b.id === 50)!.state).toBe("parked");
+      expect(bots.find((b) => b.id === 50)!.channel_id).toBe("ch-a");
+      expect(bots.find((b) => b.id === 51)!.state).toBe("parked");
+      expect(bots.find((b) => b.id === 51)!.channel_id).toBe("ch-b");
     });
   });
 
@@ -789,23 +935,29 @@ describe("BotPool persistence", () => {
       const dir = join(temp_dir, "channels", "pool-60");
       await mkdir(dir, { recursive: true });
       await writeFile(join(dir, ".env"), "DISCORD_BOT_TOKEN=fake-token-60");
-      await writeFile(join(dir, "access.json"), JSON.stringify({
-        dmPolicy: "allowlist",
-        allowFrom: [],
-        groups: { "stale-channel-id": { requireMention: false, allowFrom: [] } },
-        pending: {},
-        ackReaction: "👀",
-        replyToMode: "first",
-        textChunkLimit: 2000,
-        chunkMode: "newline",
-      }));
+      await writeFile(
+        join(dir, "access.json"),
+        JSON.stringify({
+          dmPolicy: "allowlist",
+          allowFrom: [],
+          groups: { "stale-channel-id": { requireMention: false, allowFrom: [] } },
+          pending: {},
+          ackReaction: "👀",
+          replyToMode: "first",
+          textChunkLimit: 2000,
+          chunkMode: "newline",
+        }),
+      );
 
       // No persisted state — pool-60 should be free
       const pool = new TestBotPool(config);
       await pool.initialize();
 
       // access.json should have been rewritten with empty groups
-      const access = JSON.parse(await readFile(join(dir, "access.json"), "utf-8")) as Record<string, unknown>;
+      const access = JSON.parse(await readFile(join(dir, "access.json"), "utf-8")) as Record<
+        string,
+        unknown
+      >;
       expect(access.groups).toEqual({});
     });
 
@@ -821,24 +973,37 @@ describe("BotPool persistence", () => {
 
       // Pool-60 was parked with a channel — its access.json should be cleared
       // because parked bots don't have live tmux sessions listening
-      await save_pool_state([
-        make_persisted_bot({ id: 60, state: "parked", channel_id: "ch-parked", entity_id: "e1", archetype: "planner" }),
-      ], config);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 60,
+            state: "parked",
+            channel_id: "ch-parked",
+            entity_id: "e1",
+            archetype: "planner",
+          }),
+        ],
+        config,
+      );
 
       const pool = new TestBotPool(config);
       await pool.initialize();
 
       // Parked bot: channel preserved in memory but access.json cleared
       const bots = pool.get_bots();
-      const bot60 = bots.find(b => b.id === 60)!;
+      const bot60 = bots.find((b) => b.id === 60)!;
       expect(bot60.state).toBe("parked");
       expect(bot60.channel_id).toBe("ch-parked"); // In-memory: preserved for resume
 
-      const access60 = JSON.parse(await readFile(join(temp_dir, "channels", "pool-60", "access.json"), "utf-8")) as Record<string, unknown>;
+      const access60 = JSON.parse(
+        await readFile(join(temp_dir, "channels", "pool-60", "access.json"), "utf-8"),
+      ) as Record<string, unknown>;
       expect(access60.groups).toEqual({}); // On disk: cleared
 
       // Free bot: access.json also cleared
-      const access61 = JSON.parse(await readFile(join(temp_dir, "channels", "pool-61", "access.json"), "utf-8")) as Record<string, unknown>;
+      const access61 = JSON.parse(
+        await readFile(join(temp_dir, "channels", "pool-61", "access.json"), "utf-8"),
+      ) as Record<string, unknown>;
       expect(access61.groups).toEqual({});
     });
   });
@@ -860,22 +1025,29 @@ describe("BotPool persistence", () => {
       }
 
       const p = new TestBotPool(cfg);
-      vi.spyOn(p as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
-      vi.spyOn(p as unknown as Record<string, unknown>, "kill_tmux" as never)
-        .mockImplementation(() => {});
-      vi.spyOn(p as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_avatar" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(p as unknown as Record<string, unknown>, "start_tmux" as never)
-        .mockResolvedValue(undefined);
+      vi.spyOn(p as unknown as Record<string, unknown>, "is_tmux_alive" as never).mockReturnValue(
+        false,
+      );
+      vi.spyOn(p as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+        () => {},
+      );
+      vi.spyOn(
+        p as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        p as unknown as Record<string, unknown>,
+        "set_bot_nickname" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        p as unknown as Record<string, unknown>,
+        "set_bot_avatar" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(p as unknown as Record<string, unknown>, "start_tmux" as never).mockResolvedValue(
+        undefined,
+      );
 
-      const reg = registry_entities
-        ? make_registry(registry_entities)
-        : undefined;
+      const reg = registry_entities ? make_registry(registry_entities) : undefined;
 
       await p.initialize(reg);
       return p;
@@ -902,19 +1074,23 @@ describe("BotPool persistence", () => {
 
       // Track bot:resumed events
       const events: Array<{ bot_id: number; channel_id: string; entity_id: string }> = [];
-      p.on("bot:resumed", (evt: { bot_id: number; channel_id: string; entity_id: string }) => events.push(evt));
+      p.on("bot:resumed", (evt: { bot_id: number; channel_id: string; entity_id: string }) =>
+        events.push(evt),
+      );
 
       await p.resume_parked_bots();
 
       // Bot should now be assigned
       const bots = p.get_bots();
-      const bot = bots.find(b => b.id === 1)!;
+      const bot = bots.find((b) => b.id === 1)!;
       expect(bot.state).toBe("assigned");
       expect(bot.channel_id).toBe("ch-1");
       expect(bot.entity_id).toBe("test-entity");
 
       // start_tmux called with --resume session_id
-      const start_tmux_spy = p["start_tmux" as keyof typeof p] as unknown as { mock: { calls: unknown[][] } };
+      const start_tmux_spy = p["start_tmux" as keyof typeof p] as unknown as {
+        mock: { calls: unknown[][] };
+      };
       const call = start_tmux_spy.mock.calls[0]!;
       expect(call[4]).toBe("sess-abc"); // resume_session_id argument
 
@@ -1006,10 +1182,7 @@ describe("BotPool persistence", () => {
           }),
         ],
         [1, 2],
-        [
-          make_entity_config("entity-a", ["ch-1"]),
-          make_entity_config("entity-b", ["ch-2"]),
-        ],
+        [make_entity_config("entity-a", ["ch-1"]), make_entity_config("entity-b", ["ch-2"])],
       );
 
       expect(p.get_resume_candidates()).toHaveLength(2);
@@ -1021,12 +1194,12 @@ describe("BotPool persistence", () => {
 
       // Both bots should be assigned
       const bots = p.get_bots();
-      expect(bots.find(b => b.id === 1)!.state).toBe("assigned");
-      expect(bots.find(b => b.id === 2)!.state).toBe("assigned");
+      expect(bots.find((b) => b.id === 1)!.state).toBe("assigned");
+      expect(bots.find((b) => b.id === 2)!.state).toBe("assigned");
 
       // Two events emitted
       expect(events).toHaveLength(2);
-      expect(events.map(e => e.bot_id).sort()).toEqual([1, 2]);
+      expect(events.map((e) => e.bot_id).sort()).toEqual([1, 2]);
     });
 
     it("after resume, persist() reflects correct assigned state", async () => {
@@ -1050,7 +1223,7 @@ describe("BotPool persistence", () => {
 
       // Re-read persisted state from disk
       const saved = await load_pool_state(cfg);
-      const bot_entry = saved.bots.find(b => b.id === 1);
+      const bot_entry = saved.bots.find((b) => b.id === 1);
       expect(bot_entry).toBeDefined();
       expect(bot_entry!.state).toBe("assigned");
       expect(bot_entry!.channel_id).toBe("ch-1");
@@ -1075,7 +1248,9 @@ describe("BotPool persistence", () => {
       );
 
       const events: Array<{ bot_id: number; channel_id: string; entity_id: string }> = [];
-      p.on("bot:resumed", (evt: { bot_id: number; channel_id: string; entity_id: string }) => events.push(evt));
+      p.on("bot:resumed", (evt: { bot_id: number; channel_id: string; entity_id: string }) =>
+        events.push(evt),
+      );
 
       await p.resume_parked_bots();
 
@@ -1121,16 +1296,19 @@ describe("BotPool persistence", () => {
       // session survives, the Claude process inside has a dead MCP connection.
       // The resume path must kill the old tmux and spawn fresh with --resume.
       const cfg = make_config();
-      await save_pool_state([
-        make_persisted_bot({
-          id: 1,
-          state: "assigned",
-          channel_id: "ch-1",
-          entity_id: "test-entity",
-          archetype: "builder",
-          session_id: "sess-stale",
-        }),
-      ], cfg);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "builder",
+            session_id: "sess-stale",
+          }),
+        ],
+        cfg,
+      );
 
       const dir = join(temp_dir, "channels", "pool-1");
       await mkdir(dir, { recursive: true });
@@ -1138,20 +1316,25 @@ describe("BotPool persistence", () => {
 
       const p = new TestBotPool(cfg);
       // tmux IS alive — the old session survived the restart
-      vi.spyOn(p as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(true);
-      const kill_spy = vi.spyOn(p as unknown as Record<string, unknown>, "kill_tmux" as never)
+      vi.spyOn(p as unknown as Record<string, unknown>, "is_tmux_alive" as never).mockReturnValue(
+        true,
+      );
+      const kill_spy = vi
+        .spyOn(p as unknown as Record<string, unknown>, "kill_tmux" as never)
         .mockImplementation(() => {});
-      vi.spyOn(p as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-        .mockResolvedValue(undefined);
-      const start_spy = vi.spyOn(p as unknown as Record<string, unknown>, "start_tmux" as never)
+      vi.spyOn(
+        p as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        p as unknown as Record<string, unknown>,
+        "set_bot_nickname" as never,
+      ).mockResolvedValue(undefined);
+      const start_spy = vi
+        .spyOn(p as unknown as Record<string, unknown>, "start_tmux" as never)
         .mockResolvedValue(undefined);
 
-      const reg = make_registry([
-        make_entity_config("test-entity", ["ch-1"]),
-      ]);
+      const reg = make_registry([make_entity_config("test-entity", ["ch-1"])]);
       await p.initialize(reg);
 
       // Bot is "assigned" because tmux is alive, but should be queued for resume
@@ -1160,7 +1343,9 @@ describe("BotPool persistence", () => {
       expect(p.get_resume_candidates()).toHaveLength(1);
 
       const events: Array<{ bot_id: number; channel_id: string; entity_id: string }> = [];
-      p.on("bot:resumed", (evt: { bot_id: number; channel_id: string; entity_id: string }) => events.push(evt));
+      p.on("bot:resumed", (evt: { bot_id: number; channel_id: string; entity_id: string }) =>
+        events.push(evt),
+      );
 
       await p.resume_parked_bots();
 
@@ -1169,13 +1354,13 @@ describe("BotPool persistence", () => {
 
       // Fresh tmux was spawned with --resume session_id
       const start_calls = (start_spy as unknown as { mock: { calls: unknown[][] } }).mock.calls;
-      const resume_call = start_calls.find(c => c[4] === "sess-stale");
+      const resume_call = start_calls.find((c) => c[4] === "sess-stale");
       expect(resume_call).toBeDefined();
       expect(resume_call![5]).toBe(true); // is_resume = true
 
       // Bot is still assigned with correct metadata
       const bots_after = p.get_bots();
-      const bot = bots_after.find(b => b.id === 1)!;
+      const bot = bots_after.find((b) => b.id === 1)!;
       expect(bot.state).toBe("assigned");
       expect(bot.channel_id).toBe("ch-1");
       expect(bot.session_id).toBe("sess-stale");
@@ -1197,16 +1382,19 @@ describe("BotPool persistence", () => {
       // Edge case: tmux was alive during initialize() but died before
       // resume_parked_bots() runs. kill_tmux is a no-op, spawn still works.
       const cfg = make_config();
-      await save_pool_state([
-        make_persisted_bot({
-          id: 1,
-          state: "assigned",
-          channel_id: "ch-1",
-          entity_id: "test-entity",
-          archetype: "planner",
-          session_id: "sess-died",
-        }),
-      ], cfg);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "planner",
+            session_id: "sess-died",
+          }),
+        ],
+        cfg,
+      );
 
       const dir = join(temp_dir, "channels", "pool-1");
       await mkdir(dir, { recursive: true });
@@ -1214,22 +1402,29 @@ describe("BotPool persistence", () => {
 
       const p = new TestBotPool(cfg);
       // tmux alive during init, so bot gets "assigned" state
-      const tmux_spy = vi.spyOn(p as unknown as Record<string, unknown>, "is_tmux_alive" as never)
+      const tmux_spy = vi
+        .spyOn(p as unknown as Record<string, unknown>, "is_tmux_alive" as never)
         .mockReturnValue(true);
-      vi.spyOn(p as unknown as Record<string, unknown>, "kill_tmux" as never)
-        .mockImplementation(() => {});
-      vi.spyOn(p as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(p as unknown as Record<string, unknown>, "set_bot_avatar" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(p as unknown as Record<string, unknown>, "start_tmux" as never)
-        .mockResolvedValue(undefined);
+      vi.spyOn(p as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+        () => {},
+      );
+      vi.spyOn(
+        p as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        p as unknown as Record<string, unknown>,
+        "set_bot_nickname" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        p as unknown as Record<string, unknown>,
+        "set_bot_avatar" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(p as unknown as Record<string, unknown>, "start_tmux" as never).mockResolvedValue(
+        undefined,
+      );
 
-      const reg = make_registry([
-        make_entity_config("test-entity", ["ch-1"]),
-      ]);
+      const reg = make_registry([make_entity_config("test-entity", ["ch-1"])]);
       await p.initialize(reg);
 
       expect(p.get_resume_candidates()).toHaveLength(1);
@@ -1290,14 +1485,19 @@ describe("BotPool persistence", () => {
       // NO persisted state — pool-state.json doesn't exist
 
       const pool = new TestBotPool(cfg);
-      const kill_spy = vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
+      const kill_spy = vi
+        .spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
         .mockImplementation(() => {});
-      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
 
       // tmux IS alive — this creates the zombie scenario
-      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(true);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(true);
 
       await pool.initialize();
 
@@ -1321,26 +1521,34 @@ describe("BotPool persistence", () => {
       await writeFile(join(dir, ".env"), "DISCORD_BOT_TOKEN=fake-token", "utf-8");
 
       // Persisted state exists for this bot
-      await save_pool_state([
-        make_persisted_bot({
-          id: 1,
-          state: "assigned",
-          channel_id: "ch-1",
-          entity_id: "test-entity",
-          archetype: "builder",
-          session_id: "sess-live",
-        }),
-      ], cfg);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "builder",
+            session_id: "sess-live",
+          }),
+        ],
+        cfg,
+      );
 
       const pool = new TestBotPool(cfg);
-      const kill_spy = vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
+      const kill_spy = vi
+        .spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
         .mockImplementation(() => {});
-      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
 
       // tmux is alive AND persisted state exists — not an orphan
-      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(true);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(true);
 
       await pool.initialize();
 
@@ -1365,26 +1573,34 @@ describe("BotPool persistence", () => {
       }
 
       // Only bot 1 has persisted state — bots 2 and 3 are orphans
-      await save_pool_state([
-        make_persisted_bot({
-          id: 1,
-          state: "assigned",
-          channel_id: "ch-1",
-          entity_id: "test-entity",
-          archetype: "builder",
-          session_id: "sess-1",
-        }),
-      ], cfg);
+      await save_pool_state(
+        [
+          make_persisted_bot({
+            id: 1,
+            state: "assigned",
+            channel_id: "ch-1",
+            entity_id: "test-entity",
+            archetype: "builder",
+            session_id: "sess-1",
+          }),
+        ],
+        cfg,
+      );
 
       const pool = new TestBotPool(cfg);
-      const kill_spy = vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
+      const kill_spy = vi
+        .spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
         .mockImplementation(() => {});
-      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
 
       // All three tmux sessions are alive
-      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(true);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(true);
 
       await pool.initialize();
 
@@ -1392,16 +1608,16 @@ describe("BotPool persistence", () => {
       expect(bots).toHaveLength(3);
 
       // Bot 1: has persisted state — stays assigned
-      const bot1 = bots.find(b => b.id === 1)!;
+      const bot1 = bots.find((b) => b.id === 1)!;
       expect(bot1.state).toBe("assigned");
       expect(bot1.channel_id).toBe("ch-1");
 
       // Bots 2 and 3: orphans — freed
-      const bot2 = bots.find(b => b.id === 2)!;
+      const bot2 = bots.find((b) => b.id === 2)!;
       expect(bot2.state).toBe("free");
       expect(bot2.channel_id).toBeNull();
 
-      const bot3 = bots.find(b => b.id === 3)!;
+      const bot3 = bots.find((b) => b.id === 3)!;
       expect(bot3.state).toBe("free");
       expect(bot3.channel_id).toBeNull();
 
@@ -1420,10 +1636,13 @@ describe("BotPool persistence", () => {
       const pool = new TestBotPool(cfg);
 
       // Stub side effects
-      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-        .mockImplementation(() => {});
-      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
+      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+        () => {},
+      );
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
 
       // Inject a zombie bot: assigned but no metadata
       pool.inject_bots([
@@ -1437,13 +1656,17 @@ describe("BotPool persistence", () => {
       ]);
 
       // tmux is dead — health monitor should free it
-      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
       const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
 
       // Call check_assigned_health directly
-      await (pool as unknown as { check_assigned_health: () => Promise<void> }).check_assigned_health();
+      await (
+        pool as unknown as { check_assigned_health: () => Promise<void> }
+      ).check_assigned_health();
 
       // Bot should be freed
       const bots = pool.get_bots();
@@ -1451,7 +1674,7 @@ describe("BotPool persistence", () => {
 
       // Should log the orphan message (not the session history stash message)
       const orphan_log = log_spy.mock.calls.find(
-        call => typeof call[0] === "string" && call[0].includes("Freeing orphan pool-5"),
+        (call) => typeof call[0] === "string" && call[0].includes("Freeing orphan pool-5"),
       );
       expect(orphan_log).toBeDefined();
 
@@ -1462,10 +1685,13 @@ describe("BotPool persistence", () => {
       const cfg = make_config();
       const pool = new TestBotPool(cfg);
 
-      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-        .mockImplementation(() => {});
-      vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
+      vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+        () => {},
+      );
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
 
       // Inject a properly-assigned bot
       pool.inject_bots([
@@ -1479,21 +1705,25 @@ describe("BotPool persistence", () => {
       ]);
 
       // tmux is dead
-      vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
       const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
 
-      await (pool as unknown as { check_assigned_health: () => Promise<void> }).check_assigned_health();
+      await (
+        pool as unknown as { check_assigned_health: () => Promise<void> }
+      ).check_assigned_health();
 
       // Should log session history stash (not orphan message)
       const stash_log = log_spy.mock.calls.find(
-        call => typeof call[0] === "string" && call[0].includes("Stashed session history"),
+        (call) => typeof call[0] === "string" && call[0].includes("Stashed session history"),
       );
       expect(stash_log).toBeDefined();
 
       const orphan_log = log_spy.mock.calls.find(
-        call => typeof call[0] === "string" && call[0].includes("Freeing orphan pool-5"),
+        (call) => typeof call[0] === "string" && call[0].includes("Freeing orphan pool-5"),
       );
       expect(orphan_log).toBeUndefined();
 
@@ -1515,9 +1745,7 @@ describe("atomic persistence", () => {
 
   it("save_pool_state leaves no temp files behind", async () => {
     const config = make_config();
-    const bots: PersistedPoolBot[] = [
-      make_persisted_bot({ id: 1, session_id: "sess-1" }),
-    ];
+    const bots: PersistedPoolBot[] = [make_persisted_bot({ id: 1, session_id: "sess-1" })];
 
     await save_pool_state(bots, config);
 
@@ -1525,7 +1753,7 @@ describe("atomic persistence", () => {
     const state_path = join(temp_dir, "state");
     const files = await readdir(state_path);
     expect(files).toEqual(["pool-state.json"]);
-    expect(files.some(f => f.endsWith(".tmp"))).toBe(false);
+    expect(files.some((f) => f.endsWith(".tmp"))).toBe(false);
 
     // Verify data is intact
     const loaded = await load_pool_state(config);
@@ -1537,16 +1765,10 @@ describe("atomic persistence", () => {
     const config = make_config();
 
     // Write initial state
-    await save_pool_state(
-      [make_persisted_bot({ id: 1, session_id: "sess-first" })],
-      config,
-    );
+    await save_pool_state([make_persisted_bot({ id: 1, session_id: "sess-first" })], config);
 
     // Overwrite with new state
-    await save_pool_state(
-      [make_persisted_bot({ id: 2, session_id: "sess-second" })],
-      config,
-    );
+    await save_pool_state([make_persisted_bot({ id: 2, session_id: "sess-second" })], config);
 
     // Should only have the latest state
     const loaded = await load_pool_state(config);
@@ -1562,19 +1784,22 @@ describe("atomic persistence", () => {
   it("save_pr_reviews uses atomic write (no temp files left)", async () => {
     const config = make_config();
 
-    await save_pr_reviews({
-      "e1:42": {
-        entity_id: "e1",
-        pr_number: 42,
-        reviewed_at: "2026-03-29T10:00:00Z",
-        outcome: "approved",
+    await save_pr_reviews(
+      {
+        "e1:42": {
+          entity_id: "e1",
+          pr_number: 42,
+          reviewed_at: "2026-03-29T10:00:00Z",
+          outcome: "approved",
+        },
       },
-    }, config);
+      config,
+    );
 
     const state_path = join(temp_dir, "state");
     const files = await readdir(state_path);
     expect(files).toEqual(["pr-reviews.json"]);
-    expect(files.some(f => f.endsWith(".tmp"))).toBe(false);
+    expect(files.some((f) => f.endsWith(".tmp"))).toBe(false);
 
     // Verify data is intact
     const loaded = await load_pr_reviews(config);

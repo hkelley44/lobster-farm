@@ -1,23 +1,23 @@
 import type { Server } from "node:http";
-import { load_config } from "./config.js";
-import { EntityRegistry } from "./registry.js";
-import { ClaudeSessionManager } from "./session.js";
-import type { ActiveSession, SessionResult } from "./session.js";
-import { TaskQueue } from "./queue.js";
-import { DiscordBot, resolve_bot_token } from "./discord.js";
 import { set_discord_bot, set_pool } from "./actions.js";
-import { start_server } from "./server.js";
-import { write_pid, remove_pid } from "./pid.js";
 import { CommanderProcess } from "./commander-process.js";
+import { load_config } from "./config.js";
+import { DiscordBot, resolve_bot_token } from "./discord.js";
+import { check_required_binaries, propagate_tmux_env } from "./env.js";
+import { init_github_app_from_env } from "./github-app.js";
+import { prune_daily_logs } from "./memory-pruning.js";
+import { append_session_log } from "./persistence.js";
+import { remove_pid, write_pid } from "./pid.js";
 import { BotPool } from "./pool.js";
 import { PRReviewCron } from "./pr-cron.js";
 import { PRWatchStore } from "./pr-watches.js";
-import { init_github_app_from_env } from "./github-app.js";
-import { check_required_binaries, propagate_tmux_env } from "./env.js";
-import { append_session_log } from "./persistence.js";
-import { sweep_stale_worktrees } from "./worktree-cleanup.js";
-import { prune_daily_logs } from "./memory-pruning.js";
+import { TaskQueue } from "./queue.js";
+import { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
+import { start_server } from "./server.js";
+import { ClaudeSessionManager } from "./session.js";
+import type { ActiveSession, SessionResult } from "./session.js";
+import { sweep_stale_worktrees } from "./worktree-cleanup.js";
 
 async function main(): Promise<void> {
   console.log("Starting LobsterFarm daemon...");
@@ -67,20 +67,24 @@ async function main(): Promise<void> {
     queue_session_meta.set(session.session_id, meta);
 
     // Log session start
-    void append_session_log(session.entity_id, {
-      session_id: session.session_id,
-      entity_id: session.entity_id,
-      feature_id: session.feature_id,
-      archetype: session.archetype,
-      phase: null,
-      source: "queue",
-      started_at: meta.started_at,
-      ended_at: null,
-      exit_code: null,
-      duration_ms: null,
-      bot_id: null,
-      resume: session.resume,
-    }, config);
+    void append_session_log(
+      session.entity_id,
+      {
+        session_id: session.session_id,
+        entity_id: session.entity_id,
+        feature_id: session.feature_id,
+        archetype: session.archetype,
+        phase: null,
+        source: "queue",
+        started_at: meta.started_at,
+        ended_at: null,
+        exit_code: null,
+        duration_ms: null,
+        bot_id: null,
+        resume: session.resume,
+      },
+      config,
+    );
   });
 
   session_manager.on("session:completed", (result: SessionResult) => {
@@ -90,20 +94,24 @@ async function main(): Promise<void> {
     // Log session completion
     if (meta) {
       const now = new Date().toISOString();
-      void append_session_log(meta.entity_id, {
-        session_id: result.session_id,
-        entity_id: meta.entity_id,
-        feature_id: meta.feature_id,
-        archetype: meta.archetype,
-        phase: null,
-        source: "queue",
-        started_at: meta.started_at,
-        ended_at: now,
-        exit_code: result.exit_code,
-        duration_ms: Date.now() - meta.start_ms,
-        bot_id: null,
-        resume: meta.resume,
-      }, config);
+      void append_session_log(
+        meta.entity_id,
+        {
+          session_id: result.session_id,
+          entity_id: meta.entity_id,
+          feature_id: meta.feature_id,
+          archetype: meta.archetype,
+          phase: null,
+          source: "queue",
+          started_at: meta.started_at,
+          ended_at: now,
+          exit_code: result.exit_code,
+          duration_ms: Date.now() - meta.start_ms,
+          bot_id: null,
+          resume: meta.resume,
+        },
+        config,
+      );
     }
   });
 
@@ -114,20 +122,24 @@ async function main(): Promise<void> {
     // Log session failure
     if (meta) {
       const now = new Date().toISOString();
-      void append_session_log(meta.entity_id, {
-        session_id,
-        entity_id: meta.entity_id,
-        feature_id: meta.feature_id,
-        archetype: meta.archetype,
-        phase: null,
-        source: "queue",
-        started_at: meta.started_at,
-        ended_at: now,
-        exit_code: 1,
-        duration_ms: Date.now() - meta.start_ms,
-        bot_id: null,
-        resume: meta.resume,
-      }, config);
+      void append_session_log(
+        meta.entity_id,
+        {
+          session_id,
+          entity_id: meta.entity_id,
+          feature_id: meta.feature_id,
+          archetype: meta.archetype,
+          phase: null,
+          source: "queue",
+          started_at: meta.started_at,
+          ended_at: now,
+          exit_code: 1,
+          duration_ms: Date.now() - meta.start_ms,
+          bot_id: null,
+          resume: meta.resume,
+        },
+        config,
+      );
     }
   });
 
@@ -223,7 +235,9 @@ async function main(): Promise<void> {
   if (github_app) {
     console.log("[github-app] Webhook-driven PR reviews enabled");
   } else {
-    console.log("[github-app] Not configured — webhook endpoint will accept but not process events");
+    console.log(
+      "[github-app] Not configured — webhook endpoint will accept but not process events",
+    );
   }
 
   // Initialize PR watch store (persisted across restarts)
@@ -231,7 +245,17 @@ async function main(): Promise<void> {
   await pr_watches.initialize();
 
   // Start HTTP server
-  const server = start_server(registry, config, session_manager, queue, commander, discord_connected ? discord : null, pool, github_app, pr_watches);
+  const server = start_server(
+    registry,
+    config,
+    session_manager,
+    queue,
+    commander,
+    discord_connected ? discord : null,
+    pool,
+    github_app,
+    pr_watches,
+  );
 
   // Start PR review cron (safety net — 30 min when webhooks are active, 5 min otherwise)
   const pr_cron = new PRReviewCron(
@@ -320,8 +344,12 @@ async function main(): Promise<void> {
     // Check for active work
     const work_check = pool.has_active_work();
     if (work_check.active) {
-      const names = work_check.working_bots.map(b => `${b.archetype} (pool-${String(b.id)})`).join(", ");
-      console.log(`[shutdown] Draining — ${String(work_check.working_bots.length)} agent(s) still working: ${names}`);
+      const names = work_check.working_bots
+        .map((b) => `${b.archetype} (pool-${String(b.id)})`)
+        .join(", ");
+      console.log(
+        `[shutdown] Draining — ${String(work_check.working_bots.length)} agent(s) still working: ${names}`,
+      );
 
       // Notify command center
       if (discord_connected) {
@@ -330,12 +358,14 @@ async function main(): Promise<void> {
             config.discord?.server_id ? "" : "",
             `Daemon shutting down — waiting for ${String(work_check.working_bots.length)} active agent(s) to finish: ${names}. Send another signal to force.`,
           );
-        } catch { /* best effort */ }
+        } catch {
+          /* best effort */
+        }
       }
 
       // Wait indefinitely for agents to finish (second SIGTERM forces)
       while (true) {
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        await new Promise((resolve) => setTimeout(resolve, 5000));
         const recheck = pool.has_active_work();
         if (!recheck.active) {
           console.log("[shutdown] All agents idle. Proceeding with shutdown.");

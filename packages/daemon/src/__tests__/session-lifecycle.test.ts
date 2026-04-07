@@ -1,6 +1,6 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
-import type { LobsterFarmConfig, ArchetypeRole, ChannelType } from "@lobster-farm/shared";
+import type { ArchetypeRole, ChannelType, LobsterFarmConfig } from "@lobster-farm/shared";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
+import { describe, expect, it } from "vitest";
 
 // ── Test helpers ──
 
@@ -58,7 +58,7 @@ describe("Pool — park-and-resume", () => {
     let resume_session_id: string | undefined;
 
     const returning = bots.find(
-      b => b.state === "parked" && b.channel_id === channel_id && b.entity_id === entity_id,
+      (b) => b.state === "parked" && b.channel_id === channel_id && b.entity_id === entity_id,
     );
 
     if (returning) {
@@ -81,7 +81,7 @@ describe("Pool — park-and-resume", () => {
     ];
 
     const returning = bots.find(
-      b => b.state === "parked" && b.channel_id === "chan-999" && b.entity_id === "alpha",
+      (b) => b.state === "parked" && b.channel_id === "chan-999" && b.entity_id === "alpha",
     );
 
     expect(returning).toBeUndefined();
@@ -158,12 +158,7 @@ describe("Discord — !reset interception", () => {
   });
 
   it("does NOT match partial !reset in longer messages", () => {
-    const not_reset = [
-      "!resetall",
-      "!reset me",
-      "please !reset",
-      "!resetting",
-    ];
+    const not_reset = ["!resetall", "!reset me", "please !reset", "!resetting"];
     for (const msg of not_reset) {
       expect(msg.trim().toLowerCase()).not.toBe("!reset");
     }

@@ -1,20 +1,20 @@
-import { EventEmitter } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { writeFile, readFile, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { EventEmitter } from "node:events";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
-import { lobsterfarm_dir, entity_dir, DEFAULT_ARCHETYPES } from "@lobster-farm/shared";
+import { DEFAULT_ARCHETYPES, entity_dir, lobsterfarm_dir } from "@lobster-farm/shared";
 import type { ChannelType } from "@lobster-farm/shared";
-import { save_pool_state, load_pool_state } from "./persistence.js";
-import type { PersistedPoolBot, PersistedBotAvatarState } from "./persistence.js";
-import type { EntityRegistry } from "./registry.js";
-import { resolve_model_id, resolve_effort } from "./models.js";
-import { sq } from "./shell.js";
-import { resolve_binary } from "./env.js";
-import * as sentry from "./sentry.js";
 import { notify } from "./actions.js";
+import { resolve_binary } from "./env.js";
+import { resolve_effort, resolve_model_id } from "./models.js";
+import { load_pool_state, save_pool_state } from "./persistence.js";
+import type { PersistedBotAvatarState, PersistedPoolBot } from "./persistence.js";
+import type { EntityRegistry } from "./registry.js";
+import * as sentry from "./sentry.js";
+import { sq } from "./shell.js";
 
 // ── Types ──
 
@@ -72,31 +72,37 @@ export type ActivityState = "idle" | "working" | "waiting_for_human" | "active_c
 
 // ── Agent name resolution ──
 
-function resolve_agent_name(
-  archetype: ArchetypeRole,
-  config: LobsterFarmConfig,
-): string {
+function resolve_agent_name(archetype: ArchetypeRole, config: LobsterFarmConfig): string {
   switch (archetype) {
-    case "planner": return config.agents.planner.name.toLowerCase();
-    case "designer": return config.agents.designer.name.toLowerCase();
-    case "builder": return config.agents.builder.name.toLowerCase();
-    case "operator": return config.agents.operator.name.toLowerCase();
-    case "commander": return config.agents.commander.name.toLowerCase();
-    case "reviewer": return "reviewer";
+    case "planner":
+      return config.agents.planner.name.toLowerCase();
+    case "designer":
+      return config.agents.designer.name.toLowerCase();
+    case "builder":
+      return config.agents.builder.name.toLowerCase();
+    case "operator":
+      return config.agents.operator.name.toLowerCase();
+    case "commander":
+      return config.agents.commander.name.toLowerCase();
+    case "reviewer":
+      return "reviewer";
   }
 }
 
-function resolve_agent_display_name(
-  archetype: ArchetypeRole,
-  config: LobsterFarmConfig,
-): string {
+function resolve_agent_display_name(archetype: ArchetypeRole, config: LobsterFarmConfig): string {
   switch (archetype) {
-    case "planner": return config.agents.planner.name;
-    case "designer": return config.agents.designer.name;
-    case "builder": return config.agents.builder.name;
-    case "operator": return config.agents.operator.name;
-    case "commander": return config.agents.commander.name;
-    case "reviewer": return "Reviewer";
+    case "planner":
+      return config.agents.planner.name;
+    case "designer":
+      return config.agents.designer.name;
+    case "builder":
+      return config.agents.builder.name;
+    case "operator":
+      return config.agents.operator.name;
+    case "commander":
+      return config.agents.commander.name;
+    case "reviewer":
+      return "Reviewer";
   }
 }
 
@@ -213,13 +219,13 @@ export class BotPool extends EventEmitter {
 
     // Sort by number
     pool_dirs.sort((a, b) => {
-      const num_a = parseInt(a.replace("pool-", ""), 10);
-      const num_b = parseInt(b.replace("pool-", ""), 10);
+      const num_a = Number.parseInt(a.replace("pool-", ""), 10);
+      const num_b = Number.parseInt(b.replace("pool-", ""), 10);
       return num_a - num_b;
     });
 
     for (const dir_name of pool_dirs) {
-      const id = parseInt(dir_name.replace("pool-", ""), 10);
+      const id = Number.parseInt(dir_name.replace("pool-", ""), 10);
       const state_dir = join(channels_dir, dir_name);
 
       // Verify the bot has a token and extract its user ID for nickname management.
@@ -267,11 +273,13 @@ export class BotPool extends EventEmitter {
     // Restore persisted assignments from last run
     const saved_state = await load_pool_state(this.config);
     if (saved_state.bots.length > 0) {
-      console.log(`[pool] Loaded ${String(saved_state.bots.length)} saved bot entries from pool-state.json`);
+      console.log(
+        `[pool] Loaded ${String(saved_state.bots.length)} saved bot entries from pool-state.json`,
+      );
       for (const entry of saved_state.bots) {
         console.log(
           `[pool]   pool-${String(entry.id)}: state=${entry.state}, ` +
-          `channel=${entry.channel_id}, session=${entry.session_id?.slice(0, 8) ?? "none"}`,
+            `channel=${entry.channel_id}, session=${entry.session_id?.slice(0, 8) ?? "none"}`,
         );
       }
     } else {
@@ -296,7 +304,7 @@ export class BotPool extends EventEmitter {
     // avatar persists even when the bot is released from the pool.
     const avatar_entries = saved_state.avatar_state ?? {};
     for (const [id_str, avatar_info] of Object.entries(avatar_entries)) {
-      const bot = this.bots.find(b => b.id === parseInt(id_str, 10));
+      const bot = this.bots.find((b) => b.id === Number.parseInt(id_str, 10));
       if (!bot) continue;
       bot.last_avatar_archetype = avatar_info.archetype;
       bot.last_avatar_set_at = new Date(avatar_info.set_at);
@@ -307,22 +315,25 @@ export class BotPool extends EventEmitter {
     }
 
     for (const entry of saved_state.bots) {
-      const bot = this.bots.find(b => b.id === entry.id);
+      const bot = this.bots.find((b) => b.id === entry.id);
       if (!bot) continue; // Bot directory removed since last run
 
       // Validate entity/channel still exist (if registry available)
       if (registry && !this.validate_saved_entry(entry, registry)) {
         console.log(
-          `[pool] Skipping stale entry for pool-${String(entry.id)}: ` +
-          `entity/channel no longer configured`,
+          `[pool] Skipping stale entry for pool-${String(entry.id)}: entity/channel no longer configured`,
         );
         continue;
       }
 
       // Restore model/effort — fall back to archetype defaults for older pool-state.json
       // files that don't have these fields yet.
-      const restored_model = entry.model ?? (entry.archetype ? resolve_model_id(DEFAULT_ARCHETYPES[entry.archetype]) : null);
-      const restored_effort = entry.effort ?? (entry.archetype ? resolve_effort(DEFAULT_ARCHETYPES[entry.archetype].think) : null);
+      const restored_model =
+        entry.model ??
+        (entry.archetype ? resolve_model_id(DEFAULT_ARCHETYPES[entry.archetype]) : null);
+      const restored_effort =
+        entry.effort ??
+        (entry.archetype ? resolve_effort(DEFAULT_ARCHETYPES[entry.archetype].think) : null);
 
       if (bot.state === "assigned") {
         // tmux is still running (survived restart, e.g. launchd) — restore metadata.
@@ -346,7 +357,7 @@ export class BotPool extends EventEmitter {
           this.resume_candidates.push(entry);
           console.log(
             `[pool] pool-${String(bot.id)} has live tmux but stale MCP — ` +
-            `queued for fresh resume (session: ${entry.session_id.slice(0, 8)})`,
+              `queued for fresh resume (session: ${entry.session_id.slice(0, 8)})`,
           );
         }
       } else {
@@ -426,8 +437,7 @@ export class BotPool extends EventEmitter {
     for (const bot of this.bots) {
       if (bot.state === "assigned" && !bot.channel_id) {
         console.log(
-          `[pool] Killing orphan tmux for pool-${String(bot.id)} ` +
-          `(no persisted state — leftover from crash)`,
+          `[pool] Killing orphan tmux for pool-${String(bot.id)} (no persisted state — leftover from crash)`,
         );
         this.kill_tmux(bot.tmux_session);
         bot.state = "free";
@@ -438,7 +448,9 @@ export class BotPool extends EventEmitter {
 
     // Warn once if user_id is missing — rather than on every write_access_json call
     if (!this.config.discord?.user_id) {
-      console.warn("[pool] discord.user_id not set in config — pool bot DM allowlist will be empty. Run `lf init` to configure.");
+      console.warn(
+        "[pool] discord.user_id not set in config — pool bot DM allowlist will be empty. Run `lf init` to configure.",
+      );
     }
 
     // Persist cleaned state (stale entries removed, duplicates resolved, current snapshot)
@@ -446,9 +458,9 @@ export class BotPool extends EventEmitter {
 
     console.log(
       `[pool] Initialized ${String(this.bots.length)} pool bots ` +
-      `(${String(this.bots.filter(b => b.state === "free").length)} free, ` +
-      `${String(this.bots.filter(b => b.state === "parked").length)} parked, ` +
-      `${String(this.bots.filter(b => b.state === "assigned").length)} assigned)`,
+        `(${String(this.bots.filter((b) => b.state === "free").length)} free, ` +
+        `${String(this.bots.filter((b) => b.state === "parked").length)} parked, ` +
+        `${String(this.bots.filter((b) => b.state === "assigned").length)} assigned)`,
     );
   }
 
@@ -464,8 +476,7 @@ export class BotPool extends EventEmitter {
     if (this.resume_candidates.length === 0) return;
 
     console.log(
-      `[pool] Proactively resuming ${String(this.resume_candidates.length)} bot(s) ` +
-      `that were assigned before shutdown`,
+      `[pool] Proactively resuming ${String(this.resume_candidates.length)} bot(s) that were assigned before shutdown`,
     );
 
     let resumed = 0;
@@ -473,9 +484,10 @@ export class BotPool extends EventEmitter {
       // Match both parked bots (tmux died) and assigned bots (tmux survived but
       // has stale MCP connection). Both need a fresh Claude process with --resume.
       const bot = this.bots.find(
-        b => b.id === candidate.id
-          && (b.state === "parked" || b.state === "assigned")
-          && b.channel_id === candidate.channel_id,
+        (b) =>
+          b.id === candidate.id &&
+          (b.state === "parked" || b.state === "assigned") &&
+          b.channel_id === candidate.channel_id,
       );
       if (!bot) continue;
 
@@ -487,8 +499,7 @@ export class BotPool extends EventEmitter {
         // This is safe even if the tmux session is already dead.
         if (had_live_tmux) {
           console.log(
-            `[pool] Killing stale tmux for pool-${String(bot.id)} ` +
-            `(MCP connection is dead after daemon restart)`,
+            `[pool] Killing stale tmux for pool-${String(bot.id)} (MCP connection is dead after daemon restart)`,
           );
         }
         this.kill_tmux(bot.tmux_session);
@@ -508,14 +519,24 @@ export class BotPool extends EventEmitter {
           try {
             extra_env.GH_TOKEN = await this.resolve_op_secret(github_token_ref);
           } catch (err) {
-            console.warn(`[pool] Failed to resolve GH_TOKEN for ${candidate.entity_id}: ${String(err)}`);
+            console.warn(
+              `[pool] Failed to resolve GH_TOKEN for ${candidate.entity_id}: ${String(err)}`,
+            );
           }
         }
 
         // Spawn a fresh Claude process with --resume — establishes a new MCP
         // connection to this daemon while preserving conversation context
         const working_dir = entity_dir(this.config.paths, candidate.entity_id);
-        await this.start_tmux(bot, candidate.archetype, candidate.entity_id, working_dir, candidate.session_id!, true, extra_env);
+        await this.start_tmux(
+          bot,
+          candidate.archetype,
+          candidate.entity_id,
+          working_dir,
+          candidate.session_id!,
+          true,
+          extra_env,
+        );
 
         // Update bot state to assigned
         bot.state = "assigned";
@@ -525,8 +546,8 @@ export class BotPool extends EventEmitter {
         resumed++;
         console.log(
           `[pool] Resumed pool-${String(bot.id)} with fresh MCP connection ` +
-          `(session: ${candidate.session_id!.slice(0, 8)}, ` +
-          `was: ${had_live_tmux ? "stale tmux" : "parked"})`,
+            `(session: ${candidate.session_id!.slice(0, 8)}, ` +
+            `was: ${had_live_tmux ? "stale tmux" : "parked"})`,
         );
 
         this.emit("bot:resumed", {
@@ -537,18 +558,18 @@ export class BotPool extends EventEmitter {
 
         // Bridge a continuation nudge so the resumed session doesn't sit idle.
         // Fire-and-forget — don't let a nudge failure block the resume loop.
-        this.bridge_resume_nudge(bot).catch(nudge_err => {
+        this.bridge_resume_nudge(bot).catch((nudge_err) => {
           console.warn(
             `[pool] Failed to nudge pool-${String(bot.id)} after resume: ${String(nudge_err)}`,
           );
         });
       } catch (err) {
-        console.error(
-          `[pool] Failed to resume pool-${String(bot.id)}: ${String(err)}`,
-        );
+        console.error(`[pool] Failed to resume pool-${String(bot.id)}: ${String(err)}`);
         sentry.captureException(err, {
           tags: { module: "pool", bot_id: String(bot.id) },
-          contexts: { resume: { entity_id: candidate.entity_id, session_id: candidate.session_id } },
+          contexts: {
+            resume: { entity_id: candidate.entity_id, session_id: candidate.session_id },
+          },
         });
         // Leave the bot in its current state — parked bots can still be resumed
         // on next message; assigned bots with dead tmux will be caught by health monitor
@@ -580,7 +601,7 @@ export class BotPool extends EventEmitter {
     }
 
     // Check if this channel already has an assignment
-    const existing = this.bots.find(b => b.channel_id === channel_id && b.state === "assigned");
+    const existing = this.bots.find((b) => b.channel_id === channel_id && b.state === "assigned");
     if (existing) {
       console.log(`[pool] Channel ${channel_id} already assigned to pool-${String(existing.id)}`);
       return {
@@ -604,38 +625,41 @@ export class BotPool extends EventEmitter {
     this.assigning_channels.add(channel_id);
 
     try {
+      // Resolve which session to resume — parameter, parked bot, or session history
+      let resolved_session_id = resume_session_id;
+
       // Check for a parked bot that was previously on this channel — auto-resume
       const returning = this.bots.find(
-        b => b.state === "parked" && b.channel_id === channel_id && b.entity_id === entity_id,
+        (b) => b.state === "parked" && b.channel_id === channel_id && b.entity_id === entity_id,
       );
       let bot: PoolBot | undefined;
       if (returning) {
-        resume_session_id = resume_session_id ?? returning.session_id ?? undefined;
+        resolved_session_id = resolved_session_id ?? returning.session_id ?? undefined;
         bot = returning;
         console.log(
           `[pool] Reclaiming parked bot pool-${String(bot.id)} for channel ${channel_id} ` +
-          `(session: ${resume_session_id?.slice(0, 8) ?? "fresh"})`,
+            `(session: ${resolved_session_id?.slice(0, 8) ?? "fresh"})`,
         );
       }
 
       // Check session_history for a previously evicted session on this channel.
       // Only used if no explicit resume_session_id was provided and no parked bot
       // was found (parked bots carry their own session_id).
-      if (!resume_session_id) {
+      if (!resolved_session_id) {
         const history_key = `${entity_id}:${channel_id}`;
         const history_session = this.session_history.get(history_key);
         if (history_session) {
-          resume_session_id = history_session;
+          resolved_session_id = history_session;
           console.log(
             `[pool] Found session history for channel ${channel_id}: ` +
-            `${resume_session_id.slice(0, 8)}`,
+              `${resolved_session_id.slice(0, 8)}`,
           );
         }
       }
 
       // Find a free bot if we don't have a returning one
       if (!bot) {
-        bot = this.bots.find(b => b.state === "free");
+        bot = this.bots.find((b) => b.state === "free");
       }
 
       // Activity-aware eviction: free → parked → idle assigned → waiting_for_human → FLOOR
@@ -649,20 +673,20 @@ export class BotPool extends EventEmitter {
 
       // Tier 2: Parked bots (cheapest eviction — already suspended)
       if (!bot) {
-        const parked = this.bots
-          .filter(b => b.state === "parked")
-          .sort(eviction_sort);
+        const parked = this.bots.filter((b) => b.state === "parked").sort(eviction_sort);
 
         if (parked.length > 0) {
           bot = parked[0];
-          console.log(`[pool] Evicting parked bot pool-${String(bot!.id)} (${bot!.channel_type ?? "unknown"} channel, LRU)`);
+          console.log(
+            `[pool] Evicting parked bot pool-${String(bot!.id)} (${bot!.channel_type ?? "unknown"} channel, LRU)`,
+          );
         }
       }
 
       // Tier 3: Idle assigned bots (>= 30 min since last human interaction)
       if (!bot) {
         const idle_assigned = this.bots
-          .filter(b => b.state === "assigned" && this.compute_activity_state(b) === "idle")
+          .filter((b) => b.state === "assigned" && this.compute_activity_state(b) === "idle")
           .sort(eviction_sort);
 
         if (idle_assigned.length > 0) {
@@ -675,7 +699,9 @@ export class BotPool extends EventEmitter {
       // Tier 4: Waiting-for-human bots (3-30 min since last interaction — expensive but necessary)
       if (!bot) {
         const waiting = this.bots
-          .filter(b => b.state === "assigned" && this.compute_activity_state(b) === "waiting_for_human")
+          .filter(
+            (b) => b.state === "assigned" && this.compute_activity_state(b) === "waiting_for_human",
+          )
           .sort(eviction_sort);
 
         if (waiting.length > 0) {
@@ -735,9 +761,17 @@ export class BotPool extends EventEmitter {
       // Start the tmux session — use override working_dir if provided (e.g., feature worktree)
       // For fresh sessions, generate a UUID so pool-state.json always has a session_id
       // for proactive resume on daemon restart.
-      const session_id = resume_session_id ?? randomUUID();
+      const session_id = resolved_session_id ?? randomUUID();
       const resolved_dir = working_dir ?? entity_dir(this.config.paths, entity_id);
-      await this.start_tmux(bot, archetype, entity_id, resolved_dir, session_id, !!resume_session_id, extra_env);
+      await this.start_tmux(
+        bot,
+        archetype,
+        entity_id,
+        resolved_dir,
+        session_id,
+        !!resolved_session_id,
+        extra_env,
+      );
 
       // Update bot state
       const assigned_defaults = DEFAULT_ARCHETYPES[archetype];
@@ -764,7 +798,7 @@ export class BotPool extends EventEmitter {
 
       console.log(
         `[pool] Assigned pool-${String(bot.id)} to channel ${channel_id} ` +
-        `as ${archetype} for entity ${entity_id}`,
+          `as ${archetype} for entity ${entity_id}`,
       );
 
       sentry.addBreadcrumb({
@@ -788,7 +822,7 @@ export class BotPool extends EventEmitter {
 
   /** Release a bot from its channel assignment. */
   async release(channel_id: string): Promise<void> {
-    const bot = this.bots.find(b => b.channel_id === channel_id && b.state === "assigned");
+    const bot = this.bots.find((b) => b.channel_id === channel_id && b.state === "assigned");
     if (!bot) return;
 
     // Synchronous in-flight lock: prevents double-release when two callers
@@ -844,14 +878,14 @@ export class BotPool extends EventEmitter {
     await this.persist();
     console.log(
       `[pool] Parked pool-${String(bot.id)} ` +
-      `(session: ${bot.session_id?.slice(0, 8) ?? "none"}, ` +
-      `channel: ${bot.channel_id})`,
+        `(session: ${bot.session_id?.slice(0, 8) ?? "none"}, ` +
+        `channel: ${bot.channel_id})`,
     );
   }
 
   /** Get the assignment for a channel. */
   get_assignment(channel_id: string): PoolBot | undefined {
-    return this.bots.find(b => b.channel_id === channel_id && b.state === "assigned");
+    return this.bots.find((b) => b.channel_id === channel_id && b.state === "assigned");
   }
 
   /** Clear session history for a specific channel. Used by !reset and feature completion. */
@@ -867,7 +901,7 @@ export class BotPool extends EventEmitter {
    * Returns false if the bot is not found, not assigned, or its tmux session is dead.
    * Used by discord.ts handle_message() to detect dead sessions on incoming messages. */
   is_session_alive(bot_id: number): boolean {
-    const bot = this.bots.find(b => b.id === bot_id);
+    const bot = this.bots.find((b) => b.id === bot_id);
     if (!bot || bot.state !== "assigned") return false;
     return this.is_tmux_alive(bot.tmux_session);
   }
@@ -880,7 +914,7 @@ export class BotPool extends EventEmitter {
    * Only called on the message path (not polling) to keep it lightweight.
    * Returns false if the bot is not found, not assigned, or the pane can't be read. */
   has_stale_oauth(bot_id: number): boolean {
-    const bot = this.bots.find(b => b.id === bot_id);
+    const bot = this.bots.find((b) => b.id === bot_id);
     if (!bot || bot.state !== "assigned") return false;
     return this.is_pane_stale_oauth(bot.tmux_session);
   }
@@ -889,10 +923,10 @@ export class BotPool extends EventEmitter {
    * Protected so tests can override via subclass. */
   protected is_pane_stale_oauth(session_name: string): boolean {
     try {
-      const output = execFileSync(
-        "tmux", ["capture-pane", "-t", session_name, "-p"],
-        { encoding: "utf-8", timeout: 2000 },
-      );
+      const output = execFileSync("tmux", ["capture-pane", "-t", session_name, "-p"], {
+        encoding: "utf-8",
+        timeout: 2000,
+      });
       return output.includes("Not logged in · Please run /login");
     } catch {
       return false; // Can't read pane — don't assume stale
@@ -903,7 +937,7 @@ export class BotPool extends EventEmitter {
    * Called by discord.ts before release_with_history() when the CLI is alive
    * but unresponsive due to expired authentication. */
   kill_stale_session(bot_id: number): void {
-    const bot = this.bots.find(b => b.id === bot_id);
+    const bot = this.bots.find((b) => b.id === bot_id);
     if (!bot) return;
     this.kill_tmux(bot.tmux_session);
   }
@@ -912,16 +946,14 @@ export class BotPool extends EventEmitter {
    * Stashes session_id before calling release(), which nulls all bot metadata.
    * Used by discord.ts when a message arrives for a bot with a dead tmux session. */
   async release_with_history(bot_id: number): Promise<void> {
-    const bot = this.bots.find(b => b.id === bot_id);
+    const bot = this.bots.find((b) => b.id === bot_id);
     if (!bot || !bot.channel_id) return;
 
     if (bot.session_id && bot.entity_id) {
       const key = `${bot.entity_id}:${bot.channel_id}`;
       this.session_history.set(key, bot.session_id);
       this.session_history_ts.set(key, Date.now());
-      console.log(
-        `[pool] Stashed session history for ${key}: ${bot.session_id.slice(0, 8)}`,
-      );
+      console.log(`[pool] Stashed session history for ${key}: ${bot.session_id.slice(0, 8)}`);
     }
 
     // release() uses channel_id to find the bot — grab it before it's nulled
@@ -932,19 +964,19 @@ export class BotPool extends EventEmitter {
   /** Get all bots currently assigned to a channel (state === "assigned").
    * Returns read-only snapshots — callers must not mutate the returned objects. */
   get_assigned_bots(): readonly PoolBot[] {
-    return this.bots.filter(b => b.state === "assigned");
+    return this.bots.filter((b) => b.state === "assigned");
   }
 
   /** Get pool status. */
   get_status(): PoolStatus {
     return {
       total: this.bots.length,
-      free: this.bots.filter(b => b.state === "free").length,
-      assigned: this.bots.filter(b => b.state === "assigned").length,
-      parked: this.bots.filter(b => b.state === "parked").length,
+      free: this.bots.filter((b) => b.state === "free").length,
+      assigned: this.bots.filter((b) => b.state === "assigned").length,
+      parked: this.bots.filter((b) => b.state === "parked").length,
       assignments: this.bots
-        .filter(b => b.state !== "free")
-        .map(b => ({
+        .filter((b) => b.state !== "free")
+        .map((b) => ({
           bot_id: b.id,
           channel_id: b.channel_id ?? "",
           entity_id: b.entity_id ?? "",
@@ -968,7 +1000,7 @@ export class BotPool extends EventEmitter {
     // Check recency of last human interaction
     const idle_minutes = bot.last_active
       ? (Date.now() - bot.last_active.getTime()) / 60_000
-      : Infinity;
+      : Number.POSITIVE_INFINITY;
 
     // < 3 min: active conversation — don't touch
     if (idle_minutes < 3) return "active_conversation";
@@ -991,10 +1023,10 @@ export class BotPool extends EventEmitter {
    */
   protected is_bot_idle(bot: PoolBot): boolean {
     try {
-      const output = execFileSync(
-        "tmux", ["capture-pane", "-t", bot.tmux_session, "-p"],
-        { encoding: "utf-8", timeout: 2000 },
-      );
+      const output = execFileSync("tmux", ["capture-pane", "-t", bot.tmux_session, "-p"], {
+        encoding: "utf-8",
+        timeout: 2000,
+      });
       const lines = output.trim().split("\n");
       const last_line = lines[lines.length - 1] ?? "";
       // "bypass permissions" matches the Claude Code workspace trust dialog text.
@@ -1006,7 +1038,10 @@ export class BotPool extends EventEmitter {
   }
 
   /** Check if any pool bots are actively working (not idle at prompt). */
-  has_active_work(): { active: boolean; working_bots: Array<{ id: number; archetype: string; channel_id: string }> } {
+  has_active_work(): {
+    active: boolean;
+    working_bots: Array<{ id: number; archetype: string; channel_id: string }>;
+  } {
     const working: Array<{ id: number; archetype: string; channel_id: string }> = [];
 
     for (const bot of this.bots) {
@@ -1026,7 +1061,7 @@ export class BotPool extends EventEmitter {
 
   /** Update last_active timestamp for a channel's bot. */
   touch(channel_id: string): void {
-    const bot = this.bots.find(b => b.channel_id === channel_id && b.state === "assigned");
+    const bot = this.bots.find((b) => b.channel_id === channel_id && b.state === "assigned");
     if (bot) {
       bot.last_active = new Date();
     }
@@ -1085,7 +1120,7 @@ export class BotPool extends EventEmitter {
         // Tmux session died — attempt recovery
         console.warn(
           `[pool] pool-${String(bot.id)} tmux crashed — attempting restart ` +
-          `(channel: ${bot.channel_id ?? "none"})`,
+            `(channel: ${bot.channel_id ?? "none"})`,
         );
 
         // Record this crash for loop detection
@@ -1142,9 +1177,7 @@ export class BotPool extends EventEmitter {
     const session_id = bot.session_id;
 
     if (!entity_id || !archetype) {
-      console.error(
-        `[pool] Cannot restart pool-${String(bot.id)}: missing fields — force-freeing`,
-      );
+      console.error(`[pool] Cannot restart pool-${String(bot.id)}: missing fields — force-freeing`);
 
       // Stash session history when possible — allows a future assignment on
       // this channel to resume the session even though we can't restart now.
@@ -1152,9 +1185,7 @@ export class BotPool extends EventEmitter {
         const key = `${entity_id}:${channel_id}`;
         this.session_history.set(key, session_id);
         this.session_history_ts.set(key, Date.now());
-        console.log(
-          `[pool] Stashed session history for ${key}: ${session_id.slice(0, 8)}`,
-        );
+        console.log(`[pool] Stashed session history for ${key}: ${session_id.slice(0, 8)}`);
       }
 
       bot.state = "free";
@@ -1197,7 +1228,15 @@ export class BotPool extends EventEmitter {
 
       // Restart tmux — use --resume if we have a session_id
       const working_dir = entity_dir(this.config.paths, entity_id);
-      await this.start_tmux(bot, archetype, entity_id, working_dir, resume_id, is_resume, extra_env);
+      await this.start_tmux(
+        bot,
+        archetype,
+        entity_id,
+        working_dir,
+        resume_id,
+        is_resume,
+        extra_env,
+      );
 
       // Update state — bot stays assigned with refreshed timestamps
       bot.session_id = resume_id;
@@ -1207,9 +1246,7 @@ export class BotPool extends EventEmitter {
       await this.persist();
       restarted = true;
     } catch (err) {
-      console.error(
-        `[pool] Failed to restart pool-${String(bot.id)} after crash: ${String(err)}`,
-      );
+      console.error(`[pool] Failed to restart pool-${String(bot.id)} after crash: ${String(err)}`);
       sentry.captureException(err, {
         tags: { module: "pool", bot_id: String(bot.id), action: "crash_restart" },
         contexts: { crash: { entity_id, session_id, channel_id } },
@@ -1220,9 +1257,7 @@ export class BotPool extends EventEmitter {
         const key = `${entity_id}:${channel_id}`;
         this.session_history.set(key, session_id);
         this.session_history_ts.set(key, Date.now());
-        console.log(
-          `[pool] Stashed session history for ${key}: ${session_id.slice(0, 8)}`,
-        );
+        console.log(`[pool] Stashed session history for ${key}: ${session_id.slice(0, 8)}`);
       }
 
       bot.state = "free";
@@ -1251,7 +1286,7 @@ export class BotPool extends EventEmitter {
     if (restarted) {
       console.log(
         `[pool] Restarted pool-${String(bot.id)} after crash ` +
-        `(${is_resume ? `resumed session: ${resume_id.slice(0, 8)}` : "fresh session"})`,
+          `(${is_resume ? `resumed session: ${resume_id.slice(0, 8)}` : "fresh session"})`,
       );
 
       this.emit("bot:crash_restarted", {
@@ -1269,7 +1304,9 @@ export class BotPool extends EventEmitter {
           entity_config,
         );
       } catch (notify_err) {
-        console.warn(`[pool] Failed to alert #alerts for pool-${String(bot.id)}: ${String(notify_err)}`);
+        console.warn(
+          `[pool] Failed to alert #alerts for pool-${String(bot.id)}: ${String(notify_err)}`,
+        );
       }
     }
   }
@@ -1283,9 +1320,7 @@ export class BotPool extends EventEmitter {
     const channel_id = bot.channel_id;
     const archetype = bot.archetype;
 
-    console.error(
-      `[pool] Crash loop detected for pool-${String(bot.id)} — releasing`,
-    );
+    console.error(`[pool] Crash loop detected for pool-${String(bot.id)} — releasing`);
 
     // Look up entity config for alerting
     const entity_config = entity_id ? this.registry?.get(entity_id) : undefined;
@@ -1340,14 +1375,16 @@ export class BotPool extends EventEmitter {
         entity_config,
       );
     } catch (notify_err) {
-      console.warn(`[pool] Failed to alert #alerts for pool-${String(bot.id)} crash loop: ${String(notify_err)}`);
+      console.warn(
+        `[pool] Failed to alert #alerts for pool-${String(bot.id)} crash loop: ${String(notify_err)}`,
+      );
     }
   }
 
   /** Record a crash event for a bot. Prunes entries older than 1 hour to stay bounded. */
   private record_crash(bot_id: number): void {
     const one_hour_ago = Date.now() - 60 * 60 * 1000;
-    const timestamps = (this.crash_history.get(bot_id) ?? []).filter(t => t > one_hour_ago);
+    const timestamps = (this.crash_history.get(bot_id) ?? []).filter((t) => t > one_hour_ago);
     timestamps.push(Date.now());
     this.crash_history.set(bot_id, timestamps);
   }
@@ -1357,7 +1394,7 @@ export class BotPool extends EventEmitter {
     const timestamps = this.crash_history.get(bot_id);
     if (!timestamps) return false;
     const one_hour_ago = Date.now() - 60 * 60 * 1000;
-    const recent = timestamps.filter(t => t > one_hour_ago);
+    const recent = timestamps.filter((t) => t > one_hour_ago);
     return recent.length > 3;
   }
 
@@ -1365,7 +1402,7 @@ export class BotPool extends EventEmitter {
   private cleanup_crash_history(): void {
     const one_hour_ago = Date.now() - 60 * 60 * 1000;
     for (const [bot_id, timestamps] of this.crash_history) {
-      const recent = timestamps.filter(t => t > one_hour_ago);
+      const recent = timestamps.filter((t) => t > one_hour_ago);
       if (recent.length === 0) {
         this.crash_history.delete(bot_id);
       } else {
@@ -1410,8 +1447,8 @@ export class BotPool extends EventEmitter {
    */
   private async persist(): Promise<void> {
     const to_save: PersistedPoolBot[] = this.bots
-      .filter(b => b.state !== "free" && b.channel_id && b.entity_id && b.archetype)
-      .map(b => ({
+      .filter((b) => b.state !== "free" && b.channel_id && b.entity_id && b.archetype)
+      .map((b) => ({
         id: b.id,
         state: b.state as "assigned" | "parked",
         channel_id: b.channel_id!,
@@ -1459,14 +1496,11 @@ export class BotPool extends EventEmitter {
    * Validate that a persisted entry still references a valid entity and channel.
    * Returns false for stale entries (entity removed, channel deleted, or null metadata).
    */
-  private validate_saved_entry(
-    entry: PersistedPoolBot,
-    registry: EntityRegistry,
-  ): boolean {
+  private validate_saved_entry(entry: PersistedPoolBot, registry: EntityRegistry): boolean {
     if (!entry.entity_id || !entry.channel_id) {
       console.log(
         `[pool] Rejecting pool-${String(entry.id)}: null metadata ` +
-        `(entity: ${String(entry.entity_id)}, channel: ${String(entry.channel_id)})`,
+          `(entity: ${String(entry.entity_id)}, channel: ${String(entry.channel_id)})`,
       );
       return false;
     }
@@ -1479,13 +1513,11 @@ export class BotPool extends EventEmitter {
       return false;
     }
 
-    const channel = entity.entity.channels.list.find(
-      ch => ch.id === entry.channel_id,
-    );
+    const channel = entity.entity.channels.list.find((ch) => ch.id === entry.channel_id);
     if (!channel) {
       console.log(
         `[pool] Rejecting pool-${String(entry.id)}: channel "${entry.channel_id}" ` +
-        `not found in entity "${entry.entity_id}"`,
+          `not found in entity "${entry.entity_id}"`,
       );
       return false;
     }
@@ -1495,10 +1527,7 @@ export class BotPool extends EventEmitter {
 
   // ── Internal ──
 
-  private async write_access_json(
-    state_dir: string,
-    channel_id: string | null,
-  ): Promise<void> {
+  private async write_access_json(state_dir: string, channel_id: string | null): Promise<void> {
     const groups: Record<string, { requireMention: boolean; allowFrom: string[] }> = {};
     if (channel_id) {
       groups[channel_id] = { requireMention: false, allowFrom: [] };
@@ -1530,10 +1559,10 @@ export class BotPool extends EventEmitter {
     entity_id: string,
     working_dir: string,
     session_id: string,
-    is_resume: boolean = false,
+    is_resume = false,
     extra_env: Record<string, string> = {},
   ): Promise<void> {
-    const claude_bin = process.env["CLAUDE_BIN"] ?? "claude";
+    const claude_bin = process.env.CLAUDE_BIN ?? "claude";
     const agent_name = resolve_agent_name(archetype, this.config);
 
     // Resolve model and effort from archetype defaults
@@ -1543,12 +1572,18 @@ export class BotPool extends EventEmitter {
 
     const claude_args = [
       sq(claude_bin),
-      "--channels", "plugin:discord@claude-plugins-official",
-      "--agent", sq(agent_name),
-      "--model", model_id,
-      "--permission-mode", "bypassPermissions",
-      "--add-dir", sq(working_dir),
-      "--add-dir", sq(homedir()),
+      "--channels",
+      "plugin:discord@claude-plugins-official",
+      "--agent",
+      sq(agent_name),
+      "--model",
+      model_id,
+      "--permission-mode",
+      "bypassPermissions",
+      "--add-dir",
+      sq(working_dir),
+      "--add-dir",
+      sq(homedir()),
     ];
 
     if (effort) {
@@ -1579,29 +1614,45 @@ export class BotPool extends EventEmitter {
     const env_prefix = extra_env_str ? `${extra_env_str} ` : "";
 
     return new Promise<void>((resolve, reject) => {
-      const proc = spawn("tmux", [
-        "new-session", "-d",
-        "-s", bot.tmux_session,
-        "-x", "200", "-y", "50",
-        `DISCORD_STATE_DIR=${sq(bot.state_dir)} ${git_env} ${env_prefix}${claude_cmd}`,
-      ], {
-        cwd: working_dir,
-        stdio: "ignore",
-        env: {
-          ...process.env,
-          ...extra_env,
-          DISCORD_STATE_DIR: bot.state_dir,
-          GIT_AUTHOR_NAME: display_name,
-          GIT_COMMITTER_NAME: display_name,
+      const proc = spawn(
+        "tmux",
+        [
+          "new-session",
+          "-d",
+          "-s",
+          bot.tmux_session,
+          "-x",
+          "200",
+          "-y",
+          "50",
+          `DISCORD_STATE_DIR=${sq(bot.state_dir)} ${git_env} ${env_prefix}${claude_cmd}`,
+        ],
+        {
+          cwd: working_dir,
+          stdio: "ignore",
+          env: {
+            ...process.env,
+            ...extra_env,
+            DISCORD_STATE_DIR: bot.state_dir,
+            GIT_AUTHOR_NAME: display_name,
+            GIT_COMMITTER_NAME: display_name,
+          },
         },
-      });
+      );
 
       proc.on("close", (code) => {
         if (code !== 0) {
-          console.error(`[pool] tmux new-session failed for pool-${String(bot.id)} (code ${String(code)})`);
-          sentry.captureException(new Error(`tmux new-session failed for pool-${String(bot.id)} with code ${String(code)}`), {
-            tags: { module: "pool", bot_id: String(bot.id) },
-          });
+          console.error(
+            `[pool] tmux new-session failed for pool-${String(bot.id)} (code ${String(code)})`,
+          );
+          sentry.captureException(
+            new Error(
+              `tmux new-session failed for pool-${String(bot.id)} with code ${String(code)}`,
+            ),
+            {
+              tags: { module: "pool", bot_id: String(bot.id) },
+            },
+          );
           reject(new Error(`tmux failed with code ${String(code)}`));
           return;
         }
@@ -1613,16 +1664,21 @@ export class BotPool extends EventEmitter {
               execFileSync("tmux", ["send-keys", "-t", bot.tmux_session, "Enter"], {
                 stdio: "ignore",
               });
-            } catch { /* dialog may not appear */ }
+            } catch {
+              /* dialog may not appear */
+            }
           }, 3000);
 
           console.log(`[pool] pool-${String(bot.id)} running as ${agent_name} in tmux`);
           resolve();
         } else {
           console.error(`[pool] tmux session did not start for pool-${String(bot.id)}`);
-          sentry.captureException(new Error(`tmux session did not start for pool-${String(bot.id)}`), {
-            tags: { module: "pool", bot_id: String(bot.id) },
-          });
+          sentry.captureException(
+            new Error(`tmux session did not start for pool-${String(bot.id)}`),
+            {
+              tags: { module: "pool", bot_id: String(bot.id) },
+            },
+          );
           reject(new Error("tmux session did not start"));
         }
       });
@@ -1655,14 +1711,13 @@ export class BotPool extends EventEmitter {
   /** Set a pool bot's server nickname via the daemon bot's Discord client.
    * Uses the cached user ID (extracted during initialize) and the nickname
    * handler (provided by the Discord module) — never reads bot tokens at runtime. */
-  private async set_bot_nickname(
-    bot: PoolBot,
-    archetype: ArchetypeRole,
-  ): Promise<void> {
+  private async set_bot_nickname(bot: PoolBot, archetype: ArchetypeRole): Promise<void> {
     const display_name = resolve_agent_display_name(archetype, this.config);
 
     if (!this.nickname_handler) {
-      console.log(`[pool] No nickname handler registered — skipping nickname set for pool-${String(bot.id)}`);
+      console.log(
+        `[pool] No nickname handler registered — skipping nickname set for pool-${String(bot.id)}`,
+      );
       return;
     }
 
@@ -1684,20 +1739,17 @@ export class BotPool extends EventEmitter {
    * Skips if the archetype hasn't changed since the last set, or if the bot
    * is within the rate limit cooldown window. Avatar failures are non-fatal —
    * the bot continues with its previous avatar. */
-  private async set_bot_avatar(
-    bot: PoolBot,
-    archetype: ArchetypeRole,
-  ): Promise<void> {
+  private async set_bot_avatar(bot: PoolBot, archetype: ArchetypeRole): Promise<void> {
     if (!this.avatar_handler) {
-      console.log(`[pool] No avatar handler registered — skipping avatar set for pool-${String(bot.id)}`);
+      console.log(
+        `[pool] No avatar handler registered — skipping avatar set for pool-${String(bot.id)}`,
+      );
       return;
     }
 
     // Skip if archetype hasn't changed since last avatar set
     if (bot.last_avatar_archetype === archetype) {
-      console.log(
-        `[pool] pool-${String(bot.id)} already has ${archetype} avatar — skipping`,
-      );
+      console.log(`[pool] pool-${String(bot.id)} already has ${archetype} avatar — skipping`);
       return;
     }
 
@@ -1708,7 +1760,7 @@ export class BotPool extends EventEmitter {
         const remaining_min = Math.ceil((AVATAR_COOLDOWN_MS - elapsed) / 60_000);
         console.log(
           `[pool] pool-${String(bot.id)} avatar rate-limited — ${String(remaining_min)}min remaining. ` +
-          `Keeping ${bot.last_avatar_archetype ?? "default"} avatar`,
+            `Keeping ${bot.last_avatar_archetype ?? "default"} avatar`,
         );
         return;
       }
@@ -1756,17 +1808,19 @@ export class BotPool extends EventEmitter {
     const queued = this.pending_injections.get(tmux_session) ?? [];
     queued.push(message);
     this.pending_injections.set(tmux_session, queued);
-    console.log(`[pool] Bot ${tmux_session} busy — queued message for retry (${String(queued.length)} pending)`);
+    console.log(
+      `[pool] Bot ${tmux_session} busy — queued message for retry (${String(queued.length)} pending)`,
+    );
     return false;
   }
 
   /** Check if a bot's tmux pane shows the Claude prompt indicator (❯). */
   private is_at_prompt(session_name: string): boolean {
     try {
-      const output = execFileSync(
-        "tmux", ["capture-pane", "-t", session_name, "-p"],
-        { encoding: "utf-8", timeout: 2000 },
-      );
+      const output = execFileSync("tmux", ["capture-pane", "-t", session_name, "-p"], {
+        encoding: "utf-8",
+        timeout: 2000,
+      });
       const lines = output.trim().split("\n");
       const last_line = lines[lines.length - 1] ?? "";
       return last_line.includes("❯");
@@ -1788,7 +1842,9 @@ export class BotPool extends EventEmitter {
     for (const [session, messages] of this.pending_injections) {
       if (!this.is_tmux_alive(session)) {
         this.pending_injections.delete(session);
-        console.log(`[pool] Dropped ${String(messages.length)} queued message(s) for dead session ${session}`);
+        console.log(
+          `[pool] Dropped ${String(messages.length)} queued message(s) for dead session ${session}`,
+        );
         continue;
       }
       if (this.is_at_prompt(session)) {
@@ -1797,7 +1853,9 @@ export class BotPool extends EventEmitter {
             this.send_via_tmux(session, message);
           }
           this.pending_injections.delete(session);
-          console.log(`[pool] Delivered ${String(messages.length)} queued message(s) to ${session}`);
+          console.log(
+            `[pool] Delivered ${String(messages.length)} queued message(s) to ${session}`,
+          );
         } catch (err) {
           console.warn(`[pool] Failed to deliver queued messages to ${session}: ${String(err)}`);
         }
@@ -1828,17 +1886,19 @@ export class BotPool extends EventEmitter {
     let ready = false;
 
     while (Date.now() - start < timeout) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, 1000));
       try {
-        const output = execFileSync(
-          "tmux", ["capture-pane", "-t", bot.tmux_session, "-p"],
-          { encoding: "utf-8", timeout: 2000 },
-        );
+        const output = execFileSync("tmux", ["capture-pane", "-t", bot.tmux_session, "-p"], {
+          encoding: "utf-8",
+          timeout: 2000,
+        });
         if (output.includes("Listening for channel messages") && output.includes("❯")) {
           ready = true;
           break;
         }
-      } catch { /* tmux pane not ready yet */ }
+      } catch {
+        /* tmux pane not ready yet */
+      }
     }
 
     if (!ready) {
@@ -1849,22 +1909,31 @@ export class BotPool extends EventEmitter {
     }
 
     // Small extra delay for the MCP plugin to fully connect
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise((resolve) => setTimeout(resolve, 2000));
 
     await writeFile(pending_path, nudge, "utf-8");
 
     // Deliver the nudge via tmux send-keys — the file alone is not enough.
     // The send-keys call injects a prompt into Claude's stdin telling it
     // to read the pending file (same pattern as bridge_first_message).
-    execFileSync("tmux", ["send-keys", "-t", bot.tmux_session,
-      `Your session was resumed after a daemon restart. Read ${pending_path} and continue any in-progress work.`,
-      "Enter",
-    ], { stdio: "ignore", timeout: 5000 });
+    execFileSync(
+      "tmux",
+      [
+        "send-keys",
+        "-t",
+        bot.tmux_session,
+        `Your session was resumed after a daemon restart. Read ${pending_path} and continue any in-progress work.`,
+        "Enter",
+      ],
+      { stdio: "ignore", timeout: 5000 },
+    );
 
     console.log(`[pool] Bridged resume nudge to ${bot.tmux_session}`);
 
     // Clean up the pending file after a delay
-    setTimeout(() => { void unlink(pending_path).catch(() => {}); }, 30_000);
+    setTimeout(() => {
+      void unlink(pending_path).catch(() => {});
+    }, 30_000);
   }
 
   private is_tmux_alive(session_name: string): boolean {
@@ -1879,6 +1948,8 @@ export class BotPool extends EventEmitter {
   private kill_tmux(session_name: string): void {
     try {
       execFileSync("tmux", ["kill-session", "-t", session_name], { stdio: "ignore" });
-    } catch { /* may not exist */ }
+    } catch {
+      /* may not exist */
+    }
   }
 }

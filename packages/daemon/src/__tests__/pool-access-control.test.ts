@@ -1,20 +1,17 @@
-import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BotPool } from "../pool.js";
-import type { PoolBot } from "../pool.js";
-import { readFile, rm, mkdir } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
 
 /** Create a config with the given discord.user_id. */
 function make_config(user_id?: string): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
     user: { name: "Test" },
-    discord: user_id
-      ? { server_id: "111222333", user_id }
-      : { server_id: "111222333" },
+    discord: user_id ? { server_id: "111222333", user_id } : { server_id: "111222333" },
   });
 }
 
@@ -32,8 +29,9 @@ function make_config_no_discord(): LobsterFarmConfig {
 class TestBotPool extends BotPool {
   async test_write_access_json(state_dir: string, channel_id: string | null): Promise<void> {
     // Call the private method via bracket notation
-    return (this as unknown as { write_access_json: (d: string, c: string | null) => Promise<void> })
-      .write_access_json(state_dir, channel_id);
+    return (
+      this as unknown as { write_access_json: (d: string, c: string | null) => Promise<void> }
+    ).write_access_json(state_dir, channel_id);
   }
 }
 

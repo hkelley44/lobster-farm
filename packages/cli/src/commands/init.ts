@@ -1,44 +1,59 @@
-import { Command } from "commander";
 import * as p from "@clack/prompts";
 import {
-  LobsterFarmConfigSchema,
-  TemplateVariablesSchema,
   type LobsterFarmConfig,
-  type TemplateVariables,
+  LobsterFarmConfigSchema,
   type PathConfig,
+  type TemplateVariables,
+  TemplateVariablesSchema,
 } from "@lobster-farm/shared";
-import { detect_machine, check_sudo, check_onepassword, check_claude_code, check_bun, check_tmux, check_github_cli, check_pool_bots } from "./init/detect.js";
-import { setup_tool_integrations } from "./init/tools.js";
+import { Command } from "commander";
 import {
-  prompt_user_name,
+  check_bun,
+  check_claude_code,
+  check_github_cli,
+  check_onepassword,
+  check_pool_bots,
+  check_sudo,
+  check_tmux,
+  detect_machine,
+} from "./init/detect.js";
+import {
+  create_directory_structure,
+  generate_config_files,
+  generate_settings,
+  write_global_config,
+} from "./init/generate.js";
+import {
   prompt_agent_names,
   prompt_discord,
   prompt_github,
   prompt_pool_bot_count,
   prompt_pool_bot_token,
+  prompt_user_name,
   // prompt_projects_dir removed — always defaults to ~/entities
 } from "./init/prompts.js";
-import {
-  generate_config_files,
-  generate_settings,
-  create_directory_structure,
-  write_global_config,
-} from "./init/generate.js";
+import { setup_tool_integrations } from "./init/tools.js";
 
 async function prompt_and_save_op_token(_path_overrides?: Partial<PathConfig>): Promise<void> {
   const op_token = await p.password({
     message: "1Password service account token (or press Enter to skip):",
   });
-  if (p.isCancel(op_token)) { p.cancel("Setup cancelled."); process.exit(0); }
+  if (p.isCancel(op_token)) {
+    p.cancel("Setup cancelled.");
+    process.exit(0);
+  }
 
-  if (op_token && op_token.trim()) {
+  if (op_token?.trim()) {
     const { readFile, writeFile: writeF } = await import("node:fs/promises");
-    const home = process.env["HOME"] ?? "";
+    const home = process.env.HOME ?? "";
     const zshrc_path = `${home}/.zshrc`;
     try {
       let content = await readFile(zshrc_path, "utf-8");
       if (content.includes("OP_SERVICE_ACCOUNT_TOKEN")) {
-        content = content.replace(/export OP_SERVICE_ACCOUNT_TOKEN="[^"]*"/g, `export OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"`);
+        content = content.replace(
+          /export OP_SERVICE_ACCOUNT_TOKEN="[^"]*"/g,
+          `export OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"`,
+        );
       } else {
         content += `\nexport OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"\n`;
       }
@@ -47,7 +62,7 @@ async function prompt_and_save_op_token(_path_overrides?: Partial<PathConfig>): 
       const { appendFile } = await import("node:fs/promises");
       await appendFile(zshrc_path, `\nexport OP_SERVICE_ACCOUNT_TOKEN="${op_token.trim()}"\n`);
     }
-    process.env["OP_SERVICE_ACCOUNT_TOKEN"] = op_token.trim();
+    process.env.OP_SERVICE_ACCOUNT_TOKEN = op_token.trim();
     p.log.success("1Password token saved to ~/.zshrc");
   }
 }
@@ -57,598 +72,693 @@ export const init_command = new Command("init")
   .option("--prefix <dir>", "Write output to <dir>/.claude/ and <dir>/.lobsterfarm/ instead of ~/")
   .option("--name <name>", "User name (skips interactive prompt)")
   .option("--non-interactive", "Use defaults for all prompts (requires --name)")
-  .option("--tools <list>", "Comma-separated list of tools to install (tailscale,docker,vercel,supabase,sentry)")
+  .option(
+    "--tools <list>",
+    "Comma-separated list of tools to install (tailscale,docker,vercel,supabase,sentry)",
+  )
   .option("--tailscale-authkey <key>", "Tailscale auth key for non-interactive setup")
   .option("--sentry-token <token>", "Sentry auth token")
   .option("--supabase-token <token>", "Supabase access token")
-  .action(async (options: {
-    prefix?: string;
-    name?: string;
-    nonInteractive?: boolean;
-    tools?: string;
-    tailscaleAuthkey?: string;
-    sentryToken?: string;
-    supabaseToken?: string;
-  }) => {
-    const prefix = options.prefix;
-    const non_interactive = options.nonInteractive ?? false;
-    const path_overrides: Partial<PathConfig> | undefined = prefix
-      ? {
-          lobsterfarm_dir: `${prefix}/.lobsterfarm`,
-          claude_dir: `${prefix}/.claude`,
-          projects_dir: `${prefix}/projects`,
-        }
-      : undefined;
+  .action(
+    async (options: {
+      prefix?: string;
+      name?: string;
+      nonInteractive?: boolean;
+      tools?: string;
+      tailscaleAuthkey?: string;
+      sentryToken?: string;
+      supabaseToken?: string;
+    }) => {
+      const prefix = options.prefix;
+      const non_interactive = options.nonInteractive ?? false;
+      const path_overrides: Partial<PathConfig> | undefined = prefix
+        ? {
+            lobsterfarm_dir: `${prefix}/.lobsterfarm`,
+            claude_dir: `${prefix}/.claude`,
+            projects_dir: `${prefix}/projects`,
+          }
+        : undefined;
 
-    if (prefix) {
-      p.log.info(`Using prefix: ${prefix} (files will NOT be written to ~/)`);
-    }
-
-    if (non_interactive && !options.name) {
-      console.error("Error: --non-interactive requires --name");
-      process.exit(1);
-    }
-
-    // ── Welcome ──
-    p.intro("LobsterFarm — Autonomous Software Consultancy");
-
-    if (!non_interactive) {
-      p.note(
-        "LobsterFarm runs a team of specialized Claude agents on your machine.\n" +
-          "Each agent has a role (planner, designer, builder, operator) and works\n" +
-          "autonomously on your projects via a local daemon.\n\n" +
-          "This wizard will configure your machine, name your agents, and set up\n" +
-          "the directory structure and config files.",
-        "Welcome",
-      );
-    }
-
-    // ── Step 1: User name ──
-    const user_name = non_interactive ? options.name! : await prompt_user_name();
-
-    // ── Step 2: Agent names ──
-    const agent_names = non_interactive
-      ? { planner: "Gary", designer: "Pearl", builder: "Bob", operator: "Ray", commander: "Pat" }
-      : await prompt_agent_names();
-
-    // ── Step 3: Machine detection ──
-    const spin = p.spinner();
-    spin.start("Detecting machine info...");
-    const machine = detect_machine();
-    spin.stop(`Machine: ${machine.name} (${machine.hardware})`);
-
-    // ── Step 4: Claude Code check ──
-    spin.start("Checking Claude Code...");
-    const claude = await check_claude_code();
-    spin.stop(`Claude Code: ${claude.status}`);
-
-    if (!claude.installed && !non_interactive) {
-      const install_it = await p.confirm({
-        message: "Claude Code is required but not installed. Install it now?",
-        initialValue: true,
-      });
-      if (p.isCancel(install_it)) { p.cancel("Setup cancelled."); process.exit(0); }
-
-      if (install_it) {
-        spin.start("Installing Claude Code...");
-        const { exec_command } = await import("../lib/process.js");
-        // Use Claude's official install script
-        const result = await exec_command("curl -fsSL https://claude.ai/install.sh | bash");
-        if (result.exitCode === 0) {
-          // Add ~/.local/bin to PATH for this session
-          const home = process.env["HOME"] ?? "";
-          process.env["PATH"] = `${home}/.local/bin:${process.env["PATH"] ?? ""}`;
-          spin.stop("Claude Code installed successfully");
-        } else {
-          spin.stop("Claude Code installation failed");
-          p.log.warning(`Install manually: curl -fsSL https://claude.ai/install.sh | bash\n${result.stderr}`);
-        }
-      } else {
-        p.log.warning("Continuing without Claude Code. Install it before starting the daemon.");
+      if (prefix) {
+        p.log.info(`Using prefix: ${prefix} (files will NOT be written to ~/)`);
       }
-    }
 
-    // Check if Claude Code is logged in
-    if (claude.installed || !non_interactive) {
-      const { exec_command } = await import("../lib/process.js");
-      // Try a quick auth test
-      const auth_test = await exec_command("echo 'test' | claude -p --print --no-session-persistence 2>&1");
-      if (auth_test.stderr.includes("login") || auth_test.stderr.includes("Not logged in") || auth_test.stdout.includes("Not logged in")) {
-        const do_login = await p.confirm({
-          message: "Claude Code is not logged in. Log in now? (opens browser)",
+      if (non_interactive && !options.name) {
+        console.error("Error: --non-interactive requires --name");
+        process.exit(1);
+      }
+
+      // ── Welcome ──
+      p.intro("LobsterFarm — Autonomous Software Consultancy");
+
+      if (!non_interactive) {
+        p.note(
+          "LobsterFarm runs a team of specialized Claude agents on your machine.\n" +
+            "Each agent has a role (planner, designer, builder, operator) and works\n" +
+            "autonomously on your projects via a local daemon.\n\n" +
+            "This wizard will configure your machine, name your agents, and set up\n" +
+            "the directory structure and config files.",
+          "Welcome",
+        );
+      }
+
+      // ── Step 1: User name ──
+      const user_name = non_interactive ? options.name! : await prompt_user_name();
+
+      // ── Step 2: Agent names ──
+      const agent_names = non_interactive
+        ? { planner: "Gary", designer: "Pearl", builder: "Bob", operator: "Ray", commander: "Pat" }
+        : await prompt_agent_names();
+
+      // ── Step 3: Machine detection ──
+      const spin = p.spinner();
+      spin.start("Detecting machine info...");
+      const machine = detect_machine();
+      spin.stop(`Machine: ${machine.name} (${machine.hardware})`);
+
+      // ── Step 4: Claude Code check ──
+      spin.start("Checking Claude Code...");
+      const claude = await check_claude_code();
+      spin.stop(`Claude Code: ${claude.status}`);
+
+      if (!claude.installed && !non_interactive) {
+        const install_it = await p.confirm({
+          message: "Claude Code is required but not installed. Install it now?",
           initialValue: true,
         });
-        if (p.isCancel(do_login)) { p.cancel("Setup cancelled."); process.exit(0); }
-
-        if (do_login) {
-          p.log.info("Opening browser for Claude Code login...");
-          p.log.warning("Note: Claude Code will open an interactive session. After authenticating in your browser, press Ctrl+C to return to the wizard.");
-          const { spawnSync } = await import("node:child_process");
-          spawnSync("claude", ["/login"], { stdio: "inherit" });
+        if (p.isCancel(install_it)) {
+          p.cancel("Setup cancelled.");
+          process.exit(0);
         }
-      }
-    }
 
-    // ── Step 5: Sudo check ──
-    spin.start("Checking sudo access...");
-    const sudo = await check_sudo();
-    spin.stop(`Sudo: ${sudo.status}`);
-
-    if (!sudo.has_passwordless_sudo && !non_interactive) {
-      const setup_sudo = await p.confirm({
-        message: "Set up passwordless sudo? (adds NOPASSWD to sudoers)",
-        initialValue: true,
-      });
-      if (p.isCancel(setup_sudo)) { p.cancel("Setup cancelled."); process.exit(0); }
-
-      if (setup_sudo) {
-        const user = process.env["USER"] ?? "unknown";
-        p.log.info(`Enter your password when prompted to configure sudo for "${user}"...`);
-
-        // Use spawnSync with inherited stdio so the password prompt is visible
-        const { spawnSync } = await import("node:child_process");
-        const result = spawnSync("sudo", ["sh", "-c", `echo '${user} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/lobsterfarm`], {
-          stdio: "inherit",
-        });
-
-        if (result.status === 0) {
-          sudo.has_passwordless_sudo = true;
-          sudo.status = "passwordless sudo configured";
-          p.log.success("Passwordless sudo configured");
+        if (install_it) {
+          spin.start("Installing Claude Code...");
+          const { exec_command } = await import("../lib/process.js");
+          // Use Claude's official install script
+          const result = await exec_command("curl -fsSL https://claude.ai/install.sh | bash");
+          if (result.exitCode === 0) {
+            // Add ~/.local/bin to PATH for this session
+            const home = process.env.HOME ?? "";
+            process.env.PATH = `${home}/.local/bin:${process.env.PATH ?? ""}`;
+            spin.stop("Claude Code installed successfully");
+          } else {
+            spin.stop("Claude Code installation failed");
+            p.log.warning(
+              `Install manually: curl -fsSL https://claude.ai/install.sh | bash\n${result.stderr}`,
+            );
+          }
         } else {
-          p.log.warning("Sudo setup failed — configure manually");
+          p.log.warning("Continuing without Claude Code. Install it before starting the daemon.");
         }
       }
-    }
 
-    // ── Step 6: 1Password check ──
-    spin.start("Checking 1Password CLI...");
-    const op = await check_onepassword();
-    spin.stop(`1Password: ${op.status}`);
-
-    if (!op.cli_installed && !non_interactive) {
-      const install_op = await p.confirm({
-        message: "Install 1Password CLI? (via Homebrew)",
-        initialValue: true,
-      });
-      if (p.isCancel(install_op)) { p.cancel("Setup cancelled."); process.exit(0); }
-
-      if (install_op) {
-        spin.start("Installing 1Password CLI...");
+      // Check if Claude Code is logged in
+      if (claude.installed || !non_interactive) {
         const { exec_command } = await import("../lib/process.js");
-        const result = await exec_command("brew install --cask 1password-cli");
-        if (result.exitCode === 0) {
-          op.cli_installed = true;
-          op.status = "op CLI installed";
-          spin.stop("1Password CLI installed");
-        } else {
-          spin.stop("1Password CLI installation failed");
-          p.log.warning("Install manually: brew install --cask 1password-cli");
+        // Try a quick auth test
+        const auth_test = await exec_command(
+          "echo 'test' | claude -p --print --no-session-persistence 2>&1",
+        );
+        if (
+          auth_test.stderr.includes("login") ||
+          auth_test.stderr.includes("Not logged in") ||
+          auth_test.stdout.includes("Not logged in")
+        ) {
+          const do_login = await p.confirm({
+            message: "Claude Code is not logged in. Log in now? (opens browser)",
+            initialValue: true,
+          });
+          if (p.isCancel(do_login)) {
+            p.cancel("Setup cancelled.");
+            process.exit(0);
+          }
+
+          if (do_login) {
+            p.log.info("Opening browser for Claude Code login...");
+            p.log.warning(
+              "Note: Claude Code will open an interactive session. After authenticating in your browser, press Ctrl+C to return to the wizard.",
+            );
+            const { spawnSync } = await import("node:child_process");
+            spawnSync("claude", ["/login"], { stdio: "inherit" });
+          }
         }
       }
-    }
 
-    if (op.cli_installed && !non_interactive) {
-      if (op.token_configured) {
-        const overwrite_op = await p.confirm({
-          message: "1Password service account token already configured. Update it?",
-          initialValue: false,
+      // ── Step 5: Sudo check ──
+      spin.start("Checking sudo access...");
+      const sudo = await check_sudo();
+      spin.stop(`Sudo: ${sudo.status}`);
+
+      if (!sudo.has_passwordless_sudo && !non_interactive) {
+        const setup_sudo = await p.confirm({
+          message: "Set up passwordless sudo? (adds NOPASSWD to sudoers)",
+          initialValue: true,
         });
-        if (p.isCancel(overwrite_op)) { p.cancel("Setup cancelled."); process.exit(0); }
-        if (!overwrite_op) {
-          p.log.info("Keeping existing 1Password token.");
+        if (p.isCancel(setup_sudo)) {
+          p.cancel("Setup cancelled.");
+          process.exit(0);
+        }
+
+        if (setup_sudo) {
+          const user = process.env.USER ?? "unknown";
+          p.log.info(`Enter your password when prompted to configure sudo for "${user}"...`);
+
+          // Use spawnSync with inherited stdio so the password prompt is visible
+          const { spawnSync } = await import("node:child_process");
+          const result = spawnSync(
+            "sudo",
+            ["sh", "-c", `echo '${user} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/lobsterfarm`],
+            {
+              stdio: "inherit",
+            },
+          );
+
+          if (result.status === 0) {
+            sudo.has_passwordless_sudo = true;
+            sudo.status = "passwordless sudo configured";
+            p.log.success("Passwordless sudo configured");
+          } else {
+            p.log.warning("Sudo setup failed — configure manually");
+          }
+        }
+      }
+
+      // ── Step 6: 1Password check ──
+      spin.start("Checking 1Password CLI...");
+      const op = await check_onepassword();
+      spin.stop(`1Password: ${op.status}`);
+
+      if (!op.cli_installed && !non_interactive) {
+        const install_op = await p.confirm({
+          message: "Install 1Password CLI? (via Homebrew)",
+          initialValue: true,
+        });
+        if (p.isCancel(install_op)) {
+          p.cancel("Setup cancelled.");
+          process.exit(0);
+        }
+
+        if (install_op) {
+          spin.start("Installing 1Password CLI...");
+          const { exec_command } = await import("../lib/process.js");
+          const result = await exec_command("brew install --cask 1password-cli");
+          if (result.exitCode === 0) {
+            op.cli_installed = true;
+            op.status = "op CLI installed";
+            spin.stop("1Password CLI installed");
+          } else {
+            spin.stop("1Password CLI installation failed");
+            p.log.warning("Install manually: brew install --cask 1password-cli");
+          }
+        }
+      }
+
+      if (op.cli_installed && !non_interactive) {
+        if (op.token_configured) {
+          const overwrite_op = await p.confirm({
+            message: "1Password service account token already configured. Update it?",
+            initialValue: false,
+          });
+          if (p.isCancel(overwrite_op)) {
+            p.cancel("Setup cancelled.");
+            process.exit(0);
+          }
+          if (!overwrite_op) {
+            p.log.info("Keeping existing 1Password token.");
+          } else {
+            await prompt_and_save_op_token(path_overrides);
+            op.token_configured = true;
+            op.status = "op CLI installed, service account token configured";
+          }
         } else {
+          p.note(
+            "Create a service account at https://my.1password.com → Developer → Service Accounts\n\n" +
+              "Grant it:\n" +
+              '  • "Create and manage vaults" permission (LobsterFarm will create vaults automatically)\n\n' +
+              "Note: Vaults created by the service account are auto-shared with it.\n" +
+              "You may need to share new vaults with your personal account too —\n" +
+              "go to 1Password app → Vaults → [vault name] → Sharing → Add your account",
+            "1Password Setup",
+          );
           await prompt_and_save_op_token(path_overrides);
           op.token_configured = true;
           op.status = "op CLI installed, service account token configured";
         }
-      } else {
-        p.note(
-          "Create a service account at https://my.1password.com → Developer → Service Accounts\n\n" +
-            "Grant it:\n" +
-            '  • "Create and manage vaults" permission (LobsterFarm will create vaults automatically)\n\n' +
-            "Note: Vaults created by the service account are auto-shared with it.\n" +
-            "You may need to share new vaults with your personal account too —\n" +
-            "go to 1Password app → Vaults → [vault name] → Sharing → Add your account",
-          "1Password Setup",
+      }
+
+      // Auto-create command-center vault after 1Password token is configured
+      if (op.cli_installed && op.token_configured) {
+        const { exec_command } = await import("../lib/process.js");
+        const vault_result = await exec_command("op vault create command-center --format json");
+        if (vault_result.exitCode === 0) {
+          p.log.success("1Password vault 'command-center' created");
+        } else if (vault_result.stderr?.includes("already exists")) {
+          p.log.info("1Password vault 'command-center' already exists");
+        } else {
+          p.log.warning(
+            "Could not create command-center vault. Create it manually: op vault create command-center",
+          );
+        }
+
+        p.log.warning(
+          "New vaults are only accessible to the service account by default.\n" +
+            'Share the "command-center" vault with yourself:\n' +
+            "  1Password app → Vaults → command-center → Sharing → Add your account",
         );
-        await prompt_and_save_op_token(path_overrides);
-        op.token_configured = true;
-        op.status = "op CLI installed, service account token configured";
-      }
-    }
-
-    // Auto-create command-center vault after 1Password token is configured
-    if (op.cli_installed && op.token_configured) {
-      const { exec_command } = await import("../lib/process.js");
-      const vault_result = await exec_command("op vault create command-center --format json");
-      if (vault_result.exitCode === 0) {
-        p.log.success("1Password vault 'command-center' created");
-      } else if (vault_result.stderr?.includes("already exists")) {
-        p.log.info("1Password vault 'command-center' already exists");
-      } else {
-        p.log.warning("Could not create command-center vault. Create it manually: op vault create command-center");
       }
 
-      p.log.warning(
-        'New vaults are only accessible to the service account by default.\n' +
-        'Share the "command-center" vault with yourself:\n' +
-        "  1Password app → Vaults → command-center → Sharing → Add your account",
-      );
-    }
+      // ── Step 7: Bun (required by Discord channel plugin) ──
+      spin.start("Checking Bun...");
+      const bun = await check_bun();
+      spin.stop(`Bun: ${bun.status}`);
 
-    // ── Step 7: Bun (required by Discord channel plugin) ──
-    spin.start("Checking Bun...");
-    const bun = await check_bun();
-    spin.stop(`Bun: ${bun.status}`);
-
-    if (!bun.installed && !non_interactive) {
-      const install_bun = await p.confirm({
-        message: "Bun is required for the Discord channel plugin. Install it?",
-        initialValue: true,
-      });
-      if (p.isCancel(install_bun)) { p.cancel("Setup cancelled."); process.exit(0); }
-
-      if (install_bun) {
-        spin.start("Installing Bun...");
-        const { exec_command } = await import("../lib/process.js");
-        const result = await exec_command("curl -fsSL https://bun.sh/install | bash");
-        if (result.exitCode === 0) {
-          const home = process.env["HOME"] ?? "";
-          process.env["PATH"] = `${home}/.bun/bin:${process.env["PATH"] ?? ""}`;
-          bun.installed = true;
-          bun.status = "Bun installed";
-          spin.stop("Bun installed");
-        } else {
-          spin.stop("Bun installation failed");
-          p.log.warning("Install manually: curl -fsSL https://bun.sh/install | bash");
-        }
-      }
-    }
-
-    // ── Step 8: tmux (required for Commander session) ──
-    spin.start("Checking tmux...");
-    const tmux = await check_tmux();
-    spin.stop(`tmux: ${tmux.status}`);
-
-    if (!tmux.installed && !non_interactive) {
-      const install_tmux = await p.confirm({
-        message: "tmux is required for the Commander (Pat) session. Install it?",
-        initialValue: true,
-      });
-      if (p.isCancel(install_tmux)) { p.cancel("Setup cancelled."); process.exit(0); }
-
-      if (install_tmux) {
-        spin.start("Installing tmux...");
-        const { exec_command } = await import("../lib/process.js");
-        const result = await exec_command("brew install tmux");
-        if (result.exitCode === 0) {
-          tmux.installed = true;
-          tmux.status = "tmux installed";
-          spin.stop("tmux installed");
-        } else {
-          spin.stop("tmux installation failed");
-          p.log.warning("Install manually: brew install tmux");
-        }
-      }
-    }
-
-    // ── Step 9: GitHub CLI ──
-    spin.start("Checking GitHub CLI...");
-    const gh = await check_github_cli();
-    spin.stop(`GitHub CLI: ${gh.status}`);
-
-    if (!gh.installed && !non_interactive) {
-      const install_gh = await p.confirm({
-        message: "GitHub CLI (gh) is recommended for PR workflows. Install it?",
-        initialValue: true,
-      });
-      if (p.isCancel(install_gh)) { p.cancel("Setup cancelled."); process.exit(0); }
-
-      if (install_gh) {
-        spin.start("Installing GitHub CLI...");
-        const { exec_command } = await import("../lib/process.js");
-        const result = await exec_command("brew install gh");
-        if (result.exitCode === 0) {
-          gh.installed = true;
-          spin.stop("GitHub CLI installed");
-        } else {
-          spin.stop("GitHub CLI installation failed");
-          p.log.warning("Install manually: brew install gh");
-        }
-      }
-    }
-
-    if (gh.installed && !gh.authenticated && !non_interactive) {
-      const do_gh_login = await p.confirm({
-        message: "GitHub CLI is not authenticated. Log in now?",
-        initialValue: true,
-      });
-      if (p.isCancel(do_gh_login)) { p.cancel("Setup cancelled."); process.exit(0); }
-
-      if (do_gh_login) {
-        p.log.info("Opening browser for GitHub login...");
-        const { spawnSync } = await import("node:child_process");
-        spawnSync("gh", ["auth", "login", "-w"], { stdio: "inherit" });
-        // Set up git credential helper
-        const { exec_command } = await import("../lib/process.js");
-        await exec_command("gh auth setup-git");
-        gh.authenticated = true;
-        gh.status = "gh CLI installed and authenticated";
-      }
-    }
-
-    // ── Step 10: macOS Full Disk Access ──
-    if (machine.platform === "darwin" && !non_interactive) {
-      const { exec_command } = await import("../lib/process.js");
-      const { spawnSync } = await import("node:child_process");
-      const fda_check = await exec_command("ls ~/Library/Mail/ 2>&1");
-      const likely_missing = fda_check.exitCode !== 0 && fda_check.stderr.includes("Operation not permitted");
-
-      if (likely_missing) {
-        const setup_fda = await p.confirm({
-          message: "Full Disk Access is needed for Terminal, node, and tmux. Attempt to configure?",
+      if (!bun.installed && !non_interactive) {
+        const install_bun = await p.confirm({
+          message: "Bun is required for the Discord channel plugin. Install it?",
           initialValue: true,
         });
-        if (p.isCancel(setup_fda)) { p.cancel("Setup cancelled."); process.exit(0); }
+        if (p.isCancel(install_bun)) {
+          p.cancel("Setup cancelled.");
+          process.exit(0);
+        }
 
-        if (setup_fda) {
-          // Find paths to the apps we need to grant FDA
-          const apps_to_grant = [
-            { name: "Terminal", bundle: "com.apple.Terminal" },
-            { name: "node", path: null as string | null },
-            { name: "tmux", path: null as string | null },
-          ];
+        if (install_bun) {
+          spin.start("Installing Bun...");
+          const { exec_command } = await import("../lib/process.js");
+          const result = await exec_command("curl -fsSL https://bun.sh/install | bash");
+          if (result.exitCode === 0) {
+            const home = process.env.HOME ?? "";
+            process.env.PATH = `${home}/.bun/bin:${process.env.PATH ?? ""}`;
+            bun.installed = true;
+            bun.status = "Bun installed";
+            spin.stop("Bun installed");
+          } else {
+            spin.stop("Bun installation failed");
+            p.log.warning("Install manually: curl -fsSL https://bun.sh/install | bash");
+          }
+        }
+      }
 
-          // Resolve node and tmux paths
-          const node_which = await exec_command("which node");
-          if (node_which.exitCode === 0) apps_to_grant[1]!.path = node_which.stdout.trim();
-          const tmux_which = await exec_command("which tmux");
-          if (tmux_which.exitCode === 0) apps_to_grant[2]!.path = tmux_which.stdout.trim();
+      // ── Step 8: tmux (required for Commander session) ──
+      spin.start("Checking tmux...");
+      const tmux = await check_tmux();
+      spin.stop(`tmux: ${tmux.status}`);
 
-          // Attempt TCC database modification (requires sudo)
-          spin.start("Attempting to grant Full Disk Access via TCC database...");
-          const tcc_db = "/Library/Application Support/com.apple.TCC/TCC.db";
-          let tcc_success = true;
+      if (!tmux.installed && !non_interactive) {
+        const install_tmux = await p.confirm({
+          message: "tmux is required for the Commander (Pat) session. Install it?",
+          initialValue: true,
+        });
+        if (p.isCancel(install_tmux)) {
+          p.cancel("Setup cancelled.");
+          process.exit(0);
+        }
 
-          // Grant Terminal by bundle ID
-          const terminal_result = spawnSync("sudo", [
-            "sqlite3", tcc_db,
-            `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceSystemPolicyAllFiles', 'com.apple.Terminal', 0, 2, 4, 1);`,
-          ], { stdio: "inherit" });
+        if (install_tmux) {
+          spin.start("Installing tmux...");
+          const { exec_command } = await import("../lib/process.js");
+          const result = await exec_command("brew install tmux");
+          if (result.exitCode === 0) {
+            tmux.installed = true;
+            tmux.status = "tmux installed";
+            spin.stop("tmux installed");
+          } else {
+            spin.stop("tmux installation failed");
+            p.log.warning("Install manually: brew install tmux");
+          }
+        }
+      }
 
-          if (terminal_result.status !== 0) {
-            tcc_success = false;
+      // ── Step 9: GitHub CLI ──
+      spin.start("Checking GitHub CLI...");
+      const gh = await check_github_cli();
+      spin.stop(`GitHub CLI: ${gh.status}`);
+
+      if (!gh.installed && !non_interactive) {
+        const install_gh = await p.confirm({
+          message: "GitHub CLI (gh) is recommended for PR workflows. Install it?",
+          initialValue: true,
+        });
+        if (p.isCancel(install_gh)) {
+          p.cancel("Setup cancelled.");
+          process.exit(0);
+        }
+
+        if (install_gh) {
+          spin.start("Installing GitHub CLI...");
+          const { exec_command } = await import("../lib/process.js");
+          const result = await exec_command("brew install gh");
+          if (result.exitCode === 0) {
+            gh.installed = true;
+            spin.stop("GitHub CLI installed");
+          } else {
+            spin.stop("GitHub CLI installation failed");
+            p.log.warning("Install manually: brew install gh");
+          }
+        }
+      }
+
+      if (gh.installed && !gh.authenticated && !non_interactive) {
+        const do_gh_login = await p.confirm({
+          message: "GitHub CLI is not authenticated. Log in now?",
+          initialValue: true,
+        });
+        if (p.isCancel(do_gh_login)) {
+          p.cancel("Setup cancelled.");
+          process.exit(0);
+        }
+
+        if (do_gh_login) {
+          p.log.info("Opening browser for GitHub login...");
+          const { spawnSync } = await import("node:child_process");
+          spawnSync("gh", ["auth", "login", "-w"], { stdio: "inherit" });
+          // Set up git credential helper
+          const { exec_command } = await import("../lib/process.js");
+          await exec_command("gh auth setup-git");
+          gh.authenticated = true;
+          gh.status = "gh CLI installed and authenticated";
+        }
+      }
+
+      // ── Step 10: macOS Full Disk Access ──
+      if (machine.platform === "darwin" && !non_interactive) {
+        const { exec_command } = await import("../lib/process.js");
+        const { spawnSync } = await import("node:child_process");
+        const fda_check = await exec_command("ls ~/Library/Mail/ 2>&1");
+        const likely_missing =
+          fda_check.exitCode !== 0 && fda_check.stderr.includes("Operation not permitted");
+
+        if (likely_missing) {
+          const setup_fda = await p.confirm({
+            message:
+              "Full Disk Access is needed for Terminal, node, and tmux. Attempt to configure?",
+            initialValue: true,
+          });
+          if (p.isCancel(setup_fda)) {
+            p.cancel("Setup cancelled.");
+            process.exit(0);
           }
 
-          // Grant node and tmux by path
-          for (const app of apps_to_grant.slice(1)) {
-            if (!app.path) continue;
-            const result = spawnSync("sudo", [
-              "sqlite3", tcc_db,
-              `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceSystemPolicyAllFiles', '${app.path}', 1, 2, 4, 1);`,
-            ], { stdio: "inherit" });
-            if (result.status !== 0) {
+          if (setup_fda) {
+            // Find paths to the apps we need to grant FDA
+            const apps_to_grant = [
+              { name: "Terminal", bundle: "com.apple.Terminal" },
+              { name: "node", path: null as string | null },
+              { name: "tmux", path: null as string | null },
+            ];
+
+            // Resolve node and tmux paths
+            const node_which = await exec_command("which node");
+            if (node_which.exitCode === 0) apps_to_grant[1]!.path = node_which.stdout.trim();
+            const tmux_which = await exec_command("which tmux");
+            if (tmux_which.exitCode === 0) apps_to_grant[2]!.path = tmux_which.stdout.trim();
+
+            // Attempt TCC database modification (requires sudo)
+            spin.start("Attempting to grant Full Disk Access via TCC database...");
+            const tcc_db = "/Library/Application Support/com.apple.TCC/TCC.db";
+            let tcc_success = true;
+
+            // Grant Terminal by bundle ID
+            const terminal_result = spawnSync(
+              "sudo",
+              [
+                "sqlite3",
+                tcc_db,
+                `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceSystemPolicyAllFiles', 'com.apple.Terminal', 0, 2, 4, 1);`,
+              ],
+              { stdio: "inherit" },
+            );
+
+            if (terminal_result.status !== 0) {
               tcc_success = false;
             }
-          }
 
-          if (tcc_success) {
-            spin.stop("Full Disk Access granted via TCC database");
-          } else {
-            spin.stop("TCC database method failed — opening System Settings");
-            p.log.info("Manually enable Full Disk Access for Terminal, node, and tmux.");
+            // Grant node and tmux by path
+            for (const app of apps_to_grant.slice(1)) {
+              if (!app.path) continue;
+              const result = spawnSync(
+                "sudo",
+                [
+                  "sqlite3",
+                  tcc_db,
+                  `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceSystemPolicyAllFiles', '${app.path}', 1, 2, 4, 1);`,
+                ],
+                { stdio: "inherit" },
+              );
+              if (result.status !== 0) {
+                tcc_success = false;
+              }
+            }
 
-            // Fallback: open System Settings to the right page
-            spawnSync("open", [
-              "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
-            ]);
-
-            const node_path = apps_to_grant[1]?.path ?? "not found";
-            const tmux_path = apps_to_grant[2]?.path ?? "not installed";
-            p.note(
-              "System Settings has been opened to Full Disk Access.\n\n" +
-                "Click the + button and add:\n" +
-                `  • Terminal (should be listed)\n` +
-                `  • node: ${node_path}\n` +
-                `  • tmux: ${tmux_path}\n\n` +
-                "Tip: In the file picker, press Cmd+Shift+G to type a path directly.",
-              "Manual Setup Required",
-            );
-
-            const ack = await p.confirm({ message: "Done configuring Full Disk Access?" });
-            if (p.isCancel(ack)) { p.cancel("Setup cancelled."); process.exit(0); }
-          }
-        }
-      }
-    }
-
-    // ── Step 11: Tool Integrations ──
-    const tools_config = await setup_tool_integrations(spin, non_interactive, options);
-
-    // ── Step 12: Peekaboo (computer use CLI) ──
-    let peekaboo_status = "skipped (non-macOS or non-interactive)";
-    if (machine.platform === "darwin" && !non_interactive) {
-      const { exec_command } = await import("../lib/process.js");
-      const { spawnSync } = await import("node:child_process");
-
-      spin.start("Checking Peekaboo...");
-      const peekaboo_which = await exec_command("which peekaboo");
-      const peekaboo_installed = peekaboo_which.exitCode === 0;
-      spin.stop(peekaboo_installed ? `Peekaboo: installed (${peekaboo_which.stdout.trim()})` : "Peekaboo: not installed");
-
-      if (peekaboo_installed) {
-        peekaboo_status = `installed (${peekaboo_which.stdout.trim()})`;
-      }
-
-      if (!peekaboo_installed) {
-        const install_peekaboo = await p.confirm({
-          message: "Peekaboo enables GUI automation (screen capture, clicking, typing). Install it?",
-          initialValue: true,
-        });
-        if (p.isCancel(install_peekaboo)) { p.cancel("Setup cancelled."); process.exit(0); }
-
-        if (!install_peekaboo) {
-          peekaboo_status = "skipped (user declined)";
-        }
-
-        if (install_peekaboo) {
-          // Check Swift toolchain is available
-          const swift_check = await exec_command("which swift");
-          if (swift_check.exitCode !== 0) {
-            p.log.warning("Swift toolchain not found — Peekaboo requires Xcode or Command Line Tools to build from source.");
-            p.log.info("Install Xcode from the App Store, then re-run this wizard.");
-            peekaboo_status = "not installed (Swift toolchain missing)";
-          } else {
-            const home = process.env["HOME"] ?? "";
-            const tools_dir = `${home}/.lobsterfarm/tools`;
-            const peekaboo_dir = `${tools_dir}/Peekaboo`;
-
-            // Clone the repo
-            spin.start("Cloning Peekaboo v3.0.0-beta3...");
-            const { mkdir: mkdirFs } = await import("node:fs/promises");
-            await mkdirFs(tools_dir, { recursive: true });
-
-            const clone_result = await exec_command(
-              `git clone --depth 1 --branch v3.0.0-beta3 https://github.com/steipete/Peekaboo.git "${peekaboo_dir}"`,
-            );
-            if (clone_result.exitCode !== 0) {
-              spin.stop("Peekaboo clone failed");
-              p.log.warning(`Clone failed: ${clone_result.stderr.trim()}`);
-              peekaboo_status = "not installed (clone failed)";
+            if (tcc_success) {
+              spin.stop("Full Disk Access granted via TCC database");
             } else {
-              spin.stop("Peekaboo cloned");
+              spin.stop("TCC database method failed — opening System Settings");
+              p.log.info("Manually enable Full Disk Access for Terminal, node, and tmux.");
 
-              // Build from source (this takes several minutes)
-              // Detect architecture — arm64 for Apple Silicon, x86_64 for Intel
-              const arch = process.arch === "x64" ? "x86_64" : "arm64";
+              // Fallback: open System Settings to the right page
+              spawnSync("open", [
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+              ]);
 
-              spin.start("Building Peekaboo from source (this may take a few minutes)...");
-              // Use spawnSync instead of exec_command — Swift builds routinely produce
-              // 2-10MB of output which overflows execFile's default 1MB maxBuffer.
-              const build_result = spawnSync("swift", ["build", "--arch", arch, "-c", "release"], {
-                cwd: `${peekaboo_dir}/Apps/CLI`,
-                stdio: "inherit",
-              });
-              if (build_result.status !== 0) {
-                spin.stop("Peekaboo build failed");
-                p.log.warning("Build failed — check the output above for details.");
-                peekaboo_status = "not installed (build failed)";
-              } else {
-                spin.stop("Peekaboo built successfully");
+              const node_path = apps_to_grant[1]?.path ?? "not found";
+              const tmux_path = apps_to_grant[2]?.path ?? "not installed";
+              p.note(
+                `System Settings has been opened to Full Disk Access.\n\nClick the + button and add:\n  • Terminal (should be listed)\n  • node: ${node_path}\n  • tmux: ${tmux_path}\n\nTip: In the file picker, press Cmd+Shift+G to type a path directly.`,
+                "Manual Setup Required",
+              );
 
-                // Copy binary to /usr/local/bin
-                spin.start("Installing peekaboo binary...");
-                const cp_result = spawnSync("sudo", [
-                  "cp",
-                  `${peekaboo_dir}/Apps/CLI/.build/${arch}-apple-macosx/release/peekaboo`,
-                  "/usr/local/bin/peekaboo",
-                ], { stdio: "inherit" });
-
-                if (cp_result.status !== 0) {
-                  spin.stop("Failed to copy binary to /usr/local/bin");
-                  p.log.warning(`Copy the binary manually: sudo cp Apps/CLI/.build/${arch}-apple-macosx/release/peekaboo /usr/local/bin/peekaboo`);
-                  peekaboo_status = "built but not installed (copy failed)";
-                } else {
-                  // Verify
-                  const version_check = await exec_command("peekaboo --version");
-                  if (version_check.exitCode === 0) {
-                    spin.stop(`Peekaboo installed: ${version_check.stdout.trim()}`);
-                    peekaboo_status = `installed (${version_check.stdout.trim()})`;
-                  } else {
-                    spin.stop("Peekaboo binary installed to /usr/local/bin/peekaboo");
-                    peekaboo_status = "installed (/usr/local/bin/peekaboo)";
-                  }
-                }
+              const ack = await p.confirm({ message: "Done configuring Full Disk Access?" });
+              if (p.isCancel(ack)) {
+                p.cancel("Setup cancelled.");
+                process.exit(0);
               }
             }
           }
         }
       }
 
-      // Grant Screen Recording + Accessibility permissions
-      const peekaboo_recheck = await exec_command("which peekaboo");
-      if (peekaboo_recheck.exitCode === 0) {
-        const setup_perms = await p.confirm({
-          message: "Grant Peekaboo permissions (Screen Recording + Accessibility)?",
-          initialValue: true,
-        });
-        if (p.isCancel(setup_perms)) { p.cancel("Setup cancelled."); process.exit(0); }
+      // ── Step 11: Tool Integrations ──
+      const tools_config = await setup_tool_integrations(spin, non_interactive, options);
 
-        if (setup_perms) {
-          const apps_to_grant = [
-            { name: "Terminal", bundle: "com.apple.Terminal" },
-            { name: "node", path: null as string | null },
-            { name: "tmux", path: null as string | null },
-          ];
+      // ── Step 12: Peekaboo (computer use CLI) ──
+      let peekaboo_status = "skipped (non-macOS or non-interactive)";
+      if (machine.platform === "darwin" && !non_interactive) {
+        const { exec_command } = await import("../lib/process.js");
+        const { spawnSync } = await import("node:child_process");
 
-          const node_which = await exec_command("which node");
-          if (node_which.exitCode === 0) apps_to_grant[1]!.path = node_which.stdout.trim();
-          const tmux_which = await exec_command("which tmux");
-          if (tmux_which.exitCode === 0) apps_to_grant[2]!.path = tmux_which.stdout.trim();
+        spin.start("Checking Peekaboo...");
+        const peekaboo_which = await exec_command("which peekaboo");
+        const peekaboo_installed = peekaboo_which.exitCode === 0;
+        spin.stop(
+          peekaboo_installed
+            ? `Peekaboo: installed (${peekaboo_which.stdout.trim()})`
+            : "Peekaboo: not installed",
+        );
 
-          const tcc_db = "/Library/Application Support/com.apple.TCC/TCC.db";
-          const tcc_services = ["kTCCServiceScreenCapture", "kTCCServiceAccessibility"];
+        if (peekaboo_installed) {
+          peekaboo_status = `installed (${peekaboo_which.stdout.trim()})`;
+        }
 
-          spin.start("Attempting to grant Screen Recording + Accessibility via TCC database...");
-          let tcc_success = true;
-
-          for (const service of tcc_services) {
-            // Grant Terminal by bundle ID
-            const terminal_result = spawnSync("sudo", [
-              "sqlite3", tcc_db,
-              `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('${service}', 'com.apple.Terminal', 0, 2, 4, 1);`,
-            ], { stdio: "inherit" });
-            if (terminal_result.status !== 0) tcc_success = false;
-
-            // Grant node and tmux by path
-            for (const app of apps_to_grant.slice(1)) {
-              if (!app.path) continue;
-              const result = spawnSync("sudo", [
-                "sqlite3", tcc_db,
-                `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('${service}', '${app.path}', 1, 2, 4, 1);`,
-              ], { stdio: "inherit" });
-              if (result.status !== 0) tcc_success = false;
-            }
+        if (!peekaboo_installed) {
+          const install_peekaboo = await p.confirm({
+            message:
+              "Peekaboo enables GUI automation (screen capture, clicking, typing). Install it?",
+            initialValue: true,
+          });
+          if (p.isCancel(install_peekaboo)) {
+            p.cancel("Setup cancelled.");
+            process.exit(0);
           }
 
-          if (tcc_success) {
-            spin.stop("Screen Recording + Accessibility granted via TCC database");
-          } else {
-            spin.stop("TCC database method failed — opening System Settings");
-            p.log.info("Manually enable Screen Recording and Accessibility for Terminal, node, and tmux.");
+          if (!install_peekaboo) {
+            peekaboo_status = "skipped (user declined)";
+          }
 
-            spawnSync("open", [
-              "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
-            ]);
-            spawnSync("open", [
-              "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-            ]);
+          if (install_peekaboo) {
+            // Check Swift toolchain is available
+            const swift_check = await exec_command("which swift");
+            if (swift_check.exitCode !== 0) {
+              p.log.warning(
+                "Swift toolchain not found — Peekaboo requires Xcode or Command Line Tools to build from source.",
+              );
+              p.log.info("Install Xcode from the App Store, then re-run this wizard.");
+              peekaboo_status = "not installed (Swift toolchain missing)";
+            } else {
+              const home = process.env.HOME ?? "";
+              const tools_dir = `${home}/.lobsterfarm/tools`;
+              const peekaboo_dir = `${tools_dir}/Peekaboo`;
 
-            const node_path = apps_to_grant[1]?.path ?? "not found";
-            const tmux_path = apps_to_grant[2]?.path ?? "not installed";
-            p.note(
-              "System Settings has been opened to Screen Recording and Accessibility.\n\n" +
-                "In each pane, click the + button and add:\n" +
-                `  • Terminal (should be listed)\n` +
-                `  • node: ${node_path}\n` +
-                `  • tmux: ${tmux_path}\n\n` +
-                "Tip: In the file picker, press Cmd+Shift+G to type a path directly.",
-              "Manual Setup Required",
-            );
+              // Clone the repo
+              spin.start("Cloning Peekaboo v3.0.0-beta3...");
+              const { mkdir: mkdirFs } = await import("node:fs/promises");
+              await mkdirFs(tools_dir, { recursive: true });
 
-            const ack = await p.confirm({ message: "Done configuring Screen Recording + Accessibility?" });
-            if (p.isCancel(ack)) { p.cancel("Setup cancelled."); process.exit(0); }
+              const clone_result = await exec_command(
+                `git clone --depth 1 --branch v3.0.0-beta3 https://github.com/steipete/Peekaboo.git "${peekaboo_dir}"`,
+              );
+              if (clone_result.exitCode !== 0) {
+                spin.stop("Peekaboo clone failed");
+                p.log.warning(`Clone failed: ${clone_result.stderr.trim()}`);
+                peekaboo_status = "not installed (clone failed)";
+              } else {
+                spin.stop("Peekaboo cloned");
+
+                // Build from source (this takes several minutes)
+                // Detect architecture — arm64 for Apple Silicon, x86_64 for Intel
+                const arch = process.arch === "x64" ? "x86_64" : "arm64";
+
+                spin.start("Building Peekaboo from source (this may take a few minutes)...");
+                // Use spawnSync instead of exec_command — Swift builds routinely produce
+                // 2-10MB of output which overflows execFile's default 1MB maxBuffer.
+                const build_result = spawnSync(
+                  "swift",
+                  ["build", "--arch", arch, "-c", "release"],
+                  {
+                    cwd: `${peekaboo_dir}/Apps/CLI`,
+                    stdio: "inherit",
+                  },
+                );
+                if (build_result.status !== 0) {
+                  spin.stop("Peekaboo build failed");
+                  p.log.warning("Build failed — check the output above for details.");
+                  peekaboo_status = "not installed (build failed)";
+                } else {
+                  spin.stop("Peekaboo built successfully");
+
+                  // Copy binary to /usr/local/bin
+                  spin.start("Installing peekaboo binary...");
+                  const cp_result = spawnSync(
+                    "sudo",
+                    [
+                      "cp",
+                      `${peekaboo_dir}/Apps/CLI/.build/${arch}-apple-macosx/release/peekaboo`,
+                      "/usr/local/bin/peekaboo",
+                    ],
+                    { stdio: "inherit" },
+                  );
+
+                  if (cp_result.status !== 0) {
+                    spin.stop("Failed to copy binary to /usr/local/bin");
+                    p.log.warning(
+                      `Copy the binary manually: sudo cp Apps/CLI/.build/${arch}-apple-macosx/release/peekaboo /usr/local/bin/peekaboo`,
+                    );
+                    peekaboo_status = "built but not installed (copy failed)";
+                  } else {
+                    // Verify
+                    const version_check = await exec_command("peekaboo --version");
+                    if (version_check.exitCode === 0) {
+                      spin.stop(`Peekaboo installed: ${version_check.stdout.trim()}`);
+                      peekaboo_status = `installed (${version_check.stdout.trim()})`;
+                    } else {
+                      spin.stop("Peekaboo binary installed to /usr/local/bin/peekaboo");
+                      peekaboo_status = "installed (/usr/local/bin/peekaboo)";
+                    }
+                  }
+                }
+              }
+            }
           }
         }
 
-        // Create Peekaboo skill file — respect path_overrides.claude_dir
-        const { writeFile: writeSkill, mkdir: mkdirSkill } = await import("node:fs/promises");
-        const { skills_dir: get_skills_dir } = await import("@lobster-farm/shared");
-        const skill_dir = `${get_skills_dir(path_overrides)}/peekaboo`;
-        await mkdirSkill(skill_dir, { recursive: true });
+        // Grant Screen Recording + Accessibility permissions
+        const peekaboo_recheck = await exec_command("which peekaboo");
+        if (peekaboo_recheck.exitCode === 0) {
+          const setup_perms = await p.confirm({
+            message: "Grant Peekaboo permissions (Screen Recording + Accessibility)?",
+            initialValue: true,
+          });
+          if (p.isCancel(setup_perms)) {
+            p.cancel("Setup cancelled.");
+            process.exit(0);
+          }
 
-        const skill_content = `---
+          if (setup_perms) {
+            const apps_to_grant = [
+              { name: "Terminal", bundle: "com.apple.Terminal" },
+              { name: "node", path: null as string | null },
+              { name: "tmux", path: null as string | null },
+            ];
+
+            const node_which = await exec_command("which node");
+            if (node_which.exitCode === 0) apps_to_grant[1]!.path = node_which.stdout.trim();
+            const tmux_which = await exec_command("which tmux");
+            if (tmux_which.exitCode === 0) apps_to_grant[2]!.path = tmux_which.stdout.trim();
+
+            const tcc_db = "/Library/Application Support/com.apple.TCC/TCC.db";
+            const tcc_services = ["kTCCServiceScreenCapture", "kTCCServiceAccessibility"];
+
+            spin.start("Attempting to grant Screen Recording + Accessibility via TCC database...");
+            let tcc_success = true;
+
+            for (const service of tcc_services) {
+              // Grant Terminal by bundle ID
+              const terminal_result = spawnSync(
+                "sudo",
+                [
+                  "sqlite3",
+                  tcc_db,
+                  `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('${service}', 'com.apple.Terminal', 0, 2, 4, 1);`,
+                ],
+                { stdio: "inherit" },
+              );
+              if (terminal_result.status !== 0) tcc_success = false;
+
+              // Grant node and tmux by path
+              for (const app of apps_to_grant.slice(1)) {
+                if (!app.path) continue;
+                const result = spawnSync(
+                  "sudo",
+                  [
+                    "sqlite3",
+                    tcc_db,
+                    `INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('${service}', '${app.path}', 1, 2, 4, 1);`,
+                  ],
+                  { stdio: "inherit" },
+                );
+                if (result.status !== 0) tcc_success = false;
+              }
+            }
+
+            if (tcc_success) {
+              spin.stop("Screen Recording + Accessibility granted via TCC database");
+            } else {
+              spin.stop("TCC database method failed — opening System Settings");
+              p.log.info(
+                "Manually enable Screen Recording and Accessibility for Terminal, node, and tmux.",
+              );
+
+              spawnSync("open", [
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+              ]);
+              spawnSync("open", [
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+              ]);
+
+              const node_path = apps_to_grant[1]?.path ?? "not found";
+              const tmux_path = apps_to_grant[2]?.path ?? "not installed";
+              p.note(
+                `System Settings has been opened to Screen Recording and Accessibility.\n\nIn each pane, click the + button and add:\n  • Terminal (should be listed)\n  • node: ${node_path}\n  • tmux: ${tmux_path}\n\nTip: In the file picker, press Cmd+Shift+G to type a path directly.`,
+                "Manual Setup Required",
+              );
+
+              const ack = await p.confirm({
+                message: "Done configuring Screen Recording + Accessibility?",
+              });
+              if (p.isCancel(ack)) {
+                p.cancel("Setup cancelled.");
+                process.exit(0);
+              }
+            }
+          }
+
+          // Create Peekaboo skill file — respect path_overrides.claude_dir
+          const { writeFile: writeSkill, mkdir: mkdirSkill } = await import("node:fs/promises");
+          const { skills_dir: get_skills_dir } = await import("@lobster-farm/shared");
+          const skill_dir = `${get_skills_dir(path_overrides)}/peekaboo`;
+          await mkdirSkill(skill_dir, { recursive: true });
+
+          const skill_content = `---
 name: peekaboo
 description: >
   Computer use via Peekaboo CLI. Use when a task requires GUI interaction
@@ -717,416 +827,458 @@ Always clean up after yourself:
 - macOS may require monthly re-grant of Screen Recording permission
 `;
 
-        await writeSkill(`${skill_dir}/SKILL.md`, skill_content);
-        p.log.success(`Peekaboo skill file created: ${skill_dir}/SKILL.md`);
+          await writeSkill(`${skill_dir}/SKILL.md`, skill_content);
+          p.log.success(`Peekaboo skill file created: ${skill_dir}/SKILL.md`);
 
-        // Append Peekaboo section to tools.md
-        const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
-        const tools_path = `${lf_dir(path_overrides)}/tools.md`;
-        try {
-          const { readFile: readTools, writeFile: writeTools } = await import("node:fs/promises");
-          const tools_content = await readTools(tools_path, "utf-8");
-          if (!tools_content.includes("Peekaboo")) {
-            const tools_arch = process.arch === "x64" ? "x86_64" : "arm64";
-            const peekaboo_section =
-              "\n## Computer Use (Peekaboo)\n\n" +
-              `- **Binary:** \`/usr/local/bin/peekaboo\` (v3.0.0-beta3, ${tools_arch})\n` +
-              "- **Source:** `~/.lobsterfarm/tools/Peekaboo/` (pinned to v3.0.0-beta3)\n" +
-              `- **Skill:** \`${skill_dir}/SKILL.md\` — load when GUI interaction is needed\n` +
-              "- **Permissions:** Screen Recording + Accessibility granted for Terminal, node, tmux\n" +
-              "- **When to use:** GUI-only tasks where no CLI/API alternative exists. Not the default — always prefer CLI/API.\n" +
-              "- **Cleanup:** Always delete screenshots after use (`/tmp/pb-*.png`, `~/Desktop/peekaboo_see_*.png`)\n";
+          // Append Peekaboo section to tools.md
+          const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+          const tools_path = `${lf_dir(path_overrides)}/tools.md`;
+          try {
+            const { readFile: readTools, writeFile: writeTools } = await import("node:fs/promises");
+            const tools_content = await readTools(tools_path, "utf-8");
+            if (!tools_content.includes("Peekaboo")) {
+              const tools_arch = process.arch === "x64" ? "x86_64" : "arm64";
+              const peekaboo_section = `\n## Computer Use (Peekaboo)\n\n- **Binary:** \`/usr/local/bin/peekaboo\` (v3.0.0-beta3, ${tools_arch})\n- **Source:** \`~/.lobsterfarm/tools/Peekaboo/\` (pinned to v3.0.0-beta3)\n- **Skill:** \`${skill_dir}/SKILL.md\` — load when GUI interaction is needed\n- **Permissions:** Screen Recording + Accessibility granted for Terminal, node, tmux\n- **When to use:** GUI-only tasks where no CLI/API alternative exists. Not the default — always prefer CLI/API.\n- **Cleanup:** Always delete screenshots after use (\`/tmp/pb-*.png\`, \`~/Desktop/peekaboo_see_*.png\`)\n`;
 
-            // Insert before the "Shared Services" section if it exists, otherwise append before the footer
-            if (tools_content.includes("## Shared Services")) {
-              const updated = tools_content.replace("## Shared Services", peekaboo_section + "\n## Shared Services");
-              await writeTools(tools_path, updated);
-            } else {
-              // Append before the closing italics line, or at the end
-              const footer_marker = "_This file grows";
-              if (tools_content.includes(footer_marker)) {
-                const updated = tools_content.replace(footer_marker, peekaboo_section + "\n" + footer_marker);
+              // Insert before the "Shared Services" section if it exists, otherwise append before the footer
+              if (tools_content.includes("## Shared Services")) {
+                const updated = tools_content.replace(
+                  "## Shared Services",
+                  `${peekaboo_section}\n## Shared Services`,
+                );
                 await writeTools(tools_path, updated);
               } else {
-                const { appendFile } = await import("node:fs/promises");
-                await appendFile(tools_path, peekaboo_section);
+                // Append before the closing italics line, or at the end
+                const footer_marker = "_This file grows";
+                if (tools_content.includes(footer_marker)) {
+                  const updated = tools_content.replace(
+                    footer_marker,
+                    `${peekaboo_section}\n${footer_marker}`,
+                  );
+                  await writeTools(tools_path, updated);
+                } else {
+                  const { appendFile } = await import("node:fs/promises");
+                  await appendFile(tools_path, peekaboo_section);
+                }
               }
+              p.log.success("Peekaboo section added to tools.md");
             }
-            p.log.success("Peekaboo section added to tools.md");
+          } catch {
+            // tools.md doesn't exist yet — that's fine, it'll be created by generate_config_files
+            p.log.info(
+              "tools.md not found — Peekaboo entry will need to be added manually after setup.",
+            );
           }
-        } catch {
-          // tools.md doesn't exist yet — that's fine, it'll be created by generate_config_files
-          p.log.info("tools.md not found — Peekaboo entry will need to be added manually after setup.");
         }
       }
-    }
 
-    // ── Prompts (skipped in non-interactive mode) ──
-    // Check if Discord tokens already exist
-    let has_existing_discord_token = false;
-    try {
-      const { readFile: readF } = await import("node:fs/promises");
-      const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
-      const env_content = await readF(`${lf_dir(path_overrides)}/.env`, "utf-8");
-      has_existing_discord_token = env_content.includes("DISCORD_BOT_TOKEN");
-    } catch { /* no .env yet */ }
-    if (!has_existing_discord_token) {
+      // ── Prompts (skipped in non-interactive mode) ──
+      // Check if Discord tokens already exist
+      let has_existing_discord_token = false;
       try {
         const { readFile: readF } = await import("node:fs/promises");
         const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
-        const pat_env = await readF(`${lf_dir(path_overrides)}/channels/pat/.env`, "utf-8");
-        has_existing_discord_token = pat_env.includes("DISCORD_BOT_TOKEN");
-      } catch { /* no pat .env yet */ }
-    }
-
-    const discord_setup = non_interactive ? undefined : await prompt_discord(has_existing_discord_token);
-    const github = non_interactive ? { username: "" } : await prompt_github();
-
-    // ── Build TemplateVariables ──
-    const permissions_parts: string[] = [];
-    if (sudo.has_passwordless_sudo) permissions_parts.push("sudo");
-    if (op.cli_installed && op.token_configured) permissions_parts.push("1password");
-    const permissions_status =
-      permissions_parts.length > 0
-        ? permissions_parts.join(", ") + " configured"
-        : "not fully configured";
-
-    const vars: Partial<TemplateVariables> = TemplateVariablesSchema.parse({
-      USER_NAME: user_name,
-      MACHINE_NAME: machine.name,
-      MACHINE_HARDWARE: machine.hardware,
-      SUDO_STATUS: sudo.status,
-      PERMISSIONS_STATUS: permissions_status,
-      PLANNER_NAME: agent_names.planner,
-      DESIGNER_NAME: agent_names.designer,
-      BUILDER_NAME: agent_names.builder,
-      OPERATOR_NAME: agent_names.operator,
-      COMMANDER_NAME: agent_names.commander,
-      PLANNER_NAME_LOWER: agent_names.planner.toLowerCase(),
-      DESIGNER_NAME_LOWER: agent_names.designer.toLowerCase(),
-      BUILDER_NAME_LOWER: agent_names.builder.toLowerCase(),
-      OPERATOR_NAME_LOWER: agent_names.operator.toLowerCase(),
-      COMMANDER_NAME_LOWER: agent_names.commander.toLowerCase(),
-      PROJECTS_DIR: "~/.lobsterfarm/entities",
-      GITHUB_USERNAME: github.username,
-      GITHUB_ORG: "",
-    });
-
-    // ── Build LobsterFarmConfig ──
-    const config_paths: Record<string, string> = {};
-    if (path_overrides?.lobsterfarm_dir) config_paths["lobsterfarm_dir"] = path_overrides.lobsterfarm_dir;
-    if (path_overrides?.claude_dir) config_paths["claude_dir"] = path_overrides.claude_dir;
-
-    const config_input: Record<string, unknown> = {
-      version: 1,
-      paths: config_paths,
-      user: { name: user_name },
-      machine: { name: machine.name, hardware: machine.hardware },
-      agents: {
-        planner: { name: agent_names.planner },
-        designer: { name: agent_names.designer },
-        builder: { name: agent_names.builder },
-        operator: { name: agent_names.operator },
-        commander: { name: agent_names.commander },
-      },
-    };
-
-    if (discord_setup) {
-      const discord_config: Record<string, string> = { server_id: discord_setup.server_id };
-      if (discord_setup.user_id) {
-        discord_config["user_id"] = discord_setup.user_id;
+        const env_content = await readF(`${lf_dir(path_overrides)}/.env`, "utf-8");
+        has_existing_discord_token = env_content.includes("DISCORD_BOT_TOKEN");
+      } catch {
+        /* no .env yet */
       }
-      config_input["discord"] = discord_config;
-    }
+      if (!has_existing_discord_token) {
+        try {
+          const { readFile: readF } = await import("node:fs/promises");
+          const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+          const pat_env = await readF(`${lf_dir(path_overrides)}/channels/pat/.env`, "utf-8");
+          has_existing_discord_token = pat_env.includes("DISCORD_BOT_TOKEN");
+        } catch {
+          /* no pat .env yet */
+        }
+      }
 
-    if (tools_config && Object.keys(tools_config).length > 0) {
-      config_input["tools"] = tools_config;
-    }
+      const discord_setup = non_interactive
+        ? undefined
+        : await prompt_discord(has_existing_discord_token);
+      const github = non_interactive ? { username: "" } : await prompt_github();
 
-    const config: LobsterFarmConfig = LobsterFarmConfigSchema.parse(config_input);
+      // ── Build TemplateVariables ──
+      const permissions_parts: string[] = [];
+      if (sudo.has_passwordless_sudo) permissions_parts.push("sudo");
+      if (op.cli_installed && op.token_configured) permissions_parts.push("1password");
+      const permissions_status =
+        permissions_parts.length > 0
+          ? `${permissions_parts.join(", ")} configured`
+          : "not fully configured";
 
-    // ── Generate everything ──
-    spin.start("Creating directory structure...");
-    const dirs = await create_directory_structure(path_overrides);
-    spin.stop(`Created ${dirs.length} directories`);
+      const vars: Partial<TemplateVariables> = TemplateVariablesSchema.parse({
+        USER_NAME: user_name,
+        MACHINE_NAME: machine.name,
+        MACHINE_HARDWARE: machine.hardware,
+        SUDO_STATUS: sudo.status,
+        PERMISSIONS_STATUS: permissions_status,
+        PLANNER_NAME: agent_names.planner,
+        DESIGNER_NAME: agent_names.designer,
+        BUILDER_NAME: agent_names.builder,
+        OPERATOR_NAME: agent_names.operator,
+        COMMANDER_NAME: agent_names.commander,
+        PLANNER_NAME_LOWER: agent_names.planner.toLowerCase(),
+        DESIGNER_NAME_LOWER: agent_names.designer.toLowerCase(),
+        BUILDER_NAME_LOWER: agent_names.builder.toLowerCase(),
+        OPERATOR_NAME_LOWER: agent_names.operator.toLowerCase(),
+        COMMANDER_NAME_LOWER: agent_names.commander.toLowerCase(),
+        PROJECTS_DIR: "~/.lobsterfarm/entities",
+        GITHUB_USERNAME: github.username,
+        GITHUB_ORG: "",
+      });
 
-    spin.start("Writing configuration files...");
-    const config_path = await write_global_config(config, path_overrides);
-    const files = await generate_config_files(vars, agent_names, path_overrides);
-    const settings_path = await generate_settings(path_overrides);
+      // ── Build LobsterFarmConfig ──
+      const config_paths: Record<string, string> = {};
+      if (path_overrides?.lobsterfarm_dir)
+        config_paths.lobsterfarm_dir = path_overrides.lobsterfarm_dir;
+      if (path_overrides?.claude_dir) config_paths.claude_dir = path_overrides.claude_dir;
 
-    // Write .env with secrets (daemon bot token)
-    if (discord_setup?.daemon_bot_token) {
-      const { writeFile, mkdir: mkdirFs } = await import("node:fs/promises");
-      const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
-      const env_dir = lf_dir(path_overrides);
-      await mkdirFs(env_dir, { recursive: true });
-      const env_path = `${env_dir}/.env`;
-      await writeFile(env_path, `DISCORD_BOT_TOKEN=${discord_setup.daemon_bot_token}\n`, { mode: 0o600 });
-      files.push(env_path);
-    }
+      const config_input: Record<string, unknown> = {
+        version: 1,
+        paths: config_paths,
+        user: { name: user_name },
+        machine: { name: machine.name, hardware: machine.hardware },
+        agents: {
+          planner: { name: agent_names.planner },
+          designer: { name: agent_names.designer },
+          builder: { name: agent_names.builder },
+          operator: { name: agent_names.operator },
+          commander: { name: agent_names.commander },
+        },
+      };
 
-    // Write Commander (Pat) bot token to channel state dir
-    if (discord_setup?.commander_bot_token) {
-      const { writeFile, mkdir: mkdirFs } = await import("node:fs/promises");
-      const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
-      const pat_dir = `${lf_dir(path_overrides)}/channels/pat`;
-      await mkdirFs(pat_dir, { recursive: true, mode: 0o700 });
-      const pat_env_path = `${pat_dir}/.env`;
-      await writeFile(pat_env_path, `DISCORD_BOT_TOKEN=${discord_setup.commander_bot_token}\n`, { mode: 0o600 });
-      files.push(pat_env_path);
-    }
+      if (discord_setup) {
+        const discord_config: Record<string, string> = { server_id: discord_setup.server_id };
+        if (discord_setup.user_id) {
+          discord_config.user_id = discord_setup.user_id;
+        }
+        config_input.discord = discord_config;
+      }
 
-    // ── Pool Bot Setup ──
-    // Tracks tokens collected this session for invite URL generation
-    const pool_bot_tokens: string[] = [];
-    let pool_bot_count = 0;
+      if (tools_config && Object.keys(tools_config).length > 0) {
+        config_input.tools = tools_config;
+      }
 
-    if (discord_setup && !non_interactive) {
-      const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
-      const lf_path = lf_dir(path_overrides);
-      const existing_pool = await check_pool_bots(lf_path);
-      let should_write_pool = false;
+      const config: LobsterFarmConfig = LobsterFarmConfigSchema.parse(config_input);
 
-      if (existing_pool.count > 0) {
-        p.log.info(`Found ${String(existing_pool.count)} existing pool bot${existing_pool.count > 1 ? "s" : ""} (${existing_pool.indices.map(i => `LF-${String(i)}`).join(", ")}).`);
-        const reconfigure = await p.confirm({
-          message: "Pool bots already configured. Set up new ones?",
-          initialValue: false,
+      // ── Generate everything ──
+      spin.start("Creating directory structure...");
+      const dirs = await create_directory_structure(path_overrides);
+      spin.stop(`Created ${dirs.length} directories`);
+
+      spin.start("Writing configuration files...");
+      const config_path = await write_global_config(config, path_overrides);
+      const files = await generate_config_files(vars, agent_names, path_overrides);
+      const settings_path = await generate_settings(path_overrides);
+
+      // Write .env with secrets (daemon bot token)
+      if (discord_setup?.daemon_bot_token) {
+        const { writeFile, mkdir: mkdirFs } = await import("node:fs/promises");
+        const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+        const env_dir = lf_dir(path_overrides);
+        await mkdirFs(env_dir, { recursive: true });
+        const env_path = `${env_dir}/.env`;
+        await writeFile(env_path, `DISCORD_BOT_TOKEN=${discord_setup.daemon_bot_token}\n`, {
+          mode: 0o600,
         });
-        if (p.isCancel(reconfigure)) { p.cancel("Setup cancelled."); process.exit(0); }
-
-        if (reconfigure) {
-          pool_bot_count = await prompt_pool_bot_count();
-          should_write_pool = true;
-        } else {
-          pool_bot_count = existing_pool.count;
-        }
-      } else {
-        pool_bot_count = await prompt_pool_bot_count();
-        should_write_pool = pool_bot_count > 0;
+        files.push(env_path);
       }
 
-      if (should_write_pool) {
-        const { writeFile: writeF, mkdir: mkdirFs, rm } = await import("node:fs/promises");
-
-        for (let i = 0; i < pool_bot_count; i++) {
-          const token = await prompt_pool_bot_token(i);
-          pool_bot_tokens.push(token);
-
-          const pool_dir = `${lf_path}/channels/pool-${String(i)}`;
-          await mkdirFs(pool_dir, { recursive: true, mode: 0o700 });
-          const pool_env_path = `${pool_dir}/.env`;
-          await writeF(pool_env_path, `DISCORD_BOT_TOKEN=${token}\n`, { mode: 0o600 });
-          files.push(pool_env_path);
-        }
-
-        // Clean up orphaned pool directories when count decreases
-        for (let i = pool_bot_count; i < existing_pool.count; i++) {
-          const stale_dir = `${lf_path}/channels/pool-${String(i)}`;
-          await rm(stale_dir, { recursive: true, force: true });
-        }
-
-        p.log.success(`${String(pool_bot_count)} pool bot${pool_bot_count > 1 ? "s" : ""} configured.`);
-      }
-    }
-
-    // ── Bot Invite URLs ──
-    // Generate zero-permission invite URLs for all bots and open them in the browser.
-    if (discord_setup && !non_interactive) {
-      // Collect all tokens we have access to (daemon, commander, pool bots from this session)
-      const bot_entries: Array<{ name: string; token: string }> = [];
-
-      bot_entries.push({ name: "Daemon", token: discord_setup.daemon_bot_token });
-      if (discord_setup.commander_bot_token) {
-        bot_entries.push({ name: "Pat (Commander)", token: discord_setup.commander_bot_token });
-      }
-      for (let i = 0; i < pool_bot_tokens.length; i++) {
-        bot_entries.push({ name: `LF-${String(i)}`, token: pool_bot_tokens[i]! });
-      }
-
-      if (bot_entries.length > 0) {
-        p.note(
-          "Now let's invite all bots to your server.\n\n" +
-            'Tip: Create a single role called "bot" in your server with these permissions:\n' +
-            "  Manage Server, Manage Channels, View Channels, Send Messages,\n" +
-            "  Read Message History, Manage Webhooks, Attach Files, Add Reactions,\n" +
-            "  Manage Nicknames\n" +
-            'Then assign the "bot" role to all bots at once.',
-          "Bot Invites",
-        );
-
-        const do_invite = await p.confirm({
-          message: `Open invite links for ${String(bot_entries.length)} bot${bot_entries.length > 1 ? "s" : ""} in your browser?`,
-          initialValue: true,
+      // Write Commander (Pat) bot token to channel state dir
+      if (discord_setup?.commander_bot_token) {
+        const { writeFile, mkdir: mkdirFs } = await import("node:fs/promises");
+        const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+        const pat_dir = `${lf_dir(path_overrides)}/channels/pat`;
+        await mkdirFs(pat_dir, { recursive: true, mode: 0o700 });
+        const pat_env_path = `${pat_dir}/.env`;
+        await writeFile(pat_env_path, `DISCORD_BOT_TOKEN=${discord_setup.commander_bot_token}\n`, {
+          mode: 0o600,
         });
-        if (p.isCancel(do_invite)) { p.cancel("Setup cancelled."); process.exit(0); }
+        files.push(pat_env_path);
+      }
 
-        if (do_invite) {
-          const { spawnSync } = await import("node:child_process");
-          const { setTimeout: sleep } = await import("node:timers/promises");
+      // ── Pool Bot Setup ──
+      // Tracks tokens collected this session for invite URL generation
+      const pool_bot_tokens: string[] = [];
+      let pool_bot_count = 0;
 
-          for (const entry of bot_entries) {
-            // Extract application/client ID from the token's first segment (base64-encoded)
-            const first_segment = entry.token.split(".")[0];
-            if (!first_segment) continue;
-            const client_id = Buffer.from(first_segment, "base64").toString("utf-8");
+      if (discord_setup && !non_interactive) {
+        const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+        const lf_path = lf_dir(path_overrides);
+        const existing_pool = await check_pool_bots(lf_path);
+        let should_write_pool = false;
 
-            if (!client_id || !/^\d{17,20}$/.test(client_id)) {
-              p.log.warn(`Could not extract client ID for ${entry.name} — invite URL skipped. Visit https://discord.com/developers/applications to invite manually.`);
-              continue;
-            }
-
-            const invite_url = `https://discord.com/oauth2/authorize?client_id=${client_id}&scope=bot&permissions=0`;
-
-            p.log.info(`Opening invite for ${entry.name}...`);
-            spawnSync("open", [invite_url]);
-            // Brief pause between opens so the user can accept each invite
-            await sleep(2500);
+        if (existing_pool.count > 0) {
+          p.log.info(
+            `Found ${String(existing_pool.count)} existing pool bot${existing_pool.count > 1 ? "s" : ""} (${existing_pool.indices.map((i) => `LF-${String(i)}`).join(", ")}).`,
+          );
+          const reconfigure = await p.confirm({
+            message: "Pool bots already configured. Set up new ones?",
+            initialValue: false,
+          });
+          if (p.isCancel(reconfigure)) {
+            p.cancel("Setup cancelled.");
+            process.exit(0);
           }
 
-          const ack = await p.confirm({ message: "Done inviting all bots to your server?" });
-          if (p.isCancel(ack)) { p.cancel("Setup cancelled."); process.exit(0); }
-        }
-      }
-    }
-
-    // Install Discord channel plugin for Commander
-    if (discord_setup && !non_interactive) {
-      spin.start("Installing Discord channel plugin...");
-      const { exec_command } = await import("../lib/process.js");
-      const plugin_check = await exec_command("claude plugins list 2>/dev/null");
-      if (!plugin_check.stdout.includes("discord@claude-plugins-official")) {
-        const result = await exec_command("claude plugins install discord@claude-plugins-official 2>&1");
-        if (result.exitCode === 0) {
-          spin.stop("Discord channel plugin installed");
+          if (reconfigure) {
+            pool_bot_count = await prompt_pool_bot_count();
+            should_write_pool = true;
+          } else {
+            pool_bot_count = existing_pool.count;
+          }
         } else {
-          spin.stop("Discord plugin install failed — install manually: claude plugins install discord@claude-plugins-official");
+          pool_bot_count = await prompt_pool_bot_count();
+          should_write_pool = pool_bot_count > 0;
         }
-      } else {
-        spin.stop("Discord channel plugin already installed");
+
+        if (should_write_pool) {
+          const { writeFile: writeF, mkdir: mkdirFs, rm } = await import("node:fs/promises");
+
+          for (let i = 0; i < pool_bot_count; i++) {
+            const token = await prompt_pool_bot_token(i);
+            pool_bot_tokens.push(token);
+
+            const pool_dir = `${lf_path}/channels/pool-${String(i)}`;
+            await mkdirFs(pool_dir, { recursive: true, mode: 0o700 });
+            const pool_env_path = `${pool_dir}/.env`;
+            await writeF(pool_env_path, `DISCORD_BOT_TOKEN=${token}\n`, { mode: 0o600 });
+            files.push(pool_env_path);
+          }
+
+          // Clean up orphaned pool directories when count decreases
+          for (let i = pool_bot_count; i < existing_pool.count; i++) {
+            const stale_dir = `${lf_path}/channels/pool-${String(i)}`;
+            await rm(stale_dir, { recursive: true, force: true });
+          }
+
+          p.log.success(
+            `${String(pool_bot_count)} pool bot${pool_bot_count > 1 ? "s" : ""} configured.`,
+          );
+        }
       }
-    }
 
-    // Write Pat's access.json if commander token and Discord are configured
-    if (discord_setup?.commander_bot_token && !non_interactive) {
-      p.note(
-        "Pat needs to know which Discord channel to listen in and who to accept messages from.\n\n" +
-          "Right-click the #command-center channel → Copy Channel ID.\n" +
-          (discord_setup.user_id
-            ? `Using your Discord user ID from earlier: ${discord_setup.user_id}`
-            : "Right-click your own avatar → Copy User ID."),
-        "Commander Access Control",
-      );
+      // ── Bot Invite URLs ──
+      // Generate zero-permission invite URLs for all bots and open them in the browser.
+      if (discord_setup && !non_interactive) {
+        // Collect all tokens we have access to (daemon, commander, pool bots from this session)
+        const bot_entries: Array<{ name: string; token: string }> = [];
 
-      const command_center_id = await p.text({
-        message: "#command-center channel ID:",
-        validate: (value) => {
-          if (!value.trim()) return "Channel ID is required for Pat.";
-          return undefined;
-        },
-      });
-      if (p.isCancel(command_center_id)) { p.cancel("Setup cancelled."); process.exit(0); }
+        bot_entries.push({ name: "Daemon", token: discord_setup.daemon_bot_token });
+        if (discord_setup.commander_bot_token) {
+          bot_entries.push({ name: "Pat (Commander)", token: discord_setup.commander_bot_token });
+        }
+        for (let i = 0; i < pool_bot_tokens.length; i++) {
+          bot_entries.push({ name: `LF-${String(i)}`, token: pool_bot_tokens[i]! });
+        }
 
-      // Reuse the user ID captured during Discord setup if available
-      let user_discord_id: string;
-      if (discord_setup.user_id) {
-        user_discord_id = discord_setup.user_id;
-      } else {
-        const id_result = await p.text({
-          message: "Your Discord user ID:",
+        if (bot_entries.length > 0) {
+          p.note(
+            "Now let's invite all bots to your server.\n\n" +
+              'Tip: Create a single role called "bot" in your server with these permissions:\n' +
+              "  Manage Server, Manage Channels, View Channels, Send Messages,\n" +
+              "  Read Message History, Manage Webhooks, Attach Files, Add Reactions,\n" +
+              "  Manage Nicknames\n" +
+              'Then assign the "bot" role to all bots at once.',
+            "Bot Invites",
+          );
+
+          const do_invite = await p.confirm({
+            message: `Open invite links for ${String(bot_entries.length)} bot${bot_entries.length > 1 ? "s" : ""} in your browser?`,
+            initialValue: true,
+          });
+          if (p.isCancel(do_invite)) {
+            p.cancel("Setup cancelled.");
+            process.exit(0);
+          }
+
+          if (do_invite) {
+            const { spawnSync } = await import("node:child_process");
+            const { setTimeout: sleep } = await import("node:timers/promises");
+
+            for (const entry of bot_entries) {
+              // Extract application/client ID from the token's first segment (base64-encoded)
+              const first_segment = entry.token.split(".")[0];
+              if (!first_segment) continue;
+              const client_id = Buffer.from(first_segment, "base64").toString("utf-8");
+
+              if (!client_id || !/^\d{17,20}$/.test(client_id)) {
+                p.log.warn(
+                  `Could not extract client ID for ${entry.name} — invite URL skipped. Visit https://discord.com/developers/applications to invite manually.`,
+                );
+                continue;
+              }
+
+              const invite_url = `https://discord.com/oauth2/authorize?client_id=${client_id}&scope=bot&permissions=0`;
+
+              p.log.info(`Opening invite for ${entry.name}...`);
+              spawnSync("open", [invite_url]);
+              // Brief pause between opens so the user can accept each invite
+              await sleep(2500);
+            }
+
+            const ack = await p.confirm({ message: "Done inviting all bots to your server?" });
+            if (p.isCancel(ack)) {
+              p.cancel("Setup cancelled.");
+              process.exit(0);
+            }
+          }
+        }
+      }
+
+      // Install Discord channel plugin for Commander
+      if (discord_setup && !non_interactive) {
+        spin.start("Installing Discord channel plugin...");
+        const { exec_command } = await import("../lib/process.js");
+        const plugin_check = await exec_command("claude plugins list 2>/dev/null");
+        if (!plugin_check.stdout.includes("discord@claude-plugins-official")) {
+          const result = await exec_command(
+            "claude plugins install discord@claude-plugins-official 2>&1",
+          );
+          if (result.exitCode === 0) {
+            spin.stop("Discord channel plugin installed");
+          } else {
+            spin.stop(
+              "Discord plugin install failed — install manually: claude plugins install discord@claude-plugins-official",
+            );
+          }
+        } else {
+          spin.stop("Discord channel plugin already installed");
+        }
+      }
+
+      // Write Pat's access.json if commander token and Discord are configured
+      if (discord_setup?.commander_bot_token && !non_interactive) {
+        p.note(
+          `Pat needs to know which Discord channel to listen in and who to accept messages from.\n\nRight-click the #command-center channel → Copy Channel ID.\n${
+            discord_setup.user_id
+              ? `Using your Discord user ID from earlier: ${discord_setup.user_id}`
+              : "Right-click your own avatar → Copy User ID."
+          }`,
+          "Commander Access Control",
+        );
+
+        const command_center_id = await p.text({
+          message: "#command-center channel ID:",
           validate: (value) => {
-            if (!value.trim()) return "User ID is required.";
+            if (!value.trim()) return "Channel ID is required for Pat.";
             return undefined;
           },
         });
-        if (p.isCancel(id_result)) { p.cancel("Setup cancelled."); process.exit(0); }
-        user_discord_id = id_result.trim();
+        if (p.isCancel(command_center_id)) {
+          p.cancel("Setup cancelled.");
+          process.exit(0);
+        }
+
+        // Reuse the user ID captured during Discord setup if available
+        let user_discord_id: string;
+        if (discord_setup.user_id) {
+          user_discord_id = discord_setup.user_id;
+        } else {
+          const id_result = await p.text({
+            message: "Your Discord user ID:",
+            validate: (value) => {
+              if (!value.trim()) return "User ID is required.";
+              return undefined;
+            },
+          });
+          if (p.isCancel(id_result)) {
+            p.cancel("Setup cancelled.");
+            process.exit(0);
+          }
+          user_discord_id = id_result.trim();
+        }
+
+        const { writeFile: writeF, mkdir: mkdirFs } = await import("node:fs/promises");
+        const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
+        const pat_dir = `${lf_dir(path_overrides)}/channels/pat`;
+        await mkdirFs(pat_dir, { recursive: true, mode: 0o700 });
+
+        const access_config = {
+          dmPolicy: "allowlist",
+          allowFrom: [user_discord_id],
+          groups: {
+            [command_center_id.trim()]: {
+              requireMention: false,
+              allowFrom: [],
+            },
+          },
+          pending: {},
+          ackReaction: "👀",
+          replyToMode: "first",
+          textChunkLimit: 2000,
+          chunkMode: "newline",
+        };
+
+        const access_path = `${pat_dir}/access.json`;
+        await writeF(access_path, `${JSON.stringify(access_config, null, 2)}\n`, { mode: 0o600 });
+        files.push(access_path);
+        p.log.success("Commander access control configured");
       }
 
-      const { writeFile: writeF, mkdir: mkdirFs } = await import("node:fs/promises");
-      const { lobsterfarm_dir: lf_dir } = await import("@lobster-farm/shared");
-      const pat_dir = `${lf_dir(path_overrides)}/channels/pat`;
-      await mkdirFs(pat_dir, { recursive: true, mode: 0o700 });
+      spin.stop(`Wrote ${String(files.length + 2)} configuration files`);
 
-      const access_config = {
-        dmPolicy: "allowlist",
-        allowFrom: [user_discord_id],
-        groups: {
-          [command_center_id.trim()]: {
-            requireMention: false,
-            allowFrom: [],
-          },
-        },
-        pending: {},
-        ackReaction: "👀",
-        replyToMode: "first",
-        textChunkLimit: 2000,
-        chunkMode: "newline",
-      };
+      // ── Summary ──
+      const summary_lines = [
+        `Config:     ${config_path}`,
+        `Settings:   ${settings_path}`,
+        `Agents:     ${agent_names.planner} (planner), ${agent_names.designer} (designer), ${agent_names.builder} (builder), ${agent_names.operator} (operator), ${agent_names.commander} (commander)`,
+        "Entities:   ~/.lobsterfarm/entities/",
+        `Machine:    ${machine.name}`,
+        `Sudo:       ${sudo.status}`,
+        `1Password:  ${op.status}`,
+      ];
 
-      const access_path = `${pat_dir}/access.json`;
-      await writeF(access_path, JSON.stringify(access_config, null, 2) + "\n", { mode: 0o600 });
-      files.push(access_path);
-      p.log.success("Commander access control configured");
-    }
+      summary_lines.push(`Bun:        ${bun.status}`);
+      summary_lines.push(`tmux:       ${tmux.status}`);
+      summary_lines.push(`GitHub CLI: ${gh.status}`);
+      summary_lines.push(`Peekaboo:   ${peekaboo_status}`);
 
-    spin.stop(`Wrote ${String(files.length + 2)} configuration files`);
+      if (discord_setup) {
+        const tokens = [discord_setup.daemon_bot_token ? "daemon" : ""].filter(Boolean);
+        if (discord_setup.commander_bot_token) tokens.push("commander");
+        summary_lines.push(
+          `Discord:    server ${discord_setup.server_id} (${tokens.join(" + ")} token${tokens.length > 1 ? "s" : ""} saved)`,
+        );
+      }
 
-    // ── Summary ──
-    const summary_lines = [
-      `Config:     ${config_path}`,
-      `Settings:   ${settings_path}`,
-      `Agents:     ${agent_names.planner} (planner), ${agent_names.designer} (designer), ${agent_names.builder} (builder), ${agent_names.operator} (operator), ${agent_names.commander} (commander)`,
-      `Entities:   ~/.lobsterfarm/entities/`,
-      `Machine:    ${machine.name}`,
-      `Sudo:       ${sudo.status}`,
-      `1Password:  ${op.status}`,
-    ];
+      if (pool_bot_count > 0) {
+        const last_index = pool_bot_count - 1;
+        summary_lines.push(
+          `Pool bots:  ${String(pool_bot_count)} configured (LF-0 through LF-${String(last_index)})`,
+        );
+      }
 
-    summary_lines.push(`Bun:        ${bun.status}`);
-    summary_lines.push(`tmux:       ${tmux.status}`);
-    summary_lines.push(`GitHub CLI: ${gh.status}`);
-    summary_lines.push(`Peekaboo:   ${peekaboo_status}`);
+      if (github.username) {
+        summary_lines.push(`GitHub:     ${github.username}`);
+      }
 
-    if (discord_setup) {
-      const tokens = [discord_setup.daemon_bot_token ? "daemon" : ""].filter(Boolean);
-      if (discord_setup.commander_bot_token) tokens.push("commander");
-      summary_lines.push(`Discord:    server ${discord_setup.server_id} (${tokens.join(" + ")} token${tokens.length > 1 ? "s" : ""} saved)`);
-    }
+      // Tool integration statuses
+      if (tools_config?.tailscale?.installed) {
+        const ts = tools_config.tailscale;
+        summary_lines.push(
+          `Tailscale:  connected as ${ts.hostname ?? "unknown"} (${ts.ip ?? "unknown"})`,
+        );
+      }
+      if (tools_config?.docker?.installed) {
+        summary_lines.push(`Docker:     ${tools_config.docker.runtime ?? "colima"} ready`);
+      }
+      if (tools_config?.vercel?.installed) {
+        const v = tools_config.vercel;
+        summary_lines.push(`Vercel:     authenticated as ${v.username ?? "unknown"}`);
+      }
+      if (tools_config?.supabase?.installed) {
+        summary_lines.push("Supabase:   authenticated");
+      }
+      if (tools_config?.sentry?.installed) {
+        const s = tools_config.sentry;
+        summary_lines.push(`Sentry:     authenticated${s.org ? ` (org: ${s.org})` : ""}`);
+      }
 
-    if (pool_bot_count > 0) {
-      const last_index = pool_bot_count - 1;
-      summary_lines.push(`Pool bots:  ${String(pool_bot_count)} configured (LF-0 through LF-${String(last_index)})`);
-    }
+      p.note(summary_lines.join("\n"), "Setup Complete");
 
-    if (github.username) {
-      summary_lines.push(`GitHub:     ${github.username}`);
-    }
-
-    // Tool integration statuses
-    if (tools_config?.tailscale?.installed) {
-      const ts = tools_config.tailscale;
-      summary_lines.push(`Tailscale:  connected as ${ts.hostname ?? "unknown"} (${ts.ip ?? "unknown"})`);
-    }
-    if (tools_config?.docker?.installed) {
-      summary_lines.push(`Docker:     ${tools_config.docker.runtime ?? "colima"} ready`);
-    }
-    if (tools_config?.vercel?.installed) {
-      const v = tools_config.vercel;
-      summary_lines.push(`Vercel:     authenticated as ${v.username ?? "unknown"}`);
-    }
-    if (tools_config?.supabase?.installed) {
-      summary_lines.push(`Supabase:   authenticated`);
-    }
-    if (tools_config?.sentry?.installed) {
-      const s = tools_config.sentry;
-      summary_lines.push(`Sentry:     authenticated${s.org ? ` (org: ${s.org})` : ""}`);
-    }
-
-    p.note(summary_lines.join("\n"), "Setup Complete");
-
-    p.outro(
-      "Run `lf start` to launch the daemon. Happy building!",
-    );
-  });
+      p.outro("Run `lf start` to launch the daemon. Happy building!");
+    },
+  );

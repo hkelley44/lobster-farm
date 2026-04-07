@@ -1,11 +1,11 @@
-import { Command } from "commander";
 import { execFileSync } from "node:child_process";
 import { readdirSync } from "node:fs";
-import { join } from "node:path";
 import { homedir } from "node:os";
-import { unload_service, is_service_loaded } from "../lib/launchd.js";
-import { read_pid_file, is_process_running } from "../lib/process.js";
+import { join } from "node:path";
 import { pid_file_path } from "@lobster-farm/shared";
+import { Command } from "commander";
+import { is_service_loaded, unload_service } from "../lib/launchd.js";
+import { is_process_running, read_pid_file } from "../lib/process.js";
 
 export const stop_command = new Command("stop")
   .description("Stop the LobsterFarm daemon")
@@ -27,10 +27,14 @@ export const stop_command = new Command("stop")
         if (entry.isDirectory() && entry.name.startsWith("pool-")) {
           try {
             execFileSync("tmux", ["kill-session", "-t", entry.name], { stdio: "ignore" });
-          } catch { /* session may not exist */ }
+          } catch {
+            /* session may not exist */
+          }
         }
       }
-    } catch { /* channels dir may not exist */ }
+    } catch {
+      /* channels dir may not exist */
+    }
 
     // Unload the launchd service
     await unload_service();

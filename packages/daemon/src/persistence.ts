@@ -1,8 +1,8 @@
-import { readFile, writeFile, mkdir, appendFile, rename } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { LobsterFarmConfig, ArchetypeRole, ChannelType } from "@lobster-farm/shared";
-import { lobsterfarm_dir, entity_dir } from "@lobster-farm/shared";
+import type { ArchetypeRole, ChannelType, LobsterFarmConfig } from "@lobster-farm/shared";
+import { entity_dir, lobsterfarm_dir } from "@lobster-farm/shared";
 
 const STATE_DIR = "state";
 const PR_REVIEWS_FILE = "pr-reviews.json";
@@ -30,7 +30,7 @@ function pr_watches_path(config: LobsterFarmConfig): string {
 export interface ProcessedPR {
   entity_id: string;
   pr_number: number;
-  reviewed_at: string;       // ISO timestamp
+  reviewed_at: string; // ISO timestamp
   outcome: "approved" | "changes_requested" | "pending";
   /** JSON-stringified sorted failure names — used to deduplicate CI failure alerts.
    * Only set when a CI failure alert has been sent for this PR. */
@@ -57,9 +57,7 @@ export async function save_pr_reviews(
 }
 
 /** Load PR review state from disk. Returns empty object if file doesn't exist. */
-export async function load_pr_reviews(
-  config: LobsterFarmConfig,
-): Promise<PRReviewState> {
+export async function load_pr_reviews(config: LobsterFarmConfig): Promise<PRReviewState> {
   const path = pr_reviews_path(config);
   try {
     const content = await readFile(path, "utf-8");
@@ -75,7 +73,7 @@ export async function load_pr_reviews(
 
 export interface PersistedPoolBot {
   id: number;
-  state: "assigned" | "parked";  // free bots are not persisted
+  state: "assigned" | "parked"; // free bots are not persisted
   channel_id: string;
   entity_id: string;
   archetype: ArchetypeRole;
@@ -85,8 +83,8 @@ export interface PersistedPoolBot {
   model?: string | null;
   /** Claude CLI effort level (e.g., "high"). Added in #101. */
   effort?: string | null;
-  last_active: string | null;  // ISO timestamp
-  assigned_at?: string | null;  // ISO timestamp — when the bot was assigned to its current channel
+  last_active: string | null; // ISO timestamp
+  assigned_at?: string | null; // ISO timestamp — when the bot was assigned to its current channel
   /** The archetype whose avatar is currently set on this bot's Discord profile.
    * Persisted so we don't redundantly set avatars on restart. */
   last_avatar_archetype?: ArchetypeRole | null;
@@ -97,7 +95,7 @@ export interface PersistedPoolBot {
  * the pool — we need to track it across assignment cycles. */
 export interface PersistedBotAvatarState {
   archetype: ArchetypeRole;
-  set_at: string;  // ISO timestamp
+  set_at: string; // ISO timestamp
 }
 
 /** Persisted pool state: bots + session history for cross-eviction resume. */
@@ -138,9 +136,7 @@ export async function save_pool_state(
  * Backward-compatible: if the file contains a plain array (old format),
  * treats it as bots-only with empty session history.
  */
-export async function load_pool_state(
-  config: LobsterFarmConfig,
-): Promise<PersistedPoolState> {
+export async function load_pool_state(config: LobsterFarmConfig): Promise<PersistedPoolState> {
   const path = pool_state_path(config);
   try {
     const content = await readFile(path, "utf-8");
@@ -148,24 +144,32 @@ export async function load_pool_state(
 
     // Old format: plain array of bots
     if (Array.isArray(data)) {
-      console.log(`[pool] Loaded pool-state.json (old array format, ${String(data.length)} entries)`);
+      console.log(
+        `[pool] Loaded pool-state.json (old array format, ${String(data.length)} entries)`,
+      );
       return { bots: data as PersistedPoolBot[], session_history: {}, avatar_state: {} };
     }
 
     // New format: { bots, session_history, avatar_state? }
     if (typeof data === "object" && data !== null && "bots" in data) {
       const obj = data as Record<string, unknown>;
-      const bots = Array.isArray(obj["bots"]) ? (obj["bots"] as PersistedPoolBot[]) : [];
-      const history = (typeof obj["session_history"] === "object" && obj["session_history"] !== null && !Array.isArray(obj["session_history"]))
-        ? (obj["session_history"] as Record<string, string>)
-        : {};
-      const avatars = (typeof obj["avatar_state"] === "object" && obj["avatar_state"] !== null && !Array.isArray(obj["avatar_state"]))
-        ? (obj["avatar_state"] as Record<string, PersistedBotAvatarState>)
-        : {};
+      const bots = Array.isArray(obj.bots) ? (obj.bots as PersistedPoolBot[]) : [];
+      const history =
+        typeof obj.session_history === "object" &&
+        obj.session_history !== null &&
+        !Array.isArray(obj.session_history)
+          ? (obj.session_history as Record<string, string>)
+          : {};
+      const avatars =
+        typeof obj.avatar_state === "object" &&
+        obj.avatar_state !== null &&
+        !Array.isArray(obj.avatar_state)
+          ? (obj.avatar_state as Record<string, PersistedBotAvatarState>)
+          : {};
       console.log(
         `[pool] Loaded pool-state.json (${String(bots.length)} bots, ` +
-        `${String(Object.keys(history).length)} history entries, ` +
-        `${String(Object.keys(avatars).length)} avatar entries)`,
+          `${String(Object.keys(history).length)} history entries, ` +
+          `${String(Object.keys(avatars).length)} avatar entries)`,
       );
       return { bots, session_history: history, avatar_state: avatars };
     }
@@ -173,9 +177,10 @@ export async function load_pool_state(
     console.log("[pool] pool-state.json has unexpected format — starting fresh");
     return { bots: [], session_history: {}, avatar_state: {} };
   } catch (err) {
-    const msg = err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT'
-      ? "file not found"
-      : String(err);
+    const msg =
+      err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT"
+        ? "file not found"
+        : String(err);
     console.log(`[pool] Could not load pool-state.json: ${msg} — starting fresh`);
     return { bots: [], session_history: {}, avatar_state: {} };
   }
@@ -192,12 +197,12 @@ export interface SessionLogEntry {
   archetype: ArchetypeRole;
   phase: string | null;
   source: "queue" | "pool";
-  started_at: string;           // ISO timestamp
-  ended_at: string | null;      // ISO timestamp, null if still running
-  exit_code: number | null;     // null if still running
-  duration_ms: number | null;   // computed from start/end
-  bot_id: number | null;        // pool bot ID if pool-sourced
-  resume: boolean;              // was this a resumed session?
+  started_at: string; // ISO timestamp
+  ended_at: string | null; // ISO timestamp, null if still running
+  exit_code: number | null; // null if still running
+  duration_ms: number | null; // computed from start/end
+  bot_id: number | null; // pool bot ID if pool-sourced
+  resume: boolean; // was this a resumed session?
 }
 
 function session_log_path(config: LobsterFarmConfig, entity_id: string): string {
@@ -215,7 +220,7 @@ export async function append_session_log(
 ): Promise<void> {
   const path = session_log_path(config, entity_id);
   await mkdir(dirname(path), { recursive: true });
-  await appendFile(path, JSON.stringify(entry) + "\n", "utf-8");
+  await appendFile(path, `${JSON.stringify(entry)}\n`, "utf-8");
 }
 
 /**
@@ -269,10 +274,10 @@ export async function read_session_log(
 
 /** A single PR watch: a bot is interested in this PR's terminal state. */
 export interface PersistedPRWatch {
-  repo: string;        // "owner/repo"
+  repo: string; // "owner/repo"
   pr_number: number;
-  channel_id: string;  // Discord channel that registered the watch
-  created_at: string;  // ISO timestamp
+  channel_id: string; // Discord channel that registered the watch
+  created_at: string; // ISO timestamp
 }
 
 /** Keyed by "owner/repo#pr_number" */
@@ -291,9 +296,7 @@ export async function save_pr_watches(
 }
 
 /** Load PR watches from disk. Returns empty object if file doesn't exist. */
-export async function load_pr_watches(
-  config: LobsterFarmConfig,
-): Promise<PRWatchState> {
+export async function load_pr_watches(config: LobsterFarmConfig): Promise<PRWatchState> {
   const path = pr_watches_path(config);
   try {
     const content = await readFile(path, "utf-8");

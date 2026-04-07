@@ -179,9 +179,7 @@ export async function find_worktree_for_branch(
       }
     }
   } catch (err) {
-    console.error(
-      `[worktree-cleanup] Failed to list worktrees in ${repo_path}: ${String(err)}`,
-    );
+    console.error(`[worktree-cleanup] Failed to list worktrees in ${repo_path}: ${String(err)}`);
   }
 
   return null;
@@ -195,10 +193,7 @@ export async function find_worktree_for_branch(
  *
  * Checks both git-tracked worktrees and .claude/worktrees/ directories.
  */
-export async function cleanup_after_merge(
-  repo_path: string,
-  branch: string,
-): Promise<void> {
+export async function cleanup_after_merge(repo_path: string, branch: string): Promise<void> {
   console.log(`[worktree-cleanup] Cleaning up after merge of branch: ${branch}`);
 
   // 1. Check git worktree list for a worktree on this branch
@@ -228,10 +223,7 @@ export async function cleanup_after_merge(
  * given branch. Agent-created worktrees follow the pattern of branch slug
  * as directory name (e.g., .claude/worktrees/agent-feature-134-auto-cleanup).
  */
-async function cleanup_claude_worktrees(
-  repo_path: string,
-  branch: string,
-): Promise<void> {
+async function cleanup_claude_worktrees(repo_path: string, branch: string): Promise<void> {
   const claude_wt_dir = join(repo_path, ".claude", "worktrees");
 
   try {
@@ -243,9 +235,7 @@ async function cleanup_claude_worktrees(
 
   // The branch slug is the part after the last slash, lowercased
   // e.g. "feature/134-auto-cleanup" → "134-auto-cleanup"
-  const branch_slug = branch.includes("/")
-    ? branch.slice(branch.lastIndexOf("/") + 1)
-    : branch;
+  const branch_slug = branch.includes("/") ? branch.slice(branch.lastIndexOf("/") + 1) : branch;
 
   try {
     const entries = await readdir(claude_wt_dir, { withFileTypes: true });
@@ -260,9 +250,7 @@ async function cleanup_claude_worktrees(
       }
     }
   } catch (err) {
-    console.error(
-      `[worktree-cleanup] Error scanning .claude/worktrees/: ${String(err)}`,
-    );
+    console.error(`[worktree-cleanup] Error scanning .claude/worktrees/: ${String(err)}`);
   }
 }
 
@@ -275,9 +263,7 @@ async function cleanup_claude_worktrees(
  *
  * Designed to run periodically (e.g., hourly) as a safety net.
  */
-export async function sweep_stale_worktrees(
-  registry: EntityRegistry,
-): Promise<void> {
+export async function sweep_stale_worktrees(registry: EntityRegistry): Promise<void> {
   const entities = registry.get_active();
   let total_cleaned = 0;
 
@@ -367,9 +353,7 @@ async function sweep_repo(repo_path: string): Promise<number> {
 
     // Case 1: Branch is merged into main
     if (merged_branches.has(branch)) {
-      console.log(
-        `[worktree-cleanup] Stale worktree (branch merged): ${entry.path} [${branch}]`,
-      );
+      console.log(`[worktree-cleanup] Stale worktree (branch merged): ${entry.path} [${branch}]`);
       should_clean = true;
     }
 
@@ -377,9 +361,7 @@ async function sweep_repo(repo_path: string): Promise<number> {
     if (!should_clean) {
       should_clean = await is_remote_branch_gone(repo_path, branch);
       if (should_clean) {
-        console.log(
-          `[worktree-cleanup] Stale worktree (remote gone): ${entry.path} [${branch}]`,
-        );
+        console.log(`[worktree-cleanup] Stale worktree (remote gone): ${entry.path} [${branch}]`);
       }
     }
 
@@ -401,16 +383,12 @@ async function sweep_repo(repo_path: string): Promise<number> {
  * Check if a branch's remote tracking ref (origin/<branch>) no longer exists.
  * Returns true if the remote ref is gone, false if it still exists or on error.
  */
-async function is_remote_branch_gone(
-  repo_path: string,
-  branch: string,
-): Promise<boolean> {
+async function is_remote_branch_gone(repo_path: string, branch: string): Promise<boolean> {
   try {
-    await exec(
-      "git",
-      ["rev-parse", "--verify", `refs/remotes/origin/${branch}`],
-      { cwd: repo_path, timeout: GIT_TIMEOUT_MS },
-    );
+    await exec("git", ["rev-parse", "--verify", `refs/remotes/origin/${branch}`], {
+      cwd: repo_path,
+      timeout: GIT_TIMEOUT_MS,
+    });
     // Ref exists — not stale
     return false;
   } catch {

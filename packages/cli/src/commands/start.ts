@@ -1,25 +1,20 @@
-import { Command } from "commander";
+import { execFileSync } from "node:child_process";
 import { statSync } from "node:fs";
-import { writeFile, mkdir, access, chmod } from "node:fs/promises";
+import { access, chmod, mkdir, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
-import { homedir } from "node:os";
-import {
-  pid_file_path,
-  daemon_log_path,
-  expand_home,
-  LAUNCHD_LABEL,
-} from "@lobster-farm/shared";
+import { LAUNCHD_LABEL, daemon_log_path, expand_home, pid_file_path } from "@lobster-farm/shared";
+import { Command } from "commander";
 import {
   generate_env_sh,
-  generate_wrapper_sh,
   generate_plist,
-  plist_path,
-  load_service,
+  generate_wrapper_sh,
   is_service_loaded,
+  load_service,
+  plist_path,
 } from "../lib/launchd.js";
-import { read_pid_file, is_process_running } from "../lib/process.js";
+import { is_process_running, read_pid_file } from "../lib/process.js";
 
 /** Resolve the daemon entry point.
  *
@@ -45,7 +40,18 @@ export function resolve_daemon_path(): string {
   }
 
   // Fallback: legacy entity-zero repo location (our own dev instance)
-  const legacy = join(home, ".lobsterfarm", "entities", "lobster-farm", "repos", "lobster-farm", "packages", "daemon", "dist", "index.js");
+  const legacy = join(
+    home,
+    ".lobsterfarm",
+    "entities",
+    "lobster-farm",
+    "repos",
+    "lobster-farm",
+    "packages",
+    "daemon",
+    "dist",
+    "index.js",
+  );
   if (file_exists(legacy)) return legacy;
 
   // Nothing found — return the install path so the error message is useful
@@ -133,7 +139,9 @@ export const start_command = new Command("start")
     if (loaded && !running && !opts.upgrade) {
       // Service is loaded in launchd but the process isn't running —
       // likely a crash loop. Regenerate and kickstart automatically.
-      console.log("Service is loaded but daemon is not running (crash loop?). Regenerating and restarting...");
+      console.log(
+        "Service is loaded but daemon is not running (crash loop?). Regenerating and restarting...",
+      );
       opts.upgrade = true;
     }
 
@@ -143,10 +151,7 @@ export const start_command = new Command("start")
     if (loaded) {
       // Service is already loaded — kickstart to pick up new wrapper
       const uid = process.getuid?.() ?? 501;
-      execFileSync("launchctl", [
-        "kickstart", "-k",
-        `gui/${uid}/${LAUNCHD_LABEL}`,
-      ]);
+      execFileSync("launchctl", ["kickstart", "-k", `gui/${uid}/${LAUNCHD_LABEL}`]);
       console.log("LobsterFarm daemon restarted with updated wrapper.");
     } else {
       await load_service();

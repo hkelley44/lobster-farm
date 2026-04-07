@@ -1,9 +1,9 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 
@@ -112,22 +112,29 @@ describe("crash recovery (issue #157)", () => {
     mock_notify.mockClear();
 
     // Stub side effects
-    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-      .mockImplementation(() => {});
-    vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_avatar" as never)
-      .mockResolvedValue(undefined);
-    mock_start_tmux = vi.spyOn(
-      pool as unknown as Record<string, unknown>, "start_tmux" as never,
-    ).mockResolvedValue(undefined) as unknown as ReturnType<typeof vi.fn>;
+    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+      () => {},
+    );
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "write_access_json" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "set_bot_nickname" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "set_bot_avatar" as never,
+    ).mockResolvedValue(undefined);
+    mock_start_tmux = vi
+      .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
+      .mockResolvedValue(undefined) as unknown as ReturnType<typeof vi.fn>;
 
     // Default: tmux is dead for all sessions (crash scenario)
-    mock_is_tmux_alive = vi.spyOn(
-      pool as unknown as Record<string, unknown>, "is_tmux_alive" as never,
-    ).mockReturnValue(false) as unknown as ReturnType<typeof vi.fn>;
+    mock_is_tmux_alive = vi
+      .spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
+      .mockReturnValue(false) as unknown as ReturnType<typeof vi.fn>;
   });
 
   afterEach(async () => {
@@ -322,10 +329,7 @@ describe("crash recovery (issue #157)", () => {
       // Simulate 2 prior crashes within the last hour — health check
       // records a 3rd. Total = 3, which does NOT exceed the >3 threshold.
       const now = Date.now();
-      pool.get_crash_history().set(3, [
-        now - 30 * 60_000,
-        now - 10 * 60_000,
-      ]);
+      pool.get_crash_history().set(3, [now - 30 * 60_000, now - 10 * 60_000]);
 
       await pool.run_health_check();
 
@@ -348,11 +352,7 @@ describe("crash recovery (issue #157)", () => {
 
       // Pre-populate with 3 recent crashes (within the hour)
       const now = Date.now();
-      pool.get_crash_history().set(3, [
-        now - 45 * 60_000,
-        now - 20 * 60_000,
-        now - 5 * 60_000,
-      ]);
+      pool.get_crash_history().set(3, [now - 45 * 60_000, now - 20 * 60_000, now - 5 * 60_000]);
 
       await pool.run_health_check();
 
@@ -378,11 +378,7 @@ describe("crash recovery (issue #157)", () => {
 
       // Pre-populate with 3 recent crashes
       const now = Date.now();
-      pool.get_crash_history().set(3, [
-        now - 45 * 60_000,
-        now - 20 * 60_000,
-        now - 5 * 60_000,
-      ]);
+      pool.get_crash_history().set(3, [now - 45 * 60_000, now - 20 * 60_000, now - 5 * 60_000]);
 
       await pool.run_health_check();
 
@@ -405,11 +401,7 @@ describe("crash recovery (issue #157)", () => {
       pool.inject_bots([bot]);
 
       const now = Date.now();
-      pool.get_crash_history().set(3, [
-        now - 45 * 60_000,
-        now - 20 * 60_000,
-        now - 5 * 60_000,
-      ]);
+      pool.get_crash_history().set(3, [now - 45 * 60_000, now - 20 * 60_000, now - 5 * 60_000]);
 
       const events: unknown[] = [];
       pool.on("bot:crash_loop", (data) => events.push(data));
@@ -437,11 +429,7 @@ describe("crash recovery (issue #157)", () => {
       pool.inject_bots([bot]);
 
       const now = Date.now();
-      pool.get_crash_history().set(3, [
-        now - 45 * 60_000,
-        now - 20 * 60_000,
-        now - 5 * 60_000,
-      ]);
+      pool.get_crash_history().set(3, [now - 45 * 60_000, now - 20 * 60_000, now - 5 * 60_000]);
 
       await pool.run_health_check();
 
@@ -458,8 +446,8 @@ describe("crash recovery (issue #157)", () => {
       const now = Date.now();
       pool.get_crash_history().set(5, [
         now - 2 * 60 * 60_000, // 2 hours ago — should be removed
-        now - 90 * 60_000,     // 90 min ago — should be removed
-        now - 30 * 60_000,     // 30 min ago — should be kept
+        now - 90 * 60_000, // 90 min ago — should be removed
+        now - 30 * 60_000, // 30 min ago — should be kept
       ]);
 
       // Inject a bot that's NOT assigned (so health check doesn't trigger restart)
@@ -478,7 +466,7 @@ describe("crash recovery (issue #157)", () => {
       const now = Date.now();
       pool.get_crash_history().set(7, [
         now - 2 * 60 * 60_000, // 2 hours ago
-        now - 90 * 60_000,     // 90 min ago
+        now - 90 * 60_000, // 90 min ago
       ]);
 
       pool.inject_bots([make_bot({ id: 7, state: "free" })]);
@@ -492,11 +480,7 @@ describe("crash recovery (issue #157)", () => {
     it("does not remove crashes within 3-crash threshold when they are recent", async () => {
       // 3 crashes within the last hour — not a crash loop yet, but should persist
       const now = Date.now();
-      pool.get_crash_history().set(4, [
-        now - 40 * 60_000,
-        now - 20 * 60_000,
-        now - 5 * 60_000,
-      ]);
+      pool.get_crash_history().set(4, [now - 40 * 60_000, now - 20 * 60_000, now - 5 * 60_000]);
 
       pool.inject_bots([make_bot({ id: 4, state: "free" })]);
 
@@ -520,14 +504,16 @@ describe("crash recovery (issue #157)", () => {
     });
 
     it("skips parked bots", async () => {
-      pool.inject_bots([make_bot({
-        id: 1,
-        state: "parked",
-        channel_id: "ch-1",
-        entity_id: "e1",
-        archetype: "planner",
-        session_id: "sess-1",
-      })]);
+      pool.inject_bots([
+        make_bot({
+          id: 1,
+          state: "parked",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          archetype: "planner",
+          session_id: "sess-1",
+        }),
+      ]);
 
       await pool.run_health_check();
 
@@ -538,14 +524,16 @@ describe("crash recovery (issue #157)", () => {
     it("skips assigned bots with alive tmux", async () => {
       mock_is_tmux_alive.mockReturnValue(true);
 
-      pool.inject_bots([make_bot({
-        id: 1,
-        state: "assigned",
-        channel_id: "ch-1",
-        entity_id: "e1",
-        archetype: "planner",
-        session_id: "sess-1",
-      })]);
+      pool.inject_bots([
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          archetype: "planner",
+          session_id: "sess-1",
+        }),
+      ]);
 
       await pool.run_health_check();
 
@@ -556,14 +544,16 @@ describe("crash recovery (issue #157)", () => {
     it("skips health check entirely when draining", async () => {
       pool.drain();
 
-      pool.inject_bots([make_bot({
-        id: 1,
-        state: "assigned",
-        channel_id: "ch-1",
-        entity_id: "e1",
-        archetype: "planner",
-        session_id: "sess-1",
-      })]);
+      pool.inject_bots([
+        make_bot({
+          id: 1,
+          state: "assigned",
+          channel_id: "ch-1",
+          entity_id: "e1",
+          archetype: "planner",
+          session_id: "sess-1",
+        }),
+      ]);
 
       await pool.run_health_check();
 
@@ -577,7 +567,9 @@ describe("crash recovery (issue #157)", () => {
     it("serializes overlapping health checks — second call is a no-op", async () => {
       // Use a deferred promise so start_tmux blocks until we resolve it
       let resolve_start!: () => void;
-      const blocking_promise = new Promise<void>((r) => { resolve_start = r; });
+      const blocking_promise = new Promise<void>((r) => {
+        resolve_start = r;
+      });
       mock_start_tmux.mockReturnValue(blocking_promise);
 
       const bot = make_bot({
@@ -670,11 +662,7 @@ describe("crash recovery (issue #157)", () => {
 
       // Pre-populate with 3 recent crashes to trigger crash loop on the 4th
       const now = Date.now();
-      pool.get_crash_history().set(6, [
-        now - 45 * 60_000,
-        now - 20 * 60_000,
-        now - 5 * 60_000,
-      ]);
+      pool.get_crash_history().set(6, [now - 45 * 60_000, now - 20 * 60_000, now - 5 * 60_000]);
 
       const events: unknown[] = [];
       pool.on("bot:released", (data) => events.push(data));
@@ -689,12 +677,13 @@ describe("crash recovery (issue #157)", () => {
       expect(bots[0].session_id).toBeNull();
       expect(mock_start_tmux).not.toHaveBeenCalled();
       // Should have both bot:released (from force-free) and bot:crash_loop
-      const released = events.filter((e: unknown) =>
-        (e as Record<string, unknown>).bot_id === 6 &&
-        !("archetype" in (e as Record<string, unknown>))
+      const released = events.filter(
+        (e: unknown) =>
+          (e as Record<string, unknown>).bot_id === 6 &&
+          !("archetype" in (e as Record<string, unknown>)),
       );
-      const crash_loop = events.filter((e: unknown) =>
-        (e as Record<string, unknown>).archetype === "builder"
+      const crash_loop = events.filter(
+        (e: unknown) => (e as Record<string, unknown>).archetype === "builder",
       );
       expect(released).toHaveLength(1);
       expect(crash_loop).toHaveLength(1);
@@ -757,11 +746,7 @@ describe("crash recovery (issue #157)", () => {
 
       // Pre-populate with 3 recent crashes to trigger crash loop on the 4th
       const now = Date.now();
-      pool.get_crash_history().set(8, [
-        now - 45 * 60_000,
-        now - 20 * 60_000,
-        now - 5 * 60_000,
-      ]);
+      pool.get_crash_history().set(8, [now - 45 * 60_000, now - 20 * 60_000, now - 5 * 60_000]);
 
       const events: unknown[] = [];
       pool.on("bot:crash_loop", (data) => events.push(data));

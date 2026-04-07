@@ -1,13 +1,13 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readdir } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  type RoomArchive,
+  delete_room_archive,
+  load_room_archives,
   sanitize_channel_name,
   write_room_archive,
-  load_room_archives,
-  delete_room_archive,
-  type RoomArchive,
 } from "../discord.js";
 
 // ── sanitize_channel_name ──
@@ -105,7 +105,7 @@ describe("Room archive I/O", () => {
 
     const archives_dir = join(temp_dir, "entities", "alpha", "archives");
     const files = await readdir(archives_dir);
-    const tmp_files = files.filter(f => f.endsWith(".tmp"));
+    const tmp_files = files.filter((f) => f.endsWith(".tmp"));
     expect(tmp_files).toHaveLength(0);
   });
 
@@ -118,21 +118,33 @@ describe("Room archive I/O", () => {
   it("sorts archives by closed_at ascending", async () => {
     const paths = { lobsterfarm_dir: temp_dir };
 
-    await write_room_archive("alpha", make_archive({
-      name: "room-a",
-      closed_at: "2026-03-28T05:00:00Z",
-    }), paths);
-    await write_room_archive("alpha", make_archive({
-      name: "room-b",
-      closed_at: "2026-03-28T01:00:00Z",
-    }), paths);
-    await write_room_archive("alpha", make_archive({
-      name: "room-c",
-      closed_at: "2026-03-28T03:00:00Z",
-    }), paths);
+    await write_room_archive(
+      "alpha",
+      make_archive({
+        name: "room-a",
+        closed_at: "2026-03-28T05:00:00Z",
+      }),
+      paths,
+    );
+    await write_room_archive(
+      "alpha",
+      make_archive({
+        name: "room-b",
+        closed_at: "2026-03-28T01:00:00Z",
+      }),
+      paths,
+    );
+    await write_room_archive(
+      "alpha",
+      make_archive({
+        name: "room-c",
+        closed_at: "2026-03-28T03:00:00Z",
+      }),
+      paths,
+    );
 
     const archives = await load_room_archives("alpha", paths);
-    expect(archives.map(a => a.name)).toEqual(["room-b", "room-c", "room-a"]);
+    expect(archives.map((a) => a.name)).toEqual(["room-b", "room-c", "room-a"]);
   });
 
   it("handles null session_id", async () => {
@@ -178,20 +190,28 @@ describe("Room archive I/O", () => {
   it("stores multiple archives for the same room name", async () => {
     const paths = { lobsterfarm_dir: temp_dir };
 
-    await write_room_archive("alpha", make_archive({
-      name: "auth-flow",
-      closed_at: "2026-03-28T01:00:00Z",
-      session_id: "sess-1",
-    }), paths);
+    await write_room_archive(
+      "alpha",
+      make_archive({
+        name: "auth-flow",
+        closed_at: "2026-03-28T01:00:00Z",
+        session_id: "sess-1",
+      }),
+      paths,
+    );
 
-    await write_room_archive("alpha", make_archive({
-      name: "auth-flow",
-      closed_at: "2026-03-28T04:00:00Z",
-      session_id: "sess-2",
-    }), paths);
+    await write_room_archive(
+      "alpha",
+      make_archive({
+        name: "auth-flow",
+        closed_at: "2026-03-28T04:00:00Z",
+        session_id: "sess-2",
+      }),
+      paths,
+    );
 
     const archives = await load_room_archives("alpha", paths);
-    const auth_archives = archives.filter(a => a.name === "auth-flow");
+    const auth_archives = archives.filter((a) => a.name === "auth-flow");
     expect(auth_archives).toHaveLength(2);
     // Sorted by closed_at
     expect(auth_archives[0]!.session_id).toBe("sess-1");

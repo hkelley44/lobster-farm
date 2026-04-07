@@ -1,10 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  route_message,
-  parse_command,
-  classify_intent,
-  type RoutedMessage,
-} from "../router.js";
+import { type RoutedMessage, classify_intent, parse_command, route_message } from "../router.js";
 
 function make_msg(overrides: Partial<RoutedMessage> = {}): RoutedMessage {
   return {
@@ -107,38 +102,46 @@ describe("route_message", () => {
 
   describe("alerts channel routing", () => {
     it("routes alerts messages as approval responses", () => {
-      const result = route_message(make_msg({
-        channel_type: "alerts",
-        content: "Looks good, ship it",
-      }));
+      const result = route_message(
+        make_msg({
+          channel_type: "alerts",
+          content: "Looks good, ship it",
+        }),
+      );
       expect(result.type).toBe("approval_response");
     });
 
     it("still handles commands in alerts channel", () => {
-      const result = route_message(make_msg({
-        channel_type: "alerts",
-        content: "!lf approve alpha-42",
-      }));
+      const result = route_message(
+        make_msg({
+          channel_type: "alerts",
+          content: "!lf approve alpha-42",
+        }),
+      );
       expect(result.type).toBe("command");
     });
   });
 
   describe("work room routing", () => {
     it("ignores non-command work room messages", () => {
-      const result = route_message(make_msg({
-        channel_type: "work_room",
-        content: "hello",
-      }));
+      const result = route_message(
+        make_msg({
+          channel_type: "work_room",
+          content: "hello",
+        }),
+      );
       expect(result.type).toBe("ignore");
     });
   });
 
   describe("general channel routing", () => {
     it("classifies intent for build tasks", () => {
-      const result = route_message(make_msg({
-        channel_type: "general",
-        content: "Build the REST API endpoint for orders",
-      }));
+      const result = route_message(
+        make_msg({
+          channel_type: "general",
+          content: "Build the REST API endpoint for orders",
+        }),
+      );
       expect(result.type).toBe("classify");
       if (result.type === "classify") {
         expect(result.archetype).toBe("builder");
@@ -146,20 +149,24 @@ describe("route_message", () => {
     });
 
     it("asks for clarification on ambiguous messages", () => {
-      const result = route_message(make_msg({
-        channel_type: "general",
-        content: "hello how are you",
-      }));
+      const result = route_message(
+        make_msg({
+          channel_type: "general",
+          content: "hello how are you",
+        }),
+      );
       expect(result.type).toBe("ask_clarification");
     });
   });
 
   describe("work log routing", () => {
     it("ignores work log messages", () => {
-      const result = route_message(make_msg({
-        channel_type: "work_log",
-        content: "anything here",
-      }));
+      const result = route_message(
+        make_msg({
+          channel_type: "work_log",
+          content: "anything here",
+        }),
+      );
       expect(result.type).toBe("ignore");
     });
   });

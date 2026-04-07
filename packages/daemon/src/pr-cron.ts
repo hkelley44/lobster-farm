@@ -1,25 +1,33 @@
 import { execFile } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { promisify } from "node:util";
-import type { LobsterFarmConfig, EntityConfig, ArchetypeRole } from "@lobster-farm/shared";
+import type { ArchetypeRole, EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { expand_home } from "@lobster-farm/shared";
-import type { EntityRegistry } from "./registry.js";
-import type { ClaudeSessionManager } from "./session.js";
-import type { DiscordBot } from "./discord.js";
-import type { GitHubAppAuth } from "./github-app.js";
-import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status, fetch_ci_failure_logs, build_ci_fix_prompt, MAX_CI_FIX_ATTEMPTS } from "./review-utils.js";
 import { detect_review_outcome } from "./actions.js";
-import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
-import type { PRReviewState } from "./persistence.js";
+import type { DiscordBot } from "./discord.js";
+import { resolve_binary } from "./env.js";
+import type { GitHubAppAuth } from "./github-app.js";
 import {
+  close_linked_issues,
   extract_linked_issues,
   fetch_issue_context,
-  close_linked_issues,
   nwo_from_url,
 } from "./issue-utils.js";
-import { resolve_binary } from "./env.js";
+import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
+import type { PRReviewState } from "./persistence.js";
 import type { PRWatchStore } from "./pr-watches.js";
+import type { EntityRegistry } from "./registry.js";
+import {
+  MAX_CI_FIX_ATTEMPTS,
+  attempt_auto_merge,
+  build_ci_fix_prompt,
+  build_review_fix_prompt,
+  check_ci_status,
+  fetch_ci_failure_logs,
+  fetch_review_comments,
+} from "./review-utils.js";
 import * as sentry from "./sentry.js";
+import type { ClaudeSessionManager } from "./session.js";
 
 const exec = promisify(execFile);
 
@@ -79,7 +87,7 @@ export class PRReviewCron {
   private processed: PRReviewState = {}; // persisted to disk — tracks completed reviews
   private running = false;
   private interval_ms: number = DEFAULT_INTERVAL_MS;
-  private gh_bin: string = "gh"; // resolved to absolute path in start()
+  private gh_bin = "gh"; // resolved to absolute path in start()
 
   constructor(
     private registry: EntityRegistry,
@@ -194,11 +202,18 @@ export class PRReviewCron {
 
     let prs: OpenPR[];
     try {
-      const { stdout } = await exec(this.gh_bin, [
-        "pr", "list",
-        "--state", "open",
-        "--json", "number,title,headRefName,updatedAt,url,body,author",
-      ], { cwd: repo_path, env: process.env, timeout: 30_000 });
+      const { stdout } = await exec(
+        this.gh_bin,
+        [
+          "pr",
+          "list",
+          "--state",
+          "open",
+          "--json",
+          "number,title,headRefName,updatedAt,url,body,author",
+        ],
+        { cwd: repo_path, env: process.env, timeout: 30_000 },
+      );
 
       prs = JSON.parse(stdout) as OpenPR[];
     } catch (err) {
@@ -208,7 +223,7 @@ export class PRReviewCron {
     }
 
     // Clean stale entries: remove processed PRs that are no longer open
-    const open_keys = new Set(prs.map(pr => `${entity_id}:${String(pr.number)}`));
+    const open_keys = new Set(prs.map((pr) => `${entity_id}:${String(pr.number)}`));
     let stale_cleaned = false;
     for (const key of Object.keys(this.processed)) {
       if (key.startsWith(`${entity_id}:`) && !open_keys.has(key)) {
@@ -232,7 +247,9 @@ export class PRReviewCron {
       }
       if (prior) {
         // PR updated after our review — allow re-review
-        console.log(`[pr-cron] PR #${String(pr.number)} updated since last review, allowing re-review`);
+        console.log(
+          `[pr-cron] PR #${String(pr.number)} updated since last review, allowing re-review`,
+        );
         delete this.processed[key];
       }
 
@@ -322,10 +339,11 @@ export class PRReviewCron {
     pr_number: number,
   ): Promise<PRFeedbackData | null> {
     try {
-      const { stdout } = await exec(this.gh_bin, [
-        "pr", "view", String(pr_number),
-        "--json", "reviews,comments,commits",
-      ], { cwd: repo_path, env: process.env, timeout: 15_000 });
+      const { stdout } = await exec(
+        this.gh_bin,
+        ["pr", "view", String(pr_number), "--json", "reviews,comments,commits"],
+        { cwd: repo_path, env: process.env, timeout: 15_000 },
+      );
 
       return JSON.parse(stdout) as PRFeedbackData;
     } catch {
@@ -338,9 +356,7 @@ export class PRReviewCron {
    * Uses the entity's `github_app_installation_id` if configured,
    * otherwise falls back to the default installation from env.
    */
-  private async resolve_entity_token(
-    entity_config: EntityConfig,
-  ): Promise<string | undefined> {
+  private async resolve_entity_token(entity_config: EntityConfig): Promise<string | undefined> {
     if (!this.github_app) return undefined;
 
     const override_id = entity_config.entity.accounts?.github?.github_app_installation_id;
@@ -387,36 +403,36 @@ export class PRReviewCron {
     const prompt_lines = [
       `Review PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}.`,
       `Repository: ${repo_path}`,
-      ``,
-      `Run /review to do a comprehensive code review.`,
-      `Post your review on the PR using gh cli.`,
-      ``,
-      `Review standards:`,
-      `- Every piece of actionable feedback should be included.`,
-      `- If there is ANY actionable feedback, request changes:`,
+      "",
+      "Run /review to do a comprehensive code review.",
+      "Post your review on the PR using gh cli.",
+      "",
+      "Review standards:",
+      "- Every piece of actionable feedback should be included.",
+      "- If there is ANY actionable feedback, request changes:",
       `  gh pr review ${String(pr.number)} --request-changes --body "<your review>"`,
-      `- If the code is genuinely clean with no improvements needed, approve:`,
+      "- If the code is genuinely clean with no improvements needed, approve:",
       `  gh pr review ${String(pr.number)} --approve --body "Looks good."`,
-      ``,
-      `Before merging, check CI status:`,
+      "",
+      "Before merging, check CI status:",
       `  gh pr checks ${String(pr.number)} --required`,
-      `If any required checks are failing or pending, do NOT merge.`,
-      `Instead, note the failing checks in your review and request changes.`,
-      `If no CI workflows are configured for this repo, proceed with merge normally.`,
-      ``,
-      `After posting your review:`,
-      `- If you approved, merge the PR:`,
+      "If any required checks are failing or pending, do NOT merge.",
+      "Instead, note the failing checks in your review and request changes.",
+      "If no CI workflows are configured for this repo, proceed with merge normally.",
+      "",
+      "After posting your review:",
+      "- If you approved, merge the PR:",
       `  gh pr merge ${String(pr.number)} --squash --delete-branch`,
-      `- If the merge command fails (branch behind main):`,
+      "- If the merge command fails (branch behind main):",
       `  1. Try: git fetch origin && git checkout ${pr.headRefName} && git rebase origin/main`,
       `  2. If rebase is clean (no conflicts): git push --force-with-lease origin ${pr.headRefName}`,
       `  3. Then retry: gh pr merge ${String(pr.number)} --squash --delete-branch`,
-      `  4. If rebase has conflicts: git rebase --abort — do NOT force push conflict markers`,
-      `- If you requested changes, do NOT merge.`,
+      "  4. If rebase has conflicts: git rebase --abort — do NOT force push conflict markers",
+      "- If you requested changes, do NOT merge.",
     ];
 
     if (issue_context) {
-      prompt_lines.push(``, `## Linked Issue Context`, ``, issue_context);
+      prompt_lines.push("", "## Linked Issue Context", "", issue_context);
     }
 
     const prompt = prompt_lines.join("\n");
@@ -444,7 +460,9 @@ export class PRReviewCron {
         env: spawn_env,
       });
 
-      console.log(`[pr-cron] Reviewer session ${session.session_id.slice(0, 8)} started for PR #${String(pr.number)}`);
+      console.log(
+        `[pr-cron] Reviewer session ${session.session_id.slice(0, 8)} started for PR #${String(pr.number)}`,
+      );
 
       // Listen for session completion
       const on_complete = (result: { session_id: string; exit_code: number }) => {
@@ -456,14 +474,17 @@ export class PRReviewCron {
         console.log(`[pr-cron] Review completed for PR #${String(pr.number)} in ${entity_id}`);
 
         // Persist completion so we don't re-review after restart
-        void this.persist_review_completion(entity_id, pr, repo_path, entity_config)
-          .catch(err => {
-            console.error(`[pr-cron] Failed to persist review for PR #${String(pr.number)}: ${String(err)}`);
+        void this.persist_review_completion(entity_id, pr, repo_path, entity_config).catch(
+          (err) => {
+            console.error(
+              `[pr-cron] Failed to persist review for PR #${String(pr.number)}: ${String(err)}`,
+            );
             sentry.captureException(err, {
               tags: { module: "pr-cron", entity: entity_id },
               contexts: { pr: { number: pr.number, title: pr.title } },
             });
-          });
+          },
+        );
       };
 
       const on_fail = (session_id: string, error: string) => {
@@ -483,7 +504,9 @@ export class PRReviewCron {
       this.session_manager.on("session:failed", on_fail);
     } catch (err) {
       this.active_reviews.delete(key);
-      console.error(`[pr-cron] Failed to spawn reviewer for PR #${String(pr.number)}: ${String(err)}`);
+      console.error(
+        `[pr-cron] Failed to spawn reviewer for PR #${String(pr.number)}: ${String(err)}`,
+      );
       sentry.captureException(err, {
         tags: { module: "pr-cron", entity: entity_id, action: "spawn_reviewer" },
         contexts: { pr: { number: pr.number, title: pr.title } },
@@ -527,7 +550,8 @@ export class PRReviewCron {
     review_outcome?: "approved" | "changes_requested" | "pending",
     gh_token?: string,
   ): Promise<void> {
-    const review_state = review_outcome ?? await detect_review_outcome(pr.number, repo_path, gh_token);
+    const review_state =
+      review_outcome ?? (await detect_review_outcome(pr.number, repo_path, gh_token));
 
     // Determine if internal (our agents) or truly external
     const entity_config = this.registry.get(entity_id);
@@ -549,7 +573,7 @@ export class PRReviewCron {
       }
     } else if (review_state === "approved") {
       // Check if the reviewer already merged (they're instructed to merge on approval)
-      let is_merged = await this.check_pr_merged(repo_path, pr.number, gh_token);
+      const is_merged = await this.check_pr_merged(repo_path, pr.number, gh_token);
 
       if (is_merged) {
         // Reviewer merged — close linked issues and notify
@@ -581,7 +605,11 @@ export class PRReviewCron {
         } else {
           // All checks passed (or none configured) — attempt auto-merge with rebase (#166)
           const result = await attempt_auto_merge(
-            pr.number, pr.headRefName, repo_path, this.gh_bin, gh_token,
+            pr.number,
+            pr.headRefName,
+            repo_path,
+            this.gh_bin,
+            gh_token,
           );
 
           if (result.merged) {
@@ -701,10 +729,21 @@ export class PRReviewCron {
         // reached, or dedup hit) — mark ci_failure_alerted so we don't re-process
         // the same failure set next cycle. Returns false on transient errors
         // (token resolution) so the next cycle retries.
-        const handled = await this.spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, entity_config);
+        const handled = await this.spawn_ci_fixer(
+          entity_id,
+          repo_path,
+          pr,
+          ci.failures,
+          entity_config,
+        );
         if (handled) {
           this.processed[key] = {
-            ...(this.processed[key] ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
+            ...(this.processed[key] ?? {
+              entity_id,
+              pr_number: pr.number,
+              reviewed_at: new Date().toISOString(),
+              outcome: "approved" as const,
+            }),
             ci_failure_alerted: failure_key,
           };
           await save_pr_reviews(this.processed, this.config);
@@ -713,12 +752,14 @@ export class PRReviewCron {
       }
 
       // CI passed — attempt merge
-      console.log(
-        `[pr-cron] CI passed for approved PR #${String(pr.number)} — retrying merge`,
-      );
+      console.log(`[pr-cron] CI passed for approved PR #${String(pr.number)} — retrying merge`);
 
       const result = await attempt_auto_merge(
-        pr.number, pr.headRefName, repo_path, this.gh_bin, gh_token,
+        pr.number,
+        pr.headRefName,
+        repo_path,
+        this.gh_bin,
+        gh_token,
       );
 
       if (result.merged) {
@@ -756,18 +797,20 @@ export class PRReviewCron {
     const review_comments = await fetch_review_comments(pr.number, repo_path);
 
     const prompt = [
-      `An external PR needs fixes based on reviewer feedback.`,
+      "An external PR needs fixes based on reviewer feedback.",
       `PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}`,
       `Repository: ${repo_path}`,
-      ``,
+      "",
       `First, check out the PR branch: git checkout ${pr.headRefName}`,
-      ``,
+      "",
       build_review_fix_prompt(pr.number, pr.title, review_comments),
-      ``,
-      `Do NOT merge the PR.`,
+      "",
+      "Do NOT merge the PR.",
     ].join("\n");
 
-    console.log(`[pr-cron] Spawning builder to fix external PR #${String(pr.number)} in ${entity_id}`);
+    console.log(
+      `[pr-cron] Spawning builder to fix external PR #${String(pr.number)} in ${entity_id}`,
+    );
 
     // Inject GitHub App token if available — uses per-entity installation ID when configured
     let fix_env: Record<string, string> | undefined;
@@ -792,7 +835,9 @@ export class PRReviewCron {
         env: fix_env,
       });
     } catch (err) {
-      console.error(`[pr-cron] Failed to spawn builder for external PR #${String(pr.number)}: ${String(err)}`);
+      console.error(
+        `[pr-cron] Failed to spawn builder for external PR #${String(pr.number)}: ${String(err)}`,
+      );
       sentry.captureException(err, {
         tags: { module: "pr-cron", entity: entity_id, action: "spawn_fixer" },
         contexts: { pr: { number: pr.number, title: pr.title } },
@@ -847,7 +892,9 @@ export class PRReviewCron {
       try {
         gh_token = await this.resolve_entity_token(config);
       } catch (err) {
-        console.error(`[pr-cron] Failed to get token for CI fix PR #${String(pr.number)}: ${String(err)}`);
+        console.error(
+          `[pr-cron] Failed to get token for CI fix PR #${String(pr.number)}: ${String(err)}`,
+        );
         sentry.captureException(err, {
           tags: { module: "pr-cron", entity: entity_id, action: "ci_fix_token" },
           contexts: { pr: { number: pr.number, title: pr.title } },
@@ -860,7 +907,12 @@ export class PRReviewCron {
     // retry_approved_unmerged doesn't double-spawn for the same failure set.
     const failure_key = JSON.stringify([...failed_checks].sort());
     this.processed[key] = {
-      ...(this.processed[key] ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
+      ...(this.processed[key] ?? {
+        entity_id,
+        pr_number: pr.number,
+        reviewed_at: new Date().toISOString(),
+        outcome: "approved" as const,
+      }),
       ci_fix_attempts: attempts + 1,
       ci_failure_alerted: failure_key,
     };
@@ -868,12 +920,15 @@ export class PRReviewCron {
 
     // Fetch CI failure logs for context
     const failure_logs = await fetch_ci_failure_logs(
-      pr.headRefName, repo_path, gh_token, this.gh_bin,
+      pr.headRefName,
+      repo_path,
+      gh_token,
+      this.gh_bin,
     );
 
     const prompt = [
       `Repository: ${repo_path}`,
-      ``,
+      "",
       build_ci_fix_prompt(pr.number, pr.title, pr.headRefName, failure_logs, failed_checks),
     ].join("\n");
 
@@ -920,12 +975,7 @@ export class PRReviewCron {
   private async notify_alerts(entity_id: string, message: string): Promise<void> {
     console.log(`[pr-cron:alerts] ${message}`);
     if (this.discord) {
-      await this.discord.send_to_entity(
-        entity_id,
-        "alerts",
-        message,
-        "reviewer" as ArchetypeRole,
-      );
+      await this.discord.send_to_entity(entity_id, "alerts", message, "reviewer" as ArchetypeRole);
     }
   }
 
@@ -936,14 +986,12 @@ export class PRReviewCron {
     gh_token?: string,
   ): Promise<boolean> {
     try {
-      const env = gh_token
-        ? { ...process.env, GH_TOKEN: gh_token }
-        : process.env;
-      const { stdout } = await exec(this.gh_bin, [
-        "pr", "view", String(pr_number),
-        "--json", "state",
-        "--jq", ".state",
-      ], { cwd: repo_path, env, timeout: 15_000 });
+      const env = gh_token ? { ...process.env, GH_TOKEN: gh_token } : process.env;
+      const { stdout } = await exec(
+        this.gh_bin,
+        ["pr", "view", String(pr_number), "--json", "state", "--jq", ".state"],
+        { cwd: repo_path, env, timeout: 15_000 },
+      );
       return stdout.trim() === "MERGED";
     } catch {
       return false;
@@ -971,13 +1019,15 @@ export class PRReviewCron {
     );
     const repo_full_name = repo ? nwo_from_url(repo.url) : undefined;
     if (!repo_full_name) {
-      console.warn(`[pr-cron] Cannot derive repo full name for ${repo_path} — skipping issue close`);
+      console.warn(
+        `[pr-cron] Cannot derive repo full name for ${repo_path} — skipping issue close`,
+      );
       return;
     }
 
     // Get GitHub App token for the API call — uses per-entity installation ID when configured
     if (!this.github_app) {
-      console.warn(`[pr-cron] No GitHub App configured — cannot close linked issues`);
+      console.warn("[pr-cron] No GitHub App configured — cannot close linked issues");
       return;
     }
 
@@ -988,8 +1038,8 @@ export class PRReviewCron {
     }
 
     console.log(
-      `[pr-cron] Closing linked issues ${issue_numbers.map(n => `#${String(n)}`).join(", ")} ` +
-      `for merged PR #${String(pr.number)}`,
+      `[pr-cron] Closing linked issues ${issue_numbers.map((n) => `#${String(n)}`).join(", ")} ` +
+        `for merged PR #${String(pr.number)}`,
     );
 
     const results = await close_linked_issues(repo_full_name, pr.number, issue_numbers, gh_token);
