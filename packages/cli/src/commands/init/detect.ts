@@ -1,5 +1,5 @@
-import { hostname, arch, cpus, platform, homedir } from "node:os";
-import { readdir, readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
+import { arch, cpus, homedir, hostname, platform } from "node:os";
 import { join } from "node:path";
 import { exec_command } from "../../lib/process.js";
 
@@ -52,15 +52,16 @@ export interface ClaudeCodeCheckResult {
 /** Check if Claude Code CLI is installed. */
 export async function check_claude_code(): Promise<ClaudeCodeCheckResult> {
   // Check PATH first, then common install locations
-  const check_cmd = 'claude --version 2>/dev/null || ~/.local/bin/claude --version 2>/dev/null || /usr/local/bin/claude --version 2>/dev/null';
+  const check_cmd =
+    "claude --version 2>/dev/null || ~/.local/bin/claude --version 2>/dev/null || /usr/local/bin/claude --version 2>/dev/null";
   const { exitCode, stdout } = await exec_command(check_cmd);
   if (exitCode === 0 && stdout.trim()) {
     // If found in ~/.local/bin but not in PATH, fix PATH
     const { exitCode: path_check } = await exec_command("which claude 2>/dev/null");
     if (path_check !== 0) {
       // Add to PATH for this session and suggest permanent fix
-      const home = process.env["HOME"] ?? "";
-      process.env["PATH"] = `${home}/.local/bin:${process.env["PATH"] ?? ""}`;
+      const home = process.env.HOME ?? "";
+      process.env.PATH = `${home}/.local/bin:${process.env.PATH ?? ""}`;
     }
     return {
       installed: true,
@@ -82,13 +83,13 @@ export interface BunCheckResult {
 
 /** Check if Bun is installed (required by Discord channel plugin). */
 export async function check_bun(): Promise<BunCheckResult> {
-  const check_cmd = 'bun --version 2>/dev/null || ~/.bun/bin/bun --version 2>/dev/null';
+  const check_cmd = "bun --version 2>/dev/null || ~/.bun/bin/bun --version 2>/dev/null";
   const { exitCode, stdout } = await exec_command(check_cmd);
   if (exitCode === 0 && stdout.trim()) {
     const { exitCode: path_check } = await exec_command("which bun 2>/dev/null");
     if (path_check !== 0) {
-      const home = process.env["HOME"] ?? "";
-      process.env["PATH"] = `${home}/.bun/bin:${process.env["PATH"] ?? ""}`;
+      const home = process.env.HOME ?? "";
+      process.env.PATH = `${home}/.bun/bin:${process.env.PATH ?? ""}`;
     }
     return { installed: true, status: `Bun ${stdout.trim()}` };
   }
@@ -131,7 +132,7 @@ export async function check_github_cli(): Promise<GhCheckResult> {
 export async function check_onepassword(): Promise<OnePasswordCheckResult> {
   const { exitCode: which_exit } = await exec_command("which op");
   const cli_installed = which_exit === 0;
-  const token_configured = Boolean(process.env["OP_SERVICE_ACCOUNT_TOKEN"]);
+  const token_configured = Boolean(process.env.OP_SERVICE_ACCOUNT_TOKEN);
 
   let status: string;
   if (cli_installed && token_configured) {
@@ -186,7 +187,9 @@ export async function check_tailscale(): Promise<TailscaleCheckResult> {
   result.gui_extension_running = ext_exit === 0 && ext_out.trim().length > 0;
 
   // Check daemon status and auth
-  const { exitCode: status_exit, stdout: status_out } = await exec_command("tailscale status --json 2>/dev/null");
+  const { exitCode: status_exit, stdout: status_out } = await exec_command(
+    "tailscale status --json 2>/dev/null",
+  );
   if (status_exit !== 0) {
     result.status = "installed, daemon not running";
     return result;
@@ -236,14 +239,18 @@ export async function check_docker(): Promise<DockerCheckResult> {
     status: "not installed",
   };
 
-  const { exitCode: docker_exit, stdout: docker_ver } = await exec_command("docker --version 2>/dev/null");
+  const { exitCode: docker_exit, stdout: docker_ver } = await exec_command(
+    "docker --version 2>/dev/null",
+  );
   result.docker_installed = docker_exit === 0;
   if (docker_exit === 0) {
     const match = docker_ver.match(/Docker version ([\d.]+)/);
     result.docker_version = match?.[1] ?? null;
   }
 
-  const { exitCode: colima_exit, stdout: colima_ver } = await exec_command("colima version 2>/dev/null");
+  const { exitCode: colima_exit, stdout: colima_ver } = await exec_command(
+    "colima version 2>/dev/null",
+  );
   result.colima_installed = colima_exit === 0;
   if (colima_exit === 0) {
     const match = colima_ver.match(/colima version ([\d.]+)/);
@@ -289,13 +296,25 @@ export async function check_vercel(): Promise<VercelCheckResult> {
     return { installed: false, authenticated: false, username: null, status: "not installed" };
   }
 
-  const { exitCode: whoami_exit, stdout: whoami_out } = await exec_command("vercel whoami 2>/dev/null");
+  const { exitCode: whoami_exit, stdout: whoami_out } = await exec_command(
+    "vercel whoami 2>/dev/null",
+  );
   if (whoami_exit === 0 && whoami_out.trim()) {
     const username = whoami_out.trim();
-    return { installed: true, authenticated: true, username, status: `authenticated as ${username}` };
+    return {
+      installed: true,
+      authenticated: true,
+      username,
+      status: `authenticated as ${username}`,
+    };
   }
 
-  return { installed: true, authenticated: false, username: null, status: "installed, not authenticated" };
+  return {
+    installed: true,
+    authenticated: false,
+    username: null,
+    status: "installed, not authenticated",
+  };
 }
 
 export interface SupabaseCheckResult {
@@ -307,7 +326,9 @@ export interface SupabaseCheckResult {
 
 /** Check Supabase CLI installation and auth state. */
 export async function check_supabase(): Promise<SupabaseCheckResult> {
-  const { exitCode: which_exit, stdout: ver_out } = await exec_command("supabase --version 2>/dev/null");
+  const { exitCode: which_exit, stdout: ver_out } = await exec_command(
+    "supabase --version 2>/dev/null",
+  );
   if (which_exit !== 0) {
     return { installed: false, authenticated: false, version: null, status: "not installed" };
   }
@@ -347,7 +368,9 @@ export async function check_sentry(): Promise<SentryCheckResult> {
     return { installed: false, authenticated: false, org: null, status: "not installed" };
   }
 
-  const { exitCode: info_exit, stdout: info_out } = await exec_command("sentry-cli info 2>/dev/null");
+  const { exitCode: info_exit, stdout: info_out } = await exec_command(
+    "sentry-cli info 2>/dev/null",
+  );
   if (info_exit === 0) {
     // Parse org from sentry-cli info output (line like "Default Organization: ultim8")
     const org_match = info_out.match(/Default Organization:\s*(.+)/i);
@@ -360,7 +383,12 @@ export async function check_sentry(): Promise<SentryCheckResult> {
     };
   }
 
-  return { installed: true, authenticated: false, org: null, status: "installed, not authenticated" };
+  return {
+    installed: true,
+    authenticated: false,
+    org: null,
+    status: "installed, not authenticated",
+  };
 }
 
 export interface PoolBotCheckResult {
@@ -384,8 +412,8 @@ export async function check_pool_bots(lobsterfarm_path?: string): Promise<PoolBo
     const entries = await readdir(channels_dir, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory() || !entry.name.startsWith("pool-")) continue;
-      const id = parseInt(entry.name.replace("pool-", ""), 10);
-      if (isNaN(id)) continue;
+      const id = Number.parseInt(entry.name.replace("pool-", ""), 10);
+      if (Number.isNaN(id)) continue;
 
       try {
         const env_content = await readFile(join(channels_dir, entry.name, ".env"), "utf-8");
@@ -407,9 +435,7 @@ export async function check_pool_bots(lobsterfarm_path?: string): Promise<PoolBo
     return { count, indices, status: "no pool bots configured" };
   }
   const last = indices[count - 1]!;
-  const range = count === 1
-    ? `LF-${String(indices[0])}`
-    : `LF-0 through LF-${String(last)}`;
+  const range = count === 1 ? `LF-${String(indices[0])}` : `LF-0 through LF-${String(last)}`;
   return {
     count,
     indices,

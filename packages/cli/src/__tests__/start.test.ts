@@ -1,6 +1,6 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
-import { join } from "node:path";
 import { homedir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 /**
  * Tests for resolve_daemon_path() priority logic.
@@ -16,7 +16,18 @@ import { homedir } from "node:os";
 
 const home = homedir();
 const install_path = join(home, ".lobsterfarm", "src", "packages", "daemon", "dist", "index.js");
-const legacy_path = join(home, ".lobsterfarm", "entities", "lobster-farm", "repos", "lobster-farm", "packages", "daemon", "dist", "index.js");
+const legacy_path = join(
+  home,
+  ".lobsterfarm",
+  "entities",
+  "lobster-farm",
+  "repos",
+  "lobster-farm",
+  "packages",
+  "daemon",
+  "dist",
+  "index.js",
+);
 
 // Controlled per-test: which paths should "exist"
 const existing_paths = new Set<string>();

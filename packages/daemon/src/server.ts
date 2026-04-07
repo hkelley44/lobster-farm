@@ -1,21 +1,21 @@
-import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { type IncomingMessage, type Server, type ServerResponse, createServer } from "node:http";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { DAEMON_PORT } from "@lobster-farm/shared";
-import type { EntityRegistry } from "./registry.js";
-import type { ClaudeSessionManager } from "./session.js";
-import { QueueFullError } from "./queue.js";
-import type { TaskQueue, TaskSubmission } from "./queue.js";
+import { type ArchetypeRole, expand_home } from "@lobster-farm/shared";
+import { persist_entity_config } from "./actions.js";
 import type { CommanderProcess } from "./commander-process.js";
 import { is_discord_snowflake } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
-import type { BotPool } from "./pool.js";
-import { type ArchetypeRole, expand_home } from "@lobster-farm/shared";
-import { persist_entity_config } from "./actions.js";
 import type { GitHubAppAuth } from "./github-app.js";
-import { handle_github_webhook, type WebhookContext } from "./webhook-handler.js";
+import type { BotPool } from "./pool.js";
 import type { PRWatchStore } from "./pr-watches.js";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { QueueFullError } from "./queue.js";
+import type { TaskQueue, TaskSubmission } from "./queue.js";
+import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
+import type { ClaudeSessionManager } from "./session.js";
+import { type WebhookContext, handle_github_webhook } from "./webhook-handler.js";
 
 interface ServerContext {
   registry: EntityRegistry;
@@ -172,9 +172,11 @@ async function process_sentry_webhook(
   ctx: ServerContext,
 ): Promise<void> {
   // Verify signature if webhook secret is configured
-  const webhook_secret = process.env["SENTRY_WEBHOOK_SECRET"];
+  const webhook_secret = process.env.SENTRY_WEBHOOK_SECRET;
   if (!webhook_secret) {
-    console.warn("[sentry-webhook] SENTRY_WEBHOOK_SECRET not configured — webhook is unauthenticated");
+    console.warn(
+      "[sentry-webhook] SENTRY_WEBHOOK_SECRET not configured — webhook is unauthenticated",
+    );
   } else {
     const signature = req.headers["sentry-hook-signature"] as string | undefined;
     if (!signature || !verify_sentry_signature(raw_body, signature, webhook_secret)) {
@@ -201,28 +203,32 @@ async function process_sentry_webhook(
   }
 
   // Extract error info from payload
-  const data = payload["data"] as Record<string, unknown> | undefined;
+  const data = payload.data as Record<string, unknown> | undefined;
   if (!data) return;
 
-  const issue = (resource === "issue" ? data : data["issue"]) as Record<string, unknown> | undefined;
-  const error_title = (issue?.["title"] as string) ?? "Unknown error";
-  const issue_url = (issue?.["web_url"] as string) ?? (issue?.["shortId"] as string) ?? "";
-  const project_name = (data["project_name"] as string) ??
-    ((data["project"] as Record<string, unknown>)?.["name"] as string) ?? "unknown";
+  const issue = (resource === "issue" ? data : data.issue) as Record<string, unknown> | undefined;
+  const error_title = (issue?.title as string) ?? "Unknown error";
+  const issue_url = (issue?.web_url as string) ?? (issue?.shortId as string) ?? "";
+  const project_name =
+    (data.project_name as string) ??
+    ((data.project as Record<string, unknown>)?.name as string) ??
+    "unknown";
 
   // Try to map Sentry project to an entity for targeted routing
   let target_entity_id: string | null = null;
   for (const entity of ctx.registry.get_active()) {
-    const sentry_project = (entity.entity.accounts as Record<string, unknown>)?.["sentry"] as Record<string, unknown> | undefined;
-    if (sentry_project?.["project"] === project_name) {
+    const sentry_project = (entity.entity.accounts as Record<string, unknown>)?.sentry as
+      | Record<string, unknown>
+      | undefined;
+    if (sentry_project?.project === project_name) {
       target_entity_id = entity.entity.id;
       break;
     }
   }
 
   // Format alert message
-  const action = payload["action"] as string | undefined;
-  const env = (issue?.["environment"] as string) ?? "";
+  const action = payload.action as string | undefined;
+  const env = (issue?.environment as string) ?? "";
   const prefix = action === "resolved" ? "Resolved" : "Sentry";
   const env_part = env ? ` | Env: ${env}` : "";
   const alert_message = `${prefix}: ${error_title}\nProject: ${project_name}${env_part}\n${issue_url}`;
@@ -329,7 +335,15 @@ const handle_cancel_task: RouteHandler = (req, res, ctx) => {
   }
 };
 
-function task_summary(task: { id: string; entity_id: string; feature_id: string; archetype: string; priority: string; status: string; submitted_at: Date }) {
+function task_summary(task: {
+  id: string;
+  entity_id: string;
+  feature_id: string;
+  archetype: string;
+  priority: string;
+  status: string;
+  submitted_at: Date;
+}) {
   return {
     id: task.id,
     entity_id: task.entity_id,
@@ -406,7 +420,12 @@ const handle_pool_assign: RouteHandler = async (req, res, ctx) => {
   }
 
   const body = await read_body(req);
-  let params: { channel_id?: string; entity_id?: string; archetype?: string; resume_session_id?: string };
+  let params: {
+    channel_id?: string;
+    entity_id?: string;
+    archetype?: string;
+    resume_session_id?: string;
+  };
   try {
     params = JSON.parse(body) as typeof params;
   } catch {
@@ -514,7 +533,9 @@ const handle_channel_delete: RouteHandler = async (req, res, ctx) => {
   }
 
   if (!is_discord_snowflake(params.channel_id)) {
-    json_response(res, 400, { error: `Invalid channel ID "${params.channel_id}" — not a Discord snowflake` });
+    json_response(res, 400, {
+      error: `Invalid channel ID "${params.channel_id}" — not a Discord snowflake`,
+    });
     return;
   }
 
@@ -526,7 +547,7 @@ const handle_channel_delete: RouteHandler = async (req, res, ctx) => {
   }
 
   // Validate channel belongs to entity
-  const channel_entry = entity.entity.channels.list.find(c => c.id === params.channel_id);
+  const channel_entry = entity.entity.channels.list.find((c) => c.id === params.channel_id);
   if (!channel_entry) {
     json_response(res, 404, { error: "Channel not in entity config" });
     return;
@@ -552,7 +573,9 @@ const handle_channel_delete: RouteHandler = async (req, res, ctx) => {
   }
 
   // Remove from entity config
-  entity.entity.channels.list = entity.entity.channels.list.filter(c => c.id !== params.channel_id);
+  entity.entity.channels.list = entity.entity.channels.list.filter(
+    (c) => c.id !== params.channel_id,
+  );
   await persist_entity_config(entity);
 
   // Rebuild channel map
@@ -582,11 +605,7 @@ const routes: Route[] = [
   { method: "POST", pattern: /^\/hooks\/stop$/, handler: handle_stop_hook },
 ];
 
-function route_request(
-  req: IncomingMessage,
-  res: ServerResponse,
-  ctx: ServerContext,
-): void {
+function route_request(req: IncomingMessage, res: ServerResponse, ctx: ServerContext): void {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const method = req.method ?? "GET";
 
@@ -621,7 +640,17 @@ export function start_server(
   pr_watches: PRWatchStore | null = null,
   port: number = DAEMON_PORT,
 ): Server {
-  const ctx: ServerContext = { registry, config, session_manager, queue, commander, discord, pool, github_app, pr_watches };
+  const ctx: ServerContext = {
+    registry,
+    config,
+    session_manager,
+    queue,
+    commander,
+    discord,
+    pool,
+    github_app,
+    pr_watches,
+  };
 
   const server = createServer((req, res) => {
     route_request(req, res, ctx);

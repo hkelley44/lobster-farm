@@ -1,21 +1,17 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import type {
-  ArchetypeRole,
-  LobsterFarmConfig,
-  ModelTier,
-} from "@lobster-farm/shared";
-import * as sentry from "./sentry.js";
 import { readdir } from "node:fs/promises";
+import type { ArchetypeRole, LobsterFarmConfig, ModelTier } from "@lobster-farm/shared";
 import {
-  expand_home,
-  entity_memory_path,
-  entity_daily_dir,
   entity_context_dir,
+  entity_daily_dir,
   entity_dir,
+  entity_memory_path,
+  expand_home,
 } from "@lobster-farm/shared";
 import { build_model_flags } from "./models.js";
+import * as sentry from "./sentry.js";
 
 // ── Interfaces ──
 
@@ -71,10 +67,7 @@ export interface SessionEvents {
 
 // ── Agent name resolution ──
 
-function resolve_agent_name(
-  archetype: ArchetypeRole,
-  config: LobsterFarmConfig,
-): string {
+function resolve_agent_name(archetype: ArchetypeRole, config: LobsterFarmConfig): string {
   const agents = config.agents;
   switch (archetype) {
     case "planner":
@@ -97,7 +90,7 @@ function resolve_agent_name(
 async function find_recent_daily_logs(
   entity_id: string,
   config: LobsterFarmConfig,
-  max_count: number = 5,
+  max_count = 5,
 ): Promise<string[]> {
   const daily_path = entity_daily_dir(config.paths, entity_id);
   try {
@@ -124,32 +117,32 @@ export async function build_entity_context(
   const recent_logs = await find_recent_daily_logs(entity_id, config);
 
   const lines = [
-    `## Entity Context (injected by LobsterFarm daemon)`,
-    ``,
+    "## Entity Context (injected by LobsterFarm daemon)",
+    "",
     `Entity: ${entity_id}`,
     `Feature: ${feature_id}`,
-    ``,
-    `### Session Startup`,
+    "",
+    "### Session Startup",
     `1. Read the entity's MEMORY.md at: ${mem_path}`,
     `2. Read context files at: ${ctx_path}/ (architecture.md, decisions.md, gotchas.md if they exist)`,
   ];
 
   if (recent_logs.length > 0) {
-    lines.push(`3. Check recent daily logs:`);
+    lines.push("3. Check recent daily logs:");
     for (const log of recent_logs) {
       lines.push(`   - ${log}`);
     }
   }
 
   lines.push(
-    ``,
-    `### Memory Rules`,
+    "",
+    "### Memory Rules",
     `- Write session learnings and progress to today's daily log`,
-    `- Update MEMORY.md when you make decisions future sessions need to know`,
-    `- Update context/decisions.md for significant architectural or design decisions`,
-    `- Update context/gotchas.md for known issues or workarounds discovered`,
-    ``,
-    `When you finish your work, commit and push your changes.`,
+    "- Update MEMORY.md when you make decisions future sessions need to know",
+    "- Update context/decisions.md for significant architectural or design decisions",
+    "- Update context/gotchas.md for known issues or workarounds discovered",
+    "",
+    "When you finish your work, commit and push your changes.",
   );
 
   return lines.join("\n");
@@ -158,7 +151,7 @@ export async function build_entity_context(
 // ── Find claude binary ──
 
 function claude_binary(): string {
-  return process.env["CLAUDE_BIN"] ?? "claude";
+  return process.env.CLAUDE_BIN ?? "claude";
 }
 
 // ── Implementation ──
@@ -224,8 +217,7 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
   async spawn(options: SessionSpawnOptions): Promise<ActiveSession> {
     if (options.interactive) {
       throw new Error(
-        "Interactive sessions are not yet implemented. " +
-          "Coming with Discord integration.",
+        "Interactive sessions are not yet implemented. " + "Coming with Discord integration.",
       );
     }
 
@@ -275,7 +267,12 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
     sentry.addBreadcrumb({
       category: "daemon.session",
       message: `Session spawned: ${options.archetype} for ${options.entity_id}/${options.feature_id}`,
-      data: { session_id, entity_id: options.entity_id, archetype: options.archetype, resume: is_resume },
+      data: {
+        session_id,
+        entity_id: options.entity_id,
+        archetype: options.archetype,
+        resume: is_resume,
+      },
     });
 
     this.emit("session:started", session);
@@ -325,11 +322,7 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
         };
         this.emit("session:completed", result);
       } else {
-        this.emit(
-          "session:failed",
-          session_id,
-          `Process exited with code ${String(exit_code)}`,
-        );
+        this.emit("session:failed", session_id, `Process exited with code ${String(exit_code)}`);
       }
     });
 
@@ -352,8 +345,7 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
 
   async resume(_session_id: string): Promise<ActiveSession> {
     throw new Error(
-      "Session resume is not yet implemented. " +
-        "Coming with interactive session support.",
+      "Session resume is not yet implemented. " + "Coming with interactive session support.",
     );
   }
 

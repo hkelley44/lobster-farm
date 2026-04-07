@@ -1,11 +1,11 @@
-import { describe, expect, it, vi, afterEach } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  type CommandTarget,
+  EPHEMERAL_COMMAND_NAMES,
+  type SlashInteractionLike,
   build_slash_commands,
   extract_slash_args,
   format_relative_time,
-  EPHEMERAL_COMMAND_NAMES,
-  type CommandTarget,
-  type SlashInteractionLike,
 } from "../discord.js";
 
 // ── build_slash_commands ──
@@ -14,10 +14,17 @@ describe("build_slash_commands", () => {
   const commands = build_slash_commands();
 
   it("returns all expected commands", () => {
-    const names = commands.map(c => c.name);
+    const names = commands.map((c) => c.name);
     expect(names).toEqual([
-      "help", "status",
-      "swap", "scaffold", "room", "close", "resume", "compact", "reset",
+      "help",
+      "status",
+      "swap",
+      "scaffold",
+      "room",
+      "close",
+      "resume",
+      "compact",
+      "reset",
       "archives",
     ]);
   });
@@ -30,7 +37,7 @@ describe("build_slash_commands", () => {
   });
 
   it("/status has an optional scope option with entity/all choices", () => {
-    const status = commands.find(c => c.name === "status")!;
+    const status = commands.find((c) => c.name === "status")!;
     const options = status.options;
     expect(options).toHaveLength(1);
     const opt = options[0]!.toJSON();
@@ -42,7 +49,7 @@ describe("build_slash_commands", () => {
   });
 
   it("/swap has a required agent option with fixed choices", () => {
-    const swap = commands.find(c => c.name === "swap")!;
+    const swap = commands.find((c) => c.name === "swap")!;
     const options = swap.options;
     expect(options).toHaveLength(1);
     const opt = options[0]!.toJSON();
@@ -57,7 +64,7 @@ describe("build_slash_commands", () => {
   });
 
   it("/resume has an autocomplete-enabled name option", () => {
-    const resume = commands.find(c => c.name === "resume")!;
+    const resume = commands.find((c) => c.name === "resume")!;
     const options = resume.options;
     expect(options).toHaveLength(1);
     const opt = options[0]!.toJSON();
@@ -67,7 +74,7 @@ describe("build_slash_commands", () => {
   });
 
   it("/room has a required name option", () => {
-    const room = commands.find(c => c.name === "room")!;
+    const room = commands.find((c) => c.name === "room")!;
     const options = room.options;
     expect(options).toHaveLength(1);
     const opt = options[0]!.toJSON();
@@ -76,7 +83,7 @@ describe("build_slash_commands", () => {
   });
 
   it("/scaffold has required name and optional blueprint options", () => {
-    const scaffold = commands.find(c => c.name === "scaffold")!;
+    const scaffold = commands.find((c) => c.name === "scaffold")!;
     const options = scaffold.options;
     expect(options).toHaveLength(2);
     const name_opt = options[0]!.toJSON();
@@ -89,13 +96,13 @@ describe("build_slash_commands", () => {
 
   it("/help, /compact, /reset, /archives have no options", () => {
     for (const cmd_name of ["help", "compact", "reset", "archives"]) {
-      const cmd = commands.find(c => c.name === cmd_name)!;
+      const cmd = commands.find((c) => c.name === cmd_name)!;
       expect(cmd.options).toHaveLength(0);
     }
   });
 
   it("/close has an optional force boolean option", () => {
-    const close = commands.find(c => c.name === "close")!;
+    const close = commands.find((c) => c.name === "close")!;
     const options = close.options;
     expect(options).toHaveLength(1);
     const opt = options[0]!.toJSON();
@@ -113,8 +120,12 @@ describe("CommandTarget contract", () => {
     const target: CommandTarget = {
       channel_id: "ch-test",
       author_name: "TestUser",
-      async reply(content: string) { replies.push(content); },
-      async react(emoji: string) { reactions.push(emoji); },
+      async reply(content: string) {
+        replies.push(content);
+      },
+      async react(emoji: string) {
+        reactions.push(emoji);
+      },
     };
 
     await target.reply("hello");
@@ -134,11 +145,10 @@ describe("EPHEMERAL_COMMANDS", () => {
   });
 
   it("all ephemeral and public commands are registered", () => {
-    const public_names = ["swap", "scaffold",
-      "room", "close", "resume", "compact", "reset"];
+    const public_names = ["swap", "scaffold", "room", "close", "resume", "compact", "reset"];
 
     const all_commands = build_slash_commands();
-    const all_names = all_commands.map(c => c.name);
+    const all_names = all_commands.map((c) => c.name);
 
     for (const name of [...EPHEMERAL_COMMAND_NAMES, ...public_names]) {
       expect(all_names).toContain(name);
@@ -157,8 +167,12 @@ function mock_interaction(
   return {
     commandName,
     options: {
-      getString(name: string) { return strings[name] ?? null; },
-      getBoolean(name: string) { return booleans[name] ?? null; },
+      getString(name: string) {
+        return strings[name] ?? null;
+      },
+      getBoolean(name: string) {
+        return booleans[name] ?? null;
+      },
     },
   };
 }
@@ -169,26 +183,35 @@ describe("extract_slash_args", () => {
   });
 
   it("/scaffold name:server → ['server']", () => {
-    expect(extract_slash_args(mock_interaction("scaffold", { name: "server" }))).toEqual(["server"]);
+    expect(extract_slash_args(mock_interaction("scaffold", { name: "server" }))).toEqual([
+      "server",
+    ]);
   });
 
   it("/scaffold name:my-entity → ['entity', 'my-entity']", () => {
-    expect(extract_slash_args(mock_interaction("scaffold", { name: "my-entity" }))).toEqual(["entity", "my-entity"]);
+    expect(extract_slash_args(mock_interaction("scaffold", { name: "my-entity" }))).toEqual([
+      "entity",
+      "my-entity",
+    ]);
   });
 
   it("/scaffold with blueprint → ['entity', name, '--blueprint', bp]", () => {
-    expect(extract_slash_args(mock_interaction("scaffold", { name: "acme", blueprint: "custom" }))).toEqual([
-      "entity", "acme", "--blueprint", "custom",
-    ]);
+    expect(
+      extract_slash_args(mock_interaction("scaffold", { name: "acme", blueprint: "custom" })),
+    ).toEqual(["entity", "acme", "--blueprint", "custom"]);
   });
 
   it("/scaffold name:server ignores blueprint", () => {
     // "server" short-circuits before blueprint is checked
-    expect(extract_slash_args(mock_interaction("scaffold", { name: "server", blueprint: "custom" }))).toEqual(["server"]);
+    expect(
+      extract_slash_args(mock_interaction("scaffold", { name: "server", blueprint: "custom" })),
+    ).toEqual(["server"]);
   });
 
   it("/room extracts name", () => {
-    expect(extract_slash_args(mock_interaction("room", { name: "auth-work" }))).toEqual(["auth-work"]);
+    expect(extract_slash_args(mock_interaction("room", { name: "auth-work" }))).toEqual([
+      "auth-work",
+    ]);
   });
 
   it("/close with force:true → ['--force']", () => {
@@ -204,7 +227,9 @@ describe("extract_slash_args", () => {
   });
 
   it("/resume extracts name", () => {
-    expect(extract_slash_args(mock_interaction("resume", { name: "old-session" }))).toEqual(["old-session"]);
+    expect(extract_slash_args(mock_interaction("resume", { name: "old-session" }))).toEqual([
+      "old-session",
+    ]);
   });
 
   it("unknown command returns empty array", () => {

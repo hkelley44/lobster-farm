@@ -1,13 +1,13 @@
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import { resolve_model_id } from "./models.js";
-import { sq } from "./shell.js";
 import * as sentry from "./sentry.js";
+import { sq } from "./shell.js";
 
 export interface CommanderHealth {
   state: "stopped" | "starting" | "running" | "crashed";
@@ -72,13 +72,11 @@ export class CommanderProcess extends EventEmitter {
   /** Get the PID of the main process inside the tmux session. */
   private get_tmux_pid(): number | null {
     try {
-      const out = execFileSync(
-        "tmux",
-        ["list-panes", "-t", TMUX_SESSION, "-F", "#{pane_pid}"],
-        { encoding: "utf-8" },
-      ).trim();
-      const pid = parseInt(out, 10);
-      return isNaN(pid) ? null : pid;
+      const out = execFileSync("tmux", ["list-panes", "-t", TMUX_SESSION, "-F", "#{pane_pid}"], {
+        encoding: "utf-8",
+      }).trim();
+      const pid = Number.parseInt(out, 10);
+      return Number.isNaN(pid) ? null : pid;
     } catch {
       return null;
     }
@@ -102,50 +100,70 @@ export class CommanderProcess extends EventEmitter {
         execFileSync("tmux", ["kill-session", "-t", TMUX_SESSION], {
           stdio: "ignore",
         });
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
 
     this.state = "starting";
-    const claude_bin = process.env["CLAUDE_BIN"] ?? "claude";
+    const claude_bin = process.env.CLAUDE_BIN ?? "claude";
     const agent_name = this.config.agents.commander.name.toLowerCase();
     const working_dir = lobsterfarm_dir(this.config.paths);
 
     const claude_cmd = [
       sq(claude_bin),
-      "--channels", "plugin:discord@claude-plugins-official",
-      "--agent", sq(agent_name),
-      "--model", resolve_model_id(this.config.defaults.models.planning),
-      "--permission-mode", "bypassPermissions",
-      "--add-dir", sq(working_dir),
-      "--add-dir", sq(homedir()),
+      "--channels",
+      "plugin:discord@claude-plugins-official",
+      "--agent",
+      sq(agent_name),
+      "--model",
+      resolve_model_id(this.config.defaults.models.planning),
+      "--permission-mode",
+      "bypassPermissions",
+      "--add-dir",
+      sq(working_dir),
+      "--add-dir",
+      sq(homedir()),
     ].join(" ");
 
     console.log(`[commander] Starting ${agent_name} in tmux session "${TMUX_SESSION}"...`);
 
     // Create a detached tmux session running Claude Code.
     // DISCORD_STATE_DIR is set so the channel plugin reads from the right dir.
-    const proc = spawn("tmux", [
-      "new-session", "-d",
-      "-s", TMUX_SESSION,
-      "-x", "200", "-y", "50",
-      `DISCORD_STATE_DIR=${sq(this.state_dir())} GIT_AUTHOR_NAME=${sq("Pat")} GIT_COMMITTER_NAME=${sq("Pat")} ${claude_cmd}`,
-    ], {
-      cwd: working_dir,
-      stdio: "ignore",
-      env: {
-        ...process.env,
-        DISCORD_STATE_DIR: this.state_dir(),
-        GIT_AUTHOR_NAME: "Pat",
-        GIT_COMMITTER_NAME: "Pat",
+    const proc = spawn(
+      "tmux",
+      [
+        "new-session",
+        "-d",
+        "-s",
+        TMUX_SESSION,
+        "-x",
+        "200",
+        "-y",
+        "50",
+        `DISCORD_STATE_DIR=${sq(this.state_dir())} GIT_AUTHOR_NAME=${sq("Pat")} GIT_COMMITTER_NAME=${sq("Pat")} ${claude_cmd}`,
+      ],
+      {
+        cwd: working_dir,
+        stdio: "ignore",
+        env: {
+          ...process.env,
+          DISCORD_STATE_DIR: this.state_dir(),
+          GIT_AUTHOR_NAME: "Pat",
+          GIT_COMMITTER_NAME: "Pat",
+        },
       },
-    });
+    );
 
     proc.on("close", (code) => {
       if (code !== 0) {
         console.error(`[commander] tmux new-session failed with code ${String(code)}`);
-        sentry.captureException(new Error(`Commander tmux new-session failed with code ${String(code)}`), {
-          tags: { module: "commander" },
-        });
+        sentry.captureException(
+          new Error(`Commander tmux new-session failed with code ${String(code)}`),
+          {
+            tags: { module: "commander" },
+          },
+        );
         this.state = "crashed";
         this.schedule_restart();
         return;
@@ -160,7 +178,9 @@ export class CommanderProcess extends EventEmitter {
             execFileSync("tmux", ["send-keys", "-t", TMUX_SESSION, "Enter"], {
               stdio: "ignore",
             });
-          } catch { /* ignore — dialog may not appear if already trusted */ }
+          } catch {
+            /* ignore — dialog may not appear if already trusted */
+          }
         }, 3000);
 
         this.state = "running";
@@ -230,20 +250,19 @@ export class CommanderProcess extends EventEmitter {
     this.restart_count++;
 
     if (this.restart_count > MAX_RESTARTS) {
-      console.error(
-        `[commander] Max restarts (${String(MAX_RESTARTS)}) exceeded. Giving up.`,
+      console.error(`[commander] Max restarts (${String(MAX_RESTARTS)}) exceeded. Giving up.`);
+      sentry.captureMessage(
+        `Commander exceeded ${String(MAX_RESTARTS)} restarts -- giving up`,
+        "error",
+        {
+          tags: { module: "commander" },
+        },
       );
-      sentry.captureMessage(`Commander exceeded ${String(MAX_RESTARTS)} restarts -- giving up`, "error", {
-        tags: { module: "commander" },
-      });
       this.emit("gave_up", this.restart_count);
       return;
     }
 
-    const delay =
-      BACKOFF_SCHEDULE[
-        Math.min(this.restart_count - 1, BACKOFF_SCHEDULE.length - 1)
-      ]!;
+    const delay = BACKOFF_SCHEDULE[Math.min(this.restart_count - 1, BACKOFF_SCHEDULE.length - 1)]!;
     console.log(
       `[commander] Restart ${String(this.restart_count)}/${String(MAX_RESTARTS)} in ${String(delay / 1000)}s...`,
     );
@@ -273,7 +292,9 @@ export class CommanderProcess extends EventEmitter {
         execFileSync("tmux", ["kill-session", "-t", TMUX_SESSION], {
           stdio: "ignore",
         });
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
   }
 

@@ -1,7 +1,7 @@
 import { readdir } from "node:fs/promises";
 import {
-  EntityConfigSchema,
   type EntityConfig,
+  EntityConfigSchema,
   type LobsterFarmConfig,
   entities_dir,
   entity_config_path,
@@ -28,9 +28,7 @@ export class EntityRegistry {
     let entries: string[];
     try {
       const dir_entries = await readdir(base_dir, { withFileTypes: true });
-      entries = dir_entries
-        .filter((e) => e.isDirectory())
-        .map((e) => e.name);
+      entries = dir_entries.filter((e) => e.isDirectory()).map((e) => e.name);
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         console.log("No entities directory found; starting with empty registry.");
@@ -42,7 +40,7 @@ export class EntityRegistry {
     for (const entity_id of entries) {
       const config_file = entity_config_path(this.config.paths, entity_id);
       try {
-        const entity_config = await load_yaml(config_file, EntityConfigSchema) as EntityConfig;
+        const entity_config = (await load_yaml(config_file, EntityConfigSchema)) as EntityConfig;
         this.entities.set(entity_config.entity.id, entity_config);
         console.log(`Loaded entity: ${entity_config.entity.id} (${entity_config.entity.name})`);
       } catch (err: unknown) {

@@ -1,11 +1,10 @@
-import { describe, it, expect } from "vitest";
-import { generate_env_sh, generate_wrapper_sh, generate_plist } from "../lib/launchd.js";
+import { describe, expect, it } from "vitest";
+import { generate_env_sh, generate_plist, generate_wrapper_sh } from "../lib/launchd.js";
 
 // --- generate_env_sh ---
 
 describe("generate_env_sh", () => {
-  const mock_resolver = (paths: Record<string, string>) => (name: string) =>
-    paths[name] ?? null;
+  const mock_resolver = (paths: Record<string, string>) => (name: string) => paths[name] ?? null;
 
   it("includes PATH with directories for detected binaries", () => {
     const resolver = mock_resolver({
@@ -32,12 +31,12 @@ describe("generate_env_sh", () => {
     });
 
     const result = generate_env_sh({}, resolver);
-    const path_line = result.split("\n").find(l => l.startsWith("export PATH="))!;
+    const path_line = result.split("\n").find((l) => l.startsWith("export PATH="))!;
     const path_value = path_line.replace('export PATH="', "").replace('"', "");
     const dirs = path_value.split(":");
 
     // /usr/bin should appear exactly once
-    expect(dirs.filter(d => d === "/usr/bin")).toHaveLength(1);
+    expect(dirs.filter((d) => d === "/usr/bin")).toHaveLength(1);
   });
 
   it("includes base PATH dirs even when no binaries found", () => {
@@ -57,7 +56,7 @@ describe("generate_env_sh", () => {
     });
 
     const result = generate_env_sh({}, resolver);
-    const path_line = result.split("\n").find(l => l.startsWith("export PATH="))!;
+    const path_line = result.split("\n").find((l) => l.startsWith("export PATH="))!;
     const path_value = path_line.replace('export PATH="', "").replace('"', "");
 
     const bun_idx = path_value.indexOf("/Users/test/.bun/bin");
@@ -90,7 +89,9 @@ describe("generate_env_sh", () => {
     const result = generate_env_sh(env, resolver);
 
     // The value should be escaped so it's safe inside double quotes
-    expect(result).toContain('export OP_SERVICE_ACCOUNT_TOKEN="token\\"with\\$pecial\\`chars\\\\here"');
+    expect(result).toContain(
+      'export OP_SERVICE_ACCOUNT_TOKEN="token\\"with\\$pecial\\`chars\\\\here"',
+    );
   });
 
   it("omits env vars not present in process.env", () => {
@@ -137,10 +138,15 @@ describe("generate_wrapper_sh", () => {
   });
 
   it("includes correct node and daemon paths in exec", () => {
-    const result = generate_wrapper_sh("/opt/homebrew/bin/node", "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js");
+    const result = generate_wrapper_sh(
+      "/opt/homebrew/bin/node",
+      "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js",
+    );
 
     // Both the op-run path and the fallback should include the correct node/daemon paths
-    expect(result).toContain('"/opt/homebrew/bin/node" --max-old-space-size=8192 "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js"');
+    expect(result).toContain(
+      '"/opt/homebrew/bin/node" --max-old-space-size=8192 "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js"',
+    );
   });
 
   it("uses op run to inject secrets from .env.op when available", () => {
@@ -188,11 +194,7 @@ describe("generate_plist", () => {
   });
 
   it("includes correct log paths", () => {
-    const result = generate_plist(
-      "/wrapper.sh",
-      "/logs/daemon.log",
-      "/working",
-    );
+    const result = generate_plist("/wrapper.sh", "/logs/daemon.log", "/working");
 
     expect(result).toContain("<string>/logs/daemon.log</string>");
     // Both stdout and stderr should use the same log
@@ -201,11 +203,7 @@ describe("generate_plist", () => {
   });
 
   it("includes working directory", () => {
-    const result = generate_plist(
-      "/wrapper.sh",
-      "/logs/daemon.log",
-      "/Users/farm/.lobsterfarm",
-    );
+    const result = generate_plist("/wrapper.sh", "/logs/daemon.log", "/Users/farm/.lobsterfarm");
 
     expect(result).toContain("<key>WorkingDirectory</key>");
     expect(result).toContain("<string>/Users/farm/.lobsterfarm</string>");

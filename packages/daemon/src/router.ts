@@ -29,7 +29,7 @@ interface ParsedCommand {
 function parse_command(content: string): ParsedCommand | null {
   const trimmed = content.trim();
   // Must start with "!lf " (with space) or be exactly "!lf"
-  if (!trimmed.startsWith(COMMAND_PREFIX + " ") && trimmed !== COMMAND_PREFIX) return null;
+  if (!trimmed.startsWith(`${COMMAND_PREFIX} `) && trimmed !== COMMAND_PREFIX) return null;
 
   const after_prefix = trimmed.slice(COMMAND_PREFIX.length).trim();
   if (!after_prefix) return { name: "help", args: [] };
@@ -75,11 +75,53 @@ interface Classification {
 }
 
 const INTENT_KEYWORDS: Record<ArchetypeRole, string[]> = {
-  planner: ["plan", "spec", "scope", "architecture", "design doc", "requirements", "project", "roadmap"],
-  designer: ["design", "ui", "ux", "brand", "visual", "mockup", "prototype", "animation", "layout", "component"],
-  builder: ["build", "implement", "code", "fix", "bug", "feature", "test", "refactor", "api", "endpoint"],
+  planner: [
+    "plan",
+    "spec",
+    "scope",
+    "architecture",
+    "design doc",
+    "requirements",
+    "project",
+    "roadmap",
+  ],
+  designer: [
+    "design",
+    "ui",
+    "ux",
+    "brand",
+    "visual",
+    "mockup",
+    "prototype",
+    "animation",
+    "layout",
+    "component",
+  ],
+  builder: [
+    "build",
+    "implement",
+    "code",
+    "fix",
+    "bug",
+    "feature",
+    "test",
+    "refactor",
+    "api",
+    "endpoint",
+  ],
   reviewer: ["review", "pr", "pull request", "audit", "check"],
-  operator: ["deploy", "infra", "ci", "cd", "monitor", "ops", "server", "docker", "pipeline", "sentry"],
+  operator: [
+    "deploy",
+    "infra",
+    "ci",
+    "cd",
+    "monitor",
+    "ops",
+    "server",
+    "docker",
+    "pipeline",
+    "sentry",
+  ],
 };
 
 function classify_intent(content: string): Classification | null {
@@ -143,7 +185,7 @@ export function route_message(msg: RoutedMessage): RouteAction {
         "I'm not sure what you'd like me to do. Try:\n" +
         "• `/status` — check daemon status\n" +
         "• `/room <name>` — create a work room\n" +
-        "• Or describe what you need (e.g., \"build the login page\")",
+        '• Or describe what you need (e.g., "build the login page")',
     };
   }
 

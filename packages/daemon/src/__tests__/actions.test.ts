@@ -6,8 +6,8 @@
  * returns { stdout, stderr } directly — matching Node's native behavior.
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { promisify } from "node:util";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Module-level mocks ──
 
@@ -69,10 +69,7 @@ vi.mock("node:child_process", () => {
     },
   );
 
-  (mock_exec as any)[promisify.custom] = (
-    cmd: string,
-    opts?: Record<string, unknown>,
-  ) => {
+  (mock_exec as any)[promisify.custom] = (cmd: string, opts?: Record<string, unknown>) => {
     exec_calls.push({ command: "shell", args: [cmd], options: opts });
     return Promise.resolve({ stdout: "", stderr: "" });
   };
@@ -124,23 +121,23 @@ vi.mock("../discord.js", async (importOriginal) => {
 
 // ── Import after mocks ──
 
+import type { ChannelMapping, EntityConfig } from "@lobster-farm/shared";
 import {
-  create_worktree,
+  type FeatureData,
+  assign_work_room,
+  classify_merge_error,
   cleanup_worktree,
   create_pr,
-  merge_pr,
-  run_tests,
+  create_worktree,
   detect_review_outcome,
-  classify_merge_error,
+  merge_pr,
   notify,
-  assign_work_room,
   release_work_room,
+  run_tests,
   set_discord_bot,
   set_pool,
-  type FeatureData,
 } from "../actions.js";
 import * as sentry from "../sentry.js";
-import type { EntityConfig, ChannelMapping } from "@lobster-farm/shared";
 
 // ── Test helpers ──
 
@@ -238,9 +235,7 @@ describe("create_worktree", () => {
     const result = await create_worktree(feature, config);
 
     // Should have called git branch (may fail, that's ok) and git worktree add
-    const worktree_call = exec_calls.find(
-      (c) => c.command === "git" && c.args[0] === "worktree",
-    );
+    const worktree_call = exec_calls.find((c) => c.command === "git" && c.args[0] === "worktree");
     expect(worktree_call).toBeDefined();
     expect(worktree_call!.args).toEqual([
       "worktree",
@@ -315,10 +310,7 @@ describe("cleanup_worktree", () => {
     await cleanup_worktree(feature, config);
 
     const remove_call = exec_calls.find(
-      (c) =>
-        c.command === "git" &&
-        c.args[0] === "worktree" &&
-        c.args[1] === "remove",
+      (c) => c.command === "git" && c.args[0] === "worktree" && c.args[1] === "remove",
     );
     expect(remove_call).toBeDefined();
     expect(remove_call!.args).toEqual([
@@ -352,10 +344,7 @@ describe("cleanup_worktree", () => {
 
     // Should have called git worktree prune
     const prune_call = exec_calls.find(
-      (c) =>
-        c.command === "git" &&
-        c.args[0] === "worktree" &&
-        c.args[1] === "prune",
+      (c) => c.command === "git" && c.args[0] === "worktree" && c.args[1] === "prune",
     );
     expect(prune_call).toBeDefined();
   });
@@ -369,9 +358,7 @@ describe("cleanup_worktree", () => {
     };
     // rm also fails
     const { rm } = await import("node:fs/promises");
-    (rm as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-      new Error("rm failed"),
-    );
+    (rm as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("rm failed"));
 
     const feature = make_feature({
       worktreePath: "/repos/test-repo/worktrees/42-widget",
@@ -694,9 +681,7 @@ describe("notify", () => {
 
     await notify("alerts", "Test message");
 
-    expect(log_spy).toHaveBeenCalledWith(
-      expect.stringContaining("[alerts] Test message"),
-    );
+    expect(log_spy).toHaveBeenCalledWith(expect.stringContaining("[alerts] Test message"));
 
     log_spy.mockRestore();
   });
@@ -992,9 +977,7 @@ describe("release_work_room", () => {
       "12345678901234567890",
       expect.stringContaining("Cleaning up"),
     );
-    expect(mock_discord.delete_channel).toHaveBeenCalledWith(
-      "12345678901234567890",
-    );
+    expect(mock_discord.delete_channel).toHaveBeenCalledWith("12345678901234567890");
 
     // Channel should be removed from config list
     const remaining = config.entity.channels.list.filter(
@@ -1029,4 +1012,3 @@ describe("release_work_room", () => {
     expect(mock_discord.build_channel_map).toHaveBeenCalled();
   });
 });
-

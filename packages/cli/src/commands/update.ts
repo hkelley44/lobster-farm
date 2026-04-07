@@ -1,8 +1,8 @@
-import { Command } from "commander";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync } from "node:fs";
+import { Command } from "commander";
 
 /**
  * Resolve the monorepo root directory.
@@ -34,7 +34,7 @@ function resolve_repo_root(): string {
   } catch {
     throw new Error(
       "Could not resolve LobsterFarm repo root. " +
-      "Is the CLI running from within the repository?",
+        "Is the CLI running from within the repository?",
     );
   }
 }
@@ -55,9 +55,7 @@ export const update_command = new Command("update")
     try {
       repo_dir = resolve_repo_root();
     } catch (err) {
-      console.error(
-        err instanceof Error ? err.message : "Failed to resolve repo root.",
-      );
+      console.error(err instanceof Error ? err.message : "Failed to resolve repo root.");
       process.exit(1);
     }
 
@@ -91,7 +89,7 @@ export const update_command = new Command("update")
     } catch {
       console.error(
         "Pull failed. You may have local changes that conflict.\n" +
-        "Resolve conflicts manually, then re-run: lf update",
+          "Resolve conflicts manually, then re-run: lf update",
       );
       process.exit(1);
     }
@@ -109,8 +107,7 @@ export const update_command = new Command("update")
       });
     } catch {
       console.error(
-        "Build failed. Check the output above for errors.\n" +
-        "You can retry the build manually: cd " + repo_dir + " && pnpm install && pnpm build",
+        `Build failed. Check the output above for errors.\nYou can retry the build manually: cd ${repo_dir} && pnpm install && pnpm build`,
       );
       process.exit(1);
     }

@@ -1,4 +1,4 @@
-import type { ModelTier, ModelName, ThinkLevel } from "@lobster-farm/shared";
+import type { ModelName, ModelTier, ThinkLevel } from "@lobster-farm/shared";
 
 /** Map abstract model names to Claude CLI model identifiers. */
 const MODEL_IDS: Record<ModelName, string> = {

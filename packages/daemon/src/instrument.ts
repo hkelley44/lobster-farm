@@ -11,21 +11,16 @@
 import * as Sentry from "@sentry/node";
 
 Sentry.init({
-  dsn: process.env["SENTRY_DSN"],
-  environment: process.env["NODE_ENV"] || "production",
-  release: `lobsterfarm-daemon@${process.env["GIT_SHA"] || "unknown"}`,
+  dsn: process.env.SENTRY_DSN,
+  environment: process.env.NODE_ENV || "production",
+  release: `lobsterfarm-daemon@${process.env.GIT_SHA || "unknown"}`,
   tracesSampleRate: 1.0, // low-traffic daemon — capture everything
   sampleRate: 1.0,
   normalizeDepth: 5,
   attachStacktrace: true,
   maxBreadcrumbs: 50,
   sendDefaultPii: false,
-  ignoreErrors: [
-    /ECONNRESET/,
-    /ECONNREFUSED/,
-    /socket hang up/,
-    /ETIMEDOUT/,
-  ],
+  ignoreErrors: [/ECONNRESET/, /ECONNREFUSED/, /socket hang up/, /ETIMEDOUT/],
   beforeSend(event, hint) {
     const err = hint.originalException;
     // Discord.js handles rate limits internally via retry — drop from Sentry

@@ -1,11 +1,11 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { writeFile, mkdir, rm, chmod } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { QueueFullError, TaskQueue } from "../queue.js";
 import { ClaudeSessionManager } from "../session.js";
-import { TaskQueue, QueueFullError } from "../queue.js";
 
 function make_config(overrides?: Record<string, unknown>): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
@@ -24,7 +24,7 @@ describe("Queue depth enforcement", () => {
 
   afterEach(async () => {
     await rm(tmp, { recursive: true, force: true });
-    delete process.env["CLAUDE_BIN"];
+    delete process.env.CLAUDE_BIN;
   });
 
   describe("TaskQueue.submit() with max_queue_depth", () => {
@@ -32,7 +32,7 @@ describe("Queue depth enforcement", () => {
       const mock_claude = join(tmp, "mock-claude-slow");
       await writeFile(mock_claude, "#!/bin/bash\nsleep 30\n", "utf-8");
       await chmod(mock_claude, 0o755);
-      process.env["CLAUDE_BIN"] = mock_claude;
+      process.env.CLAUDE_BIN = mock_claude;
 
       // max_active=1, max_queue_depth=2: first task goes active, next 2 can queue, 4th should fail
       const config = make_config({
@@ -89,7 +89,7 @@ describe("Queue depth enforcement", () => {
       const mock_claude = join(tmp, "mock-claude-fast");
       await writeFile(mock_claude, "#!/bin/bash\nexit 0\n", "utf-8");
       await chmod(mock_claude, 0o755);
-      process.env["CLAUDE_BIN"] = mock_claude;
+      process.env.CLAUDE_BIN = mock_claude;
 
       const config = make_config({
         concurrency: { max_active_sessions: 1, max_queue_depth: 1 },
@@ -127,7 +127,7 @@ describe("Queue depth enforcement", () => {
       const mock_claude = join(tmp, "mock-claude-slow");
       await writeFile(mock_claude, "#!/bin/bash\nsleep 30\n", "utf-8");
       await chmod(mock_claude, 0o755);
-      process.env["CLAUDE_BIN"] = mock_claude;
+      process.env.CLAUDE_BIN = mock_claude;
 
       const config = make_config({
         concurrency: { max_active_sessions: 1, max_queue_depth: 10 },
@@ -174,7 +174,7 @@ describe("Queue depth enforcement", () => {
       const mock_claude = join(tmp, "mock-claude-fast");
       await writeFile(mock_claude, "#!/bin/bash\nexit 0\n", "utf-8");
       await chmod(mock_claude, 0o755);
-      process.env["CLAUDE_BIN"] = mock_claude;
+      process.env.CLAUDE_BIN = mock_claude;
 
       const config = make_config({
         concurrency: { max_active_sessions: 1, max_queue_depth: 10 },

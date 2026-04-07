@@ -1,10 +1,10 @@
 import { Command } from "commander";
-import { init_command } from "./commands/init.js";
-import { start_command } from "./commands/start.js";
-import { stop_command } from "./commands/stop.js";
-import { restart_command } from "./commands/restart.js";
-import { status_command } from "./commands/status.js";
 import { entity_command } from "./commands/entity.js";
+import { init_command } from "./commands/init.js";
+import { restart_command } from "./commands/restart.js";
+import { start_command } from "./commands/start.js";
+import { status_command } from "./commands/status.js";
+import { stop_command } from "./commands/stop.js";
 import { update_command } from "./commands/update.js";
 
 const program = new Command()

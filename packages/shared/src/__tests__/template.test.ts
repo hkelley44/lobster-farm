@@ -1,12 +1,12 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { writeFile, mkdir, rm, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  resolve_template,
-  load_and_resolve,
-  write_resolved,
   find_unresolved,
+  load_and_resolve,
+  resolve_template,
+  write_resolved,
 } from "../template.js";
 
 describe("resolve_template", () => {
@@ -18,18 +18,17 @@ describe("resolve_template", () => {
   });
 
   it("replaces multiple occurrences of the same placeholder", () => {
-    const result = resolve_template(
-      "{{BUILDER_NAME}} builds. {{BUILDER_NAME}} tests.",
-      { BUILDER_NAME: "Bob" },
-    );
+    const result = resolve_template("{{BUILDER_NAME}} builds. {{BUILDER_NAME}} tests.", {
+      BUILDER_NAME: "Bob",
+    });
     expect(result).toBe("Bob builds. Bob tests.");
   });
 
   it("replaces different placeholders", () => {
-    const result = resolve_template(
-      "{{PLANNER_NAME}} plans, {{BUILDER_NAME}} builds.",
-      { PLANNER_NAME: "Gary", BUILDER_NAME: "Bob" },
-    );
+    const result = resolve_template("{{PLANNER_NAME}} plans, {{BUILDER_NAME}} builds.", {
+      PLANNER_NAME: "Gary",
+      BUILDER_NAME: "Bob",
+    });
     expect(result).toBe("Gary plans, Bob builds.");
   });
 

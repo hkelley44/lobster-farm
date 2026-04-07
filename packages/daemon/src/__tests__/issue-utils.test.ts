@@ -1,8 +1,8 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  extract_linked_issues,
-  extract_first_linked_issue,
   close_linked_issues,
+  extract_first_linked_issue,
+  extract_linked_issues,
   nwo_from_url,
 } from "../issue-utils.js";
 
@@ -26,7 +26,9 @@ describe("extract_linked_issues", () => {
   });
 
   it("extracts multiple linked issues from body", () => {
-    expect(extract_linked_issues("Closes #10\nFixes #20\nResolves #30", null)).toEqual([10, 20, 30]);
+    expect(extract_linked_issues("Closes #10\nFixes #20\nResolves #30", null)).toEqual([
+      10, 20, 30,
+    ]);
   });
 
   it("extracts #N from title", () => {
@@ -78,7 +80,9 @@ describe("extract_first_linked_issue", () => {
 
 describe("nwo_from_url", () => {
   it("parses HTTPS URL", () => {
-    expect(nwo_from_url("https://github.com/test-org/lobster-farm.git")).toBe("test-org/lobster-farm");
+    expect(nwo_from_url("https://github.com/test-org/lobster-farm.git")).toBe(
+      "test-org/lobster-farm",
+    );
   });
 
   it("parses SSH URL", () => {
@@ -102,12 +106,10 @@ describe("close_linked_issues", () => {
   let log_spy: ReturnType<typeof vi.spyOn>;
 
   /** Helper: mock an open-issue GET state response. */
-  const open_state = () =>
-    new Response(JSON.stringify({ state: "open" }), { status: 200 });
+  const open_state = () => new Response(JSON.stringify({ state: "open" }), { status: 200 });
 
   /** Helper: mock a closed-issue GET state response. */
-  const closed_state = () =>
-    new Response(JSON.stringify({ state: "closed" }), { status: 200 });
+  const closed_state = () => new Response(JSON.stringify({ state: "closed" }), { status: 200 });
 
   /** Helper: mock a generic 200 OK response. */
   const ok = () => new Response("{}", { status: 200 });
@@ -150,7 +152,9 @@ describe("close_linked_issues", () => {
     expect(fetch_spy).toHaveBeenNthCalledWith(
       1,
       "https://api.github.com/repos/owner/repo/issues/10",
-      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer ghs_token" }) }),
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer ghs_token" }),
+      }),
     );
 
     // First issue: PATCH close
@@ -187,9 +191,7 @@ describe("close_linked_issues", () => {
     // Only 1 API call: the GET state check
     expect(fetch_spy).toHaveBeenCalledTimes(1);
     expect(results).toEqual([{ issue_number: 10, success: true }]);
-    expect(log_spy).toHaveBeenCalledWith(
-      expect.stringContaining("Issue #10 already closed"),
-    );
+    expect(log_spy).toHaveBeenCalledWith(expect.stringContaining("Issue #10 already closed"));
   });
 
   it("skips closed issues and processes open ones in a mixed batch", async () => {
@@ -222,7 +224,7 @@ describe("close_linked_issues", () => {
     for (const call of fetch_spy.mock.calls) {
       const init = call[1] as RequestInit | undefined;
       const headers = (init?.headers ?? {}) as Record<string, string>;
-      expect(headers["Authorization"]).toBe("Bearer ghs_test_token");
+      expect(headers.Authorization).toBe("Bearer ghs_test_token");
     }
   });
 
@@ -261,9 +263,7 @@ describe("close_linked_issues", () => {
 
     // Only 2 calls: GET state + PATCH close. No comment POST.
     expect(fetch_spy).toHaveBeenCalledTimes(2);
-    expect(results).toEqual([
-      { issue_number: 10, success: false, error: "403 Forbidden" },
-    ]);
+    expect(results).toEqual([{ issue_number: 10, success: false, error: "403 Forbidden" }]);
   });
 
   it("handles fetch throwing an exception", async () => {

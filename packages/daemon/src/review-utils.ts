@@ -18,16 +18,21 @@ const exec_async = promisify(execFile);
  * Fetch the most recent review comments from a PR.
  * Returns the concatenated review body text, or a fallback message if fetching fails.
  */
-export async function fetch_review_comments(
-  pr_number: number,
-  repo_path: string,
-): Promise<string> {
+export async function fetch_review_comments(pr_number: number, repo_path: string): Promise<string> {
   try {
-    const { stdout } = await exec_async("gh", [
-      "pr", "view", String(pr_number),
-      "--json", "reviews",
-      "--jq", ".reviews | map(select(.state == \"CHANGES_REQUESTED\")) | last | .body // empty",
-    ], { cwd: repo_path, timeout: 15_000 });
+    const { stdout } = await exec_async(
+      "gh",
+      [
+        "pr",
+        "view",
+        String(pr_number),
+        "--json",
+        "reviews",
+        "--jq",
+        '.reviews | map(select(.state == "CHANGES_REQUESTED")) | last | .body // empty',
+      ],
+      { cwd: repo_path, timeout: 15_000 },
+    );
     const body = stdout.trim();
     if (body) return body;
   } catch {
@@ -36,12 +41,23 @@ export async function fetch_review_comments(
 
   // Fallback: try to get any review body
   try {
-    const { stdout } = await exec_async("gh", [
-      "pr", "view", String(pr_number),
-      "--json", "reviews",
-      "--jq", ".reviews | last | .body // empty",
-    ], { cwd: repo_path, timeout: 15_000 });
-    return stdout.trim() || `(No review body found. Run \`gh pr view ${String(pr_number)} --json reviews\` to inspect.)`;
+    const { stdout } = await exec_async(
+      "gh",
+      [
+        "pr",
+        "view",
+        String(pr_number),
+        "--json",
+        "reviews",
+        "--jq",
+        ".reviews | last | .body // empty",
+      ],
+      { cwd: repo_path, timeout: 15_000 },
+    );
+    return (
+      stdout.trim() ||
+      `(No review body found. Run \`gh pr view ${String(pr_number)} --json reviews\` to inspect.)`
+    );
   } catch {
     return `(Could not fetch review comments. Run \`gh pr view ${String(pr_number)} --json reviews\` to inspect.)`;
   }
@@ -55,11 +71,11 @@ export async function check_merge_conflicts(
   repo_path: string,
 ): Promise<boolean> {
   try {
-    const { stdout } = await exec_async("gh", [
-      "pr", "view", String(pr_number),
-      "--json", "mergeable",
-      "--jq", ".mergeable",
-    ], { cwd: repo_path, timeout: 15_000 });
+    const { stdout } = await exec_async(
+      "gh",
+      ["pr", "view", String(pr_number), "--json", "mergeable", "--jq", ".mergeable"],
+      { cwd: repo_path, timeout: 15_000 },
+    );
 
     // GitHub returns "CONFLICTING", "MERGEABLE", or "UNKNOWN"
     return stdout.trim().toUpperCase() === "CONFLICTING";
@@ -79,23 +95,20 @@ export function build_review_fix_prompt(
   review_comments?: string,
 ): string {
   const pr = String(pr_number);
-  const lines = [
-    `The reviewer requested changes on PR #${pr}: ${title}`,
-    ``,
-  ];
+  const lines = [`The reviewer requested changes on PR #${pr}: ${title}`, ""];
 
   if (review_comments) {
-    lines.push(`## Reviewer Feedback`, ``, review_comments, ``);
+    lines.push("## Reviewer Feedback", "", review_comments, "");
   }
 
   lines.push(
-    `## Instructions`,
-    ``,
+    "## Instructions",
+    "",
     `1. Read the reviewer's feedback carefully`,
-    `2. Fix each issue mentioned`,
-    `3. Run the test suite to verify your changes`,
-    `4. Commit and push`,
-    ``,
+    "2. Fix each issue mentioned",
+    "3. Run the test suite to verify your changes",
+    "4. Commit and push",
+    "",
     `Do NOT change anything the reviewer didn't flag. Keep changes minimal and targeted.`,
   );
 
@@ -128,20 +141,16 @@ export async function attempt_auto_merge(
   pr_number: number,
   branch: string,
   repo_path: string,
-  gh_bin: string = "gh",
+  gh_bin = "gh",
   gh_token?: string,
 ): Promise<AutoMergeResult> {
   const pr = String(pr_number);
-  const env = gh_token
-    ? { ...process.env, GH_TOKEN: gh_token }
-    : process.env;
+  const env = gh_token ? { ...process.env, GH_TOKEN: gh_token } : process.env;
   const exec_opts = { cwd: repo_path, env, timeout: 30_000 };
 
   // Step 1: Direct merge retry
   try {
-    await exec_async(gh_bin, [
-      "pr", "merge", pr, "--squash", "--delete-branch",
-    ], exec_opts);
+    await exec_async(gh_bin, ["pr", "merge", pr, "--squash", "--delete-branch"], exec_opts);
     return { merged: true, method: "direct" };
   } catch (err) {
     console.log(
@@ -163,9 +172,7 @@ export async function attempt_auto_merge(
     const mergeable = await poll_mergeable(pr_number, repo_path, gh_bin, env);
     if (mergeable) {
       try {
-        await exec_async(gh_bin, [
-          "pr", "merge", pr, "--squash", "--delete-branch",
-        ], exec_opts);
+        await exec_async(gh_bin, ["pr", "merge", pr, "--squash", "--delete-branch"], exec_opts);
         return { merged: true, method: "update-branch" };
       } catch (err) {
         console.log(
@@ -182,9 +189,7 @@ export async function attempt_auto_merge(
     const mergeable = await poll_mergeable(pr_number, repo_path, gh_bin, env);
     if (mergeable) {
       try {
-        await exec_async(gh_bin, [
-          "pr", "merge", pr, "--squash", "--delete-branch",
-        ], exec_opts);
+        await exec_async(gh_bin, ["pr", "merge", pr, "--squash", "--delete-branch"], exec_opts);
         return { merged: true, method: "local-rebase" };
       } catch (err) {
         return {
@@ -209,9 +214,11 @@ async function get_repo_nwo(
   env: NodeJS.ProcessEnv,
 ): Promise<string | null> {
   try {
-    const { stdout } = await exec_async(gh_bin, [
-      "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner",
-    ], { cwd: repo_path, env, timeout: 15_000 });
+    const { stdout } = await exec_async(
+      gh_bin,
+      ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+      { cwd: repo_path, env, timeout: 15_000 },
+    );
     const nwo = stdout.trim();
     return nwo || null;
   } catch {
@@ -230,10 +237,11 @@ async function try_update_branch(
   env: NodeJS.ProcessEnv,
 ): Promise<boolean> {
   try {
-    await exec_async(gh_bin, [
-      "api", `repos/${nwo}/pulls/${String(pr_number)}/update-branch`,
-      "--method", "PUT",
-    ], { cwd: "/tmp", env, timeout: 30_000 });
+    await exec_async(
+      gh_bin,
+      ["api", `repos/${nwo}/pulls/${String(pr_number)}/update-branch`, "--method", "PUT"],
+      { cwd: "/tmp", env, timeout: 30_000 },
+    );
     console.log(`[auto-merge] update-branch API succeeded for PR #${String(pr_number)}`);
     return true;
   } catch (err) {
@@ -259,11 +267,11 @@ async function poll_mergeable(
 
   while (Date.now() < deadline) {
     try {
-      const { stdout } = await exec_async(gh_bin, [
-        "pr", "view", pr,
-        "--json", "mergeable",
-        "--jq", ".mergeable",
-      ], { cwd: repo_path, env, timeout: 15_000 });
+      const { stdout } = await exec_async(
+        gh_bin,
+        ["pr", "view", pr, "--json", "mergeable", "--jq", ".mergeable"],
+        { cwd: repo_path, env, timeout: 15_000 },
+      );
 
       const state = stdout.trim().toUpperCase();
       if (state === "MERGEABLE") return true;
@@ -292,9 +300,11 @@ async function try_local_rebase(
   // Get the remote URL from the repo
   let remote_url: string;
   try {
-    const { stdout } = await exec_async("git", [
-      "remote", "get-url", "origin",
-    ], { cwd: repo_path, env, timeout: 10_000 });
+    const { stdout } = await exec_async("git", ["remote", "get-url", "origin"], {
+      cwd: repo_path,
+      env,
+      timeout: 10_000,
+    });
     remote_url = stdout.trim();
   } catch {
     return { success: false, error: "Could not determine remote URL" };
@@ -311,26 +321,21 @@ async function try_local_rebase(
 
   try {
     // Clone the branch (shallow to save time)
-    await exec_async("git", [
-      "clone", "--single-branch", "--branch", branch, remote_url, tmp_dir,
-    ], { env, timeout: 60_000 });
+    await exec_async("git", ["clone", "--single-branch", "--branch", branch, remote_url, tmp_dir], {
+      env,
+      timeout: 60_000,
+    });
 
     // Fetch main
-    await exec_async("git", [
-      "fetch", "origin", "main",
-    ], { cwd: tmp_dir, env, timeout: 30_000 });
+    await exec_async("git", ["fetch", "origin", "main"], { cwd: tmp_dir, env, timeout: 30_000 });
 
     // Attempt rebase
     try {
-      await exec_async("git", [
-        "rebase", "origin/main",
-      ], { cwd: tmp_dir, env, timeout: 60_000 });
+      await exec_async("git", ["rebase", "origin/main"], { cwd: tmp_dir, env, timeout: 60_000 });
     } catch {
       // Rebase failed — abort and clean up
       try {
-        await exec_async("git", [
-          "rebase", "--abort",
-        ], { cwd: tmp_dir, env, timeout: 10_000 });
+        await exec_async("git", ["rebase", "--abort"], { cwd: tmp_dir, env, timeout: 10_000 });
       } catch {
         // Abort failed too — best-effort
       }
@@ -338,9 +343,11 @@ async function try_local_rebase(
     }
 
     // Rebase succeeded — force-push with lease
-    await exec_async("git", [
-      "push", "--force-with-lease", "origin", branch,
-    ], { cwd: tmp_dir, env, timeout: 30_000 });
+    await exec_async("git", ["push", "--force-with-lease", "origin", branch], {
+      cwd: tmp_dir,
+      env,
+      timeout: 30_000,
+    });
 
     console.log(`[auto-merge] Local rebase succeeded for branch ${branch}`);
     return { success: true };
@@ -383,18 +390,16 @@ export async function check_ci_status(
   pr_number: number,
   repo_path: string,
   gh_token?: string,
-  gh_bin: string = "gh",
+  gh_bin = "gh",
 ): Promise<CICheckStatus> {
-  const env = gh_token
-    ? { ...process.env, GH_TOKEN: gh_token }
-    : process.env;
+  const env = gh_token ? { ...process.env, GH_TOKEN: gh_token } : process.env;
 
   try {
-    const { stdout } = await exec_async(gh_bin, [
-      "pr", "checks", String(pr_number),
-      "--required",
-      "--json", "name,state,conclusion",
-    ], { cwd: repo_path, env, timeout: 15_000 });
+    const { stdout } = await exec_async(
+      gh_bin,
+      ["pr", "checks", String(pr_number), "--required", "--json", "name,state,conclusion"],
+      { cwd: repo_path, env, timeout: 15_000 },
+    );
 
     const checks = JSON.parse(stdout) as Array<{
       name: string;
@@ -413,7 +418,11 @@ export async function check_ci_status(
     for (const check of checks) {
       if (check.state === "PENDING" || check.state === "QUEUED" || check.state === "IN_PROGRESS") {
         has_pending = true;
-      } else if (check.conclusion !== "SUCCESS" && check.conclusion !== "NEUTRAL" && check.conclusion !== "SKIPPED") {
+      } else if (
+        check.conclusion !== "SUCCESS" &&
+        check.conclusion !== "NEUTRAL" &&
+        check.conclusion !== "SKIPPED"
+      ) {
         failures.push(check.name);
       }
     }
@@ -459,23 +468,30 @@ export async function fetch_ci_failure_logs(
   branch: string,
   repo_path: string,
   gh_token?: string,
-  gh_bin: string = "gh",
+  gh_bin = "gh",
 ): Promise<CIFailureLog[]> {
-  const env = gh_token
-    ? { ...process.env, GH_TOKEN: gh_token }
-    : process.env;
+  const env = gh_token ? { ...process.env, GH_TOKEN: gh_token } : process.env;
   const exec_opts = { cwd: repo_path, env, timeout: 30_000 };
 
   // Step 1: Find failed runs on this branch
   let runs: Array<{ databaseId: number; name: string }>;
   try {
-    const { stdout } = await exec_async(gh_bin, [
-      "run", "list",
-      "--branch", branch,
-      "--status", "failure",
-      "--json", "databaseId,name",
-      "--limit", "5",
-    ], exec_opts);
+    const { stdout } = await exec_async(
+      gh_bin,
+      [
+        "run",
+        "list",
+        "--branch",
+        branch,
+        "--status",
+        "failure",
+        "--json",
+        "databaseId,name",
+        "--limit",
+        "5",
+      ],
+      exec_opts,
+    );
 
     runs = JSON.parse(stdout) as Array<{ databaseId: number; name: string }>;
   } catch {
@@ -490,17 +506,18 @@ export async function fetch_ci_failure_logs(
 
   for (const run of runs) {
     try {
-      const { stdout } = await exec_async(gh_bin, [
-        "run", "view", String(run.databaseId),
-        "--log-failed",
-      ], { ...exec_opts, timeout: 60_000 });
+      const { stdout } = await exec_async(
+        gh_bin,
+        ["run", "view", String(run.databaseId), "--log-failed"],
+        { ...exec_opts, timeout: 60_000 },
+      );
 
       // Truncate to last N lines — CI logs can be enormous
       const lines = stdout.split("\n");
-      const truncated = lines.length > CI_LOG_TAIL_LINES
-        ? `... (${String(lines.length - CI_LOG_TAIL_LINES)} lines truncated)\n` +
-          lines.slice(-CI_LOG_TAIL_LINES).join("\n")
-        : stdout;
+      const truncated =
+        lines.length > CI_LOG_TAIL_LINES
+          ? `... (${String(lines.length - CI_LOG_TAIL_LINES)} lines truncated)\n${lines.slice(-CI_LOG_TAIL_LINES).join("\n")}`
+          : stdout;
 
       logs.push({
         check_name: run.name,
@@ -532,43 +549,36 @@ export function build_ci_fix_prompt(
   const pr = String(pr_number);
   const lines = [
     `PR #${pr}: "${title}" on branch ${branch} was approved but CI checks are failing.`,
-    ``,
+    "",
   ];
 
   if (failure_logs.length > 0) {
-    lines.push(`## CI Failure Logs`, ``);
+    lines.push("## CI Failure Logs", "");
 
     for (const log of failure_logs) {
-      lines.push(
-        `### ${log.check_name}`,
-        ``,
-        "```",
-        log.log_output,
-        "```",
-        ``,
-      );
+      lines.push(`### ${log.check_name}`, "", "```", log.log_output, "```", "");
     }
   } else if (failed_check_names?.length) {
     // Log fetching failed but we still know which checks are failing
     lines.push(
       `Failing CI checks: ${failed_check_names.join(", ")}`,
-      ``,
+      "",
       `(Detailed logs unavailable — run \`gh run list --branch ${branch} --status failure\` to investigate)`,
-      ``,
+      "",
     );
   }
 
   lines.push(
-    `## Instructions`,
-    ``,
+    "## Instructions",
+    "",
     `1. Check out the branch: git checkout ${branch}`,
-    `2. Read the CI failure logs above carefully`,
-    `3. Fix the issues causing CI failures (lint errors, type errors, test failures, etc.)`,
-    `4. Run the test suite locally to verify your fixes`,
-    `5. Commit and push your changes`,
-    ``,
-    `Keep changes minimal and targeted — only fix what CI is complaining about.`,
-    `Do NOT merge the PR.`,
+    "2. Read the CI failure logs above carefully",
+    "3. Fix the issues causing CI failures (lint errors, type errors, test failures, etc.)",
+    "4. Run the test suite locally to verify your fixes",
+    "5. Commit and push your changes",
+    "",
+    "Keep changes minimal and targeted — only fix what CI is complaining about.",
+    "Do NOT merge the PR.",
   );
 
   return lines.join("\n");

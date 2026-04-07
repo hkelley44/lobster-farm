@@ -1,9 +1,9 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { join } from "node:path";
-import { mkdtemp, rm, writeFile, readFile, mkdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
-import type { LobsterFarmConfig, ArchetypeRole } from "@lobster-farm/shared";
+import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DiscordBot } from "../discord.js";
 import { EntityRegistry } from "../registry.js";
 
@@ -147,8 +147,8 @@ describe("avatar cache load/save", () => {
     // Verify file exists and has correct content
     const raw = await readFile(join(temp_dir, "state", "avatar-urls.json"), "utf-8");
     const data = JSON.parse(raw) as Record<string, string>;
-    expect(data["gary"]).toBe("https://cdn.discordapp.com/attachments/1/gary.jpg");
-    expect(data["bob"]).toBe("https://cdn.discordapp.com/attachments/1/bob.jpg");
+    expect(data.gary).toBe("https://cdn.discordapp.com/attachments/1/gary.jpg");
+    expect(data.bob).toBe("https://cdn.discordapp.com/attachments/1/bob.jpg");
 
     // Create a new bot and load the cache
     const bot2 = new TestDiscordBot(config, registry);
@@ -210,7 +210,7 @@ describe("avatar cache load/save", () => {
 
       const raw = await readFile(join(fresh_dir, "state", "avatar-urls.json"), "utf-8");
       const data = JSON.parse(raw) as Record<string, string>;
-      expect(data["gary"]).toBe("https://example.com/gary.jpg");
+      expect(data.gary).toBe("https://example.com/gary.jpg");
     } finally {
       await rm(fresh_dir, { recursive: true, force: true });
     }

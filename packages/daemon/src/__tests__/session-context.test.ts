@@ -1,7 +1,7 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock sentry
 vi.mock("../sentry.js", () => ({
@@ -51,7 +51,13 @@ describe("session-context", () => {
     it("searches across multiple project directories", async () => {
       const session_id = "multi-proj-1234-5678-9012-123456789012";
       await mkdir(join(tmp_dir, ".claude", "projects", "other-project"), { recursive: true });
-      const file_path = join(tmp_dir, ".claude", "projects", "other-project", `${session_id}.jsonl`);
+      const file_path = join(
+        tmp_dir,
+        ".claude",
+        "projects",
+        "other-project",
+        `${session_id}.jsonl`,
+      );
       await writeFile(file_path, "{}");
 
       const result = await find_session_file(session_id);
@@ -151,11 +157,25 @@ describe("session-context", () => {
       const lines = [
         JSON.stringify({
           type: "assistant",
-          message: { usage: { input_tokens: 1000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 50 } },
+          message: {
+            usage: {
+              input_tokens: 1000,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+              output_tokens: 50,
+            },
+          },
         }),
         JSON.stringify({
           type: "assistant",
-          message: { usage: { input_tokens: 50000, cache_creation_input_tokens: 0, cache_read_input_tokens: 100000, output_tokens: 200 } },
+          message: {
+            usage: {
+              input_tokens: 50000,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 100000,
+              output_tokens: 200,
+            },
+          },
         }),
       ];
       await writeFile(file_path, lines.join("\n"));
@@ -217,27 +237,62 @@ describe("session-context", () => {
         // Turn 1: 100k total
         JSON.stringify({
           type: "assistant",
-          message: { usage: { input_tokens: 80000, cache_creation_input_tokens: 10000, cache_read_input_tokens: 10000, output_tokens: 500 } },
+          message: {
+            usage: {
+              input_tokens: 80000,
+              cache_creation_input_tokens: 10000,
+              cache_read_input_tokens: 10000,
+              output_tokens: 500,
+            },
+          },
         }),
         // Turn 2: grows to 200k
         JSON.stringify({
           type: "assistant",
-          message: { usage: { input_tokens: 150000, cache_creation_input_tokens: 20000, cache_read_input_tokens: 30000, output_tokens: 600 } },
+          message: {
+            usage: {
+              input_tokens: 150000,
+              cache_creation_input_tokens: 20000,
+              cache_read_input_tokens: 30000,
+              output_tokens: 600,
+            },
+          },
         }),
         // Turn 3: drops to 50k — compaction #1 (50k < 200k * 0.5)
         JSON.stringify({
           type: "assistant",
-          message: { usage: { input_tokens: 40000, cache_creation_input_tokens: 5000, cache_read_input_tokens: 5000, output_tokens: 300 } },
+          message: {
+            usage: {
+              input_tokens: 40000,
+              cache_creation_input_tokens: 5000,
+              cache_read_input_tokens: 5000,
+              output_tokens: 300,
+            },
+          },
         }),
         // Turn 4: grows back to 150k
         JSON.stringify({
           type: "assistant",
-          message: { usage: { input_tokens: 100000, cache_creation_input_tokens: 20000, cache_read_input_tokens: 30000, output_tokens: 400 } },
+          message: {
+            usage: {
+              input_tokens: 100000,
+              cache_creation_input_tokens: 20000,
+              cache_read_input_tokens: 30000,
+              output_tokens: 400,
+            },
+          },
         }),
         // Turn 5: drops to 30k — compaction #2 (30k < 150k * 0.5)
         JSON.stringify({
           type: "assistant",
-          message: { usage: { input_tokens: 20000, cache_creation_input_tokens: 5000, cache_read_input_tokens: 5000, output_tokens: 200 } },
+          message: {
+            usage: {
+              input_tokens: 20000,
+              cache_creation_input_tokens: 5000,
+              cache_read_input_tokens: 5000,
+              output_tokens: 200,
+            },
+          },
         }),
       ];
       await writeFile(file_path, lines.join("\n"));
@@ -257,17 +312,38 @@ describe("session-context", () => {
         // Turn 1: 100k total
         JSON.stringify({
           type: "assistant",
-          message: { usage: { input_tokens: 80000, cache_creation_input_tokens: 10000, cache_read_input_tokens: 10000, output_tokens: 500 } },
+          message: {
+            usage: {
+              input_tokens: 80000,
+              cache_creation_input_tokens: 10000,
+              cache_read_input_tokens: 10000,
+              output_tokens: 500,
+            },
+          },
         }),
         // Turn 2: drops to 90k (10% decrease — NOT a compaction)
         JSON.stringify({
           type: "assistant",
-          message: { usage: { input_tokens: 70000, cache_creation_input_tokens: 10000, cache_read_input_tokens: 10000, output_tokens: 400 } },
+          message: {
+            usage: {
+              input_tokens: 70000,
+              cache_creation_input_tokens: 10000,
+              cache_read_input_tokens: 10000,
+              output_tokens: 400,
+            },
+          },
         }),
         // Turn 3: drops to 72k (20% decrease — NOT a compaction, still above 50%)
         JSON.stringify({
           type: "assistant",
-          message: { usage: { input_tokens: 52000, cache_creation_input_tokens: 10000, cache_read_input_tokens: 10000, output_tokens: 300 } },
+          message: {
+            usage: {
+              input_tokens: 52000,
+              cache_creation_input_tokens: 10000,
+              cache_read_input_tokens: 10000,
+              output_tokens: 300,
+            },
+          },
         }),
       ];
       await writeFile(file_path, lines.join("\n"));
@@ -284,7 +360,14 @@ describe("session-context", () => {
       const lines = [
         JSON.stringify({
           type: "assistant",
-          message: { usage: { input_tokens: 500, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 50 } },
+          message: {
+            usage: {
+              input_tokens: 500,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+              output_tokens: 50,
+            },
+          },
         }),
       ];
       await writeFile(file_path, lines.join("\n"));

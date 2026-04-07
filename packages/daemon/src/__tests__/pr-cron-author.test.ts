@@ -1,6 +1,6 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
-import type { LobsterFarmConfig, EntityConfig } from "@lobster-farm/shared";
-import { LobsterFarmConfigSchema, EntityConfigSchema } from "@lobster-farm/shared";
+import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
+import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Mocks ──
 
@@ -41,8 +41,16 @@ function make_entity(github_user?: string): EntityConfig {
 
 describe("PR cron — author-based alert labeling", () => {
   let alerts: string[];
-  let mock_registry: { get: ReturnType<typeof vi.fn>; get_active: ReturnType<typeof vi.fn>; get_all: ReturnType<typeof vi.fn> };
-  let mock_session_manager: { spawn: ReturnType<typeof vi.fn>; on: ReturnType<typeof vi.fn>; removeListener: ReturnType<typeof vi.fn> };
+  let mock_registry: {
+    get: ReturnType<typeof vi.fn>;
+    get_active: ReturnType<typeof vi.fn>;
+    get_all: ReturnType<typeof vi.fn>;
+  };
+  let mock_session_manager: {
+    spawn: ReturnType<typeof vi.fn>;
+    on: ReturnType<typeof vi.fn>;
+    removeListener: ReturnType<typeof vi.fn>;
+  };
   let mock_discord: { send_to_entity: ReturnType<typeof vi.fn> };
   beforeEach(() => {
     alerts = [];
@@ -60,10 +68,12 @@ describe("PR cron — author-based alert labeling", () => {
     };
 
     mock_discord = {
-      send_to_entity: vi.fn().mockImplementation((_entity: string, _channel: string, message: string) => {
-        alerts.push(message);
-        return Promise.resolve();
-      }),
+      send_to_entity: vi
+        .fn()
+        .mockImplementation((_entity: string, _channel: string, message: string) => {
+          alerts.push(message);
+          return Promise.resolve();
+        }),
     };
   });
 

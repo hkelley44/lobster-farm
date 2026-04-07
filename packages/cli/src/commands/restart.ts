@@ -1,12 +1,12 @@
-import { Command } from "commander";
-import { writeFile, chmod } from "node:fs/promises";
-import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { chmod, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { join } from "node:path";
+import { LAUNCHD_LABEL, pid_file_path } from "@lobster-farm/shared";
+import { Command } from "commander";
 import { generate_wrapper_sh } from "../lib/launchd.js";
 import { is_service_loaded } from "../lib/launchd.js";
-import { read_pid_file, is_process_running } from "../lib/process.js";
-import { LAUNCHD_LABEL, pid_file_path } from "@lobster-farm/shared";
+import { is_process_running, read_pid_file } from "../lib/process.js";
 import { resolve_daemon_path } from "./start.js";
 
 /** Resolve the absolute path to the node binary. */
@@ -44,10 +44,7 @@ export const restart_command = new Command("restart")
     // no longer kills tmux sessions, pool bots survive the restart and are
     // rediscovered on startup via pool-state.json + tmux has-session checks.
     const uid = process.getuid?.() ?? 501;
-    execFileSync("launchctl", [
-      "kickstart", "-k",
-      `gui/${uid}/${LAUNCHD_LABEL}`,
-    ]);
+    execFileSync("launchctl", ["kickstart", "-k", `gui/${uid}/${LAUNCHD_LABEL}`]);
 
     console.log("Daemon restarting... tmux sessions preserved.");
 
@@ -58,7 +55,7 @@ export const restart_command = new Command("restart")
     let pid: number | null = null;
 
     while (Date.now() - start < TIMEOUT_MS) {
-      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
       pid = await read_pid_file(pid_file_path());
       if (pid !== null && is_process_running(pid)) {
         break;

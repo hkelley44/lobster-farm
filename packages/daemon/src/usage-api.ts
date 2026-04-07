@@ -65,7 +65,7 @@ export async function read_oauth_credentials(): Promise<OAuthCredentials> {
   );
 
   const blob = JSON.parse(stdout.trim()) as Record<string, unknown>;
-  const oauth = blob["claudeAiOauth"] as OAuthCredentials | undefined;
+  const oauth = blob.claudeAiOauth as OAuthCredentials | undefined;
   if (!oauth?.accessToken) {
     throw new Error("No claudeAiOauth.accessToken found in Keychain credentials");
   }
@@ -87,7 +87,7 @@ export async function fetch_subscription_usage(): Promise<SubscriptionUsageSumma
     const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
       method: "GET",
       headers: {
-        "Authorization": `Bearer ${creds.accessToken}`,
+        Authorization: `Bearer ${creds.accessToken}`,
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": "claude-code/1.0.0",
       },
@@ -99,7 +99,7 @@ export async function fetch_subscription_usage(): Promise<SubscriptionUsageSumma
       return null;
     }
 
-    const data = await response.json() as SubscriptionUsageResponse;
+    const data = (await response.json()) as SubscriptionUsageResponse;
     return {
       raw: data,
       summary: format_usage_summary(data),

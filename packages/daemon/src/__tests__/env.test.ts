@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { check_required_binaries, propagate_tmux_env, resolve_binary } from "../env.js";
 
 describe("check_required_binaries", () => {
@@ -45,17 +45,15 @@ describe("check_required_binaries", () => {
 
     expect(() => check_required_binaries(checker)).not.toThrow();
     expect(exit_code).toBeUndefined();
-    expect(warn_spy).toHaveBeenCalledWith(
-      expect.stringContaining("op"),
-    );
+    expect(warn_spy).toHaveBeenCalledWith(expect.stringContaining("op"));
 
     warn_spy.mockRestore();
   });
 
   it("logs the current PATH on failure for debugging", () => {
     const error_spy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const original_path = process.env["PATH"];
-    process.env["PATH"] = "/test/path:/usr/bin";
+    const original_path = process.env.PATH;
+    process.env.PATH = "/test/path:/usr/bin";
 
     // Fail "claude"
     const checker = (name: string) => name !== "claude";
@@ -66,12 +64,10 @@ describe("check_required_binaries", () => {
       // Expected — process.exit throws
     }
 
-    expect(error_spy).toHaveBeenCalledWith(
-      expect.stringContaining("/test/path:/usr/bin"),
-    );
+    expect(error_spy).toHaveBeenCalledWith(expect.stringContaining("/test/path:/usr/bin"));
 
     error_spy.mockRestore();
-    process.env["PATH"] = original_path;
+    process.env.PATH = original_path;
   });
 
   it("lists all missing required binaries in the error message", () => {
@@ -86,9 +82,7 @@ describe("check_required_binaries", () => {
       // Expected
     }
 
-    expect(error_spy).toHaveBeenCalledWith(
-      expect.stringContaining("claude, bun"),
-    );
+    expect(error_spy).toHaveBeenCalledWith(expect.stringContaining("claude, bun"));
 
     error_spy.mockRestore();
   });
@@ -134,7 +128,7 @@ describe("propagate_tmux_env", () => {
     propagate_tmux_env(env, setter);
 
     expect(calls).toHaveLength(2);
-    expect(calls.map(c => c[0])).toEqual(["PATH", "HOME"]);
+    expect(calls.map((c) => c[0])).toEqual(["PATH", "HOME"]);
   });
 
   it("does not throw when tmux server is not running", () => {

@@ -9,30 +9,38 @@
  * once the current reviewer finishes.
  */
 
-import type { IncomingMessage, ServerResponse } from "node:http";
 import { execFile } from "node:child_process";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { promisify } from "node:util";
 import type { ArchetypeRole } from "@lobster-farm/shared";
 import { expand_home } from "@lobster-farm/shared";
-import type { GitHubAppAuth } from "./github-app.js";
-import type { EntityRegistry } from "./registry.js";
-import type { ClaudeSessionManager, SessionResult } from "./session.js";
-import type { DiscordBot } from "./discord.js";
-import { detect_review_outcome } from "./actions.js";
-import { fetch_review_comments, build_review_fix_prompt, attempt_auto_merge, check_ci_status, fetch_ci_failure_logs, build_ci_fix_prompt, MAX_CI_FIX_ATTEMPTS } from "./review-utils.js";
-import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { detect_review_outcome } from "./actions.js";
+import type { DiscordBot } from "./discord.js";
+import type { GitHubAppAuth } from "./github-app.js";
 import {
+  close_linked_issues,
   extract_first_linked_issue,
   extract_linked_issues,
   fetch_issue_context,
-  close_linked_issues,
   nwo_from_url,
 } from "./issue-utils.js";
-import { cleanup_after_merge } from "./worktree-cleanup.js";
+import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { BotPool } from "./pool.js";
 import type { PRWatchStore } from "./pr-watches.js";
+import type { EntityRegistry } from "./registry.js";
+import {
+  MAX_CI_FIX_ATTEMPTS,
+  attempt_auto_merge,
+  build_ci_fix_prompt,
+  build_review_fix_prompt,
+  check_ci_status,
+  fetch_ci_failure_logs,
+  fetch_review_comments,
+} from "./review-utils.js";
 import * as sentry from "./sentry.js";
+import type { ClaudeSessionManager, SessionResult } from "./session.js";
+import { cleanup_after_merge } from "./worktree-cleanup.js";
 
 const exec = promisify(execFile);
 
@@ -248,15 +256,14 @@ async function route_event(
   const repo_full_name = payload.repository?.full_name;
 
   if (!pr || !repo_full_name) {
-    console.log(`[webhook] pull_request event missing PR or repo data`);
+    console.log("[webhook] pull_request event missing PR or repo data");
     return;
   }
 
   // Extract installation ID from the webhook payload so we authenticate
   // against the correct GitHub account (multi-installation support).
-  const installation_id = payload.installation?.id != null
-    ? String(payload.installation.id)
-    : undefined;
+  const installation_id =
+    payload.installation?.id != null ? String(payload.installation.id) : undefined;
 
   // Map repo to entity
   const match = find_entity_for_repo(repo_full_name, ctx.registry);
@@ -269,11 +276,12 @@ async function route_event(
   if (action === "closed" && pr.merged === true) {
     console.log(
       `[webhook] pull_request.closed (merged) for #${String(pr.number)} ` +
-      `in ${match.entity_id} (${repo_full_name})`,
+        `in ${match.entity_id} (${repo_full_name})`,
     );
     await handle_pr_merged(pr, repo_full_name, match.repo_path, ctx, installation_id);
     await notify_pr_watcher(
-      repo_full_name, pr.number,
+      repo_full_name,
+      pr.number,
       `PR #${String(pr.number)} ("${pr.title}") has been merged to main. Continue your work.`,
       ctx,
     );
@@ -284,10 +292,11 @@ async function route_event(
   if (action === "closed" && pr.merged !== true) {
     console.log(
       `[webhook] pull_request.closed (not merged) for #${String(pr.number)} ` +
-      `in ${match.entity_id} (${repo_full_name})`,
+        `in ${match.entity_id} (${repo_full_name})`,
     );
     await notify_pr_watcher(
-      repo_full_name, pr.number,
+      repo_full_name,
+      pr.number,
       `PR #${String(pr.number)} ("${pr.title}") was closed without merging.`,
       ctx,
     );
@@ -303,7 +312,7 @@ async function route_event(
 
   console.log(
     `[webhook] pull_request.${action} for #${String(pr.number)} ` +
-    `in ${match.entity_id} (${repo_full_name})`,
+      `in ${match.entity_id} (${repo_full_name})`,
   );
 
   sentry.addBreadcrumb({
@@ -316,9 +325,7 @@ async function route_event(
   const key = review_key(match.entity_id, pr.number);
   const existing = active_reviews.get(key);
   if (existing) {
-    console.log(
-      `[webhook] Review already in-flight for ${key} — marking for requeue`,
-    );
+    console.log(`[webhook] Review already in-flight for ${key} — marking for requeue`);
     existing.needs_requeue = true;
     return;
   }
@@ -370,9 +377,7 @@ async function spawn_review(
   // Build reviewer prompt
   const prompt = build_reviewer_prompt(pr, repo_path, issue_context);
 
-  console.log(
-    `[webhook] Spawning reviewer for PR #${String(pr.number)} in ${entity_id}`,
-  );
+  console.log(`[webhook] Spawning reviewer for PR #${String(pr.number)} in ${entity_id}`);
 
   try {
     const session = await ctx.session_manager.spawn({
@@ -389,7 +394,7 @@ async function spawn_review(
 
     console.log(
       `[webhook] Reviewer session ${session.session_id.slice(0, 8)} ` +
-      `started for PR #${String(pr.number)}`,
+        `started for PR #${String(pr.number)}`,
     );
 
     // Listen for session completion
@@ -407,7 +412,15 @@ async function spawn_review(
           });
         })
         .finally(() => {
-          cleanup_and_maybe_requeue(key, entity_id, repo_path, repo_full_name, pr, ctx, installation_id);
+          cleanup_and_maybe_requeue(
+            key,
+            entity_id,
+            repo_path,
+            repo_full_name,
+            pr,
+            ctx,
+            installation_id,
+          );
         });
     };
 
@@ -416,14 +429,20 @@ async function spawn_review(
       ctx.session_manager.removeListener("session:completed", on_complete);
       ctx.session_manager.removeListener("session:failed", on_fail);
 
-      console.error(
-        `[webhook] Review session failed for PR #${String(pr.number)}: ${error}`,
-      );
+      console.error(`[webhook] Review session failed for PR #${String(pr.number)}: ${error}`);
       sentry.captureException(new Error(error), {
         tags: { module: "webhook", entity: entity_id },
         contexts: { pr: { number: pr.number, title: pr.title } },
       });
-      cleanup_and_maybe_requeue(key, entity_id, repo_path, repo_full_name, pr, ctx, installation_id);
+      cleanup_and_maybe_requeue(
+        key,
+        entity_id,
+        repo_path,
+        repo_full_name,
+        pr,
+        ctx,
+        installation_id,
+      );
     };
 
     ctx.session_manager.on("session:completed", on_complete);
@@ -466,9 +485,7 @@ async function handle_review_completion(
 
   const outcome = await detect_review_outcome(pr.number, repo_path, gh_token);
 
-  console.log(
-    `[webhook] Review completed for PR #${String(pr.number)} — outcome: ${outcome}`,
-  );
+  console.log(`[webhook] Review completed for PR #${String(pr.number)} — outcome: ${outcome}`);
 
   // Route outcome
   if (outcome === "changes_requested") {
@@ -483,7 +500,8 @@ async function handle_review_completion(
     // Not terminal — the fix loop will push new commits, triggering re-review.
     // The watch stays alive so the bot gets the final merged/closed event.
     await notify_pr_watcher(
-      repo_full_name, pr.number,
+      repo_full_name,
+      pr.number,
       `PR #${String(pr.number)} ("${pr.title}") received review feedback: changes requested. The fix loop is handling it.`,
       ctx,
       false,
@@ -507,7 +525,11 @@ async function handle_review_completion(
       } else {
         // All checks passed (or none configured) — proceed with merge
         const result = await attempt_auto_merge(
-          pr.number, pr.head.ref, repo_path, undefined, gh_token,
+          pr.number,
+          pr.head.ref,
+          repo_path,
+          undefined,
+          gh_token,
         );
 
         if (result.merged) {
@@ -520,7 +542,8 @@ async function handle_review_completion(
           );
           // Auto-merged — notify watching bot
           await notify_pr_watcher(
-            repo_full_name, pr.number,
+            repo_full_name,
+            pr.number,
             `PR #${String(pr.number)} ("${pr.title}") was approved and merged to main. Continue your work.`,
             ctx,
           );
@@ -540,7 +563,8 @@ async function handle_review_completion(
       );
       // Reviewer already merged — notify watching bot
       await notify_pr_watcher(
-        repo_full_name, pr.number,
+        repo_full_name,
+        pr.number,
         `PR #${String(pr.number)} ("${pr.title}") was approved and merged to main. Continue your work.`,
         ctx,
       );
@@ -552,7 +576,6 @@ async function handle_review_completion(
       ctx,
     );
   }
-
 }
 
 /**
@@ -575,13 +598,15 @@ function cleanup_and_maybe_requeue(
     console.log(
       `[webhook] Re-reviewing PR #${String(pr.number)} — new commits arrived during previous review`,
     );
-    void spawn_review(entity_id, repo_path, repo_full_name, pr, ctx, installation_id).catch((err) => {
-      console.error(`[webhook] Requeue failed for PR #${String(pr.number)}: ${String(err)}`);
-      sentry.captureException(err, {
-        tags: { module: "webhook", entity: entity_id, action: "requeue" },
-        contexts: { pr: { number: pr.number, title: pr.title } },
-      });
-    });
+    void spawn_review(entity_id, repo_path, repo_full_name, pr, ctx, installation_id).catch(
+      (err) => {
+        console.error(`[webhook] Requeue failed for PR #${String(pr.number)}: ${String(err)}`);
+        sentry.captureException(err, {
+          tags: { module: "webhook", entity: entity_id, action: "requeue" },
+          contexts: { pr: { number: pr.number, title: pr.title } },
+        });
+      },
+    );
   }
 }
 
@@ -597,20 +622,18 @@ async function spawn_fixer(
   const review_comments = await fetch_review_comments(pr.number, repo_path);
 
   const prompt = [
-    `An external PR needs fixes based on reviewer feedback.`,
+    "An external PR needs fixes based on reviewer feedback.",
     `PR #${String(pr.number)}: "${pr.title}" on branch ${pr.head.ref}`,
     `Repository: ${repo_path}`,
-    ``,
+    "",
     `First, check out the PR branch: git checkout ${pr.head.ref}`,
-    ``,
+    "",
     build_review_fix_prompt(pr.number, pr.title, review_comments),
-    ``,
-    `Do NOT merge the PR.`,
+    "",
+    "Do NOT merge the PR.",
   ].join("\n");
 
-  console.log(
-    `[webhook] Spawning builder to fix PR #${String(pr.number)} in ${entity_id}`,
-  );
+  console.log(`[webhook] Spawning builder to fix PR #${String(pr.number)} in ${entity_id}`);
 
   try {
     // Get fresh token for builder too
@@ -628,9 +651,7 @@ async function spawn_fixer(
       env: { GH_TOKEN: gh_token },
     });
   } catch (err) {
-    console.error(
-      `[webhook] Failed to spawn builder for PR #${String(pr.number)}: ${String(err)}`,
-    );
+    console.error(`[webhook] Failed to spawn builder for PR #${String(pr.number)}: ${String(err)}`);
     sentry.captureException(err, {
       tags: { module: "webhook", entity: entity_id, action: "spawn_fixer" },
       contexts: { pr: { number: pr.number, title: pr.title } },
@@ -697,20 +718,23 @@ async function spawn_ci_fixer(
   // retry_approved_unmerged doesn't double-spawn for the same failure set.
   const failure_key = JSON.stringify([...failed_checks].sort());
   pr_state[key] = {
-    ...(entry ?? { entity_id, pr_number: pr.number, reviewed_at: new Date().toISOString(), outcome: "approved" as const }),
+    ...(entry ?? {
+      entity_id,
+      pr_number: pr.number,
+      reviewed_at: new Date().toISOString(),
+      outcome: "approved" as const,
+    }),
     ci_fix_attempts: attempts + 1,
     ci_failure_alerted: failure_key,
   };
   await save_pr_reviews(pr_state, ctx.config);
 
   // Fetch CI failure logs for context
-  const failure_logs = await fetch_ci_failure_logs(
-    pr.head.ref, repo_path, gh_token,
-  );
+  const failure_logs = await fetch_ci_failure_logs(pr.head.ref, repo_path, gh_token);
 
   const prompt = [
     `Repository: ${repo_path}`,
-    ``,
+    "",
     build_ci_fix_prompt(pr.number, pr.title, pr.head.ref, failure_logs, failed_checks),
   ].join("\n");
 
@@ -749,46 +773,42 @@ async function spawn_ci_fixer(
 
 // ── Prompt building ──
 
-function build_reviewer_prompt(
-  pr: WebhookPR,
-  repo_path: string,
-  issue_context: string,
-): string {
+function build_reviewer_prompt(pr: WebhookPR, repo_path: string, issue_context: string): string {
   const lines = [
     `Review PR #${String(pr.number)}: "${pr.title}" on branch ${pr.head.ref}.`,
     `Repository: ${repo_path}`,
-    ``,
-    `Run /review to do a comprehensive code review.`,
-    ``,
-    `Post your review on the PR using gh cli.`,
-    `You are authenticated as the LobsterFarm Reviewer GitHub App.`,
-    ``,
-    `Review standards:`,
-    `- Every piece of actionable feedback should be included.`,
-    `- If there is ANY actionable feedback, request changes:`,
+    "",
+    "Run /review to do a comprehensive code review.",
+    "",
+    "Post your review on the PR using gh cli.",
+    "You are authenticated as the LobsterFarm Reviewer GitHub App.",
+    "",
+    "Review standards:",
+    "- Every piece of actionable feedback should be included.",
+    "- If there is ANY actionable feedback, request changes:",
     `  gh pr review ${String(pr.number)} --request-changes --body "<your review>"`,
-    `- If the code is genuinely clean with no improvements needed, approve:`,
+    "- If the code is genuinely clean with no improvements needed, approve:",
     `  gh pr review ${String(pr.number)} --approve --body "Looks good."`,
-    ``,
-    `Before merging, check CI status:`,
+    "",
+    "Before merging, check CI status:",
     `  gh pr checks ${String(pr.number)} --required`,
-    `If any required checks are failing or pending, do NOT merge.`,
-    `Instead, note the failing checks in your review and request changes.`,
-    `If no CI workflows are configured for this repo, proceed with merge normally.`,
-    ``,
-    `After posting your review:`,
-    `- If you approved, merge the PR:`,
+    "If any required checks are failing or pending, do NOT merge.",
+    "Instead, note the failing checks in your review and request changes.",
+    "If no CI workflows are configured for this repo, proceed with merge normally.",
+    "",
+    "After posting your review:",
+    "- If you approved, merge the PR:",
     `  gh pr merge ${String(pr.number)} --squash --delete-branch`,
-    `- If the merge command fails (branch behind main):`,
+    "- If the merge command fails (branch behind main):",
     `  1. Try: git fetch origin && git checkout ${pr.head.ref} && git rebase origin/main`,
     `  2. If rebase is clean (no conflicts): git push --force-with-lease origin ${pr.head.ref}`,
     `  3. Then retry: gh pr merge ${String(pr.number)} --squash --delete-branch`,
-    `  4. If rebase has conflicts: git rebase --abort — do NOT force push conflict markers`,
-    `- If you requested changes, do NOT merge.`,
+    "  4. If rebase has conflicts: git rebase --abort — do NOT force push conflict markers",
+    "- If you requested changes, do NOT merge.",
   ];
 
   if (issue_context) {
-    lines.push(``, `## Linked Issue Context`, ``, issue_context);
+    lines.push("", "## Linked Issue Context", "", issue_context);
   }
 
   return lines.join("\n");
@@ -831,8 +851,8 @@ async function handle_pr_merged(
 
     if (gh_token) {
       console.log(
-        `[webhook] Closing linked issues ${issue_numbers.map(n => `#${String(n)}`).join(", ")} ` +
-        `for merged PR #${String(pr.number)}`,
+        `[webhook] Closing linked issues ${issue_numbers.map((n) => `#${String(n)}`).join(", ")} ` +
+          `for merged PR #${String(pr.number)}`,
       );
 
       const results = await close_linked_issues(repo_full_name, pr.number, issue_numbers, gh_token);
@@ -856,9 +876,7 @@ async function handle_pr_merged(
     await cleanup_after_merge(repo_path, pr.head.ref);
   } catch (err) {
     // Best-effort — never let cleanup break the merge handler
-    console.error(
-      `[webhook] Worktree cleanup failed for branch ${pr.head.ref}: ${String(err)}`,
-    );
+    console.error(`[webhook] Worktree cleanup failed for branch ${pr.head.ref}: ${String(err)}`);
     sentry.captureException(err, {
       tags: { module: "webhook", action: "worktree_cleanup" },
       contexts: { pr: { number: pr.number, branch: pr.head.ref } },
@@ -885,22 +903,23 @@ async function post_auto_merge_cleanup(
   const issue_numbers = extract_linked_issues(pr.body, pr.title);
   if (issue_numbers.length > 0) {
     // Derive repo full name from entity registry
-    const entity_config = ctx.registry.get_active().find(
-      (e: { entity: { id: string } }) => e.entity.id === entity_id,
-    );
-    const repo = entity_config?.entity.repos.find(
-      (r: { path: string; url: string }) => {
-        const expanded = expand_home(r.path);
-        return expanded === repo_path;
-      },
-    );
+    const entity_config = ctx.registry
+      .get_active()
+      .find((e: { entity: { id: string } }) => e.entity.id === entity_id);
+    const repo = entity_config?.entity.repos.find((r: { path: string; url: string }) => {
+      const expanded = expand_home(r.path);
+      return expanded === repo_path;
+    });
     const repo_full_name = repo ? nwo_from_url(repo.url) : undefined;
 
     if (repo_full_name) {
       try {
         const gh_token = await resolve_token(ctx.github_app, installation_id);
         const results = await close_linked_issues(
-          repo_full_name, pr.number, issue_numbers, gh_token,
+          repo_full_name,
+          pr.number,
+          issue_numbers,
+          gh_token,
         );
         for (const result of results) {
           if (!result.success) {
@@ -948,13 +967,10 @@ async function post_auto_merge_cleanup(
  * Settings → Permissions & Events → Subscribe to events → check "Workflow runs".
  * Without this subscription, this handler will never receive events.
  */
-async function handle_workflow_run(
-  payload: WebhookPayload,
-  ctx: WebhookContext,
-): Promise<void> {
+async function handle_workflow_run(payload: WebhookPayload, ctx: WebhookContext): Promise<void> {
   const workflow = payload.workflow_run;
   if (!workflow) {
-    console.log(`[webhook] workflow_run event missing workflow_run data`);
+    console.log("[webhook] workflow_run event missing workflow_run data");
     return;
   }
 
@@ -967,14 +983,14 @@ async function handle_workflow_run(
   ) {
     console.log(
       `[webhook] Ignoring workflow_run: conclusion=${workflow.conclusion ?? "null"}, ` +
-      `event=${workflow.event}, branch=${workflow.head_branch}`,
+        `event=${workflow.event}, branch=${workflow.head_branch}`,
     );
     return;
   }
 
   const repo_full_name = payload.repository?.full_name;
   if (!repo_full_name) {
-    console.log(`[webhook] workflow_run event missing repository data`);
+    console.log("[webhook] workflow_run event missing repository data");
     return;
   }
 
@@ -1004,12 +1020,7 @@ async function notify_alerts(
 ): Promise<void> {
   console.log(`[webhook:alerts] ${message}`);
   if (ctx.discord) {
-    await ctx.discord.send_to_entity(
-      entity_id,
-      "alerts",
-      message,
-      "reviewer" as ArchetypeRole,
-    );
+    await ctx.discord.send_to_entity(entity_id, "alerts", message, "reviewer" as ArchetypeRole);
   }
 }
 
@@ -1038,12 +1049,12 @@ async function notify_pr_watcher(
     await ctx.pool.inject_message_to_bot(assignment.tmux_session, message);
     console.log(
       `[webhook] Notified watcher for ${repo_full_name}#${String(pr_number)} ` +
-      `via ${assignment.tmux_session} (terminal=${String(terminal)})`,
+        `via ${assignment.tmux_session} (terminal=${String(terminal)})`,
     );
   } else {
     console.log(
       `[webhook] Watch exists for ${repo_full_name}#${String(pr_number)} ` +
-      `but no active assignment for channel ${watch.channel_id} — cleaning up`,
+        `but no active assignment for channel ${watch.channel_id} — cleaning up`,
     );
   }
 
@@ -1060,14 +1071,12 @@ async function check_pr_merged(
   gh_token?: string,
 ): Promise<boolean> {
   try {
-    const env = gh_token
-      ? { ...process.env, GH_TOKEN: gh_token }
-      : undefined;
-    const { stdout } = await exec("gh", [
-      "pr", "view", String(pr_number),
-      "--json", "state",
-      "--jq", ".state",
-    ], { cwd: repo_path, timeout: 15_000, ...(env ? { env } : {}) });
+    const env = gh_token ? { ...process.env, GH_TOKEN: gh_token } : undefined;
+    const { stdout } = await exec(
+      "gh",
+      ["pr", "view", String(pr_number), "--json", "state", "--jq", ".state"],
+      { cwd: repo_path, timeout: 15_000, ...(env ? { env } : {}) },
+    );
     return stdout.trim() === "MERGED";
   } catch {
     return false;

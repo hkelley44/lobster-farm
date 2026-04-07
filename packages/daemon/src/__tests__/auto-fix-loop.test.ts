@@ -39,8 +39,8 @@ vi.mock("node:child_process", async () => {
 
 import {
   build_review_fix_prompt,
-  fetch_review_comments,
   check_merge_conflicts,
+  fetch_review_comments,
 } from "../review-utils.js";
 
 /**
@@ -55,8 +55,11 @@ function mock_gh_responses(responses: Array<{ stdout?: string; error?: Error }>)
     call_idx++;
 
     // promisify adds callback as the last argument
-    const callback = args[args.length - 1] as
-      (err: Error | null, stdout: string, stderr: string) => void;
+    const callback = args[args.length - 1] as (
+      err: Error | null,
+      stdout: string,
+      stderr: string,
+    ) => void;
 
     if (typeof callback === "function") {
       if (resp.error) {
@@ -115,28 +118,22 @@ describe("fetch_review_comments", () => {
 
   it("falls back to last review body when CHANGES_REQUESTED filter returns empty", async () => {
     mock_gh_responses([
-      { stdout: "" },  // first call: CHANGES_REQUESTED filter returns empty
-      { stdout: "General review body\n" },  // second call: last review fallback
+      { stdout: "" }, // first call: CHANGES_REQUESTED filter returns empty
+      { stdout: "General review body\n" }, // second call: last review fallback
     ]);
     const result = await fetch_review_comments(10, "/tmp/repo");
     expect(result).toBe("General review body");
   });
 
   it("returns fallback message when all gh calls fail", async () => {
-    mock_gh_responses([
-      { error: new Error("gh not found") },
-      { error: new Error("gh not found") },
-    ]);
+    mock_gh_responses([{ error: new Error("gh not found") }, { error: new Error("gh not found") }]);
     const result = await fetch_review_comments(10, "/tmp/repo");
     expect(result).toContain("Could not fetch review comments");
     expect(result).toContain("gh pr view 10");
   });
 
   it("returns empty-body fallback when both calls return empty", async () => {
-    mock_gh_responses([
-      { stdout: "" },
-      { stdout: "" },
-    ]);
+    mock_gh_responses([{ stdout: "" }, { stdout: "" }]);
     const result = await fetch_review_comments(10, "/tmp/repo");
     expect(result).toContain("No review body found");
   });
@@ -169,4 +166,3 @@ describe("check_merge_conflicts", () => {
     expect(result).toBe(false);
   });
 });
-

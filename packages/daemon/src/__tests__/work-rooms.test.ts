@@ -1,10 +1,6 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
 import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
-import type {
-  LobsterFarmConfig,
-  EntityConfig,
-  ChannelMapping,
-} from "@lobster-farm/shared";
+import type { ChannelMapping, EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FeatureData } from "../actions.js";
 import * as actions from "../actions.js";
 
@@ -15,7 +11,7 @@ import * as actions from "../actions.js";
 const GEN_ID = "10000000000000001";
 const WR_IDS = ["10000000000000010", "10000000000000020", "10000000000000030"] as const;
 const DYN_WR = "10000000000000040"; // Returned by mock create_channel for dynamic rooms
-const AL_ID  = "10000000000000099";
+const AL_ID = "10000000000000099";
 const CAT_ID = "10000000000000100";
 
 function make_config(): LobsterFarmConfig {
@@ -59,9 +55,7 @@ function make_feature(overrides: Partial<FeatureData> = {}): FeatureData {
 /** Create channel list with N static work rooms (default 0 — dynamic-only).
  * Also includes general and alerts. Uses valid snowflake IDs. */
 function make_static_work_rooms(count = 0): ChannelMapping[] {
-  const channels: ChannelMapping[] = [
-    { type: "general", id: GEN_ID },
-  ];
+  const channels: ChannelMapping[] = [{ type: "general", id: GEN_ID }];
   for (let i = 1; i <= count; i++) {
     channels.push({
       type: "work_room",
@@ -125,7 +119,7 @@ describe("Work Room Assignment", () => {
 
       expect(room_id).toBe(WR_IDS[0]);
       // Verify assigned_feature was set on the channel entry
-      const wr1 = entity.entity.channels.list.find(c => c.id === WR_IDS[0]);
+      const wr1 = entity.entity.channels.list.find((c) => c.id === WR_IDS[0]);
       expect(wr1?.assigned_feature).toBe("alpha-42");
     });
 
@@ -146,10 +140,12 @@ describe("Work Room Assignment", () => {
       const entity = make_entity_config(make_static_work_rooms(3));
       // Pool has bots in wr-1 and wr-2
       // @ts-expect-error — mock pool
-      actions.set_pool(make_mock_pool({
-        [WR_IDS[0]]: { id: 0, archetype: "builder" },
-        [WR_IDS[1]]: { id: 1, archetype: "planner" },
-      }));
+      actions.set_pool(
+        make_mock_pool({
+          [WR_IDS[0]]: { id: 0, archetype: "builder" },
+          [WR_IDS[1]]: { id: 1, archetype: "planner" },
+        }),
+      );
 
       const room_id = await actions.assign_work_room(feature, entity);
 
@@ -161,11 +157,13 @@ describe("Work Room Assignment", () => {
       const entity = make_entity_config(make_static_work_rooms(3));
       // All three rooms have pool bots
       // @ts-expect-error — mock pool
-      actions.set_pool(make_mock_pool({
-        [WR_IDS[0]]: { id: 0, archetype: "planner" },
-        [WR_IDS[1]]: { id: 1, archetype: "builder" },
-        [WR_IDS[2]]: { id: 2, archetype: "planner" },
-      }));
+      actions.set_pool(
+        make_mock_pool({
+          [WR_IDS[0]]: { id: 0, archetype: "planner" },
+          [WR_IDS[1]]: { id: 1, archetype: "builder" },
+          [WR_IDS[2]]: { id: 2, archetype: "planner" },
+        }),
+      );
 
       const room_id = await actions.assign_work_room(feature, entity);
 
@@ -182,15 +180,17 @@ describe("Work Room Assignment", () => {
       const entity = make_entity_config(make_static_work_rooms(3));
       // All rooms occupied by pool bots
       // @ts-expect-error — mock pool
-      actions.set_pool(make_mock_pool({
-        [WR_IDS[0]]: { id: 0, archetype: "builder" },
-        [WR_IDS[1]]: { id: 1, archetype: "builder" },
-        [WR_IDS[2]]: { id: 2, archetype: "builder" },
-      }));
+      actions.set_pool(
+        make_mock_pool({
+          [WR_IDS[0]]: { id: 0, archetype: "builder" },
+          [WR_IDS[1]]: { id: 1, archetype: "builder" },
+          [WR_IDS[2]]: { id: 2, archetype: "builder" },
+        }),
+      );
 
       await actions.assign_work_room(feature, entity);
 
-      const dynamic_entry = entity.entity.channels.list.find(c => c.id === DYN_WR);
+      const dynamic_entry = entity.entity.channels.list.find((c) => c.id === DYN_WR);
       expect(dynamic_entry).toBeDefined();
       expect(dynamic_entry?.dynamic).toBe(true);
       expect(dynamic_entry?.type).toBe("work_room");
@@ -211,11 +211,13 @@ describe("Work Room Assignment", () => {
       const entity = make_entity_config(make_static_work_rooms(3));
       // All rooms occupied by pool
       // @ts-expect-error — mock pool
-      actions.set_pool(make_mock_pool({
-        [WR_IDS[0]]: { id: 0, archetype: "planner" },
-        [WR_IDS[1]]: { id: 1, archetype: "builder" },
-        [WR_IDS[2]]: { id: 2, archetype: "planner" },
-      }));
+      actions.set_pool(
+        make_mock_pool({
+          [WR_IDS[0]]: { id: 0, archetype: "planner" },
+          [WR_IDS[1]]: { id: 1, archetype: "builder" },
+          [WR_IDS[2]]: { id: 2, archetype: "planner" },
+        }),
+      );
       actions.set_discord_bot(null);
 
       const room_id = await actions.assign_work_room(feature, entity);
@@ -283,7 +285,7 @@ describe("Work Room Assignment", () => {
 
       await actions.assign_work_room(feature, entity);
 
-      const dynamic_entry = entity.entity.channels.list.find(c => c.id === DYN_WR);
+      const dynamic_entry = entity.entity.channels.list.find((c) => c.id === DYN_WR);
       expect(dynamic_entry).toBeDefined();
       expect(dynamic_entry?.dynamic).toBe(true);
       expect(dynamic_entry?.type).toBe("work_room");
@@ -309,7 +311,7 @@ describe("Work Room Assignment", () => {
 
       await actions.release_work_room(feature, entity);
 
-      const wr1 = entity.entity.channels.list.find(c => c.id === WR_IDS[0]);
+      const wr1 = entity.entity.channels.list.find((c) => c.id === WR_IDS[0]);
       expect(wr1?.assigned_feature).toBeNull();
     });
 
@@ -356,7 +358,7 @@ describe("Work Room Assignment", () => {
 
       await actions.release_work_room(feature, entity);
 
-      const remaining = entity.entity.channels.list.find(c => c.id === DYN_WR);
+      const remaining = entity.entity.channels.list.find((c) => c.id === DYN_WR);
       expect(remaining).toBeUndefined();
     });
 
@@ -405,7 +407,7 @@ describe("Work Room Assignment", () => {
       await actions.release_work_room(feature, entity);
 
       // Static room should still be in the list
-      const wr2 = entity.entity.channels.list.find(c => c.id === WR_IDS[1]);
+      const wr2 = entity.entity.channels.list.find((c) => c.id === WR_IDS[1]);
       expect(wr2).toBeDefined();
       expect(wr2?.type).toBe("work_room");
     });
@@ -414,25 +416,19 @@ describe("Work Room Assignment", () => {
 
 describe("Schema — ChannelMapping", () => {
   it("accepts dynamic: true", () => {
-    const entity = make_entity_config([
-      { type: "work_room", id: WR_IDS[0], dynamic: true },
-    ]);
+    const entity = make_entity_config([{ type: "work_room", id: WR_IDS[0], dynamic: true }]);
     const wr = entity.entity.channels.list[0];
     expect(wr?.dynamic).toBe(true);
   });
 
   it("accepts dynamic: false", () => {
-    const entity = make_entity_config([
-      { type: "work_room", id: WR_IDS[0], dynamic: false },
-    ]);
+    const entity = make_entity_config([{ type: "work_room", id: WR_IDS[0], dynamic: false }]);
     const wr = entity.entity.channels.list[0];
     expect(wr?.dynamic).toBe(false);
   });
 
   it("defaults to undefined when dynamic is omitted", () => {
-    const entity = make_entity_config([
-      { type: "work_room", id: WR_IDS[0] },
-    ]);
+    const entity = make_entity_config([{ type: "work_room", id: WR_IDS[0] }]);
     const wr = entity.entity.channels.list[0];
     expect(wr?.dynamic).toBeUndefined();
   });

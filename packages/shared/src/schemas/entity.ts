@@ -1,9 +1,5 @@
 import { z } from "zod";
-import {
-  EntityStatusSchema,
-  ChannelTypeSchema,
-  RepoStructureSchema,
-} from "./enums.js";
+import { ChannelTypeSchema, EntityStatusSchema, RepoStructureSchema } from "./enums.js";
 
 export const ChannelMappingSchema = z.object({
   type: ChannelTypeSchema,
@@ -14,10 +10,12 @@ export const ChannelMappingSchema = z.object({
 });
 export type ChannelMapping = z.infer<typeof ChannelMappingSchema>;
 
-export const ChannelsSchema = z.object({
-  category_id: z.string().default(""),
-  list: z.array(ChannelMappingSchema).default([]),
-}).default({ category_id: "", list: [] });
+export const ChannelsSchema = z
+  .object({
+    category_id: z.string().default(""),
+    list: z.array(ChannelMappingSchema).default([]),
+  })
+  .default({ category_id: "", list: [] });
 export type Channels = z.infer<typeof ChannelsSchema>;
 
 // Per-entity configuration (~/.lobsterfarm/entities/{id}/config.yaml)
@@ -33,29 +31,41 @@ export const EntityConfigSchema = z.object({
     // channel structure, model defaults. Entity config only needs overrides.
     blueprint: z.string().optional(),
 
-    repos: z.array(z.object({
-      name: z.string(),
-      url: z.string(),
-      path: z.string(),
-      structure: RepoStructureSchema.default("monorepo"),
-    })).default([]),
+    repos: z
+      .array(
+        z.object({
+          name: z.string(),
+          url: z.string(),
+          path: z.string(),
+          structure: RepoStructureSchema.default("monorepo"),
+        }),
+      )
+      .default([]),
 
-    accounts: z.object({
-      github: z.object({
-        org: z.string().optional(),
-        user: z.string().optional(),
-        // Override the default GitHub App installation ID for this entity.
-        // Used by the AutoReviewer to authenticate against repos owned by
-        // different GitHub accounts (e.g. rg-jax vs ultim8).
-        github_app_installation_id: z.string().optional(),
-      }).optional(),
-      vercel: z.object({
-        project: z.string().optional(),
-      }).optional(),
-      sentry: z.object({
-        project: z.string().optional(),
-      }).optional(),
-    }).default({}),
+    accounts: z
+      .object({
+        github: z
+          .object({
+            org: z.string().optional(),
+            user: z.string().optional(),
+            // Override the default GitHub App installation ID for this entity.
+            // Used by the AutoReviewer to authenticate against repos owned by
+            // different GitHub accounts (e.g. rg-jax vs ultim8).
+            github_app_installation_id: z.string().optional(),
+          })
+          .optional(),
+        vercel: z
+          .object({
+            project: z.string().optional(),
+          })
+          .optional(),
+        sentry: z
+          .object({
+            project: z.string().optional(),
+          })
+          .optional(),
+      })
+      .default({}),
 
     channels: ChannelsSchema,
 
@@ -65,15 +75,19 @@ export const EntityConfigSchema = z.object({
     }),
 
     // SOPs and guidelines come from the blueprint. Only list overrides here.
-    sop_overrides: z.object({
-      add: z.array(z.string()).default([]),
-      remove: z.array(z.string()).default([]),
-    }).optional(),
+    sop_overrides: z
+      .object({
+        add: z.array(z.string()).default([]),
+        remove: z.array(z.string()).default([]),
+      })
+      .optional(),
 
-    guideline_overrides: z.object({
-      add: z.array(z.string()).default([]),
-      remove: z.array(z.string()).default([]),
-    }).optional(),
+    guideline_overrides: z
+      .object({
+        add: z.array(z.string()).default([]),
+        remove: z.array(z.string()).default([]),
+      })
+      .optional(),
 
     secrets: z.object({
       vault: z.string().default("1password"),

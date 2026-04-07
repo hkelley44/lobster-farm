@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { promisify } from "node:util";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Create a callback-style mock function that promisify can wrap properly.
 // Node's execFile has a custom promisify symbol, but a plain vi.fn() does not.
@@ -8,14 +8,21 @@ import { promisify } from "node:util";
 let keychain_result: { stdout: string; error: Error | null } = { stdout: "", error: null };
 
 const mock_exec_file = Object.assign(
-  vi.fn((_cmd: string, _args: string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
-    if (keychain_result.error) {
-      cb(keychain_result.error, "", "");
-    } else {
-      cb(null, keychain_result.stdout, "");
-    }
-    return {} as never;
-  }),
+  vi.fn(
+    (
+      _cmd: string,
+      _args: string[],
+      _opts: unknown,
+      cb: (err: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      if (keychain_result.error) {
+        cb(keychain_result.error, "", "");
+      } else {
+        cb(null, keychain_result.stdout, "");
+      }
+      return {} as never;
+    },
+  ),
   {
     // Custom promisify implementation so promisify(execFile) works in the module
     [promisify.custom]: (...args: unknown[]) => {
@@ -113,13 +120,18 @@ describe("fetch_subscription_usage", () => {
 
     const api_response: SubscriptionUsageResponse = {
       five_hour: { utilization: 5, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
-      seven_day: { utilization: 29, resets_at: new Date(Date.now() + 2 * 86_400_000 + 4 * 3_600_000).toISOString() },
+      seven_day: {
+        utilization: 29,
+        resets_at: new Date(Date.now() + 2 * 86_400_000 + 4 * 3_600_000).toISOString(),
+      },
     };
 
-    fetch_spy.mockResolvedValueOnce(new Response(JSON.stringify(api_response), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
+    fetch_spy.mockResolvedValueOnce(
+      new Response(JSON.stringify(api_response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
 
     const result = await fetch_subscription_usage();
     expect(result).not.toBeNull();
@@ -144,7 +156,7 @@ describe("fetch_subscription_usage", () => {
     const call_args = fetch_spy.mock.calls[0]!;
     expect(call_args[0]).toBe("https://api.anthropic.com/api/oauth/usage");
     const headers = (call_args[1] as RequestInit).headers as Record<string, string>;
-    expect(headers["Authorization"]).toBe("Bearer bearer-test-abc");
+    expect(headers.Authorization).toBe("Bearer bearer-test-abc");
     expect(headers["anthropic-beta"]).toBe("oauth-2025-04-20");
   });
 
@@ -185,10 +197,12 @@ describe("fetch_subscription_usage", () => {
       extra_usage: { is_enabled: true, monthly_limit: 100, used_credits: 23.5, utilization: 23.5 },
     };
 
-    fetch_spy.mockResolvedValueOnce(new Response(JSON.stringify(api_response), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
+    fetch_spy.mockResolvedValueOnce(
+      new Response(JSON.stringify(api_response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
 
     const result = await fetch_subscription_usage();
     expect(result).not.toBeNull();
@@ -204,13 +218,18 @@ describe("fetch_subscription_usage", () => {
     };
 
     const api_response: SubscriptionUsageResponse = {
-      seven_day: { utilization: 50, resets_at: new Date(Date.now() + 3 * 86_400_000).toISOString() },
+      seven_day: {
+        utilization: 50,
+        resets_at: new Date(Date.now() + 3 * 86_400_000).toISOString(),
+      },
     };
 
-    fetch_spy.mockResolvedValueOnce(new Response(JSON.stringify(api_response), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
+    fetch_spy.mockResolvedValueOnce(
+      new Response(JSON.stringify(api_response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
 
     const result = await fetch_subscription_usage();
     expect(result).not.toBeNull();
@@ -226,10 +245,12 @@ describe("fetch_subscription_usage", () => {
       error: null,
     };
 
-    fetch_spy.mockResolvedValueOnce(new Response(JSON.stringify({}), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
+    fetch_spy.mockResolvedValueOnce(
+      new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
 
     const result = await fetch_subscription_usage();
     expect(result).not.toBeNull();

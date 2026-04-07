@@ -1,5 +1,5 @@
 import * as p from "@clack/prompts";
-import { DEFAULT_ARCHETYPES, type ArchetypeRole } from "@lobster-farm/shared";
+import { type ArchetypeRole, DEFAULT_ARCHETYPES } from "@lobster-farm/shared";
 
 /** Prompt for the user's name (required). */
 export async function prompt_user_name(): Promise<string> {
@@ -69,7 +69,10 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
       message: "Discord bot tokens already configured. Update them?",
       initialValue: false,
     });
-    if (p.isCancel(overwrite)) { p.cancel("Setup cancelled."); process.exit(0); }
+    if (p.isCancel(overwrite)) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
     if (!overwrite) return undefined;
   } else {
     const wants_discord = await p.confirm({
@@ -105,7 +108,7 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
   }
 
   p.note(
-    'Step 1: Go to https://discord.com/developers/applications\n' +
+    "Step 1: Go to https://discord.com/developers/applications\n" +
       'Step 2: Click "New Application" → name it "Daemon"\n' +
       'Step 3: In the Installation tab → set Install Link to "None"\n' +
       "Step 4: In the Bot tab:\n" +
@@ -129,7 +132,7 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
   }
 
   p.note(
-    'Step 1: Go to https://discord.com/developers/applications\n' +
+    "Step 1: Go to https://discord.com/developers/applications\n" +
       'Step 2: Click "New Application" → name it "Pat"\n' +
       'Step 3: In the Installation tab → set Install Link to "None"\n' +
       "Step 4: In the Bot tab:\n" +
@@ -149,7 +152,8 @@ export async function prompt_discord(existing_token?: boolean): Promise<DiscordS
   }
 
   const user_id = await p.text({
-    message: "Your Discord user ID (right-click your avatar → Copy User ID, or press Enter to skip):",
+    message:
+      "Your Discord user ID (right-click your avatar → Copy User ID, or press Enter to skip):",
     defaultValue: "",
   });
   if (p.isCancel(user_id)) {
@@ -197,8 +201,8 @@ export async function prompt_pool_bot_count(): Promise<number> {
     placeholder: "3",
     defaultValue: "3",
     validate: (value) => {
-      const n = parseInt(value, 10);
-      if (isNaN(n) || n < 0 || n > 10) return "Enter a number between 0 and 10.";
+      const n = Number.parseInt(value, 10);
+      if (Number.isNaN(n) || n < 0 || n > 10) return "Enter a number between 0 and 10.";
       return undefined;
     },
   });
@@ -206,20 +210,13 @@ export async function prompt_pool_bot_count(): Promise<number> {
     p.cancel("Setup cancelled.");
     process.exit(0);
   }
-  return parseInt(count, 10);
+  return Number.parseInt(count, 10);
 }
 
 /** Prompt for a single pool bot token. Shows step-by-step creation guidance. */
 export async function prompt_pool_bot_token(index: number): Promise<string> {
   p.note(
-    `Step 1: Go to https://discord.com/developers/applications\n` +
-      `Step 2: Click "New Application" → name it "LF-${String(index)}"\n` +
-      'Step 3: In the Installation tab → set Install Link to "None"\n' +
-      "Step 4: In the Bot tab:\n" +
-      '  - Uncheck "Public Bot"\n' +
-      "  - Enable all 3 Privileged Gateway Intents:\n" +
-      "    Presence Intent, Server Members Intent, Message Content Intent\n" +
-      '  - Click "Reset Token" → copy the token',
+    `Step 1: Go to https://discord.com/developers/applications\nStep 2: Click "New Application" → name it "LF-${String(index)}"\nStep 3: In the Installation tab → set Install Link to "None"\nStep 4: In the Bot tab:\n  - Uncheck "Public Bot"\n  - Enable all 3 Privileged Gateway Intents:\n    Presence Intent, Server Members Intent, Message Content Intent\n  - Click "Reset Token" → copy the token`,
     `Create Pool Bot LF-${String(index)}`,
   );
 

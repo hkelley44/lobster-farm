@@ -1,10 +1,10 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
-import { LobsterFarmConfigSchema, EntityConfigSchema } from "@lobster-farm/shared";
-import type { LobsterFarmConfig, EntityConfig, ChannelMapping } from "@lobster-farm/shared";
-import { is_discord_snowflake, DiscordBot } from "../discord.js";
-import { EntityRegistry } from "../registry.js";
+import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
+import type { ChannelMapping, EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FeatureData } from "../actions.js";
 import * as actions from "../actions.js";
+import { DiscordBot, is_discord_snowflake } from "../discord.js";
+import type { EntityRegistry } from "../registry.js";
 
 // ── Test helpers ──
 
@@ -28,7 +28,7 @@ function make_entity_config(
       accounts: {},
       channels: {
         category_id: "",
-        list: channels.map(ch => ({
+        list: channels.map((ch) => ({
           type: ch.type as "general" | "work_room" | "work_log" | "alerts",
           id: ch.id,
           name: ch.name ?? ch.type,
@@ -48,7 +48,7 @@ function make_registry(entities: EntityConfig[]): EntityRegistry {
   return {
     get: (id: string) => map.get(id),
     get_all: () => [...map.values()],
-    get_active: () => [...map.values()].filter(e => e.entity.status === "active"),
+    get_active: () => [...map.values()].filter((e) => e.entity.status === "active"),
     count: () => map.size,
   } as unknown as EntityRegistry;
 }
@@ -63,7 +63,8 @@ class TestDiscordBot extends DiscordBot {
   }
 
   get_entity_channels(): Map<string, Map<string, string>> {
-    return (this as unknown as { entity_channels: Map<string, Map<string, string>> }).entity_channels;
+    return (this as unknown as { entity_channels: Map<string, Map<string, string>> })
+      .entity_channels;
   }
 }
 
@@ -195,7 +196,9 @@ describe("find_upload_channel returns valid snowflake when mixed entries exist",
     bot.build_channel_map();
 
     // find_upload_channel is private — call it through the class
-    const upload_id = (bot as unknown as { find_upload_channel: () => string | null }).find_upload_channel();
+    const upload_id = (
+      bot as unknown as { find_upload_channel: () => string | null }
+    ).find_upload_channel();
 
     // The only valid channel in the map is the work_log one
     expect(upload_id).toBe("1486494404784160849");
@@ -214,7 +217,9 @@ describe("find_upload_channel returns valid snowflake when mixed entries exist",
 
     bot.build_channel_map();
 
-    const upload_id = (bot as unknown as { find_upload_channel: () => string | null }).find_upload_channel();
+    const upload_id = (
+      bot as unknown as { find_upload_channel: () => string | null }
+    ).find_upload_channel();
     expect(upload_id).toBeNull();
   });
 });
@@ -226,9 +231,7 @@ describe("find_upload_channel returns valid snowflake when mixed entries exist",
 const VALID_WR = "10000000000000010";
 const VALID_GEN = "10000000000000001";
 
-function make_actions_entity(
-  channels: ChannelMapping[],
-): EntityConfig {
+function make_actions_entity(channels: ChannelMapping[]): EntityConfig {
   return EntityConfigSchema.parse({
     entity: {
       id: "alpha",
@@ -300,8 +303,8 @@ describe("assign_work_room — snowflake guard", () => {
     const feature = make_feature();
     const entity = make_actions_entity([
       { type: "general", id: VALID_GEN },
-      { type: "work_room", id: "wr-1" },  // placeholder — skipped
-      { type: "work_room", id: VALID_WR },  // valid — should be assigned
+      { type: "work_room", id: "wr-1" }, // placeholder — skipped
+      { type: "work_room", id: VALID_WR }, // valid — should be assigned
     ]);
 
     const room_id = await actions.assign_work_room(feature, entity);
@@ -322,9 +325,7 @@ describe("release_work_room — snowflake guard", () => {
 
   it("skips Discord calls for static room with placeholder ID", async () => {
     const feature = make_feature({ discordWorkRoom: "wr-1" });
-    const entity = make_actions_entity([
-      { type: "work_room", id: "wr-1", purpose: "Room 1" },
-    ]);
+    const entity = make_actions_entity([{ type: "work_room", id: "wr-1", purpose: "Room 1" }]);
 
     await actions.release_work_room(feature, entity);
 
@@ -334,23 +335,19 @@ describe("release_work_room — snowflake guard", () => {
 
   it("skips Discord calls for dynamic room with placeholder ID", async () => {
     const feature = make_feature({ discordWorkRoom: "wr-1" });
-    const entity = make_actions_entity([
-      { type: "work_room", id: "wr-1", dynamic: true },
-    ]);
+    const entity = make_actions_entity([{ type: "work_room", id: "wr-1", dynamic: true }]);
 
     await actions.release_work_room(feature, entity);
 
     // Config cleanup still happens (removes from list), but no Discord calls
     expect(discord.send).not.toHaveBeenCalled();
     expect(discord.delete_channel).not.toHaveBeenCalled();
-    expect(entity.entity.channels.list.find(c => c.id === "wr-1")).toBeUndefined();
+    expect(entity.entity.channels.list.find((c) => c.id === "wr-1")).toBeUndefined();
   });
 
   it("makes Discord calls for room with valid snowflake ID", async () => {
     const feature = make_feature({ discordWorkRoom: VALID_WR });
-    const entity = make_actions_entity([
-      { type: "work_room", id: VALID_WR, purpose: "Room 1" },
-    ]);
+    const entity = make_actions_entity([{ type: "work_room", id: VALID_WR, purpose: "Room 1" }]);
 
     await actions.release_work_room(feature, entity);
 

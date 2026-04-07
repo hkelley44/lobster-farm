@@ -1,13 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import type {
-  LobsterFarmConfig,
-  ArchetypeRole,
-  ModelTier,
-  Priority,
-} from "@lobster-farm/shared";
-import type { ClaudeSessionManager, SessionResult } from "./session.js";
+import type { ArchetypeRole, LobsterFarmConfig, ModelTier, Priority } from "@lobster-farm/shared";
 import * as sentry from "./sentry.js";
+import type { ClaudeSessionManager, SessionResult } from "./session.js";
 
 // ── Types ──
 

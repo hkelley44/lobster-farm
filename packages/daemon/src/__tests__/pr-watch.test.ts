@@ -1,11 +1,11 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
-import { PRWatchStore, watch_key } from "../pr-watches.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { load_pr_watches } from "../persistence.js";
+import { PRWatchStore, watch_key } from "../pr-watches.js";
 
 let temp_dir: string;
 

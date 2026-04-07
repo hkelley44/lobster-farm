@@ -1,11 +1,11 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
-import type { LobsterFarmConfig, ArchetypeRole } from "@lobster-farm/shared";
-import { BotPool, AVATAR_COOLDOWN_MS } from "../pool.js";
-import type { PoolBot, AvatarHandler } from "../pool.js";
+import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AVATAR_COOLDOWN_MS, BotPool } from "../pool.js";
+import type { AvatarHandler, PoolBot } from "../pool.js";
 
 let temp_dir: string;
 
@@ -64,20 +64,28 @@ describe("Pool bot avatar management", () => {
     pool = new TestBotPool(config);
 
     // Stub out assign's side effects
-    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-      .mockImplementation(() => {});
-    vi.spyOn(pool as unknown as Record<string, unknown>, "write_access_json" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-      .mockReturnValue(false);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "park_bot" as never)
-      .mockImplementation(async (bot: PoolBot) => {
+    vi.spyOn(pool as unknown as Record<string, unknown>, "kill_tmux" as never).mockImplementation(
+      () => {},
+    );
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "write_access_json" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "set_bot_nickname" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never).mockResolvedValue(
+      undefined,
+    );
+    vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never).mockReturnValue(
+      false,
+    );
+    vi.spyOn(pool as unknown as Record<string, unknown>, "park_bot" as never).mockImplementation(
+      async (bot: PoolBot) => {
         bot.state = "parked";
-      });
+      },
+    );
 
     // Register a spy avatar handler
     avatar_handler = vi.fn<AvatarHandler>().mockResolvedValue(undefined);
@@ -97,10 +105,7 @@ describe("Pool bot avatar management", () => {
 
       expect(avatar_handler).toHaveBeenCalledOnce();
       // Handler receives state_dir and lowercase agent name
-      expect(avatar_handler).toHaveBeenCalledWith(
-        "/tmp/test-pool-1",
-        "gary",
-      );
+      expect(avatar_handler).toHaveBeenCalledWith("/tmp/test-pool-1", "gary");
     });
 
     it("calls avatar handler with correct agent name for each archetype", async () => {
@@ -115,10 +120,7 @@ describe("Pool bot avatar management", () => {
         avatar_handler.mockClear();
         pool.inject_bots([make_bot({ id: 1, state: "free" })]);
         await pool.assign("ch-1", "e1", archetype);
-        expect(avatar_handler).toHaveBeenCalledWith(
-          "/tmp/test-pool-1",
-          expected_name,
-        );
+        expect(avatar_handler).toHaveBeenCalledWith("/tmp/test-pool-1", expected_name);
       }
     });
 
@@ -130,7 +132,7 @@ describe("Pool bot avatar management", () => {
 
       // The bot's avatar state should be updated
       const status = pool.get_status();
-      const assignment = status.assignments.find(a => a.bot_id === 1);
+      const assignment = status.assignments.find((a) => a.bot_id === 1);
       expect(assignment).toBeDefined();
       // We can't directly inspect PoolBot fields via get_status(), but we can
       // verify the handler was called and the bot doesn't get called again
@@ -171,10 +173,7 @@ describe("Pool bot avatar management", () => {
       await pool.assign("ch-1", "e1", "builder");
 
       expect(avatar_handler).toHaveBeenCalledOnce();
-      expect(avatar_handler).toHaveBeenCalledWith(
-        "/tmp/test-pool-1",
-        "bob",
-      );
+      expect(avatar_handler).toHaveBeenCalledWith("/tmp/test-pool-1", "bob");
     });
   });
 
@@ -268,16 +267,26 @@ describe("Pool bot avatar management", () => {
     it("skips avatar set gracefully when no handler is registered", async () => {
       // Create a fresh pool without an avatar handler
       const bare_pool = new TestBotPool(config);
-      vi.spyOn(bare_pool as unknown as Record<string, unknown>, "kill_tmux" as never)
-        .mockImplementation(() => {});
-      vi.spyOn(bare_pool as unknown as Record<string, unknown>, "write_access_json" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(bare_pool as unknown as Record<string, unknown>, "set_bot_nickname" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(bare_pool as unknown as Record<string, unknown>, "start_tmux" as never)
-        .mockResolvedValue(undefined);
-      vi.spyOn(bare_pool as unknown as Record<string, unknown>, "is_tmux_alive" as never)
-        .mockReturnValue(false);
+      vi.spyOn(
+        bare_pool as unknown as Record<string, unknown>,
+        "kill_tmux" as never,
+      ).mockImplementation(() => {});
+      vi.spyOn(
+        bare_pool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        bare_pool as unknown as Record<string, unknown>,
+        "set_bot_nickname" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        bare_pool as unknown as Record<string, unknown>,
+        "start_tmux" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        bare_pool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
 
       bare_pool.inject_bots([make_bot({ id: 1, state: "free" })]);
 

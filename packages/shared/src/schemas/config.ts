@@ -16,81 +16,109 @@ const AgentNameSchema = z.object({
 export const LobsterFarmConfigSchema = z.object({
   version: z.number().int().default(1),
 
-  paths: z.object({
-    projects_dir: z.string().default("~/projects"),
-    lobsterfarm_dir: z.string().default("~/.lobsterfarm"),
-    claude_dir: z.string().default("~/.claude"),
-  }).default({}),
+  paths: z
+    .object({
+      projects_dir: z.string().default("~/projects"),
+      lobsterfarm_dir: z.string().default("~/.lobsterfarm"),
+      claude_dir: z.string().default("~/.claude"),
+    })
+    .default({}),
 
-  concurrency: z.object({
-    max_active_sessions: z.number().int().min(1).default(3),
-    max_queue_depth: z.number().int().min(1).default(20),
-  }).default({}),
+  concurrency: z
+    .object({
+      max_active_sessions: z.number().int().min(1).default(3),
+      max_queue_depth: z.number().int().min(1).default(20),
+    })
+    .default({}),
 
-  defaults: z.object({
-    models: z.object({
-      planning: ModelTierSchema.default({ model: "opus", think: "high" }),
-      design: ModelTierSchema.default({ model: "opus", think: "standard" }),
-      building: ModelTierSchema.default({ model: "opus", think: "high" }),
-      database: ModelTierSchema.default({ model: "opus", think: "high" }),
-      review: ModelTierSchema.default({ model: "sonnet", think: "standard" }),
-      operations: ModelTierSchema.default({ model: "sonnet", think: "standard" }),
-      triage: ModelTierSchema.default({ model: "sonnet", think: "standard" }),
-      classification: ModelTierSchema.default({ model: "haiku", think: "none" }),
-    }).default({}),
-  }).default({}),
+  defaults: z
+    .object({
+      models: z
+        .object({
+          planning: ModelTierSchema.default({ model: "opus", think: "high" }),
+          design: ModelTierSchema.default({ model: "opus", think: "standard" }),
+          building: ModelTierSchema.default({ model: "opus", think: "high" }),
+          database: ModelTierSchema.default({ model: "opus", think: "high" }),
+          review: ModelTierSchema.default({ model: "sonnet", think: "standard" }),
+          operations: ModelTierSchema.default({ model: "sonnet", think: "standard" }),
+          triage: ModelTierSchema.default({ model: "sonnet", think: "standard" }),
+          classification: ModelTierSchema.default({ model: "haiku", think: "none" }),
+        })
+        .default({}),
+    })
+    .default({}),
 
-  discord: z.object({
-    server_id: z.string(),
-    bot_token_ref: z.string().optional(),
-    /** The owner's Discord user ID — used for pool bot access control. */
-    user_id: z.string().optional(),
-  }).optional(),
+  discord: z
+    .object({
+      server_id: z.string(),
+      bot_token_ref: z.string().optional(),
+      /** The owner's Discord user ID — used for pool bot access control. */
+      user_id: z.string().optional(),
+    })
+    .optional(),
 
   user: z.object({
     name: z.string(),
     email: z.string().optional(),
   }),
 
-  machine: z.object({
-    name: z.string().default(""),
-    hardware: z.string().default(""),
-  }).default({}),
+  machine: z
+    .object({
+      name: z.string().default(""),
+      hardware: z.string().default(""),
+    })
+    .default({}),
 
-  agents: z.object({
-    planner: AgentNameSchema.default({ name: "Gary" }),
-    designer: AgentNameSchema.default({ name: "Pearl" }),
-    builder: AgentNameSchema.default({ name: "Bob" }),
-    operator: AgentNameSchema.default({ name: "Ray" }),
-    commander: AgentNameSchema.default({ name: "Pat" }),
-  }).default({}),
+  agents: z
+    .object({
+      planner: AgentNameSchema.default({ name: "Gary" }),
+      designer: AgentNameSchema.default({ name: "Pearl" }),
+      builder: AgentNameSchema.default({ name: "Bob" }),
+      operator: AgentNameSchema.default({ name: "Ray" }),
+      commander: AgentNameSchema.default({ name: "Pat" }),
+    })
+    .default({}),
 
-  pr_cron: z.object({
-    enabled: z.boolean().default(true),
-  }).optional(),
+  pr_cron: z
+    .object({
+      enabled: z.boolean().default(true),
+    })
+    .optional(),
 
-  tools: z.object({
-    tailscale: z.object({
-      installed: z.boolean().default(false),
-      hostname: z.string().optional(),
-      ip: z.string().optional(),
-    }).optional(),
-    docker: z.object({
-      installed: z.boolean().default(false),
-      runtime: z.enum(["colima", "docker-desktop", "other"]).optional(),
-    }).optional(),
-    vercel: z.object({
-      installed: z.boolean().default(false),
-      username: z.string().optional(),
-    }).optional(),
-    supabase: z.object({
-      installed: z.boolean().default(false),
-    }).optional(),
-    sentry: z.object({
-      installed: z.boolean().default(false),
-      org: z.string().optional(),
-    }).optional(),
-  }).optional(),
+  tools: z
+    .object({
+      tailscale: z
+        .object({
+          installed: z.boolean().default(false),
+          hostname: z.string().optional(),
+          ip: z.string().optional(),
+        })
+        .optional(),
+      docker: z
+        .object({
+          installed: z.boolean().default(false),
+          runtime: z.enum(["colima", "docker-desktop", "other"]).optional(),
+        })
+        .optional(),
+      vercel: z
+        .object({
+          installed: z.boolean().default(false),
+          username: z.string().optional(),
+        })
+        .optional(),
+      supabase: z
+        .object({
+          installed: z.boolean().default(false),
+        })
+        .optional(),
+      sentry: z
+        .object({
+          installed: z.boolean().default(false),
+          org: z.string().optional(),
+        })
+        .optional(),
+    })
+    .optional(),
 });
 
 export type LobsterFarmConfig = z.infer<typeof LobsterFarmConfigSchema>;

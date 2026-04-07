@@ -1,11 +1,11 @@
-import { readFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
 
 /** Read a PID file and return the PID, or null if the file doesn't exist / is invalid. */
 export async function read_pid_file(path: string): Promise<number | null> {
   try {
     const content = await readFile(path, "utf-8");
-    const pid = parseInt(content.trim(), 10);
+    const pid = Number.parseInt(content.trim(), 10);
     if (Number.isNaN(pid) || pid <= 0) return null;
     return pid;
   } catch {
@@ -30,15 +30,11 @@ export function exec_command(
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   // Use the user's shell (or /bin/zsh on macOS) so PATH includes
   // homebrew, npm global, etc. Login shell (-l) loads .zshrc/.bashrc.
-  const shell = process.env["SHELL"] ?? "/bin/zsh";
+  const shell = process.env.SHELL ?? "/bin/zsh";
   return new Promise((resolve) => {
     execFile(shell, ["-l", "-c", cmd], { env: process.env }, (error, stdout, stderr) => {
       const exitCode =
-        error && "code" in error && typeof error.code === "number"
-          ? error.code
-          : error
-            ? 1
-            : 0;
+        error && "code" in error && typeof error.code === "number" ? error.code : error ? 1 : 0;
       resolve({ stdout: stdout ?? "", stderr: stderr ?? "", exitCode });
     });
   });

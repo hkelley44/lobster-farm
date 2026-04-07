@@ -1,6 +1,6 @@
+import { DAEMON_PORT, pid_file_path } from "@lobster-farm/shared";
 import { Command } from "commander";
-import { read_pid_file, is_process_running } from "../lib/process.js";
-import { pid_file_path, DAEMON_PORT } from "@lobster-farm/shared";
+import { is_process_running, read_pid_file } from "../lib/process.js";
 
 /** Shape returned by the daemon's GET /status endpoint. */
 interface DaemonStatus {
@@ -78,13 +78,9 @@ export const status_command = new Command("status")
       if (response.ok) {
         const data = (await response.json()) as DaemonStatus;
         console.log(`  Uptime:     ${format_uptime(data.uptime_seconds)}`);
-        console.log(
-          `  Entities:   ${data.entities.active} active / ${data.entities.total} total`,
-        );
+        console.log(`  Entities:   ${data.entities.active} active / ${data.entities.total} total`);
         console.log(`  Sessions:   ${data.sessions.active} active`);
-        console.log(
-          `  Queue:      ${data.queue.pending} pending, ${data.queue.active} active`,
-        );
+        console.log(`  Queue:      ${data.queue.pending} pending, ${data.queue.active} active`);
         console.log(`  Commander:  ${data.commander.state}`);
       } else {
         console.log(`  HTTP status endpoint returned ${response.status}`);

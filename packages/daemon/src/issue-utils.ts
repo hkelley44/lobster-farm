@@ -46,7 +46,7 @@ export function extract_linked_issues(body: string | null, title: string | null)
   // Parse "Closes #N", "Fixes #N", "Resolves #N" from body (all occurrences)
   if (body) {
     for (const match of body.matchAll(/(?:closes|fixes|resolves)\s+#(\d+)/gi)) {
-      issues.add(parseInt(match[1]!, 10));
+      issues.add(Number.parseInt(match[1]!, 10));
     }
   }
 
@@ -54,7 +54,7 @@ export function extract_linked_issues(body: string | null, title: string | null)
   if (title) {
     const title_match = title.match(/#(\d+)/);
     if (title_match) {
-      issues.add(parseInt(title_match[1]!, 10));
+      issues.add(Number.parseInt(title_match[1]!, 10));
     }
   }
 
@@ -71,7 +71,7 @@ export function extract_linked_issues(body: string | null, title: string | null)
 export function extract_first_linked_issue(body: string | null): number | null {
   if (!body) return null;
   const match = body.match(/(?:closes|fixes|resolves)\s+#(\d+)/i);
-  return match ? parseInt(match[1]!, 10) : null;
+  return match ? Number.parseInt(match[1]!, 10) : null;
 }
 
 // ── Issue context fetching ──
@@ -87,26 +87,32 @@ export async function fetch_issue_context(
 ): Promise<string> {
   try {
     const env = gh_token ? { ...process.env, GH_TOKEN: gh_token } : process.env;
-    const { stdout } = await exec("gh", [
-      "issue", "view", String(issue_number),
-      "--json", "title,body,number",
-      "--jq", `"## Issue #" + (.number | tostring) + ": " + .title + "\\n\\n" + .body`,
-    ], {
-      cwd: repo_path,
-      timeout: 15_000,
-      env,
-    });
+    const { stdout } = await exec(
+      "gh",
+      [
+        "issue",
+        "view",
+        String(issue_number),
+        "--json",
+        "title,body,number",
+        "--jq",
+        `"## Issue #" + (.number | tostring) + ": " + .title + "\\n\\n" + .body`,
+      ],
+      {
+        cwd: repo_path,
+        timeout: 15_000,
+        env,
+      },
+    );
     const result = stdout.trim();
 
     // Truncate very long issue bodies to avoid blowing up reviewer context
     if (result.length > 2000) {
-      return result.slice(0, 2000) + "\n\n[...truncated]";
+      return `${result.slice(0, 2000)}\n\n[...truncated]`;
     }
     return result;
   } catch (err) {
-    console.log(
-      `[issue-utils] Could not fetch issue #${String(issue_number)}: ${String(err)}`,
-    );
+    console.log(`[issue-utils] Could not fetch issue #${String(issue_number)}: ${String(err)}`);
     return "";
   }
 }
@@ -161,7 +167,7 @@ export async function close_linked_issues(
         { headers },
       );
       if (state_res.ok) {
-        const data = await state_res.json() as { state?: string };
+        const data = (await state_res.json()) as { state?: string };
         if (data.state === "closed") {
           console.log(`[issue-utils] Issue #${String(issue_number)} already closed — skipping`);
           results.push({ issue_number, success: true });
@@ -210,7 +216,9 @@ export async function close_linked_issues(
         // Comment failure is non-critical — the issue is already closed
       }
 
-      console.log(`[issue-utils] Closed issue #${String(issue_number)} (via PR #${String(pr_number)})`);
+      console.log(
+        `[issue-utils] Closed issue #${String(issue_number)} (via PR #${String(pr_number)})`,
+      );
       results.push({ issue_number, success: true });
     } catch (err) {
       const msg = String(err);

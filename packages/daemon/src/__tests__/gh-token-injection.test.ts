@@ -9,9 +9,9 @@
  */
 
 import { EventEmitter } from "node:events";
-import { describe, expect, it, beforeEach, vi } from "vitest";
-import { LobsterFarmConfigSchema, EntityConfigSchema } from "@lobster-farm/shared";
-import type { LobsterFarmConfig, EntityConfig } from "@lobster-farm/shared";
+import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
+import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 
@@ -79,9 +79,7 @@ function make_entity_config(overrides: {
       memory: { path: `/tmp/test-memory/${overrides.id}` },
       secrets: {
         vault_name: `entity-${overrides.id}`,
-        ...(overrides.github_token_ref
-          ? { github_token_ref: overrides.github_token_ref }
-          : {}),
+        ...(overrides.github_token_ref ? { github_token_ref: overrides.github_token_ref } : {}),
       },
     },
   });
@@ -105,7 +103,8 @@ class GhTokenTestPool extends BotPool {
 
   /** Replace resolve_op_secret with a test double. */
   override_resolve_op_secret(mock: (ref: string) => Promise<string>): void {
-    (this as unknown as { resolve_op_secret: (ref: string) => Promise<string> }).resolve_op_secret = mock;
+    (this as unknown as { resolve_op_secret: (ref: string) => Promise<string> }).resolve_op_secret =
+      mock;
   }
 
   protected override is_bot_idle(): boolean {
@@ -147,42 +146,57 @@ describe("per-entity GitHub token injection", () => {
     registry = new MockRegistry();
 
     // Stub pool side effects unrelated to start_tmux
-    vi.spyOn(pool as unknown as { kill_tmux: (s: string) => void }, "kill_tmux" as never)
-      .mockImplementation(() => {});
-    vi.spyOn(pool as unknown as { write_access_json: (d: string, c: string | null) => Promise<void> }, "write_access_json" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as { set_bot_nickname: (d: string, a: string) => Promise<void> }, "set_bot_nickname" as never)
-      .mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as { set_bot_avatar: (b: PoolBot, a: string) => Promise<void> }, "set_bot_avatar" as never)
-      .mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as { kill_tmux: (s: string) => void },
+      "kill_tmux" as never,
+    ).mockImplementation(() => {});
+    vi.spyOn(
+      pool as unknown as { write_access_json: (d: string, c: string | null) => Promise<void> },
+      "write_access_json" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as { set_bot_nickname: (d: string, a: string) => Promise<void> },
+      "set_bot_nickname" as never,
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      pool as unknown as { set_bot_avatar: (b: PoolBot, a: string) => Promise<void> },
+      "set_bot_avatar" as never,
+    ).mockResolvedValue(undefined);
     // is_tmux_alive must return true AFTER spawn so start_tmux resolves successfully
-    vi.spyOn(pool as unknown as { is_tmux_alive: (s: string) => boolean }, "is_tmux_alive" as never)
-      .mockReturnValue(true);
-    vi.spyOn(pool as unknown as { park_bot: (b: PoolBot) => Promise<void> }, "park_bot" as never)
-      .mockImplementation(async (bot: PoolBot) => {
-        bot.state = "parked";
-      });
+    vi.spyOn(
+      pool as unknown as { is_tmux_alive: (s: string) => boolean },
+      "is_tmux_alive" as never,
+    ).mockReturnValue(true);
+    vi.spyOn(
+      pool as unknown as { park_bot: (b: PoolBot) => Promise<void> },
+      "park_bot" as never,
+    ).mockImplementation(async (bot: PoolBot) => {
+      bot.state = "parked";
+    });
   });
 
   describe("resolve_github_token_ref", () => {
     it("returns null when registry is not set", () => {
-      const resolve = (pool as unknown as { resolve_github_token_ref: (id: string) => string | null })
-        .resolve_github_token_ref.bind(pool);
+      const resolve = (
+        pool as unknown as { resolve_github_token_ref: (id: string) => string | null }
+      ).resolve_github_token_ref.bind(pool);
       expect(resolve("some-entity")).toBeNull();
     });
 
     it("returns null when entity is not in registry", () => {
       pool.inject_registry(registry);
-      const resolve = (pool as unknown as { resolve_github_token_ref: (id: string) => string | null })
-        .resolve_github_token_ref.bind(pool);
+      const resolve = (
+        pool as unknown as { resolve_github_token_ref: (id: string) => string | null }
+      ).resolve_github_token_ref.bind(pool);
       expect(resolve("nonexistent")).toBeNull();
     });
 
     it("returns null when entity has no github_token_ref", () => {
       registry.add(make_entity_config({ id: "no-token" }));
       pool.inject_registry(registry);
-      const resolve = (pool as unknown as { resolve_github_token_ref: (id: string) => string | null })
-        .resolve_github_token_ref.bind(pool);
+      const resolve = (
+        pool as unknown as { resolve_github_token_ref: (id: string) => string | null }
+      ).resolve_github_token_ref.bind(pool);
       expect(resolve("no-token")).toBeNull();
     });
 
@@ -190,8 +204,9 @@ describe("per-entity GitHub token injection", () => {
       const ref = "op://entity-my-app/github/credential";
       registry.add(make_entity_config({ id: "with-token", github_token_ref: ref }));
       pool.inject_registry(registry);
-      const resolve = (pool as unknown as { resolve_github_token_ref: (id: string) => string | null })
-        .resolve_github_token_ref.bind(pool);
+      const resolve = (
+        pool as unknown as { resolve_github_token_ref: (id: string) => string | null }
+      ).resolve_github_token_ref.bind(pool);
       expect(resolve("with-token")).toBe(ref);
     });
   });
@@ -204,7 +219,7 @@ describe("per-entity GitHub token injection", () => {
 
       await pool.assign("ch-test", "no-gh-token", "builder", undefined, "work_room");
 
-      const tmux_call = spawn_calls.find(c => c.command === "tmux");
+      const tmux_call = spawn_calls.find((c) => c.command === "tmux");
       expect(tmux_call).toBeDefined();
 
       // The tmux command string (last element in the args array)
@@ -242,7 +257,7 @@ describe("per-entity GitHub token injection", () => {
 
       await pool.assign("ch-test", "gh-token-entity", "builder", undefined, "work_room");
 
-      const tmux_call = spawn_calls.find(c => c.command === "tmux");
+      const tmux_call = spawn_calls.find((c) => c.command === "tmux");
       expect(tmux_call).toBeDefined();
       const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
 
@@ -288,7 +303,7 @@ describe("per-entity GitHub token injection", () => {
       // Should NOT throw — session starts without GH_TOKEN
       await pool.assign("ch-test", "fail-entity", "builder", undefined, "work_room");
 
-      const tmux_call = spawn_calls.find(c => c.command === "tmux");
+      const tmux_call = spawn_calls.find((c) => c.command === "tmux");
       expect(tmux_call).toBeDefined();
       const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
 
@@ -314,7 +329,7 @@ describe("per-entity GitHub token injection", () => {
       // resolve_op_secret should never be called — resolve_github_token_ref returns null
       expect(resolve_spy).not.toHaveBeenCalled();
 
-      const tmux_call = spawn_calls.find(c => c.command === "tmux");
+      const tmux_call = spawn_calls.find((c) => c.command === "tmux");
       expect(tmux_call).toBeDefined();
       const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
 

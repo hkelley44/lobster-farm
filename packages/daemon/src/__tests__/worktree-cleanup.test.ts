@@ -1,9 +1,9 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  cleanup_after_merge,
+  find_worktree_for_branch,
   parse_worktree_list,
   remove_worktree,
-  find_worktree_for_branch,
-  cleanup_after_merge,
   sweep_stale_worktrees,
 } from "../worktree-cleanup.js";
 
@@ -47,33 +47,39 @@ vi.mock("../sentry.js", () => ({
 // ── Helpers ──
 
 /** Build porcelain output for git worktree list. */
-function make_porcelain(...entries: Array<{
-  path: string;
-  head?: string;
-  branch?: string;
-  bare?: boolean;
-}>): string {
-  return entries.map((e) => {
-    const lines = [`worktree ${e.path}`];
-    lines.push(`HEAD ${e.head ?? "abc1234567890"}`);
-    if (e.branch) lines.push(`branch ${e.branch}`);
-    if (e.bare) lines.push("bare");
-    return lines.join("\n");
-  }).join("\n\n");
+function make_porcelain(
+  ...entries: Array<{
+    path: string;
+    head?: string;
+    branch?: string;
+    bare?: boolean;
+  }>
+): string {
+  return entries
+    .map((e) => {
+      const lines = [`worktree ${e.path}`];
+      lines.push(`HEAD ${e.head ?? "abc1234567890"}`);
+      if (e.branch) lines.push(`branch ${e.branch}`);
+      if (e.bare) lines.push("bare");
+      return lines.join("\n");
+    })
+    .join("\n\n");
 }
 
 /**
  * Configure mock_exec_file to handle specific git commands.
  * Returns a chainable builder for easy test setup.
  */
-function setup_git_mocks(opts: {
-  worktree_list?: string;
-  worktree_remove_error?: Error;
-  branch_delete_error?: Error;
-  merged_branches?: string;
-  fetch_error?: Error;
-  rev_parse_missing?: string[]; // branches whose remote ref is gone
-} = {}): void {
+function setup_git_mocks(
+  opts: {
+    worktree_list?: string;
+    worktree_remove_error?: Error;
+    branch_delete_error?: Error;
+    merged_branches?: string;
+    fetch_error?: Error;
+    rev_parse_missing?: string[]; // branches whose remote ref is gone
+  } = {},
+): void {
   mock_exec_file.mockImplementation((cmd: string, args: string[], _opts: unknown) => {
     if (cmd !== "git") return "";
 
@@ -112,7 +118,7 @@ function setup_git_mocks(opts: {
       const ref = args[2] ?? "";
       const branch = ref.replace("refs/remotes/origin/", "");
       if (opts.rev_parse_missing?.includes(branch)) {
-        throw new Error(`fatal: Needed a single revision`);
+        throw new Error("fatal: Needed a single revision");
       }
       return "abc123";
     }
@@ -131,11 +137,7 @@ beforeEach(() => {
 
 describe("parse_worktree_list", () => {
   it("parses a single main worktree", () => {
-    const output = [
-      "worktree /repo",
-      "HEAD abc123",
-      "branch refs/heads/main",
-    ].join("\n");
+    const output = ["worktree /repo", "HEAD abc123", "branch refs/heads/main"].join("\n");
 
     const entries = parse_worktree_list(output);
     expect(entries).toHaveLength(1);
@@ -174,11 +176,7 @@ describe("parse_worktree_list", () => {
   });
 
   it("recognizes bare worktree entries", () => {
-    const output = [
-      "worktree /repo",
-      "HEAD abc123",
-      "bare",
-    ].join("\n");
+    const output = ["worktree /repo", "HEAD abc123", "bare"].join("\n");
 
     const entries = parse_worktree_list(output);
     expect(entries[0]!.bare).toBe(true);
@@ -251,9 +249,7 @@ describe("find_worktree_for_branch", () => {
   });
 
   it("returns null when no worktree matches", async () => {
-    const porcelain = make_porcelain(
-      { path: "/repo", branch: "refs/heads/main" },
-    );
+    const porcelain = make_porcelain({ path: "/repo", branch: "refs/heads/main" });
     setup_git_mocks({ worktree_list: porcelain });
 
     const result = await find_worktree_for_branch("/repo", "feature/nonexistent");
@@ -291,7 +287,9 @@ describe("cleanup_after_merge", () => {
   });
 
   it("still tries to delete branch when no worktree is found", async () => {
-    setup_git_mocks({ worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }) });
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+    });
 
     await cleanup_after_merge("/repo", "feature/orphan");
 
@@ -304,7 +302,9 @@ describe("cleanup_after_merge", () => {
   });
 
   it("scans .claude/worktrees/ for matching agent directories", async () => {
-    setup_git_mocks({ worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }) });
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+    });
 
     // Simulate .claude/worktrees/ directory with a matching entry
     mock_stat.mockResolvedValue({ isDirectory: () => true });
@@ -336,7 +336,9 @@ describe("cleanup_after_merge", () => {
   });
 
   it("does not throw when .claude/worktrees/ does not exist", async () => {
-    setup_git_mocks({ worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }) });
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+    });
     mock_stat.mockImplementation(async (path: string) => {
       if (path.includes(".claude/worktrees")) throw new Error("ENOENT");
       return { isDirectory: () => true };
@@ -446,9 +448,7 @@ describe("sweep_stale_worktrees", () => {
   });
 
   it("never removes the main worktree", async () => {
-    const porcelain = make_porcelain(
-      { path: "/repo", branch: "refs/heads/main" },
-    );
+    const porcelain = make_porcelain({ path: "/repo", branch: "refs/heads/main" });
     setup_git_mocks({
       worktree_list: porcelain,
       merged_branches: "  main\n",

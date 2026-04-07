@@ -9,7 +9,7 @@
  * tokens last 1 hour, so we refresh at 50 min).
  */
 
-import { createSign, createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, createSign, timingSafeEqual } from "node:crypto";
 
 // ── Types ──
 
@@ -41,11 +41,7 @@ const JWT_IAT_DRIFT_SECONDS = 60;
 /** Base64url-encode a buffer or string. */
 function base64url(input: Buffer | string): string {
   const buf = typeof input === "string" ? Buffer.from(input) : input;
-  return buf
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 /**
@@ -68,9 +64,7 @@ function normalize_pem(raw: string): string {
   // If still no newlines, try reconstructing from space-separated or continuous base64
   if (!normalized.includes("\n") && normalized.includes("-----BEGIN")) {
     // Extract the header, base64 body, and footer
-    const match = normalized.match(
-      /^(-----BEGIN [A-Z ]+-----)(.+)(-----END [A-Z ]+-----)$/,
-    );
+    const match = normalized.match(/^(-----BEGIN [A-Z ]+-----)(.+)(-----END [A-Z ]+-----)$/);
     if (match) {
       const [, header, body, footer] = match;
       // Split base64 body into 64-char lines
@@ -172,9 +166,7 @@ export class GitHubAppAuth {
 
     if (!res.ok) {
       const body = await res.text();
-      throw new Error(
-        `Failed to get installation token: ${String(res.status)} ${body}`,
-      );
+      throw new Error(`Failed to get installation token: ${String(res.status)} ${body}`);
     }
 
     const data = (await res.json()) as { token: string; expires_at: string };
@@ -202,9 +194,7 @@ export class GitHubAppAuth {
       return false;
     }
 
-    const expected = createHmac("sha256", this.config.webhook_secret)
-      .update(payload)
-      .digest("hex");
+    const expected = createHmac("sha256", this.config.webhook_secret).update(payload).digest("hex");
 
     const actual = signature.slice("sha256=".length);
 
@@ -213,10 +203,7 @@ export class GitHubAppAuth {
       return false;
     }
 
-    return timingSafeEqual(
-      Buffer.from(expected, "hex"),
-      Buffer.from(actual, "hex"),
-    );
+    return timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(actual, "hex"));
   }
 }
 
@@ -225,10 +212,10 @@ export class GitHubAppAuth {
  * Returns null if any required var is missing (graceful degradation).
  */
 export function init_github_app_from_env(): GitHubAppAuth | null {
-  const app_id = process.env["GITHUB_APP_ID"];
-  const private_key = process.env["GITHUB_APP_PRIVATE_KEY"];
-  const installation_id = process.env["GITHUB_APP_INSTALLATION_ID"];
-  const webhook_secret = process.env["GITHUB_APP_WEBHOOK_SECRET"];
+  const app_id = process.env.GITHUB_APP_ID;
+  const private_key = process.env.GITHUB_APP_PRIVATE_KEY;
+  const installation_id = process.env.GITHUB_APP_INSTALLATION_ID;
+  const webhook_secret = process.env.GITHUB_APP_WEBHOOK_SECRET;
 
   // Normalize PEM key — env var injection can mangle newlines
   const normalized_key = private_key ? normalize_pem(private_key) : undefined;
@@ -240,15 +227,15 @@ export function init_github_app_from_env(): GitHubAppAuth | null {
       !installation_id && "GITHUB_APP_INSTALLATION_ID",
       !webhook_secret && "GITHUB_APP_WEBHOOK_SECRET",
     ].filter(Boolean);
-    console.log(
-      `[github-app] Not configured — missing env vars: ${missing.join(", ")}`,
-    );
+    console.log(`[github-app] Not configured — missing env vars: ${missing.join(", ")}`);
     return null;
   }
 
-  console.log(
-    `[github-app] Initialized (app_id=${app_id}, installation_id=${installation_id})`,
-  );
-  return new GitHubAppAuth({ app_id, private_key: normalized_key, installation_id, webhook_secret });
+  console.log(`[github-app] Initialized (app_id=${app_id}, installation_id=${installation_id})`);
+  return new GitHubAppAuth({
+    app_id,
+    private_key: normalized_key,
+    installation_id,
+    webhook_secret,
+  });
 }
-

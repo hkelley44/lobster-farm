@@ -1,13 +1,10 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { mkdir, rm, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
-import {
-  append_session_log,
-  read_session_log,
-} from "../persistence.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { append_session_log, read_session_log } from "../persistence.js";
 import type { SessionLogEntry } from "../persistence.js";
 
 function make_config(tmp: string): LobsterFarmConfig {
@@ -186,7 +183,7 @@ describe("Session Log", () => {
       const malformed = "this is not json{{{";
       const valid2 = JSON.stringify(make_entry({ session_id: "s2" }));
 
-      await writeFile(log_path, [valid1, malformed, valid2].join("\n") + "\n", "utf-8");
+      await writeFile(log_path, `${[valid1, malformed, valid2].join("\n")}\n`, "utf-8");
 
       const entries = await read_session_log("alpha", config);
       expect(entries).toHaveLength(2);
@@ -236,9 +233,13 @@ describe("Session Log", () => {
 
     it("respects limit parameter (returns last N entries)", async () => {
       for (let i = 0; i < 5; i++) {
-        await append_session_log("alpha", make_entry({
-          session_id: `session-${String(i)}`,
-        }), config);
+        await append_session_log(
+          "alpha",
+          make_entry({
+            session_id: `session-${String(i)}`,
+          }),
+          config,
+        );
       }
 
       const entries = await read_session_log("alpha", config, { limit: 2 });
@@ -276,23 +277,31 @@ describe("Session Log", () => {
       const start_time = Date.now();
 
       // Start entry
-      await append_session_log("alpha", make_entry({
-        session_id,
-        started_at: new Date(start_time).toISOString(),
-        ended_at: null,
-        exit_code: null,
-        duration_ms: null,
-      }), config);
+      await append_session_log(
+        "alpha",
+        make_entry({
+          session_id,
+          started_at: new Date(start_time).toISOString(),
+          ended_at: null,
+          exit_code: null,
+          duration_ms: null,
+        }),
+        config,
+      );
 
       // Completion entry (simulating ~5s later)
       const end_time = start_time + 5000;
-      await append_session_log("alpha", make_entry({
-        session_id,
-        started_at: new Date(start_time).toISOString(),
-        ended_at: new Date(end_time).toISOString(),
-        exit_code: 0,
-        duration_ms: 5000,
-      }), config);
+      await append_session_log(
+        "alpha",
+        make_entry({
+          session_id,
+          started_at: new Date(start_time).toISOString(),
+          ended_at: new Date(end_time).toISOString(),
+          exit_code: 0,
+          duration_ms: 5000,
+        }),
+        config,
+      );
 
       const entries = await read_session_log("alpha", config);
       expect(entries).toHaveLength(2);
@@ -311,27 +320,35 @@ describe("Session Log", () => {
       const session_id = "pool-3-assign";
 
       // Assignment entry
-      await append_session_log("alpha", make_entry({
-        session_id,
-        source: "pool",
-        bot_id: 3,
-        ended_at: null,
-      }), config);
+      await append_session_log(
+        "alpha",
+        make_entry({
+          session_id,
+          source: "pool",
+          bot_id: 3,
+          ended_at: null,
+        }),
+        config,
+      );
 
       // Session ended entry
-      await append_session_log("alpha", make_entry({
-        session_id: "pool-3-ended",
-        source: "pool",
-        bot_id: 3,
-        ended_at: "2026-03-26T11:00:00.000Z",
-        exit_code: 0,
-        duration_ms: 3_600_000,
-      }), config);
+      await append_session_log(
+        "alpha",
+        make_entry({
+          session_id: "pool-3-ended",
+          source: "pool",
+          bot_id: 3,
+          ended_at: "2026-03-26T11:00:00.000Z",
+          exit_code: 0,
+          duration_ms: 3_600_000,
+        }),
+        config,
+      );
 
       const entries = await read_session_log("alpha", config);
       expect(entries).toHaveLength(2);
-      expect(entries.every(e => e.source === "pool")).toBe(true);
-      expect(entries.every(e => e.bot_id === 3)).toBe(true);
+      expect(entries.every((e) => e.source === "pool")).toBe(true);
+      expect(entries.every((e) => e.bot_id === 3)).toBe(true);
     });
   });
 });
