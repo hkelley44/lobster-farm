@@ -9,7 +9,7 @@
  * once the current reviewer finishes.
  */
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { promisify } from "node:util";
 import type { ArchetypeRole } from "@lobster-farm/shared";
@@ -1097,13 +1097,29 @@ async function spawn_deploy_triage(
 
 // ── Prompt building ──
 
-export function build_reviewer_prompt(
-  pr: WebhookPR,
-  repo_path: string,
-  issue_context: string,
-): string {
+/**
+ * Derive owner/repo (e.g. "ultim88888888/lobster-farm") from a local checkout
+ * by reading the git remote URL. Returns null when the remote is missing or
+ * doesn't point at GitHub — callers should degrade gracefully.
+ */
+function get_repo_full_name(repo_path: string): string | null {
+  try {
+    const stdout = execFileSync("git", ["remote", "get-url", "origin"], {
+      cwd: repo_path,
+      encoding: "utf-8",
+      timeout: 5000,
+    });
+    return nwo_from_url(stdout.trim()) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function build_reviewer_prompt(pr: WebhookPR, repo_path: string, issue_context: string): string {
+  const n = String(pr.number);
+  const repo_full_name = get_repo_full_name(repo_path);
   const lines = [
-    `Review PR #${String(pr.number)}: "${pr.title}" on branch ${pr.head.ref}.`,
+    `Review PR #${n}: "${pr.title}" on branch ${pr.head.ref}.`,
     `Repository: ${repo_path}`,
     "",
     "Run /review to do a comprehensive code review.",
@@ -1114,12 +1130,30 @@ export function build_reviewer_prompt(
     "Review standards:",
     "- Every piece of actionable feedback should be included.",
     "- If there is ANY actionable feedback, request changes:",
-    `  gh pr review ${String(pr.number)} --request-changes --body "<your review>"`,
+    `  gh pr review ${n} --request-changes --body "<your review>" && echo "✓ Review posted"`,
     "- If the code is genuinely clean with no improvements needed, approve:",
-    `  gh pr review ${String(pr.number)} --approve --body "Looks good."`,
+    `  gh pr review ${n} --approve --body "Looks good." && echo "✓ Review posted"`,
+    "",
+  ];
+
+  // Verification step — only possible when we know owner/repo
+  if (repo_full_name) {
+    lines.push(
+      "After posting your review, verify it landed:",
+      `  gh api repos/${repo_full_name}/pulls/${n}/reviews --jq '.[-1].state'`,
+      "If the state is CHANGES_REQUESTED or APPROVED, your review is confirmed. Move on.",
+      "",
+    );
+  }
+
+  lines.push(
+    "IMPORTANT:",
+    "- Post your review ONCE. Do not retry if the command exits 0.",
+    "- Never dismiss, delete, or modify reviews you have already posted.",
+    "- If you accidentally post duplicate reviews, leave them — do not try to clean up.",
     "",
     "CI status — three distinct cases, treat them differently:",
-    `  gh pr checks ${String(pr.number)} --required`,
+    `  gh pr checks ${n} --required`,
     "",
     "1. FAILING required checks (conclusion failure/cancelled/timed_out):",
     "   The PR is broken. Note the failing checks in your review and request",
@@ -1146,16 +1180,16 @@ export function build_reviewer_prompt(
     "After posting your review:",
     "- If you approved AND all required checks are passing (or none configured),",
     "  merge the PR:",
-    `  gh pr merge ${String(pr.number)} --squash --delete-branch`,
+    `  gh pr merge ${n} --squash --delete-branch`,
     "- If you approved but CI is still pending, do NOT run the merge command",
     "  yourself. The daemon will merge once checks clear. Your review is the signal.",
     "- If the merge command fails (branch behind main):",
     `  1. Try: git fetch origin && git checkout ${pr.head.ref} && git rebase origin/main`,
     `  2. If rebase is clean (no conflicts): git push --force-with-lease origin ${pr.head.ref}`,
-    `  3. Then retry: gh pr merge ${String(pr.number)} --squash --delete-branch`,
+    `  3. Then retry: gh pr merge ${n} --squash --delete-branch`,
     "  4. If rebase has conflicts: git rebase --abort — do NOT force push conflict markers",
     "- If you requested changes, do NOT merge.",
-  ];
+  );
 
   if (issue_context) {
     lines.push("", "## Linked Issue Context", "", issue_context);
