@@ -107,7 +107,7 @@ Five types, each with a distinct loading behavior:
 
 | Type | Loading | Purpose | Example |
 |------|---------|---------|---------|
-| **DNA** | Auto-load by task match | Creative/expertise lenses | coding-dna, design-dna, planning-dna |
+| **DNA** | Auto-load by task match | Creative/expertise lenses | coding-dna, design-dna, planning-dna, review-dna |
 | **Guidelines** | Auto-load by task match | Operational requirements | secrets-guideline, readme-guideline, discord-guideline |
 | **SOPs** | Auto-load by task match | Step-by-step procedures with gates | entity-scaffold, feature-lifecycle, pr-review-merge |
 | **Rules** | Always loaded | Universal constraints | secrets rules, git rules, escalation rules |

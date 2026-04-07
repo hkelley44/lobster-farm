@@ -60,7 +60,7 @@ Before approving, check if CI checks exist and their status:
 gh pr checks {N} --required
 ```
 
-If CI is failing or pending, note it in your review. You can still approve the code quality — the daemon handles CI gating for merge. But if the failures are clearly related to the PR's changes (type errors, test failures), flag them as 🔴 issues.
+If CI failures are unrelated to this PR (pre-existing, flaky tests), note them informally and approve on code quality. If CI failures are clearly caused by this PR (type errors, failing tests introduced by these changes), flag each as a 🔴 issue and request changes.
 
 If no CI checks are configured for this repo, note it but don't block the review.
 

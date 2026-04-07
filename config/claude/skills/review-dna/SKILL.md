@@ -17,7 +17,7 @@ description: "Code review standards — priority order, frontend criteria, CI aw
 ## Severity Levels
 
 - 🔴 **Must fix** — Bugs, security issues, data loss risks, spec violations. Blocks merge.
-- 🟡 **Should address** — Robustness gaps, performance concerns, maintainability issues. Blocks merge in automated review.
+- 🟡 **Should address** — Robustness gaps, performance concerns, maintainability issues. Reviewer requests changes when present.
 - 🟢 **Praise** — Well-crafted code, clever solutions, good patterns. Always include at least one.
 
 ## Comment Format
