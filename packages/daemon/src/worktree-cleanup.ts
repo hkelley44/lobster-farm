@@ -8,18 +8,81 @@
  * the merge handler, PR cron, or daemon lifecycle.
  */
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { expand_home } from "@lobster-farm/shared";
 import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
+import { sq } from "./shell.js";
 
 const exec = promisify(execFile);
 
 /** Timeout for git commands — generous but bounded. */
 const GIT_TIMEOUT_MS = 30_000;
+
+// ── Session relocation ──
+
+/**
+ * Check all tmux sessions for panes whose cwd is inside `target_path`.
+ * For any matches, send a `cd` command to relocate them to `safe_path`.
+ *
+ * Best-effort: errors for individual sessions are logged but never thrown.
+ * This prevents worktree cleanup from failing if tmux is unavailable or
+ * a session is in a transient state.
+ *
+ * @returns The number of sessions that were relocated.
+ */
+export async function relocate_sessions_from_path(
+  target_path: string,
+  safe_path: string,
+): Promise<number> {
+  // Normalize: ensure target_path ends with / for prefix matching.
+  // This prevents false positives like /foo/bar-baz matching /foo/bar.
+  const target_prefix = target_path.endsWith("/") ? target_path : `${target_path}/`;
+
+  let sessions: string[];
+  try {
+    const result = execFileSync("tmux", ["list-sessions", "-F", "#{session_name}"], {
+      encoding: "utf-8",
+      timeout: 5000,
+    });
+    sessions = result.trim().split("\n").filter(Boolean);
+  } catch {
+    // tmux not running or no sessions — nothing to relocate
+    return 0;
+  }
+
+  let relocated = 0;
+
+  for (const session of sessions) {
+    try {
+      const pane_cwd = execFileSync(
+        "tmux",
+        ["display-message", "-t", session, "-p", "#{pane_current_path}"],
+        { encoding: "utf-8", timeout: 2000 },
+      ).trim();
+
+      // Check if the pane's cwd is inside (or exactly at) the target path
+      if (pane_cwd === target_path || pane_cwd.startsWith(target_prefix)) {
+        execFileSync("tmux", ["send-keys", "-t", session, `cd ${sq(safe_path)}`, "Enter"], {
+          timeout: 2000,
+        });
+        console.log(`[worktree-cleanup] Relocated ${session}: ${pane_cwd} → ${safe_path}`);
+        relocated++;
+      }
+    } catch (err) {
+      // Per-session errors are non-fatal — the session may have died between
+      // listing and querying, or it may be in a state that rejects send-keys.
+      console.log(
+        `[worktree-cleanup] Could not check/relocate session ${session}: ${String(err instanceof Error ? err.message : err)}`,
+      );
+    }
+  }
+
+  return relocated;
+}
 
 // ── Parsed worktree entry from `git worktree list --porcelain` ──
 
@@ -199,6 +262,13 @@ export async function cleanup_after_merge(repo_path: string, branch: string): Pr
   // 1. Check git worktree list for a worktree on this branch
   const worktree_path = await find_worktree_for_branch(repo_path, branch);
   if (worktree_path) {
+    // Relocate any sessions whose cwd is inside this worktree before removal
+    const relocated = await relocate_sessions_from_path(worktree_path, repo_path);
+    if (relocated > 0) {
+      console.log(
+        `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${worktree_path}`,
+      );
+    }
     await remove_worktree(repo_path, worktree_path, branch);
   } else {
     console.log(`[worktree-cleanup] No git worktree found for branch: ${branch}`);
@@ -246,6 +316,13 @@ async function cleanup_claude_worktrees(repo_path: string, branch: string): Prom
       if (entry.name.includes(branch_slug)) {
         const wt_path = join(claude_wt_dir, entry.name);
         console.log(`[worktree-cleanup] Found .claude/worktrees/ match: ${wt_path}`);
+        // Relocate any sessions whose cwd is inside this worktree before removal
+        const relocated = await relocate_sessions_from_path(wt_path, repo_path);
+        if (relocated > 0) {
+          console.log(
+            `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${wt_path}`,
+          );
+        }
         await remove_worktree(repo_path, wt_path, branch);
       }
     }
@@ -366,6 +443,13 @@ async function sweep_repo(repo_path: string): Promise<number> {
     }
 
     if (should_clean) {
+      // Relocate any sessions whose cwd is inside this worktree before removal
+      const relocated = await relocate_sessions_from_path(entry.path, repo_path);
+      if (relocated > 0) {
+        console.log(
+          `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${entry.path}`,
+        );
+      }
       const removed = await remove_worktree(repo_path, entry.path, branch);
       if (removed) cleaned++;
     }

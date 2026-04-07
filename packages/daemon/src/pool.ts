@@ -1,10 +1,11 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
-import { DEFAULT_ARCHETYPES, entity_dir, lobsterfarm_dir } from "@lobster-farm/shared";
+import { DEFAULT_ARCHETYPES, entity_dir, expand_home, lobsterfarm_dir } from "@lobster-farm/shared";
 import type { ChannelType } from "@lobster-farm/shared";
 import { notify } from "./actions.js";
 import { resolve_binary } from "./env.js";
@@ -1141,7 +1142,12 @@ export class BotPool extends EventEmitter {
 
       for (const bot of this.bots) {
         if (bot.state !== "assigned") continue;
-        if (this.is_tmux_alive(bot.tmux_session)) continue;
+
+        if (this.is_tmux_alive(bot.tmux_session)) {
+          // Session alive — check for orphaned cwd (directory deleted out from under it)
+          await this.check_cwd_health(bot);
+          continue;
+        }
 
         // Tmux session died — attempt recovery
         console.warn(
@@ -1960,6 +1966,68 @@ export class BotPool extends EventEmitter {
     setTimeout(() => {
       void unlink(pending_path).catch(() => {});
     }, 30_000);
+  }
+
+  /**
+   * Check if a bot's tmux pane cwd still exists on disk.
+   * If the directory has been deleted (e.g., worktree removed), send a `cd`
+   * to the entity's primary repo root to recover the session.
+   *
+   * Best-effort — all errors are caught to avoid disrupting the health loop.
+   */
+  private async check_cwd_health(bot: PoolBot): Promise<void> {
+    try {
+      const pane_cwd = execFileSync(
+        "tmux",
+        ["display-message", "-t", bot.tmux_session, "-p", "#{pane_current_path}"],
+        { encoding: "utf-8", timeout: 2000 },
+      ).trim();
+
+      if (!pane_cwd) return;
+
+      // Check if the directory still exists
+      try {
+        await stat(pane_cwd);
+        return; // Directory exists — all good
+      } catch {
+        // Directory doesn't exist — need to recover
+      }
+
+      // Resolve a safe fallback path from the entity's primary repo
+      let safe_path = homedir(); // ultimate fallback
+      if (bot.entity_id && this.registry) {
+        const entity_config = this.registry.get(bot.entity_id);
+        const repo_path = entity_config?.entity.repos[0]?.path;
+        if (repo_path) {
+          safe_path = expand_home(repo_path);
+        }
+      }
+
+      execFileSync("tmux", ["send-keys", "-t", bot.tmux_session, `cd ${sq(safe_path)}`, "Enter"], {
+        timeout: 2000,
+      });
+
+      console.log(
+        `[pool] Recovered orphaned cwd for ${bot.tmux_session}: ${pane_cwd} → ${safe_path}`,
+      );
+
+      // Alert the entity's #alerts channel
+      if (bot.entity_id && this.registry) {
+        const entity_config = this.registry.get(bot.entity_id);
+        try {
+          await notify(
+            "alerts",
+            `⚠️ Pool bot ${bot.tmux_session} had orphaned cwd (\`${pane_cwd}\`). Auto-recovered to \`${safe_path}\`.`,
+            entity_config,
+          );
+        } catch {
+          // Notification failure must not crash the health loop
+        }
+      }
+    } catch {
+      // Best-effort — tmux display-message or send-keys failed.
+      // The existing liveness check handles truly dead sessions separately.
+    }
   }
 
   private is_tmux_alive(session_name: string): boolean {
