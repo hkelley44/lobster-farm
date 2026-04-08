@@ -241,6 +241,7 @@ export class PRReviewCron {
     for (const pr of prs) {
       // Skip draft PRs — builder is still iterating
       if (pr.isDraft) {
+        console.log(`[pr-cron] Skipping draft PR #${String(pr.number)} in ${entity_id}`);
         continue;
       }
 
