@@ -15,6 +15,7 @@ Skills fall into three categories:
 - `design-dna/` -- Visual systems, UI implementation, animation, and design-in-code principles.
 - `planning-dna/` -- Spec writing, scope management, socratic discovery methodology.
 - `review-dna/` -- Code review standards, priority order, frontend criteria, CI awareness.
+- `tech-standards/` -- Architectural best practices and team technology standards. Shared decision guide for planners, builders, and reviewers.
 - `secrets-guideline/` -- 1Password-based secret management. The "never handle raw secrets" rule.
 - `readme-guideline/` -- Directory documentation standards. When and how to write READMEs.
 - `discord-guideline/` -- Discord server management. Channel scaffolding, bot architecture, webhook patterns.
