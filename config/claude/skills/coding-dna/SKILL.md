@@ -867,7 +867,8 @@ export default async function DashboardPage() {
   const metrics = await fetch("https://api.example.com/metrics", {
     next: { revalidate: 60 }, // ISR: revalidate every 60 seconds
   });
-  return <Dashboard data={await metrics.json()} />;
+  const data = await metrics.json();
+  return <Dashboard data={data} />;
 }
 ```
 
