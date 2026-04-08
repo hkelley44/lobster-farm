@@ -760,6 +760,8 @@ Closes #123"
 gh pr ready
 ```
 
+> **See also:** [PR Workflow](#pr-workflow) below for verification requirements (`none` vs `user` gate) and watch registration.
+
 ### Commits
 
 **Conventional commits:**
@@ -802,6 +804,8 @@ LOCAL = True if os.getcwd().split('/')[1] == 'Users' else False
 ---
 
 ## PR Workflow
+
+> **See also:** [Pull Requests — Draft vs. Ready](#pull-requests--draft-vs-ready) above for the draft → ready lifecycle and validation checklist.
 
 ### Check the Spec's Verification Requirement
 
