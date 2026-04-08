@@ -726,6 +726,34 @@ The code never knows or cares that 1Password is involved. It just reads env vars
 
 Git workflow (branching rules, PR process, merge policy) is defined per-project in each repo's `CLAUDE.md`. Read it before starting work.
 
+### Pull Requests — Draft vs. Ready
+
+**Open a draft PR when you start a feature branch.** This gives visibility (the branch and diff are trackable) without triggering review or auto-merge. Keep pushing commits as you iterate.
+
+**Only convert to "Ready for Review" when the implementation is validated end-to-end.** The auto-reviewer will pick it up, review, and merge automatically. There is no going back — once it's ready, it's in the merge pipeline.
+
+Before marking a PR as ready, verify:
+- [ ] The feature works end-to-end, not just "code compiles"
+- [ ] For backend changes: the server starts, routes respond correctly
+- [ ] For database changes: migrations run cleanly (up and down)
+- [ ] For infra/deploy changes: the build succeeds, the deploy works
+- [ ] For data pipelines: the pipeline has run successfully against real data at least once
+- [ ] For frontend changes: the page renders, interactions work, no console errors
+
+**The goal is one PR per feature, not one PR per attempt.** If you find issues after pushing, fix them on the same branch and push again — don't merge and open a new PR.
+
+```bash
+# Open draft PR at the start of work
+gh pr create --draft --title "feat: add token market cap backfill" --body "WIP"
+
+# Keep iterating...
+git add -A && git commit -m "fix: handle API rate limits"
+git push
+
+# When validated, mark ready (triggers auto-review → auto-merge)
+gh pr ready
+```
+
 ### Commits
 
 **Conventional commits:**
@@ -1054,6 +1082,7 @@ Loggers are configurable per-environment. In prod you want structured logs. In d
 | `asyncio.run()` inside library code | Async-native functions + sync wrappers |
 | One massive `utils.py` | Split by domain: `time_utils`, `text`, `pandas_utils` |
 | `inplace=True` parameter pattern | Always return new objects. Immutability is clarity. |
+| Opening a ready PR before validating | Open as draft, iterate, mark ready when it works |
 
 ---
 
