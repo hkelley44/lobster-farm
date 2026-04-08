@@ -153,7 +153,7 @@ export async function build_entity_context(
 // ── DNA skill loading ──
 
 /** Read DNA skill files and concatenate their content. */
-async function load_dna_content(dna_skills: string[]): Promise<string | null> {
+export async function load_dna_content(dna_skills: string[]): Promise<string | null> {
   const home = homedir();
   const sections: string[] = [];
 
@@ -163,7 +163,7 @@ async function load_dna_content(dna_skills: string[]): Promise<string | null> {
       const content = await readFile(skill_path, "utf-8");
       sections.push(content);
     } catch {
-      console.log(`[session] DNA skill not found: ${skill_path}`);
+      console.warn(`[session] DNA skill not found: ${skill_path}`);
     }
   }
 
