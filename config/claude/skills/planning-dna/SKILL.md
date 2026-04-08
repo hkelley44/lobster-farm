@@ -62,6 +62,7 @@ Before writing any spec, complete these steps:
 2. **Check other active entities** — the team's established patterns span all projects. If sonar uses Auth.js, that's the team standard for Next.js auth.
 3. **Load relevant practice skills** — `tech-standards` for architectural decisions, `coding-dna` if you need implementation context.
 4. **Audit the existing codebase** — you might spec something that already exists, or propose a tool the team has already rejected.
+5. **Review Agent Routing** (below) before assigning deliverables — know which agent owns which work type.
 
 ### The Consistency Rule
 
