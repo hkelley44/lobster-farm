@@ -18,5 +18,6 @@ Skills fall into three categories:
 - `secrets-guideline/` -- 1Password-based secret management. The "never handle raw secrets" rule.
 - `readme-guideline/` -- Directory documentation standards. When and how to write READMEs.
 - `discord-guideline/` -- Discord server management. Channel scaffolding, bot architecture, webhook patterns.
+- `tech-standards/` -- Architectural best practices and team technology standards. Shared decision guide for planners, builders, and reviewers.
 - `pr-review-merge/` -- SOP for the PR review, feedback, and merge workflow.
 - `entity-scaffold/` -- SOP for standing up a new entity from a blueprint.

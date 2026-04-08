@@ -54,6 +54,29 @@ When unsure, default to `user`. It only costs a "looks good" message.
 
 ---
 
+## Pre-Spec Checklist
+
+Before writing any spec, complete these steps:
+
+1. **Read the entity's MEMORY.md** — understand the existing architecture, tech stack, and past decisions.
+2. **Check other active entities** — the team's established patterns span all projects. If sonar uses Auth.js, that's the team standard for Next.js auth.
+3. **Load relevant practice skills** — `tech-standards` for architectural decisions, `coding-dna` if you need implementation context.
+4. **Audit the existing codebase** — you might spec something that already exists, or propose a tool the team has already rejected.
+5. **Review Agent Routing** (below) before assigning deliverables — know which agent owns which work type.
+
+### The Consistency Rule
+
+When an entity already uses a tool or pattern, that is the default for new features. When the team has an established standard across entities, that is the default for new entities.
+
+Only propose alternatives when:
+- The existing tool genuinely cannot handle the requirement (document why in the spec)
+- The alternative is strictly better AND the migration cost is justified
+- {{USER_NAME}} has explicitly asked to evaluate alternatives
+
+"I prefer X" or "X is newer" is not sufficient justification. Consistency has compounding value.
+
+---
+
 ## Spec Format (GitHub Issue)
 
 Every spec must include:
@@ -94,6 +117,32 @@ Note who can answer and the default if no answer.
 
 ---
 
+## Agent Routing
+
+Every task in a spec must be assigned to the correct agent. Never give work to the wrong specialist — it produces worse results and misses domain expertise.
+
+| Work Type | Agent | Examples |
+|-----------|-------|---------|
+| **Application code** | {{BUILDER_NAME}} | Feature code, API endpoints, database queries, tests, refactors, bug fixes |
+| **UI/UX design & layout** | {{DESIGNER_NAME}} | Brand kits, design systems, page layouts, component design, visual exploration, animation |
+| **Infrastructure & DevOps** | {{OPERATOR_NAME}} | AWS resources, Docker, CI/CD, deployment config, monitoring, DNS, SSL, security groups |
+
+### Hard Rules
+
+- **Infrastructure is NEVER builder work.** ECR, ECS, ALB, security groups, IAM, Secrets Manager, task definitions — all {{OPERATOR_NAME}}.
+- **Design is NEVER builder work.** If the task is primarily about how something LOOKS or the UX flow — {{DESIGNER_NAME}}. {{BUILDER_NAME}} implements designs, not creates them.
+- **Code is NEVER operator work.** Application logic, API endpoints, frontend components — all {{BUILDER_NAME}}.
+- **Mixed specs get split.** If a feature needs both code and infra, create separate tasks: one for {{BUILDER_NAME}}, one for {{OPERATOR_NAME}}. Same for code + design: {{DESIGNER_NAME}} first, then {{BUILDER_NAME}} implements.
+
+### Decision Guide
+
+- Does it touch AWS, Docker, CI/CD, or deployment config? → {{OPERATOR_NAME}}
+- Does it involve visual design, brand, UX decisions, or page layout? → {{DESIGNER_NAME}}
+- Does it involve writing application code, APIs, or tests? → {{BUILDER_NAME}}
+- Is it ambiguous? State the ambiguity, pick the best fit, and note why in the spec.
+
+---
+
 ## Anti-Patterns
 
 - ❌ Specs that describe HOW to implement instead of WHAT to build — leave implementation to the Builder
@@ -102,6 +151,10 @@ Note who can answer and the default if no answer.
 - ❌ Planning without checking existing codebase — you might spec something that already exists
 - ❌ Waterfall planning for uncertain features — if you can't confidently spec it, propose a spike first
 - ❌ Over-specifying implementation details — the Builder knows how to code. Specify the what and why.
+- ❌ Proposing tools the team doesn't use without checking existing stack first — consistency matters
+- ❌ Speccing manual implementations of what established libraries handle (e.g., manual auth cookies instead of Auth.js)
+- ❌ Giving infrastructure work to {{BUILDER_NAME}} or design work to {{BUILDER_NAME}} — route to the correct specialist
+- ❌ Monolithic specs that mix code, design, and infra in one task — split by agent
 
 ---
 
