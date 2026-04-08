@@ -122,6 +122,7 @@ const INTENT_KEYWORDS: Record<ArchetypeRole, string[]> = {
     "pipeline",
     "sentry",
   ],
+  commander: [],
 };
 
 function classify_intent(content: string): Classification | null {
