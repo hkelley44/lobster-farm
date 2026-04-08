@@ -11,7 +11,7 @@
 import { EventEmitter } from "node:events";
 import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 
@@ -136,10 +136,20 @@ describe("per-entity GitHub token injection", () => {
   let config: LobsterFarmConfig;
   let pool: GhTokenTestPool;
   let registry: MockRegistry;
+  const saved_gh_token = process.env.GH_TOKEN;
+
+  afterAll(() => {
+    // Restore host environment's GH_TOKEN
+    if (saved_gh_token !== undefined) {
+      process.env.GH_TOKEN = saved_gh_token;
+    }
+  });
 
   beforeEach(() => {
     vi.clearAllMocks();
     spawn_calls = [];
+    // Isolate tests from the host environment's GH_TOKEN
+    delete process.env.GH_TOKEN;
 
     config = make_config();
     pool = new GhTokenTestPool(config);

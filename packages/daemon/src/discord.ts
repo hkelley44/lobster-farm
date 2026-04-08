@@ -158,6 +158,7 @@ export function format_relative_time(iso: string): string {
 interface ChannelEntry {
   entity_id: string;
   channel_type: ChannelType;
+  assigned_feature?: string;
 }
 
 // ── Command target abstraction ──
@@ -532,7 +533,9 @@ export class DiscordBot extends EventEmitter {
       console.error(`[discord] Failed to register slash commands: ${String(err)}`);
       sentry.captureException(err, {
         tags: { component: "discord", operation: "register_slash_commands" },
-        extra: { hint: "Most likely missing applications.commands OAuth2 scope" },
+        contexts: {
+          debug: { hint: "Most likely missing applications.commands OAuth2 scope" },
+        },
       });
     }
   }
@@ -1130,8 +1133,18 @@ export class DiscordBot extends EventEmitter {
   }
 
   /** Set reference to queue for command handling. */
+  // @ts-expect-error — reserved for future use; assigned via set_managers()
   private _queue: TaskQueue | null = null;
   private _pool: BotPool | null = null;
+  /** Feature lifecycle manager — wired up when features module is ready. */
+  private _features: {
+    get_features_by_entity(entity_id: string): Array<{
+      id: string;
+      title?: string;
+      phase: string;
+      discordWorkRoom?: string;
+    }>;
+  } | null = null;
 
   set_managers(queue: TaskQueue): void {
     this._queue = queue;

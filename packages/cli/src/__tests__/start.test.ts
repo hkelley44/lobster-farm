@@ -55,6 +55,7 @@ describe("resolve_daemon_path", () => {
     existing_paths.add(install_path);
     existing_paths.add(legacy_path);
 
+    // @ts-expect-error — ?t=N query busts bun's module cache between tests
     const { resolve_daemon_path } = await import("../commands/start.js?t=1");
     const result = resolve_daemon_path();
     expect(result).toBe(install_path);
@@ -63,6 +64,7 @@ describe("resolve_daemon_path", () => {
   it("falls back to legacy path when install and walk-up paths do not exist", async () => {
     existing_paths.add(legacy_path);
 
+    // @ts-expect-error — ?t=N query busts bun's module cache between tests
     const { resolve_daemon_path } = await import("../commands/start.js?t=2");
     const result = resolve_daemon_path();
     expect(result).toBe(legacy_path);
@@ -71,6 +73,7 @@ describe("resolve_daemon_path", () => {
   it("returns install path as default when nothing exists on disk", async () => {
     // All paths missing — function returns install_path so the error
     // message points the user to where the daemon should be installed.
+    // @ts-expect-error — ?t=N query busts bun's module cache between tests
     const { resolve_daemon_path } = await import("../commands/start.js?t=3");
     const result = resolve_daemon_path();
     expect(result).toBe(install_path);
