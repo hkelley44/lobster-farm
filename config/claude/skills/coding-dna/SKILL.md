@@ -850,10 +850,12 @@ export default function FundingPage() {
 - Third-party libraries that use hooks (charts, animations, drag-and-drop)
 
 **When NOT to use `"use client"`:**
-- Components that only render props/children
-- Layout shells, wrappers, providers that just compose children
-- Pages that fetch data and pass it down
+- Components that only render props/children (no hooks, no browser APIs)
+- Layout shells and structural wrappers that pass children through unchanged
+- Pages that fetch data server-side and pass it to client children
 - Components that only use server-compatible features
+
+> **Context providers are the exception** — they always need `"use client"` because `createContext` is a client API. The pattern: mark the *provider file* as client, keep the *layout* as server.
 
 #### Data Fetching
 
