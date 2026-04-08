@@ -1,7 +1,9 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readdir } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ArchetypeRole, LobsterFarmConfig, ModelTier } from "@lobster-farm/shared";
 import {
   entity_context_dir,
@@ -148,6 +150,26 @@ export async function build_entity_context(
   return lines.join("\n");
 }
 
+// ── DNA skill loading ──
+
+/** Read DNA skill files and concatenate their content. */
+async function load_dna_content(dna_skills: string[]): Promise<string | null> {
+  const home = homedir();
+  const sections: string[] = [];
+
+  for (const skill of dna_skills) {
+    const skill_path = join(home, ".claude", "skills", skill, "SKILL.md");
+    try {
+      const content = await readFile(skill_path, "utf-8");
+      sections.push(content);
+    } catch {
+      console.log(`[session] DNA skill not found: ${skill_path}`);
+    }
+  }
+
+  return sections.length > 0 ? sections.join("\n\n---\n\n") : null;
+}
+
 // ── Find claude binary ──
 
 function claude_binary(): string {
@@ -203,6 +225,14 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
       this.config,
     );
     args.push("--append-system-prompt", entity_context);
+
+    // Inject DNA skill content into system prompt
+    if (options.dna.length > 0) {
+      const dna_content = await load_dna_content(options.dna);
+      if (dna_content) {
+        args.push("--append-system-prompt", dna_content);
+      }
+    }
 
     // Grant access to entity memory directory
     const ent_dir = entity_dir(this.config.paths, options.entity_id);
