@@ -72,6 +72,7 @@ interface WebhookPR {
   body: string | null;
   user: { login: string };
   merged?: boolean;
+  draft?: boolean;
 }
 
 /** Minimal workflow_run shape from webhook payload. */
@@ -314,9 +315,15 @@ async function route_event(
   }
 
   // Only handle PR events that warrant a review
-  const reviewable_actions = ["opened", "synchronize", "reopened"];
+  const reviewable_actions = ["opened", "synchronize", "reopened", "ready_for_review"];
   if (!reviewable_actions.includes(action)) {
     console.log(`[webhook] Ignoring pull_request.${action} for #${String(pr.number)}`);
+    return;
+  }
+
+  // Skip draft PRs — they're still being worked on
+  if (pr.draft) {
+    console.log(`[webhook] Skipping draft PR #${String(pr.number)}`);
     return;
   }
 

@@ -41,6 +41,7 @@ interface OpenPR {
   url: string;
   body: string;
   author: { login: string };
+  isDraft: boolean;
 }
 
 interface ActiveReview {
@@ -210,7 +211,7 @@ export class PRReviewCron {
           "--state",
           "open",
           "--json",
-          "number,title,headRefName,updatedAt,url,body,author",
+          "number,title,headRefName,updatedAt,url,body,author,isDraft",
         ],
         { cwd: repo_path, env: process.env, timeout: 30_000 },
       );
@@ -238,6 +239,11 @@ export class PRReviewCron {
     if (prs.length === 0) return;
 
     for (const pr of prs) {
+      // Skip draft PRs — builder is still iterating
+      if (pr.isDraft) {
+        continue;
+      }
+
       const key = `${entity_id}:${String(pr.number)}`;
 
       // Skip if already processed — unless PR was updated since our review
