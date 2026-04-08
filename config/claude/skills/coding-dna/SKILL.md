@@ -746,11 +746,17 @@ Before marking a PR as ready, verify:
 # Open draft PR at the start of work
 gh pr create --draft --title "feat: add token market cap backfill" --body "WIP"
 
-# Keep iterating...
-git add -A && git commit -m "fix: handle API rate limits"
+# Keep iterating — stage specific files, not -A
+git add src/api/rate-limit.ts && git commit -m "fix: handle API rate limits"
 git push
 
-# When validated, mark ready (triggers auto-review → auto-merge)
+# When validated, update PR body with full description and issue link
+gh pr edit --body "## Summary
+- Added rate limit handling for external API calls
+
+Closes #123"
+
+# Then mark ready (triggers auto-review → auto-merge)
 gh pr ready
 ```
 
