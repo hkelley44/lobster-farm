@@ -809,11 +809,179 @@ _Brief for now — {{DESIGNER_NAME}} drives the design system. We implement fait
 - **Type everything.** Props interfaces, API response types, utility return types.
 - **No `any`.** Use `unknown` if you truly don't know the type, then narrow it.
 
-### Next.js
+### Next.js 15 (App Router)
 
-- **App Router** (not Pages Router) — server components by default
-- **Server components for data fetching** — client components only when you need interactivity
-- **API routes** for BFF patterns when the Python backend isn't the right fit
+#### Server-First Architecture
+
+Server components are the default. Every component is a server component unless it needs interactivity. This is the single most important pattern in modern Next.js.
+
+**The rule:** Push `"use client"` as far DOWN the component tree as possible. Never at the layout or shell level. A page should be a server component that fetches data and passes it to client children.
+
+```tsx
+// ✅ GOOD — server page, client child
+// app/tools/funding/page.tsx (SERVER)
+import { FundingTable } from "./funding-table";
+
+export default async function FundingPage() {
+  const data = await fetchFundingRates();
+  return <FundingTable data={data} />;
+}
+
+// app/tools/funding/funding-table.tsx (CLIENT)
+"use client";
+export function FundingTable({ data }: { data: FundingRate[] }) {
+  const [sortBy, setSortBy] = useState("rate");
+  // Interactive table with sorting, filtering, etc.
+}
+
+// ❌ BAD — entire page is client
+// app/tools/funding/page.tsx
+"use client";
+export default function FundingPage() {
+  const { data } = useFunding(); // fetches client-side
+  return <table>...</table>;
+}
+```
+
+**When to use `"use client"`:**
+- useState, useEffect, useRef, or any React hook
+- Event handlers (onClick, onChange, onSubmit)
+- Browser APIs (window, document, localStorage)
+- Third-party libraries that use hooks (charts, animations, drag-and-drop)
+
+**When NOT to use `"use client"`:**
+- Components that only render props/children (no hooks, no browser APIs)
+- Layout shells and structural wrappers that pass children through unchanged
+- Pages that fetch data server-side and pass it to client children
+- Components that only use server-compatible features
+
+> **Context providers are the exception** — they always need `"use client"` because `createContext` is a client API. The pattern: mark the *provider file* as client, keep the *layout* as server.
+
+#### Data Fetching
+
+**Server components fetch data directly — no useEffect, no TanStack Query needed:**
+
+```tsx
+// Server component — fetch happens at request time, no client JS
+export default async function DashboardPage() {
+  const metrics = await fetch("https://api.example.com/metrics", {
+    next: { revalidate: 60 }, // ISR: revalidate every 60 seconds
+  });
+  return <Dashboard data={await metrics.json()} />;
+}
+```
+
+**Use TanStack Query only in client components that need:**
+- Real-time polling (refetchInterval)
+- Optimistic updates
+- Infinite scroll / pagination with client state
+- User-triggered refetches
+
+**Data fetching decision tree:**
+1. Can this data be fetched at build time? → `generateStaticParams` + static rendering
+2. Can it be fetched at request time on the server? → Server component + `fetch()`
+3. Does it need real-time updates? → Client component + TanStack Query or WebSocket
+4. Is it user-triggered (search, filter)? → Client component + TanStack Query
+
+#### Loading & Error States
+
+**Always provide loading and error boundaries:**
+
+```
+app/
+  tools/
+    funding/
+      page.tsx        # Server component
+      loading.tsx      # Instant loading skeleton (shown while page.tsx streams)
+      error.tsx        # Error boundary with retry
+      funding-table.tsx # Client component for interactivity
+```
+
+```tsx
+// loading.tsx — shown immediately while the server component fetches
+import { Skeleton } from "@/components/ui/skeleton";
+
+export default function Loading() {
+  return (
+    <div className="space-y-4">
+      <Skeleton className="h-8 w-48" />
+      <Skeleton className="h-[400px] w-full" />
+    </div>
+  );
+}
+
+// error.tsx — must be "use client"
+"use client";
+
+export default function Error({
+  error,
+  reset,
+}: {
+  error: Error;
+  reset: () => void;
+}) {
+  return (
+    <div>
+      <h2>Something went wrong</h2>
+      <button onClick={reset}>Try again</button>
+    </div>
+  );
+}
+```
+
+**Use Suspense boundaries for granular loading within a page:**
+
+```tsx
+import { Suspense } from "react";
+
+export default function DashboardPage() {
+  return (
+    <div>
+      <h1>Dashboard</h1>
+      <Suspense fallback={<MetricsSkeleton />}>
+        <Metrics />  {/* async server component */}
+      </Suspense>
+      <Suspense fallback={<ChartSkeleton />}>
+        <RecentActivity />  {/* async server component */}
+      </Suspense>
+    </div>
+  );
+}
+```
+
+#### Caching
+
+**Three caching layers — use all of them:**
+
+1. **Server-side fetch cache** — `fetch()` in server components auto-deduplicates. Add `next: { revalidate: N }` for time-based revalidation.
+2. **Route handler headers** — Set `Cache-Control` on API responses for browser/CDN caching:
+   ```tsx
+   return NextResponse.json(data, {
+     headers: { "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300" },
+   });
+   ```
+3. **Client cache (TanStack Query)** — For client components only. Set appropriate `staleTime` and `gcTime`.
+
+#### Real-Time Data
+
+- **WebSocket or SSE** for truly live data (prices, order updates, streaming feeds). Do not poll at <10s intervals — that's expensive and wasteful.
+- **Polling (refetchInterval)** is fine for slow-changing data (>30s intervals) or when WebSocket infrastructure isn't available.
+- **Server-Sent Events (SSE)** are simpler than WebSocket when you only need server→client push.
+
+#### Component Boundaries
+
+```
+// Layout of a well-structured page:
+
+ServerLayout (server)
+  └── ServerPage (server) — fetches data
+        ├── StaticHeader (server) — just renders props
+        ├── InteractiveTable (client) — needs sorting, filtering
+        │     └── TableRow (server-compatible) — no hooks needed
+        └── Chart (client) — needs refs, WebSocket
+```
+
+Never mark a layout, shell, or wrapper as `"use client"`. If the shell needs one interactive element (e.g., a hamburger menu), extract that element into its own client component and keep the shell as a server component.
 
 ### Styling
 

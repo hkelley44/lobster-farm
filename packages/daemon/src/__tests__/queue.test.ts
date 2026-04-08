@@ -14,6 +14,19 @@ function make_config(overrides?: Record<string, unknown>): LobsterFarmConfig {
   });
 }
 
+/** Poll until predicate is true (avoids flaky setTimeout-based waits on slow CI). */
+async function wait_for(
+  predicate: () => boolean,
+  timeout_ms = 5000,
+  interval_ms = 25,
+): Promise<void> {
+  const deadline = Date.now() + timeout_ms;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("wait_for timed out");
+    await new Promise((r) => setTimeout(r, interval_ms));
+  }
+}
+
 describe("TaskQueue", () => {
   let tmp: string;
 
@@ -107,8 +120,8 @@ describe("TaskQueue", () => {
       });
     }
 
-    // Give spawning a moment
-    await new Promise((r) => setTimeout(r, 100));
+    // Wait for processes to spawn and fill active slots
+    await wait_for(() => queue.get_stats().active === 2);
 
     const stats = queue.get_stats();
     // Only 2 should be active, 2 should be pending
@@ -152,7 +165,7 @@ describe("TaskQueue", () => {
     }
 
     // Wait for all 3 to complete (mock exits immediately, queue chains them)
-    await new Promise((r) => setTimeout(r, 1000));
+    await wait_for(() => completed === 3);
 
     expect(completed).toBe(3);
     expect(queue.get_stats().active).toBe(0);
@@ -196,7 +209,7 @@ describe("TaskQueue", () => {
       worktree_path: tmp,
     });
 
-    await new Promise((r) => setTimeout(r, 100));
+    await wait_for(() => queue.get_stats().active === 1);
     expect(queue.get_stats().pending).toBe(1);
 
     // Cancel the queued task
@@ -237,7 +250,7 @@ describe("TaskQueue", () => {
       worktree_path: tmp,
     });
 
-    await new Promise((r) => setTimeout(r, 50));
+    await wait_for(() => queue.get_stats().active === 1);
 
     // These 3 will queue (slot is full)
     queue.submit({

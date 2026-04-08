@@ -14,6 +14,19 @@ function make_config(overrides?: Record<string, unknown>): LobsterFarmConfig {
   });
 }
 
+/** Poll until predicate is true (avoids flaky setTimeout-based waits on slow CI). */
+async function wait_for(
+  predicate: () => boolean,
+  timeout_ms = 5000,
+  interval_ms = 25,
+): Promise<void> {
+  const deadline = Date.now() + timeout_ms;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("wait_for timed out");
+    await new Promise((r) => setTimeout(r, interval_ms));
+  }
+}
+
 describe("Queue depth enforcement", () => {
   let tmp: string;
 
@@ -54,8 +67,7 @@ describe("Queue depth enforcement", () => {
 
       // Task 1: goes active (slot available)
       queue.submit(make_submission(1));
-      await new Promise((r) => setTimeout(r, 50));
-      expect(queue.get_stats().active).toBe(1);
+      await wait_for(() => queue.get_stats().active === 1);
       expect(queue.get_stats().pending).toBe(0);
 
       // Task 2: queues (1/2 pending slots)
@@ -110,16 +122,15 @@ describe("Queue depth enforcement", () => {
 
       // Submit first task (goes active), second queues (1/1 pending), third should fail
       queue.submit(make_submission(1));
-      await new Promise((r) => setTimeout(r, 50));
+      await wait_for(() => queue.get_stats().active === 1);
 
       queue.submit(make_submission(2));
       expect(() => queue.submit(make_submission(3))).toThrow(QueueFullError);
 
-      // Wait for tasks to complete
-      await new Promise((r) => setTimeout(r, 1000));
+      // Wait for all tasks to drain (mock-claude-fast exits immediately)
+      await wait_for(() => queue.get_stats().pending === 0 && queue.get_stats().active === 0);
 
       // Queue should be empty now — new submissions should work
-      expect(queue.get_stats().pending).toBe(0);
       expect(() => queue.submit(make_submission(4))).not.toThrow();
     });
 
@@ -148,7 +159,7 @@ describe("Queue depth enforcement", () => {
         worktree_path: tmp,
       });
 
-      await new Promise((r) => setTimeout(r, 50));
+      await wait_for(() => queue.get_stats().active === 1);
       // First task should go active
       expect(queue.pending_count).toBe(0);
 

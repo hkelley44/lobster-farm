@@ -14,6 +14,19 @@ function make_config(overrides?: Partial<LobsterFarmConfig>): LobsterFarmConfig 
   });
 }
 
+/** Poll until predicate is true (avoids race conditions on slow CI). */
+async function wait_for(
+  predicate: () => boolean,
+  timeout_ms = 5000,
+  interval_ms = 25,
+): Promise<void> {
+  const deadline = Date.now() + timeout_ms;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("wait_for timed out");
+    await new Promise((r) => setTimeout(r, interval_ms));
+  }
+}
+
 describe("build_model_flags", () => {
   it("maps opus/high to correct flags", () => {
     const flags = build_model_flags({ model: "opus", think: "high" });
@@ -264,8 +277,9 @@ describe("ClaudeSessionManager", () => {
       expect(mgr.get_by_feature("alpha-42")).toBeTruthy();
       expect(mgr.get_by_feature("alpha-99")).toBeNull();
 
-      // Clean up
+      // Clean up — kill sends SIGTERM; session map cleanup is async
       await mgr.kill(session.session_id);
+      await wait_for(() => mgr.get_active().length === 0);
       expect(mgr.get_active()).toHaveLength(0);
 
       delete process.env.CLAUDE_BIN;
