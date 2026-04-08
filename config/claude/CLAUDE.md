@@ -32,7 +32,9 @@ The LobsterFarm daemon sets up your environment before you wake up — you're al
 1. Read the entity's `MEMORY.md` for accumulated project knowledge (path provided in entity CLAUDE.md)
 2. Check `daily/` logs (today + yesterday) for recent context
 3. If working on a feature: read the GitHub issue spec
-4. Load relevant DNA skills based on your task
+4. Load DNA skills:
+   - **Always** load your primary DNA (see The Team table below)
+   - Load additional DNA based on task context (e.g., database-dna for schema work, design-dna when implementing designs)
 
 ---
 
@@ -41,7 +43,7 @@ The LobsterFarm daemon sets up your environment before you wake up — you're al
 ### Reading
 - **Entity MEMORY.md** — long-term curated knowledge for this project. Read every session.
 - **Daily logs** (today + yesterday) — recent session context.
-- DNA skills are auto-loaded based on task matching. You can also explicitly invoke them.
+- Your primary DNA skill is mandatory every session. Additional DNA loads based on task context.
 
 ### Writing
 - **Session learnings, progress, decisions** → `daily/YYYY-MM-DD.md` in the entity's memory directory
