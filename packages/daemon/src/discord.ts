@@ -1138,7 +1138,8 @@ export class DiscordBot extends EventEmitter {
   private _pool: BotPool | null = null;
 
   set_managers(_queue: TaskQueue): void {
-    console.debug("[discord] set_managers called — queue wiring deferred (TODO)");
+    // Queue wiring deferred — will be used for slash-command task submission
+    console.debug("[discord] set_managers called — queue wiring not yet implemented");
   }
 
   set_pool(pool: BotPool): void {
