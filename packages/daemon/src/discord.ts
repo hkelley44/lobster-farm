@@ -158,6 +158,10 @@ export function format_relative_time(iso: string): string {
 interface ChannelEntry {
   entity_id: string;
   channel_type: ChannelType;
+  /** Feature ID assigned to this work room (set by /open, cleared by /close). */
+  assigned_feature?: string | null;
+  /** Human-readable purpose from entity config (e.g., "aws", "io-site"). */
+  purpose?: string;
 }
 
 // ── Command target abstraction ──
@@ -1131,12 +1135,11 @@ export class DiscordBot extends EventEmitter {
     );
   }
 
-  /** Set reference to queue for command handling. */
-  // @ts-expect-error — reserved for future use; assigned via set_managers()
-  private _queue: TaskQueue | null = null;
   private _pool: BotPool | null = null;
-  set_managers(queue: TaskQueue): void {
-    this._queue = queue;
+
+  set_managers(_queue: TaskQueue): void {
+    // Queue wiring deferred — will be used for slash-command task submission
+    console.debug("[discord] set_managers called — queue wiring not yet implemented");
   }
 
   set_pool(pool: BotPool): void {

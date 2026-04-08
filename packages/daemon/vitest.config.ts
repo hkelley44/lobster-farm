@@ -2,8 +2,8 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    // Integration tests spawn real processes (mock claude scripts)
-    // which need more time on CI runners than the default 5s
-    testTimeout: 15_000,
+    // Tests spawn real subprocesses (mock Claude scripts with sleep).
+    // Default 5s is too tight on CI runners where process startup is slower.
+    testTimeout: 20_000,
   },
 });
