@@ -158,7 +158,6 @@ export function format_relative_time(iso: string): string {
 interface ChannelEntry {
   entity_id: string;
   channel_type: ChannelType;
-  assigned_feature?: string;
 }
 
 // ── Command target abstraction ──
@@ -1136,16 +1135,6 @@ export class DiscordBot extends EventEmitter {
   // @ts-expect-error — reserved for future use; assigned via set_managers()
   private _queue: TaskQueue | null = null;
   private _pool: BotPool | null = null;
-  /** Feature lifecycle manager — wired up when features module is ready. */
-  private _features: {
-    get_features_by_entity(entity_id: string): Array<{
-      id: string;
-      title?: string;
-      phase: string;
-      discordWorkRoom?: string;
-    }>;
-  } | null = null;
-
   set_managers(queue: TaskQueue): void {
     this._queue = queue;
   }
@@ -1877,14 +1866,12 @@ export class DiscordBot extends EventEmitter {
   }
 
   /**
-   * /close [force:true]
+   * /close
    * Archives the current work room's session and deletes the channel.
    * Only works in work_room channels.
-   * If there's an active feature lifecycle in this room, warns the user
-   * and requires --force to proceed.
    */
   private async handle_close_command(
-    args: string[],
+    _args: string[],
     routed: RoutedMessage,
     target: CommandTarget,
   ): Promise<void> {
@@ -1907,22 +1894,6 @@ export class DiscordBot extends EventEmitter {
     if (!channel_entry) {
       await target.reply("Channel not found in entity config.");
       return;
-    }
-
-    // Guard: warn if there's an active feature lifecycle in this room
-    if (this._features) {
-      const active_features = this._features
-        .get_features_by_entity(routed.entity_id)
-        .filter(
-          (f) => f.discordWorkRoom === channel_id && !["done", "cancelled"].includes(f.phase),
-        );
-      if (active_features.length > 0 && !args.includes("--force")) {
-        const title = active_features[0]!.title ?? active_features[0]!.id;
-        await target.reply(
-          `This room has an active feature (**${title}**). Close anyway? Use \`/close\` with the \`force\` option.`,
-        );
-        return;
-      }
     }
 
     // Determine the room name from the purpose field or the channel name
@@ -2152,7 +2123,6 @@ export class DiscordBot extends EventEmitter {
       content: "",
       author: interaction.user.tag,
       channel_id: interaction.channelId,
-      assigned_feature: entry?.assigned_feature,
     };
 
     // Extract args from interaction options, mapping to the same
