@@ -1020,7 +1020,7 @@ export class BotPool extends EventEmitter {
    * default for eviction checks: we'd rather evict a bot we can't observe than
    * refuse to evict when the pool is exhausted.
    */
-  protected is_bot_idle(bot: PoolBot): boolean {
+  is_bot_idle(bot: PoolBot): boolean {
     try {
       const output = execFileSync("tmux", ["capture-pane", "-t", bot.tmux_session, "-p"], {
         encoding: "utf-8",
