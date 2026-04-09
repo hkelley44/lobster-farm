@@ -803,10 +803,10 @@ export class DiscordBot extends EventEmitter {
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = (lines[i] ?? "").trim();
         if (!line.includes("⏺")) continue;
-        // Match "⏺ bob(description)" or "⏺ Agent(name)" patterns
-        const agent_line_match = line.match(/⏺\s+(\w+)\(/);
-        if (agent_line_match?.[1] && agent_line_match[1] !== "Agent") {
-          subagent_name = agent_line_match[1];
+        // Match "⏺ Agent(name)" to extract the spawned agent name
+        const agent_spawn_match = line.match(/⏺\s+Agent\((\w+)/);
+        if (agent_spawn_match?.[1]) {
+          subagent_name = agent_spawn_match[1];
           break;
         }
         if (line.includes("Agent")) {
@@ -826,7 +826,7 @@ export class DiscordBot extends EventEmitter {
     }
 
     // Find the last ⏺ line for current status + extract detail
-    let status = thinking_status === "thinking" ? "Thinking..." : "Starting...";
+    let status = "Thinking...";
     let detail: string | null = null;
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = (lines[i] ?? "").trim();
