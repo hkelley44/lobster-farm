@@ -645,6 +645,7 @@ export class DiscordBot extends EventEmitter {
     const interval = setInterval(() => {
       if (!this._pool) {
         this.stop_typing_loop(channel_id);
+        void this.finalize_status_embed(channel_id);
         return;
       }
 
@@ -703,7 +704,7 @@ export class DiscordBot extends EventEmitter {
     // Find the last activity line (last ⏺ line) for current status
     let status = "Thinking...";
     for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
+      const line = (lines[i] ?? "").trim();
       if (!line.includes("⏺")) continue;
 
       // Extract the tool name from the line
@@ -766,7 +767,7 @@ export class DiscordBot extends EventEmitter {
    * Send a status embed to a channel showing the agent is working.
    * Stores the message ID so we can edit it when the agent finishes.
    */
-  async send_status_embed(channel_id: string, archetype: string): Promise<void> {
+  async send_status_embed(channel_id: string, archetype: ArchetypeRole | "system"): Promise<void> {
     if (!this.connected) return;
 
     // Don't stack embeds — finalize any existing one first
@@ -774,7 +775,7 @@ export class DiscordBot extends EventEmitter {
       await this.finalize_status_embed(channel_id);
     }
 
-    const identity = this.resolve_agent_identity(archetype as ArchetypeRole);
+    const identity = this.resolve_agent_identity(archetype);
     const now = Date.now();
 
     const entry = {
@@ -820,7 +821,7 @@ export class DiscordBot extends EventEmitter {
       if (status === entry.last_status && tool_count === entry.tool_count) return;
 
       entry.last_status = status;
-      entry.tool_count = tool_count;
+      entry.tool_count = Math.max(entry.tool_count, tool_count);
 
       const embed = this.build_working_embed(entry);
 
