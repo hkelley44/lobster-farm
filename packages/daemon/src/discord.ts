@@ -32,6 +32,7 @@ import {
   type TextChannel,
   type Webhook,
 } from "discord.js";
+import { PAT_TMUX_SESSION } from "./commander-process.js";
 import { is_tmux_session_idle } from "./pool.js";
 import type { BotPool, PoolBot } from "./pool.js";
 import type { TaskQueue } from "./queue.js";
@@ -726,7 +727,7 @@ export class DiscordBot extends EventEmitter {
     // Don't stack loops for the same channel
     if (this.typing_loops.has(channel_id)) return;
 
-    const TMUX_SESSION = "pat";
+    const TMUX_SESSION = PAT_TMUX_SESSION;
 
     // Fire immediately, then repeat
     void this.send_typing(channel_id);

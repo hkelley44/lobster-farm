@@ -19,7 +19,7 @@ export interface CommanderHealth {
   tmux_session: string;
 }
 
-const TMUX_SESSION = "pat";
+export const PAT_TMUX_SESSION = "pat";
 const BACKOFF_SCHEDULE = [0, 5_000, 15_000, 60_000, 300_000];
 const BACKOFF_RESET_MS = 10 * 60 * 1000; // 10 min stable → reset counter
 const MAX_RESTARTS = 5;
@@ -82,7 +82,7 @@ export class CommanderProcess extends EventEmitter {
   /** Check if the tmux session is alive. */
   private is_tmux_alive(): boolean {
     try {
-      execFileSync("tmux", ["has-session", "-t", TMUX_SESSION], {
+      execFileSync("tmux", ["has-session", "-t", PAT_TMUX_SESSION], {
         stdio: "ignore",
       });
       return true;
@@ -94,9 +94,13 @@ export class CommanderProcess extends EventEmitter {
   /** Get the PID of the main process inside the tmux session. */
   private get_tmux_pid(): number | null {
     try {
-      const out = execFileSync("tmux", ["list-panes", "-t", TMUX_SESSION, "-F", "#{pane_pid}"], {
-        encoding: "utf-8",
-      }).trim();
+      const out = execFileSync(
+        "tmux",
+        ["list-panes", "-t", PAT_TMUX_SESSION, "-F", "#{pane_pid}"],
+        {
+          encoding: "utf-8",
+        },
+      ).trim();
       const pid = Number.parseInt(out, 10);
       return Number.isNaN(pid) ? null : pid;
     } catch {
@@ -119,7 +123,7 @@ export class CommanderProcess extends EventEmitter {
     // Kill any stale tmux session
     if (this.is_tmux_alive()) {
       try {
-        execFileSync("tmux", ["kill-session", "-t", TMUX_SESSION], {
+        execFileSync("tmux", ["kill-session", "-t", PAT_TMUX_SESSION], {
           stdio: "ignore",
         });
       } catch {
@@ -165,7 +169,7 @@ export class CommanderProcess extends EventEmitter {
 
     const claude_cmd = claude_args.join(" ");
 
-    console.log(`[commander] Starting ${agent_name} in tmux session "${TMUX_SESSION}"...`);
+    console.log(`[commander] Starting ${agent_name} in tmux session "${PAT_TMUX_SESSION}"...`);
 
     // Create a detached tmux session running Claude Code.
     // DISCORD_STATE_DIR is set so the channel plugin reads from the right dir.
@@ -175,7 +179,7 @@ export class CommanderProcess extends EventEmitter {
         "new-session",
         "-d",
         "-s",
-        TMUX_SESSION,
+        PAT_TMUX_SESSION,
         "-x",
         "200",
         "-y",
@@ -214,7 +218,7 @@ export class CommanderProcess extends EventEmitter {
         // Auto-accept it after a brief delay for the UI to render.
         setTimeout(() => {
           try {
-            execFileSync("tmux", ["send-keys", "-t", TMUX_SESSION, "Enter"], {
+            execFileSync("tmux", ["send-keys", "-t", PAT_TMUX_SESSION, "Enter"], {
               stdio: "ignore",
             });
           } catch {
@@ -333,7 +337,7 @@ export class CommanderProcess extends EventEmitter {
     if (this.is_tmux_alive()) {
       console.log("[commander] Stopping tmux session...");
       try {
-        execFileSync("tmux", ["kill-session", "-t", TMUX_SESSION], {
+        execFileSync("tmux", ["kill-session", "-t", PAT_TMUX_SESSION], {
           stdio: "ignore",
         });
       } catch {
@@ -358,7 +362,7 @@ export class CommanderProcess extends EventEmitter {
           : null,
       restart_count: this.restart_count,
       last_started_at: this.last_started_at?.toISOString() ?? null,
-      tmux_session: TMUX_SESSION,
+      tmux_session: PAT_TMUX_SESSION,
     };
   }
 }
