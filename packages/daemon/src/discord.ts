@@ -467,7 +467,16 @@ export class DiscordBot extends EventEmitter {
   /** Active typing indicator intervals keyed by channel ID. */
   private typing_loops = new Map<string, NodeJS.Timeout>();
   /** Active status embeds keyed by channel ID. */
-  private status_embeds = new Map<string, { message_id: string; start_time: number }>();
+  private status_embeds = new Map<
+    string,
+    {
+      message_id: string;
+      start_time: number;
+      last_status: string;
+      tool_count: number;
+      agent_name: string;
+    }
+  >();
 
   constructor(
     private config: LobsterFarmConfig,
@@ -552,7 +561,7 @@ export class DiscordBot extends EventEmitter {
   async disconnect(): Promise<void> {
     if (this.connected) {
       console.log("[discord] Disconnecting...");
-      this.stop_all_typing_loops();
+      await this.stop_all_typing_loops();
       sentry.addBreadcrumb({
         category: "daemon.lifecycle",
         message: "Discord disconnecting",
@@ -647,6 +656,9 @@ export class DiscordBot extends EventEmitter {
       }
 
       void this.send_typing(channel_id);
+
+      // Parse tmux output and update the status embed if activity changed
+      void this.update_status_embed_from_tmux(channel_id, bot);
     }, 8000);
 
     this.typing_loops.set(channel_id, interval);
@@ -662,15 +674,93 @@ export class DiscordBot extends EventEmitter {
   }
 
   /** Stop all typing loops (e.g. on disconnect). */
-  stop_all_typing_loops(): void {
+  async stop_all_typing_loops(): Promise<void> {
+    const finalizations: Promise<void>[] = [];
     for (const [channel_id, interval] of this.typing_loops) {
       clearInterval(interval);
       this.typing_loops.delete(channel_id);
-      void this.finalize_status_embed(channel_id);
+      finalizations.push(this.finalize_status_embed(channel_id));
     }
+    await Promise.allSettled(finalizations);
   }
 
   // ── Status embeds ──
+
+  /**
+   * Parse Claude Code tmux output to extract current activity and tool count.
+   * Looks for patterns like "⏺ Read(...)", "⏺ Edit(...)", "⏺ Bash(...)", "⏺ Agent(...)".
+   */
+  private parse_tmux_activity(tmux_output: string): {
+    status: string;
+    tool_count: number;
+  } {
+    const lines = tmux_output.split("\n");
+
+    // Count tool use lines (⏺ markers)
+    const tool_lines = lines.filter((l) => l.includes("⏺"));
+    const tool_count = tool_lines.length;
+
+    // Find the last activity line (last ⏺ line) for current status
+    let status = "Thinking...";
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line.includes("⏺")) continue;
+
+      // Extract the tool name from the line
+      if (line.includes("Read") || line.includes("read")) {
+        status = "Reading files";
+      } else if (line.includes("Edit") || line.includes("Wrote to")) {
+        status = "Editing code";
+      } else if (line.includes("Write")) {
+        status = "Writing files";
+      } else if (line.includes("Bash")) {
+        status = "Running commands";
+      } else if (line.includes("Agent")) {
+        status = "Spawning subagent";
+      } else if (line.includes("Grep") || line.includes("Glob")) {
+        status = "Searching codebase";
+      } else if (line.includes("WebSearch") || line.includes("WebFetch")) {
+        status = "Searching the web";
+      } else if (line.includes("discord") && line.includes("reply")) {
+        status = "Composing reply";
+      } else if (line.includes("MCP")) {
+        status = "Using tools";
+      } else {
+        status = "Working...";
+      }
+      break;
+    }
+
+    return { status, tool_count };
+  }
+
+  /** Format elapsed seconds as a human-readable duration. */
+  private format_duration(seconds: number): string {
+    if (seconds < 60) return `${String(seconds)}s`;
+    return `${String(Math.floor(seconds / 60))}m ${String(seconds % 60)}s`;
+  }
+
+  /**
+   * Build a working-state embed for the given tracking entry.
+   */
+  private build_working_embed(entry: {
+    agent_name: string;
+    last_status: string;
+    tool_count: number;
+    start_time: number;
+  }): EmbedBuilder {
+    const elapsed = Math.round((Date.now() - entry.start_time) / 1000);
+    const parts = [`**${entry.agent_name}** — Working`];
+    parts.push(`Status: ${entry.last_status}`);
+    if (entry.tool_count > 0) {
+      parts.push(
+        `${String(entry.tool_count)} tool ${entry.tool_count === 1 ? "use" : "uses"} · ${this.format_duration(elapsed)}`,
+      );
+    } else {
+      parts.push(this.format_duration(elapsed));
+    }
+    return new EmbedBuilder().setColor(0xf59e0b).setDescription(parts.join("\n"));
+  }
 
   /**
    * Send a status embed to a channel showing the agent is working.
@@ -687,23 +777,60 @@ export class DiscordBot extends EventEmitter {
     const identity = this.resolve_agent_identity(archetype as ArchetypeRole);
     const now = Date.now();
 
-    const embed = new EmbedBuilder()
-      .setColor(0xf59e0b) // amber
-      .setDescription(`**${identity.name}** is working on it...`);
+    const entry = {
+      message_id: "",
+      start_time: now,
+      last_status: "Starting...",
+      tool_count: 0,
+      agent_name: identity.name,
+    };
 
-    if (identity.avatar_url) {
-      embed.setThumbnail(identity.avatar_url);
-    }
+    const embed = this.build_working_embed(entry);
 
     try {
       const channel = await this.client.channels.fetch(channel_id);
       if (!channel?.isTextBased()) return;
 
       const msg = await (channel as TextChannel).send({ embeds: [embed] });
-      this.status_embeds.set(channel_id, { message_id: msg.id, start_time: now });
+      entry.message_id = msg.id;
+      this.status_embeds.set(channel_id, entry);
     } catch (err) {
       // Best-effort — don't let embed failures break message handling
       console.error(`[discord] Failed to send status embed: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Parse tmux output from a bot and update the status embed if activity changed.
+   * Called from the typing loop every 8 seconds.
+   */
+  private async update_status_embed_from_tmux(channel_id: string, bot: PoolBot): Promise<void> {
+    const entry = this.status_embeds.get(channel_id);
+    if (!entry) return;
+
+    try {
+      const output = execFileSync("tmux", ["capture-pane", "-t", bot.tmux_session, "-p"], {
+        encoding: "utf-8",
+        timeout: 2000,
+      });
+
+      const { status, tool_count } = this.parse_tmux_activity(output);
+
+      // Only edit if something actually changed
+      if (status === entry.last_status && tool_count === entry.tool_count) return;
+
+      entry.last_status = status;
+      entry.tool_count = tool_count;
+
+      const embed = this.build_working_embed(entry);
+
+      const channel = await this.client.channels.fetch(channel_id);
+      if (!channel?.isTextBased()) return;
+
+      const msg = await (channel as TextChannel).messages.fetch(entry.message_id);
+      await msg.edit({ embeds: [embed] });
+    } catch {
+      // Best-effort — tmux read or Discord edit failure is non-fatal
     }
   }
 
@@ -716,23 +843,16 @@ export class DiscordBot extends EventEmitter {
     this.status_embeds.delete(channel_id);
 
     const elapsed = Math.round((Date.now() - entry.start_time) / 1000);
-    const duration =
-      elapsed < 60
-        ? `${String(elapsed)}s`
-        : `${String(Math.floor(elapsed / 60))}m ${String(elapsed % 60)}s`;
+    const duration = this.format_duration(elapsed);
 
-    // Look up the agent for this channel
-    let agent_name = "Agent";
-    if (this._pool) {
-      const bot = this._pool.get_assignment(channel_id);
-      if (bot?.archetype) {
-        agent_name = this.resolve_agent_identity(bot.archetype as ArchetypeRole).name;
-      }
+    const parts = [`**${entry.agent_name}** — Done`];
+    if (entry.tool_count > 0) {
+      parts.push(`${String(entry.tool_count)} tool uses · ${duration}`);
+    } else {
+      parts.push(duration);
     }
 
-    const embed = new EmbedBuilder()
-      .setColor(0x10b981) // green
-      .setDescription(`**${agent_name}** finished — took ${duration}`);
+    const embed = new EmbedBuilder().setColor(0x10b981).setDescription(parts.join("\n"));
 
     try {
       const channel = await this.client.channels.fetch(channel_id);
