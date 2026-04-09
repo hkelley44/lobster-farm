@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
@@ -66,6 +66,15 @@ export class CommanderProcess extends EventEmitter {
   /** Persist the session_id so future restarts can resume. */
   private async write_session_id(session_id: string): Promise<void> {
     await writeFile(this.session_state_path(), JSON.stringify({ session_id }, null, 2), "utf-8");
+  }
+
+  /** Clear persisted session state so the next startup begins fresh. */
+  private async clear_session_id(): Promise<void> {
+    try {
+      await unlink(this.session_state_path());
+    } catch {
+      /* ignore — file may not exist */
+    }
   }
 
   /** Check if Pat's bot token is configured. */
@@ -306,6 +315,9 @@ export class CommanderProcess extends EventEmitter {
           tags: { module: "commander" },
         },
       );
+      // Clear persisted session so the next daemon startup gets a fresh session
+      // instead of re-entering a resume loop on an expired session ID.
+      void this.clear_session_id().catch(() => {});
       this.emit("gave_up", this.restart_count);
       return;
     }

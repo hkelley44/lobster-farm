@@ -1560,7 +1560,10 @@ export class DiscordBot extends EventEmitter {
     // Commander (Pat) handles #command-center via its own Discord bot.
     // The daemon's bot sees user messages there too — start typing + status
     // embeds so the user gets visual feedback while Pat processes.
-    if (!entry && this.command_center_channel_id === message.channelId) {
+    // Lazily resolve the channel ID if it hasn't been cached yet (covers the
+    // narrow window between bot ready and the async find_command_center_channel).
+    const cc_id = this.command_center_channel_id ?? (await this.find_command_center_channel());
+    if (!entry && cc_id === message.channelId) {
       this.start_commander_typing_loop(message.channelId);
       void this.send_status_embed(message.channelId, "commander");
       return;
