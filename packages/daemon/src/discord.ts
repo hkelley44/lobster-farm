@@ -708,7 +708,7 @@ export class DiscordBot extends EventEmitter {
       if (!line.includes("⏺")) continue;
 
       // Extract the tool name from the line
-      if (line.includes("Read") || line.includes("read")) {
+      if (line.includes("Read")) {
         status = "Reading files";
       } else if (line.includes("Edit") || line.includes("Wrote to")) {
         status = "Editing code";
@@ -786,17 +786,24 @@ export class DiscordBot extends EventEmitter {
       agent_name: identity.name,
     };
 
+    // Claim the slot BEFORE the async send to prevent concurrent calls from
+    // both posting embeds for the same channel (the second caller will see
+    // the entry and finalize it instead of creating a duplicate).
+    this.status_embeds.set(channel_id, entry);
+
     const embed = this.build_working_embed(entry);
 
     try {
       const channel = await this.client.channels.fetch(channel_id);
-      if (!channel?.isTextBased()) return;
+      if (!channel?.isTextBased()) {
+        this.status_embeds.delete(channel_id);
+        return;
+      }
 
       const msg = await (channel as TextChannel).send({ embeds: [embed] });
-      entry.message_id = msg.id;
-      this.status_embeds.set(channel_id, entry);
+      entry.message_id = msg.id; // update in-place; map already has the ref
     } catch (err) {
-      // Best-effort — don't let embed failures break message handling
+      this.status_embeds.delete(channel_id); // clean up on failure
       console.error(`[discord] Failed to send status embed: ${String(err)}`);
     }
   }
@@ -807,7 +814,7 @@ export class DiscordBot extends EventEmitter {
    */
   private async update_status_embed_from_tmux(channel_id: string, bot: PoolBot): Promise<void> {
     const entry = this.status_embeds.get(channel_id);
-    if (!entry) return;
+    if (!entry?.message_id) return; // not yet sent or already finalized
 
     try {
       const output = execFileSync("tmux", ["capture-pane", "-t", bot.tmux_session, "-p"], {
@@ -842,6 +849,7 @@ export class DiscordBot extends EventEmitter {
     const entry = this.status_embeds.get(channel_id);
     if (!entry) return;
     this.status_embeds.delete(channel_id);
+    if (!entry.message_id) return; // embed was claimed but never sent — nothing to edit
 
     const elapsed = Math.round((Date.now() - entry.start_time) / 1000);
     const duration = this.format_duration(elapsed);
