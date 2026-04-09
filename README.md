@@ -29,6 +29,14 @@ lf init
 
 **Prerequisites:** Node.js 22+, pnpm, Claude Code, 1Password CLI
 
+## Pre-commit Hooks
+
+The repo uses [Husky](https://typicode.github.io/husky/) + [lint-staged](https://github.com/lint-staged/lint-staged) to enforce Biome lint/format checks before each commit. Hooks are installed automatically via the `prepare` script when you run `pnpm install`.
+
+Staged files matching `*.{ts,tsx,js,jsx,json,jsonc}` are run through `biome check --write`, which auto-fixes formatting and lint issues before the commit goes through. If Biome finds unfixable errors, the commit is blocked.
+
+The `--relative` flag is used in the hook to pass relative paths to Biome, which is required for compatibility with git worktrees (Biome's `files.ignore` patterns match against absolute paths).
+
 ## Usage
 
 ```bash
