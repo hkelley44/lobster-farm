@@ -432,10 +432,17 @@ export async function check_ci_status(
       pending: has_pending,
       failures,
     };
-  } catch {
-    // gh pr checks command failed — could be rate limit, auth error, or network issue.
-    // Treat as pending to avoid bypassing CI gates on infrastructure failures.
-    // pr-cron will retry on the next cycle.
+  } catch (err: unknown) {
+    // `gh pr checks --required` exits non-zero when no required checks exist,
+    // with stderr like "no required checks reported". That's not an error — it
+    // means the repo has no CI configured, so the PR is mergeable.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/no.*checks?\s+reported/i.test(msg)) {
+      return { passed: true, pending: false, failures: [] };
+    }
+
+    // Genuine failure (rate limit, auth, network) — treat as pending so we
+    // don't bypass CI gates on infrastructure errors. pr-cron will retry.
     return { passed: false, pending: true, failures: [] };
   }
 }

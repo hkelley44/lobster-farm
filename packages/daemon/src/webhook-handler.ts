@@ -532,10 +532,48 @@ async function handle_review_completion(
       const ci = await check_ci_status(pr.number, repo_path, gh_token);
 
       if (ci.pending) {
-        console.log(
-          `[webhook] CI checks pending for PR #${String(pr.number)} — skipping merge, pr-cron retry pass will handle`,
-        );
-        // Don't merge yet — pr-cron's retry_approved_unmerged pass will check CI and merge next cycle
+        const pr_cron_enabled = ctx.config.pr_cron?.enabled !== false;
+
+        if (pr_cron_enabled) {
+          console.log(
+            `[webhook] CI checks pending for PR #${String(pr.number)} — skipping merge, pr-cron retry pass will handle`,
+          );
+        } else {
+          // pr-cron is disabled — no retry will happen. Attempt merge immediately
+          // in case the "pending" is a false positive (e.g. stale check state).
+          console.log(
+            `[webhook] CI checks pending for PR #${String(pr.number)} but pr-cron is disabled — attempting merge`,
+          );
+
+          const result = await attempt_auto_merge(
+            pr.number,
+            pr.head.ref,
+            repo_path,
+            undefined,
+            gh_token,
+          );
+
+          if (result.merged) {
+            await post_auto_merge_cleanup(pr, entity_id, repo_path, ctx, installation_id);
+            await notify_alerts(
+              entity_id,
+              `PR #${String(pr.number)}: ${pr.title} — approved and merged (pr-cron disabled, CI pending bypassed)`,
+              ctx,
+            );
+            await notify_pr_watcher(
+              repo_full_name,
+              pr.number,
+              `PR #${String(pr.number)} ("${pr.title}") was approved and merged to main. Continue your work.`,
+              ctx,
+            );
+          } else {
+            await notify_alerts(
+              entity_id,
+              `PR #${String(pr.number)}: ${pr.title} — approved but CI checks pending and pr-cron is disabled. Merge failed: ${result.error ?? "manual intervention needed."}`,
+              ctx,
+            );
+          }
+        }
       } else if (ci.failures.length > 0) {
         // Spawn builder to fix CI failures (#196)
         await spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, ctx, installation_id);

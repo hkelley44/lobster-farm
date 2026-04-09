@@ -238,6 +238,30 @@ describe("check_ci_status", () => {
     expect(result.pending).toBe(true);
     expect(result.failures).toEqual([]);
   });
+
+  it("returns passed when gh pr checks errors with 'no checks reported' (#233)", async () => {
+    route_exec({
+      "gh pr checks": () => new Error("no required checks reported"),
+    });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result.passed).toBe(true);
+    expect(result.pending).toBe(false);
+    expect(result.failures).toEqual([]);
+  });
+
+  it("still returns pending for non-'no checks' errors (#233)", async () => {
+    route_exec({
+      "gh pr checks": () => new Error("network timeout"),
+    });
+
+    const result = await check_ci_status(42, "/tmp/test-repo");
+
+    expect(result.passed).toBe(false);
+    expect(result.pending).toBe(true);
+    expect(result.failures).toEqual([]);
+  });
 });
 
 // ── Webhook handler workflow_run tests ──
@@ -540,6 +564,8 @@ describe("webhook handler — CI gating on review completion", () => {
    */
   async function trigger_review_completion(
     ci_route: ExecRoute,
+    ctx_overrides: Partial<WebhookContext> = {},
+    extra_routes: Record<string, ExecRoute> = {},
   ): Promise<{ ctx: WebhookContext; discord: { send_to_entity: ReturnType<typeof vi.fn> } }> {
     // Route gh pr view (check_pr_merged → not merged), gh pr checks (CI status),
     // and gh run list/view for CI fix log fetching (#196)
@@ -548,6 +574,7 @@ describe("webhook handler — CI gating on review completion", () => {
       "gh pr checks": ci_route,
       "gh run list": () => ({ stdout: JSON.stringify([]) }),
       "gh run view": () => ({ stdout: "" }),
+      ...extra_routes,
     });
 
     const payload = JSON.stringify({
@@ -563,7 +590,7 @@ describe("webhook handler — CI gating on review completion", () => {
       installation: { id: 12345 },
     });
 
-    const ctx = make_context();
+    const ctx = make_context(ctx_overrides);
     const req = make_request(payload, {
       "x-hub-signature-256": sign_payload(payload),
       "x-github-event": "pull_request",
@@ -629,5 +656,66 @@ describe("webhook handler — CI gating on review completion", () => {
 
     // Command failure returns { passed: false, pending: true } — silent skip, no alert
     expect(discord.send_to_entity).not.toHaveBeenCalled();
+  });
+
+  it("attempts merge when CI pending and pr-cron is disabled (#233)", async () => {
+    const config_with_cron_disabled = {
+      paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" },
+      pr_cron: { enabled: false },
+    } as WebhookContext["config"];
+
+    const { discord } = await trigger_review_completion(
+      () => ({
+        stdout: JSON.stringify([
+          { name: "Build", state: "IN_PROGRESS", conclusion: "" },
+        ]),
+      }),
+      { config: config_with_cron_disabled },
+      {
+        // attempt_auto_merge will call gh pr merge, then fall through to
+        // update-branch → repo view → local rebase. We only need merge to succeed.
+        "gh pr merge": () => ({ stdout: "merged" }),
+        "gh repo view": () => ({ stdout: "test-org/lobster-farm" }),
+      },
+    );
+
+    // Should alert about the merge, not silently defer
+    expect(discord.send_to_entity).toHaveBeenCalledWith(
+      "test-entity",
+      "alerts",
+      expect.stringContaining("pr-cron disabled"),
+      "reviewer",
+    );
+  });
+
+  it("alerts when CI pending, pr-cron disabled, and merge fails (#233)", async () => {
+    const config_with_cron_disabled = {
+      paths: { lobsterfarm_dir: "/tmp/test-lf", projects_dir: "/tmp" },
+      pr_cron: { enabled: false },
+    } as WebhookContext["config"];
+
+    const { discord } = await trigger_review_completion(
+      () => ({
+        stdout: JSON.stringify([
+          { name: "Build", state: "IN_PROGRESS", conclusion: "" },
+        ]),
+      }),
+      { config: config_with_cron_disabled },
+      {
+        "gh pr merge": () => new Error("merge blocked by branch protection"),
+        "gh repo view": () => ({ stdout: "test-org/lobster-farm" }),
+        // update-branch and local rebase will also fail
+        "gh api": () => new Error("update-branch failed"),
+        "git remote": () => new Error("no remote"),
+      },
+    );
+
+    // Should alert about the failed merge with pr-cron disabled context
+    expect(discord.send_to_entity).toHaveBeenCalledWith(
+      "test-entity",
+      "alerts",
+      expect.stringContaining("pr-cron is disabled"),
+      "reviewer",
+    );
   });
 });
