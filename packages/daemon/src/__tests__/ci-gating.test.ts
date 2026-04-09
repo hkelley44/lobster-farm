@@ -664,6 +664,8 @@ describe("webhook handler — CI gating on review completion", () => {
       pr_cron: { enabled: false },
     } as WebhookContext["config"];
 
+    const merge_route = vi.fn(() => ({ stdout: "merged" }));
+
     const { discord } = await trigger_review_completion(
       () => ({
         stdout: JSON.stringify([{ name: "Build", state: "IN_PROGRESS", conclusion: "" }]),
@@ -672,16 +674,20 @@ describe("webhook handler — CI gating on review completion", () => {
       {
         // attempt_auto_merge will call gh pr merge, then fall through to
         // update-branch → repo view → local rebase. We only need merge to succeed.
-        "gh pr merge": () => ({ stdout: "merged" }),
+        "gh pr merge": merge_route,
         "gh repo view": () => ({ stdout: "test-org/lobster-farm" }),
       },
     );
 
-    // Should alert about the merge, not silently defer
+    // Verify merge was actually attempted, not just that an alert was sent
+    expect(merge_route).toHaveBeenCalled();
+
+    // Assert on success-specific text ("CI pending bypassed" only appears in the
+    // success alert, not the failure one which says "Merge failed")
     expect(discord.send_to_entity).toHaveBeenCalledWith(
       "test-entity",
       "alerts",
-      expect.stringContaining("pr-cron disabled"),
+      expect.stringContaining("CI pending bypassed"),
       "reviewer",
     );
   });
