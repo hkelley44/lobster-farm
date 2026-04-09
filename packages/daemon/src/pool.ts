@@ -69,6 +69,31 @@ export interface PoolStatus {
 /** Activity state computed on demand from observable signals (tmux pane, timestamps). */
 export type ActivityState = "idle" | "working" | "waiting_for_human" | "active_conversation";
 
+// ── Tmux idle detection ──
+
+/**
+ * Check whether a tmux session is idle (showing a prompt, not actively processing).
+ * Reads the last line of the tmux pane and looks for prompt or permission dialog indicators.
+ *
+ * Fails open (returns true) when the pane can't be read — safe default for eviction
+ * and typing-loop termination.
+ */
+export function is_tmux_session_idle(tmux_session: string): boolean {
+  try {
+    const output = execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
+      encoding: "utf-8",
+      timeout: 2000,
+    });
+    const lines = output.trim().split("\n");
+    const last_line = lines[lines.length - 1] ?? "";
+    // "bypass permissions" matches the Claude Code workspace trust dialog text.
+    // This is UI-text dependent and may break if Claude Code changes the dialog wording.
+    return last_line.includes("❯") || last_line.includes("bypass permissions");
+  } catch {
+    return true; // Can't check — assume idle (fail-open)
+  }
+}
+
 // ── Agent name resolution ──
 
 function resolve_agent_name(archetype: ArchetypeRole, config: LobsterFarmConfig): string {
@@ -1021,19 +1046,7 @@ export class BotPool extends EventEmitter {
    * refuse to evict when the pool is exhausted.
    */
   is_bot_idle(bot: PoolBot): boolean {
-    try {
-      const output = execFileSync("tmux", ["capture-pane", "-t", bot.tmux_session, "-p"], {
-        encoding: "utf-8",
-        timeout: 2000,
-      });
-      const lines = output.trim().split("\n");
-      const last_line = lines[lines.length - 1] ?? "";
-      // "bypass permissions" matches the Claude Code workspace trust dialog text.
-      // This is UI-text dependent and may break if Claude Code changes the dialog wording.
-      return last_line.includes("❯") || last_line.includes("bypass permissions");
-    } catch {
-      return true; // Can't check — assume idle (fail-open for eviction)
-    }
+    return is_tmux_session_idle(bot.tmux_session);
   }
 
   /** Check if any pool bots are actively working (not idle at prompt). */

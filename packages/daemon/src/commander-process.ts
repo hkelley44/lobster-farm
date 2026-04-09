@@ -1,6 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
@@ -44,6 +45,27 @@ export class CommanderProcess extends EventEmitter {
   /** State directory for Pat's Discord channel plugin. */
   private state_dir(): string {
     return join(lobsterfarm_dir(this.config.paths), "channels", "pat");
+  }
+
+  /** Path to the session state file (persists session_id across restarts). */
+  private session_state_path(): string {
+    return join(this.state_dir(), "session-state.json");
+  }
+
+  /** Read the persisted session_id, if any. Returns null on missing or corrupt file. */
+  private async read_session_id(): Promise<string | null> {
+    try {
+      const content = await readFile(this.session_state_path(), "utf-8");
+      const state = JSON.parse(content) as { session_id?: string };
+      return state.session_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Persist the session_id so future restarts can resume. */
+  private async write_session_id(session_id: string): Promise<void> {
+    await writeFile(this.session_state_path(), JSON.stringify({ session_id }, null, 2), "utf-8");
   }
 
   /** Check if Pat's bot token is configured. */
@@ -110,7 +132,14 @@ export class CommanderProcess extends EventEmitter {
     const agent_name = this.config.agents.commander.name.toLowerCase();
     const working_dir = lobsterfarm_dir(this.config.paths);
 
-    const claude_cmd = [
+    // Resolve session ID for resume support. If we have a persisted session_id
+    // from a previous run, use --resume to restore conversation context.
+    // Otherwise generate a fresh ID and use --session-id to establish it.
+    const existing_session_id = await this.read_session_id();
+    const is_resume = existing_session_id !== null;
+    const session_id = existing_session_id ?? randomUUID();
+
+    const claude_args = [
       sq(claude_bin),
       "--channels",
       "plugin:discord@claude-plugins-official",
@@ -124,7 +153,17 @@ export class CommanderProcess extends EventEmitter {
       sq(working_dir),
       "--add-dir",
       sq(homedir()),
-    ].join(" ");
+    ];
+
+    if (is_resume) {
+      claude_args.push("--resume", sq(session_id));
+      console.log(`[commander] Resuming session ${session_id.slice(0, 8)}...`);
+    } else {
+      claude_args.push("--session-id", sq(session_id));
+      console.log(`[commander] Starting fresh session ${session_id.slice(0, 8)}...`);
+    }
+
+    const claude_cmd = claude_args.join(" ");
 
     console.log(`[commander] Starting ${agent_name} in tmux session "${TMUX_SESSION}"...`);
 
@@ -188,6 +227,11 @@ export class CommanderProcess extends EventEmitter {
         const pid = this.get_tmux_pid();
         console.log(`[commander] ${agent_name} running in tmux (pane pid: ${String(pid)})`);
         this.emit("started", pid);
+
+        // Persist session_id so future restarts can resume the conversation
+        void this.write_session_id(session_id).catch((err) => {
+          console.error(`[commander] Failed to persist session_id: ${String(err)}`);
+        });
 
         // Start health check polling
         this.start_health_polling();

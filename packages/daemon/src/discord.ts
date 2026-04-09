@@ -32,6 +32,7 @@ import {
   type TextChannel,
   type Webhook,
 } from "discord.js";
+import { is_tmux_session_idle } from "./pool.js";
 import type { BotPool, PoolBot } from "./pool.js";
 import type { TaskQueue } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
@@ -477,6 +478,8 @@ export class DiscordBot extends EventEmitter {
       agent_name: string;
     }
   >();
+  /** Cached #command-center channel ID (resolved lazily from the GLOBAL category). */
+  private command_center_channel_id: string | null = null;
 
   constructor(
     private config: LobsterFarmConfig,
@@ -504,6 +507,14 @@ export class DiscordBot extends EventEmitter {
 
         // Register guild-specific slash commands (instant, no propagation delay)
         void this.register_slash_commands();
+
+        // Eagerly resolve #command-center channel ID so handle_message()
+        // can detect user messages there and show typing + status embeds.
+        void this.find_command_center_channel().then((id) => {
+          if (id) {
+            console.log(`[discord] Command center channel resolved: ${id}`);
+          }
+        });
 
         this.emit("connected");
         resolve();
@@ -592,6 +603,27 @@ export class DiscordBot extends EventEmitter {
     return channel?.id ?? null;
   }
 
+  /** Find the #command-center channel by name under the GLOBAL category. Caches the result. */
+  async find_command_center_channel(): Promise<string | null> {
+    if (this.command_center_channel_id) return this.command_center_channel_id;
+
+    const guild = await this.get_guild();
+    if (!guild) return null;
+
+    const category = guild.channels.cache.find(
+      (c) => c.name === "GLOBAL" && c.type === DiscordChannelType.GuildCategory,
+    );
+    if (!category) return null;
+
+    const channel = guild.channels.cache.find(
+      (c) => c.name === "command-center" && c.parentId === category.id,
+    );
+    if (channel) {
+      this.command_center_channel_id = channel.id;
+    }
+    return this.command_center_channel_id;
+  }
+
   /** Send a plain message to a channel (from the bot itself). */
   async send(channel_id: string, content: string): Promise<void> {
     if (!this.connected) {
@@ -659,7 +691,7 @@ export class DiscordBot extends EventEmitter {
       void this.send_typing(channel_id);
 
       // Parse tmux output and update the status embed if activity changed
-      void this.update_status_embed_from_tmux(channel_id, bot);
+      void this.update_status_embed_from_tmux(channel_id, bot.tmux_session);
     }, 8000);
 
     this.typing_loops.set(channel_id, interval);
@@ -683,6 +715,47 @@ export class DiscordBot extends EventEmitter {
       finalizations.push(this.finalize_status_embed(channel_id));
     }
     await Promise.allSettled(finalizations);
+  }
+
+  /**
+   * Start a typing indicator loop for the Commander (Pat) in #command-center.
+   * Uses Pat's fixed tmux session ("pat") for idle detection and activity parsing,
+   * independent of the bot pool.
+   */
+  start_commander_typing_loop(channel_id: string): void {
+    // Don't stack loops for the same channel
+    if (this.typing_loops.has(channel_id)) return;
+
+    const TMUX_SESSION = "pat";
+
+    // Fire immediately, then repeat
+    void this.send_typing(channel_id);
+
+    // Track consecutive idle checks to avoid premature finalization.
+    // Pat's channel plugin needs time to deliver the message — if we
+    // check idle on the very first tick, the bot may not have started yet.
+    let consecutive_idle = 0;
+    const IDLE_THRESHOLD = 2; // require 2 consecutive idle checks before finalizing
+
+    const interval = setInterval(() => {
+      if (is_tmux_session_idle(TMUX_SESSION)) {
+        consecutive_idle++;
+        if (consecutive_idle >= IDLE_THRESHOLD) {
+          this.stop_typing_loop(channel_id);
+          void this.finalize_status_embed(channel_id);
+          return;
+        }
+      } else {
+        consecutive_idle = 0;
+      }
+
+      void this.send_typing(channel_id);
+
+      // Parse tmux output and update the status embed if activity changed
+      void this.update_status_embed_from_tmux(channel_id, TMUX_SESSION);
+    }, 4000);
+
+    this.typing_loops.set(channel_id, interval);
   }
 
   // ── Status embeds ──
@@ -809,15 +882,19 @@ export class DiscordBot extends EventEmitter {
   }
 
   /**
-   * Parse tmux output from a bot and update the status embed if activity changed.
-   * Called from the typing loop every 8 seconds.
+   * Parse tmux output from a session and update the status embed if activity changed.
+   * Called from the typing loop every tick. Accepts a tmux session name directly
+   * so it works for both pool bots and the commander (Pat).
    */
-  private async update_status_embed_from_tmux(channel_id: string, bot: PoolBot): Promise<void> {
+  private async update_status_embed_from_tmux(
+    channel_id: string,
+    tmux_session: string,
+  ): Promise<void> {
     const entry = this.status_embeds.get(channel_id);
     if (!entry?.message_id) return; // not yet sent or already finalized
 
     try {
-      const output = execFileSync("tmux", ["capture-pane", "-t", bot.tmux_session, "-p"], {
+      const output = execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
         encoding: "utf-8",
         timeout: 2000,
       });
@@ -1479,8 +1556,16 @@ export class DiscordBot extends EventEmitter {
     // Look up channel in entity map
     const entry = this.channel_map.get(message.channelId);
 
-    // Unmapped channels: ignore everything.
     // Commander (Pat) handles #command-center via its own Discord bot.
+    // The daemon's bot sees user messages there too — start typing + status
+    // embeds so the user gets visual feedback while Pat processes.
+    if (!entry && this.command_center_channel_id === message.channelId) {
+      this.start_commander_typing_loop(message.channelId);
+      void this.send_status_embed(message.channelId, "commander");
+      return;
+    }
+
+    // Unmapped channels: ignore everything.
     if (!entry) return;
 
     // Ignore legacy !lf text commands — all commands are now slash commands.
