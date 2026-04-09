@@ -463,6 +463,8 @@ export class DiscordBot extends EventEmitter {
   private connected = false;
   /** Cached avatar CDN URLs keyed by lowercase agent name. */
   private avatar_urls = new Map<string, string>();
+  /** Active typing indicator intervals keyed by channel ID. */
+  private typing_loops = new Map<string, NodeJS.Timeout>();
 
   constructor(
     private config: LobsterFarmConfig,
@@ -547,6 +549,7 @@ export class DiscordBot extends EventEmitter {
   async disconnect(): Promise<void> {
     if (this.connected) {
       console.log("[discord] Disconnecting...");
+      this.stop_all_typing_loops();
       sentry.addBreadcrumb({
         category: "daemon.lifecycle",
         message: "Discord disconnecting",
@@ -594,6 +597,71 @@ export class DiscordBot extends EventEmitter {
       sentry.captureException(err, {
         tags: { module: "discord", action: "send" },
       });
+    }
+  }
+
+  /** Send a typing indicator to a channel. Lasts ~10 seconds in Discord UI. */
+  async send_typing(channel_id: string): Promise<void> {
+    if (!this.connected) return;
+
+    try {
+      const channel = await this.client.channels.fetch(channel_id);
+      if (channel?.isTextBased()) {
+        await (channel as TextChannel).sendTyping();
+      }
+    } catch {
+      // Silently ignore — typing indicators are best-effort
+    }
+  }
+
+  /**
+   * Start a typing indicator loop for a channel. Sends typing every 8 seconds
+   * while the assigned pool bot is actively processing (not idle at prompt).
+   * Auto-stops when the bot returns to idle or the bot is released.
+   */
+  start_typing_loop(channel_id: string): void {
+    // Don't stack loops for the same channel
+    if (this.typing_loops.has(channel_id)) return;
+    if (!this._pool) return;
+
+    // Fire immediately, then repeat
+    void this.send_typing(channel_id);
+
+    // NOTE: is_bot_idle() calls execFileSync("tmux", ...) — synchronous and blocking.
+    // Fine at current scale (sub-ms per call), but if pool utilization grows this
+    // should be replaced with an async tmux check or a dedicated idle-state event.
+    const interval = setInterval(() => {
+      if (!this._pool) {
+        this.stop_typing_loop(channel_id);
+        return;
+      }
+
+      const bot = this._pool.get_assignment(channel_id);
+      if (!bot || this._pool.is_bot_idle(bot)) {
+        this.stop_typing_loop(channel_id);
+        return;
+      }
+
+      void this.send_typing(channel_id);
+    }, 8000);
+
+    this.typing_loops.set(channel_id, interval);
+  }
+
+  /** Stop the typing indicator loop for a channel. */
+  stop_typing_loop(channel_id: string): void {
+    const interval = this.typing_loops.get(channel_id);
+    if (interval) {
+      clearInterval(interval);
+      this.typing_loops.delete(channel_id);
+    }
+  }
+
+  /** Stop all typing loops (e.g. on disconnect). */
+  stop_all_typing_loops(): void {
+    for (const [channel_id, interval] of this.typing_loops) {
+      clearInterval(interval);
+      this.typing_loops.delete(channel_id);
     }
   }
 
@@ -1282,6 +1350,8 @@ export class DiscordBot extends EventEmitter {
           } catch {
             /* ignore */
           }
+          // Start typing indicator loop while bot processes
+          this.start_typing_loop(message.channelId);
         } else {
           try {
             await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
@@ -1302,6 +1372,8 @@ export class DiscordBot extends EventEmitter {
       } else {
         // Bot is assigned and tmux is alive — touch for LRU tracking
         this._pool.touch(message.channelId);
+        // Start typing indicator loop while bot processes the new message
+        this.start_typing_loop(message.channelId);
       }
     }
   }

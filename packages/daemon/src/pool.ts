@@ -2,7 +2,6 @@ import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { readFile, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
 import { DEFAULT_ARCHETYPES, entity_dir, lobsterfarm_dir } from "@lobster-farm/shared";
@@ -1021,7 +1020,7 @@ export class BotPool extends EventEmitter {
    * default for eviction checks: we'd rather evict a bot we can't observe than
    * refuse to evict when the pool is exhausted.
    */
-  protected is_bot_idle(bot: PoolBot): boolean {
+  is_bot_idle(bot: PoolBot): boolean {
     try {
       const output = execFileSync("tmux", ["capture-pane", "-t", bot.tmux_session, "-p"], {
         encoding: "utf-8",
@@ -1556,7 +1555,7 @@ export class BotPool extends EventEmitter {
   private async start_tmux(
     bot: PoolBot,
     archetype: ArchetypeRole,
-    _entity_id: string,
+    entity_id: string,
     working_dir: string,
     session_id: string,
     is_resume = false,
@@ -1583,7 +1582,7 @@ export class BotPool extends EventEmitter {
       "--add-dir",
       sq(working_dir),
       "--add-dir",
-      sq(homedir()),
+      sq(entity_dir(this.config.paths, entity_id)),
     ];
 
     if (effort) {
