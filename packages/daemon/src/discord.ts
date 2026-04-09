@@ -627,6 +627,9 @@ export class DiscordBot extends EventEmitter {
     // Fire immediately, then repeat
     void this.send_typing(channel_id);
 
+    // NOTE: is_bot_idle() calls execFileSync("tmux", ...) — synchronous and blocking.
+    // Fine at current scale (sub-ms per call), but if pool utilization grows this
+    // should be replaced with an async tmux check or a dedicated idle-state event.
     const interval = setInterval(() => {
       if (!this._pool) {
         this.stop_typing_loop(channel_id);
