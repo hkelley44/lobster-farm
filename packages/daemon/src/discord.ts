@@ -475,6 +475,7 @@ export class DiscordBot extends EventEmitter {
       message_id: string;
       start_time: number;
       last_status: string;
+      last_detail: string | null;
       tool_count: number;
       agent_name: string;
     }
@@ -762,11 +763,13 @@ export class DiscordBot extends EventEmitter {
   // ── Status embeds ──
 
   /**
-   * Parse Claude Code tmux output to extract current activity and tool count.
-   * Looks for patterns like "⏺ Read(...)", "⏺ Edit(...)", "⏺ Bash(...)", "⏺ Agent(...)".
+   * Parse Claude Code tmux output to extract current activity, tool count, and detail.
+   * Reads ⏺ markers for tool calls, ✻ for thinking status, and the status bar
+   * for background subagents.
    */
   private parse_tmux_activity(tmux_output: string): {
     status: string;
+    detail: string | null;
     tool_count: number;
   } {
     const lines = tmux_output.split("\n");
@@ -775,27 +778,89 @@ export class DiscordBot extends EventEmitter {
     const tool_lines = lines.filter((l) => l.includes("⏺"));
     const tool_count = tool_lines.length;
 
-    // Find the last activity line (last ⏺ line) for current status
-    let status = "Thinking...";
+    // Check status bar for background subagents
+    const last_line = lines[lines.length - 1] ?? "";
+    const agent_match = last_line.match(/(\d+) local agent/);
+    const has_background_agents = !!agent_match;
+
+    // Check for ✻ thinking indicators (Churned = processing, Baked = waiting)
+    let thinking_status: string | null = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = (lines[i] ?? "").trim();
+      if (line.startsWith("✻")) {
+        if (line.includes("local agent")) {
+          thinking_status = "subagent_running";
+        } else if (line.includes("Churned") || line.includes("Baked")) {
+          thinking_status = "thinking";
+        }
+        break;
+      }
+    }
+
+    // If parent is at prompt with background agents, show subagent status
+    if (has_background_agents || thinking_status === "subagent_running") {
+      let subagent_name: string | null = null;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = (lines[i] ?? "").trim();
+        if (!line.includes("⏺")) continue;
+        // Match "⏺ bob(description)" or "⏺ Agent(name)" patterns
+        const agent_line_match = line.match(/⏺\s+(\w+)\(/);
+        if (agent_line_match?.[1] && agent_line_match[1] !== "Agent") {
+          subagent_name = agent_line_match[1];
+          break;
+        }
+        if (line.includes("Agent")) {
+          subagent_name = "subagent";
+          break;
+        }
+      }
+
+      const count_str = agent_match
+        ? `${agent_match[1]} subagent${agent_match[1] === "1" ? "" : "s"}`
+        : "Subagent";
+      return {
+        status: `${count_str} running`,
+        detail: subagent_name ? `→ ${subagent_name}` : null,
+        tool_count,
+      };
+    }
+
+    // Find the last ⏺ line for current status + extract detail
+    let status = thinking_status === "thinking" ? "Thinking..." : "Starting...";
+    let detail: string | null = null;
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = (lines[i] ?? "").trim();
       if (!line.includes("⏺")) continue;
 
-      // Extract the tool name from the line
+      // Extract parenthesized argument for detail (file path, command, etc.)
+      const paren_match = line.match(/⏺\s+\w+\((.+?)(?:\)|$)/);
+      const raw_detail = paren_match?.[1];
+
       if (line.includes("Read")) {
         status = "Reading files";
+        detail = this.extract_path_detail(raw_detail);
       } else if (line.includes("Edit") || line.includes("Wrote to")) {
         status = "Editing code";
+        detail = this.extract_path_detail(raw_detail);
       } else if (line.includes("Write")) {
         status = "Writing files";
+        detail = this.extract_path_detail(raw_detail);
       } else if (line.includes("Bash")) {
         status = "Running commands";
+        detail = this.extract_command_detail(raw_detail);
       } else if (line.includes("Agent")) {
         status = "Spawning subagent";
-      } else if (line.includes("Grep") || line.includes("Glob")) {
+      } else if (line.includes("Grep")) {
+        status = "Searching codebase";
+        detail = this.extract_grep_detail(raw_detail);
+      } else if (line.includes("Glob")) {
         status = "Searching codebase";
       } else if (line.includes("WebSearch") || line.includes("WebFetch")) {
         status = "Searching the web";
+      } else if (line.includes("Skill")) {
+        status = "Loading skill";
+      } else if (line.includes("ToolSearch")) {
+        status = "Loading tools";
       } else if (line.includes("discord") && line.includes("reply")) {
         status = "Composing reply";
       } else if (line.includes("MCP")) {
@@ -806,7 +871,32 @@ export class DiscordBot extends EventEmitter {
       break;
     }
 
-    return { status, tool_count };
+    return { status, detail, tool_count };
+  }
+
+  /** Extract a short file path from a Read/Edit/Write argument. */
+  private extract_path_detail(raw: string | undefined): string | null {
+    if (!raw) return null;
+    const cleaned = raw.replace(/['"]/g, "").trim();
+    const parts = cleaned.split("/").filter(Boolean);
+    if (parts.length <= 3) return `\`${cleaned}\``;
+    return `\`…/${parts.slice(-3).join("/")}\``;
+  }
+
+  /** Extract a short command from a Bash argument. */
+  private extract_command_detail(raw: string | undefined): string | null {
+    if (!raw) return null;
+    const cleaned = raw.replace(/['"]/g, "").trim();
+    if (cleaned.length > 50) return `\`${cleaned.slice(0, 47)}…\``;
+    return `\`${cleaned}\``;
+  }
+
+  /** Extract search pattern from a Grep argument. */
+  private extract_grep_detail(raw: string | undefined): string | null {
+    if (!raw) return null;
+    const cleaned = raw.replace(/['"]/g, "").trim();
+    if (cleaned.length > 40) return `\`${cleaned.slice(0, 37)}…\``;
+    return `\`${cleaned}\``;
   }
 
   /** Format elapsed seconds as a human-readable duration. */
@@ -821,12 +911,16 @@ export class DiscordBot extends EventEmitter {
   private build_working_embed(entry: {
     agent_name: string;
     last_status: string;
+    last_detail: string | null;
     tool_count: number;
     start_time: number;
   }): EmbedBuilder {
     const elapsed = Math.round((Date.now() - entry.start_time) / 1000);
     const parts = [`**${entry.agent_name}** — Working`];
     parts.push(`Status: ${entry.last_status}`);
+    if (entry.last_detail) {
+      parts.push(entry.last_detail);
+    }
     if (entry.tool_count > 0) {
       parts.push(
         `${String(entry.tool_count)} tool ${entry.tool_count === 1 ? "use" : "uses"} · ${this.format_duration(elapsed)}`,
@@ -856,6 +950,7 @@ export class DiscordBot extends EventEmitter {
       message_id: "",
       start_time: now,
       last_status: "Starting...",
+      last_detail: null as string | null,
       tool_count: 0,
       agent_name: identity.name,
     };
@@ -900,12 +995,19 @@ export class DiscordBot extends EventEmitter {
         timeout: 2000,
       });
 
-      const { status, tool_count } = this.parse_tmux_activity(output);
+      const { status, detail, tool_count } = this.parse_tmux_activity(output);
 
       // Only edit if something actually changed
-      if (status === entry.last_status && tool_count === entry.tool_count) return;
+      if (
+        status === entry.last_status &&
+        detail === entry.last_detail &&
+        tool_count === entry.tool_count
+      ) {
+        return;
+      }
 
       entry.last_status = status;
+      entry.last_detail = detail;
       entry.tool_count = Math.max(entry.tool_count, tool_count);
 
       const embed = this.build_working_embed(entry);
