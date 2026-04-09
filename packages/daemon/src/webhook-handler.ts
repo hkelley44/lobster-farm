@@ -539,8 +539,9 @@ async function handle_review_completion(
             `[webhook] CI checks pending for PR #${String(pr.number)} — skipping merge, pr-cron retry pass will handle`,
           );
         } else {
-          // pr-cron is disabled — no retry will happen. Attempt merge immediately
-          // in case the "pending" is a false positive (e.g. stale check state).
+          // pr-cron is disabled — no retry will happen. Attempt the merge now even
+          // though CI is still running: without a cron, approved PRs would otherwise
+          // be stuck indefinitely. The alert makes this bypass explicit.
           console.log(
             `[webhook] CI checks pending for PR #${String(pr.number)} but pr-cron is disabled — attempting merge`,
           );

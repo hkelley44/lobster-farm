@@ -666,9 +666,7 @@ describe("webhook handler — CI gating on review completion", () => {
 
     const { discord } = await trigger_review_completion(
       () => ({
-        stdout: JSON.stringify([
-          { name: "Build", state: "IN_PROGRESS", conclusion: "" },
-        ]),
+        stdout: JSON.stringify([{ name: "Build", state: "IN_PROGRESS", conclusion: "" }]),
       }),
       { config: config_with_cron_disabled },
       {
@@ -696,9 +694,7 @@ describe("webhook handler — CI gating on review completion", () => {
 
     const { discord } = await trigger_review_completion(
       () => ({
-        stdout: JSON.stringify([
-          { name: "Build", state: "IN_PROGRESS", conclusion: "" },
-        ]),
+        stdout: JSON.stringify([{ name: "Build", state: "IN_PROGRESS", conclusion: "" }]),
       }),
       { config: config_with_cron_disabled },
       {
