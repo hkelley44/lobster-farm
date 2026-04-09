@@ -739,6 +739,12 @@ docs: add pipe module README
 
 Keep commits atomic. One logical change per commit. If you're writing "and" in your commit message, it's probably two commits.
 
+### Pre-commit Hooks
+
+All LobsterFarm repos use husky + lint-staged. Every commit automatically runs Biome lint+format on staged files. **Never skip hooks** (`--no-verify` is banned). If the hook fails, fix the issue — don't bypass it.
+
+As a belt-and-suspenders habit: run `pnpm lint` before committing to catch issues early. But the hook is the real safety net.
+
 ### Environment Separation
 
 | Environment | Branch | Database | Secrets | Deployment |
