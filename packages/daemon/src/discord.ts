@@ -24,6 +24,7 @@ import {
   type ChatInputCommandInteraction,
   Client,
   ChannelType as DiscordChannelType,
+  EmbedBuilder,
   GatewayIntentBits,
   type Guild,
   type Message,
@@ -465,6 +466,8 @@ export class DiscordBot extends EventEmitter {
   private avatar_urls = new Map<string, string>();
   /** Active typing indicator intervals keyed by channel ID. */
   private typing_loops = new Map<string, NodeJS.Timeout>();
+  /** Active status embeds keyed by channel ID. */
+  private status_embeds = new Map<string, { message_id: string; start_time: number }>();
 
   constructor(
     private config: LobsterFarmConfig,
@@ -639,6 +642,7 @@ export class DiscordBot extends EventEmitter {
       const bot = this._pool.get_assignment(channel_id);
       if (!bot || this._pool.is_bot_idle(bot)) {
         this.stop_typing_loop(channel_id);
+        void this.finalize_status_embed(channel_id);
         return;
       }
 
@@ -662,6 +666,83 @@ export class DiscordBot extends EventEmitter {
     for (const [channel_id, interval] of this.typing_loops) {
       clearInterval(interval);
       this.typing_loops.delete(channel_id);
+      void this.finalize_status_embed(channel_id);
+    }
+  }
+
+  // ── Status embeds ──
+
+  /**
+   * Send a status embed to a channel showing the agent is working.
+   * Stores the message ID so we can edit it when the agent finishes.
+   */
+  async send_status_embed(channel_id: string, archetype: string): Promise<void> {
+    if (!this.connected) return;
+
+    // Don't stack embeds — finalize any existing one first
+    if (this.status_embeds.has(channel_id)) {
+      await this.finalize_status_embed(channel_id);
+    }
+
+    const identity = this.resolve_agent_identity(archetype as ArchetypeRole);
+    const now = Date.now();
+
+    const embed = new EmbedBuilder()
+      .setColor(0xf59e0b) // amber
+      .setDescription(`**${identity.name}** is working on it...`);
+
+    if (identity.avatar_url) {
+      embed.setThumbnail(identity.avatar_url);
+    }
+
+    try {
+      const channel = await this.client.channels.fetch(channel_id);
+      if (!channel?.isTextBased()) return;
+
+      const msg = await (channel as TextChannel).send({ embeds: [embed] });
+      this.status_embeds.set(channel_id, { message_id: msg.id, start_time: now });
+    } catch (err) {
+      // Best-effort — don't let embed failures break message handling
+      console.error(`[discord] Failed to send status embed: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Edit the status embed to show the agent is done. Removes tracking state.
+   */
+  async finalize_status_embed(channel_id: string): Promise<void> {
+    const entry = this.status_embeds.get(channel_id);
+    if (!entry) return;
+    this.status_embeds.delete(channel_id);
+
+    const elapsed = Math.round((Date.now() - entry.start_time) / 1000);
+    const duration =
+      elapsed < 60
+        ? `${String(elapsed)}s`
+        : `${String(Math.floor(elapsed / 60))}m ${String(elapsed % 60)}s`;
+
+    // Look up the agent for this channel
+    let agent_name = "Agent";
+    if (this._pool) {
+      const bot = this._pool.get_assignment(channel_id);
+      if (bot?.archetype) {
+        agent_name = this.resolve_agent_identity(bot.archetype as ArchetypeRole).name;
+      }
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0x10b981) // green
+      .setDescription(`**${agent_name}** finished — took ${duration}`);
+
+    try {
+      const channel = await this.client.channels.fetch(channel_id);
+      if (!channel?.isTextBased()) return;
+
+      const msg = await (channel as TextChannel).messages.fetch(entry.message_id);
+      await msg.edit({ embeds: [embed] });
+    } catch (err) {
+      // Message might have been deleted — that's fine
+      console.error(`[discord] Failed to finalize status embed: ${String(err)}`);
     }
   }
 
@@ -1350,8 +1431,9 @@ export class DiscordBot extends EventEmitter {
           } catch {
             /* ignore */
           }
-          // Start typing indicator loop while bot processes
+          // Start typing indicator loop + status embed while bot processes
           this.start_typing_loop(message.channelId);
+          void this.send_status_embed(message.channelId, archetype);
         } else {
           try {
             await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
@@ -1372,8 +1454,9 @@ export class DiscordBot extends EventEmitter {
       } else {
         // Bot is assigned and tmux is alive — touch for LRU tracking
         this._pool.touch(message.channelId);
-        // Start typing indicator loop while bot processes the new message
+        // Start typing indicator loop + status embed while bot processes the new message
         this.start_typing_loop(message.channelId);
+        void this.send_status_embed(message.channelId, assignment.archetype ?? "planner");
       }
     }
   }
