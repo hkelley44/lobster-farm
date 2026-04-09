@@ -1,6 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
@@ -18,7 +19,7 @@ export interface CommanderHealth {
   tmux_session: string;
 }
 
-const TMUX_SESSION = "pat";
+export const PAT_TMUX_SESSION = "pat";
 const BACKOFF_SCHEDULE = [0, 5_000, 15_000, 60_000, 300_000];
 const BACKOFF_RESET_MS = 10 * 60 * 1000; // 10 min stable → reset counter
 const MAX_RESTARTS = 5;
@@ -46,6 +47,36 @@ export class CommanderProcess extends EventEmitter {
     return join(lobsterfarm_dir(this.config.paths), "channels", "pat");
   }
 
+  /** Path to the session state file (persists session_id across restarts). */
+  private session_state_path(): string {
+    return join(this.state_dir(), "session-state.json");
+  }
+
+  /** Read the persisted session_id, if any. Returns null on missing or corrupt file. */
+  private async read_session_id(): Promise<string | null> {
+    try {
+      const content = await readFile(this.session_state_path(), "utf-8");
+      const state = JSON.parse(content) as { session_id?: string };
+      return state.session_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Persist the session_id so future restarts can resume. */
+  private async write_session_id(session_id: string): Promise<void> {
+    await writeFile(this.session_state_path(), JSON.stringify({ session_id }, null, 2), "utf-8");
+  }
+
+  /** Clear persisted session state so the next startup begins fresh. */
+  private async clear_session_id(): Promise<void> {
+    try {
+      await unlink(this.session_state_path());
+    } catch {
+      /* ignore — file may not exist */
+    }
+  }
+
   /** Check if Pat's bot token is configured. */
   async has_token(): Promise<boolean> {
     try {
@@ -60,7 +91,7 @@ export class CommanderProcess extends EventEmitter {
   /** Check if the tmux session is alive. */
   private is_tmux_alive(): boolean {
     try {
-      execFileSync("tmux", ["has-session", "-t", TMUX_SESSION], {
+      execFileSync("tmux", ["has-session", "-t", PAT_TMUX_SESSION], {
         stdio: "ignore",
       });
       return true;
@@ -72,9 +103,13 @@ export class CommanderProcess extends EventEmitter {
   /** Get the PID of the main process inside the tmux session. */
   private get_tmux_pid(): number | null {
     try {
-      const out = execFileSync("tmux", ["list-panes", "-t", TMUX_SESSION, "-F", "#{pane_pid}"], {
-        encoding: "utf-8",
-      }).trim();
+      const out = execFileSync(
+        "tmux",
+        ["list-panes", "-t", PAT_TMUX_SESSION, "-F", "#{pane_pid}"],
+        {
+          encoding: "utf-8",
+        },
+      ).trim();
       const pid = Number.parseInt(out, 10);
       return Number.isNaN(pid) ? null : pid;
     } catch {
@@ -97,7 +132,7 @@ export class CommanderProcess extends EventEmitter {
     // Kill any stale tmux session
     if (this.is_tmux_alive()) {
       try {
-        execFileSync("tmux", ["kill-session", "-t", TMUX_SESSION], {
+        execFileSync("tmux", ["kill-session", "-t", PAT_TMUX_SESSION], {
           stdio: "ignore",
         });
       } catch {
@@ -110,7 +145,14 @@ export class CommanderProcess extends EventEmitter {
     const agent_name = this.config.agents.commander.name.toLowerCase();
     const working_dir = lobsterfarm_dir(this.config.paths);
 
-    const claude_cmd = [
+    // Resolve session ID for resume support. If we have a persisted session_id
+    // from a previous run, use --resume to restore conversation context.
+    // Otherwise generate a fresh ID and use --session-id to establish it.
+    const existing_session_id = await this.read_session_id();
+    const is_resume = existing_session_id !== null;
+    const session_id = existing_session_id ?? randomUUID();
+
+    const claude_args = [
       sq(claude_bin),
       "--channels",
       "plugin:discord@claude-plugins-official",
@@ -124,9 +166,19 @@ export class CommanderProcess extends EventEmitter {
       sq(working_dir),
       "--add-dir",
       sq(homedir()),
-    ].join(" ");
+    ];
 
-    console.log(`[commander] Starting ${agent_name} in tmux session "${TMUX_SESSION}"...`);
+    if (is_resume) {
+      claude_args.push("--resume", sq(session_id));
+      console.log(`[commander] Resuming session ${session_id.slice(0, 8)}...`);
+    } else {
+      claude_args.push("--session-id", sq(session_id));
+      console.log(`[commander] Starting fresh session ${session_id.slice(0, 8)}...`);
+    }
+
+    const claude_cmd = claude_args.join(" ");
+
+    console.log(`[commander] Starting ${agent_name} in tmux session "${PAT_TMUX_SESSION}"...`);
 
     // Create a detached tmux session running Claude Code.
     // DISCORD_STATE_DIR is set so the channel plugin reads from the right dir.
@@ -136,7 +188,7 @@ export class CommanderProcess extends EventEmitter {
         "new-session",
         "-d",
         "-s",
-        TMUX_SESSION,
+        PAT_TMUX_SESSION,
         "-x",
         "200",
         "-y",
@@ -175,7 +227,7 @@ export class CommanderProcess extends EventEmitter {
         // Auto-accept it after a brief delay for the UI to render.
         setTimeout(() => {
           try {
-            execFileSync("tmux", ["send-keys", "-t", TMUX_SESSION, "Enter"], {
+            execFileSync("tmux", ["send-keys", "-t", PAT_TMUX_SESSION, "Enter"], {
               stdio: "ignore",
             });
           } catch {
@@ -188,6 +240,11 @@ export class CommanderProcess extends EventEmitter {
         const pid = this.get_tmux_pid();
         console.log(`[commander] ${agent_name} running in tmux (pane pid: ${String(pid)})`);
         this.emit("started", pid);
+
+        // Persist session_id so future restarts can resume the conversation
+        void this.write_session_id(session_id).catch((err) => {
+          console.error(`[commander] Failed to persist session_id: ${String(err)}`);
+        });
 
         // Start health check polling
         this.start_health_polling();
@@ -258,6 +315,9 @@ export class CommanderProcess extends EventEmitter {
           tags: { module: "commander" },
         },
       );
+      // Clear persisted session so the next daemon startup gets a fresh session
+      // instead of re-entering a resume loop on an expired session ID.
+      void this.clear_session_id().catch(() => {});
       this.emit("gave_up", this.restart_count);
       return;
     }
@@ -289,7 +349,7 @@ export class CommanderProcess extends EventEmitter {
     if (this.is_tmux_alive()) {
       console.log("[commander] Stopping tmux session...");
       try {
-        execFileSync("tmux", ["kill-session", "-t", TMUX_SESSION], {
+        execFileSync("tmux", ["kill-session", "-t", PAT_TMUX_SESSION], {
           stdio: "ignore",
         });
       } catch {
@@ -314,7 +374,7 @@ export class CommanderProcess extends EventEmitter {
           : null,
       restart_count: this.restart_count,
       last_started_at: this.last_started_at?.toISOString() ?? null,
-      tmux_session: TMUX_SESSION,
+      tmux_session: PAT_TMUX_SESSION,
     };
   }
 }
