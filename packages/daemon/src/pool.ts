@@ -75,6 +75,11 @@ export type ActivityState = "idle" | "working" | "waiting_for_human" | "active_c
  * Check whether a tmux session is idle (showing a prompt, not actively processing).
  * Reads the last line of the tmux pane and looks for prompt or permission dialog indicators.
  *
+ * Checks three things (in order):
+ * 1. "esc to interrupt" → actively generating → NOT idle
+ * 2. "local agent" → background subagent running → NOT idle
+ * 3. "❯" or "bypass permissions" → at prompt with no active work → idle
+ *
  * Fails open (returns true) when the pane can't be read — safe default for eviction
  * and typing-loop termination.
  */
@@ -86,8 +91,17 @@ export function is_tmux_session_idle(tmux_session: string): boolean {
     });
     const lines = output.trim().split("\n");
     const last_line = lines[lines.length - 1] ?? "";
-    // "bypass permissions" matches the Claude Code workspace trust dialog text.
-    // This is UI-text dependent and may break if Claude Code changes the dialog wording.
+
+    // Claude Code's status bar shows "esc to interrupt" only during active generation.
+    if (last_line.includes("esc to interrupt")) return false;
+
+    // Background subagents: status bar shows "N local agent(s)" when subagents are running.
+    // The parent is at the prompt but work is still happening — NOT idle.
+    if (last_line.includes("local agent")) return false;
+
+    // If no active indicators, check for idle indicators:
+    // - "❯" prompt visible (waiting for input)
+    // - "bypass permissions" in status bar without active-work indicators (idle at prompt)
     return last_line.includes("❯") || last_line.includes("bypass permissions");
   } catch {
     return true; // Can't check — assume idle (fail-open)
