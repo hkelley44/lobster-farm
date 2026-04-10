@@ -661,9 +661,10 @@ export class DiscordBot extends EventEmitter {
   }
 
   /**
-   * Start a typing indicator loop for a channel. Sends typing every 8 seconds
+   * Start a typing indicator loop for a channel. Sends typing every 4 seconds
    * while the assigned pool bot is actively processing (not idle at prompt).
    * Auto-stops when the bot returns to idle or the bot is released.
+   * Also detects stale OAuth tokens mid-session and recycles the bot.
    */
   start_typing_loop(channel_id: string): void {
     // Don't stack loops for the same channel
@@ -673,9 +674,12 @@ export class DiscordBot extends EventEmitter {
     // Fire immediately, then repeat
     void this.send_typing(channel_id);
 
-    // NOTE: is_bot_idle() calls execFileSync("tmux", ...) — synchronous and blocking.
-    // Fine at current scale (sub-ms per call), but if pool utilization grows this
-    // should be replaced with an async tmux check or a dedicated idle-state event.
+    // Track consecutive idle checks to avoid premature finalization.
+    // The MCP plugin needs time to deliver the message — checking idle
+    // on the very first tick may fire before the bot starts processing.
+    let consecutive_idle = 0;
+    const IDLE_THRESHOLD = 2; // require 2 consecutive idle checks (~8s) before finalizing
+
     const interval = setInterval(() => {
       if (!this._pool) {
         this.stop_typing_loop(channel_id);
@@ -684,17 +688,48 @@ export class DiscordBot extends EventEmitter {
       }
 
       const bot = this._pool.get_assignment(channel_id);
-      if (!bot || this._pool.is_bot_idle(bot)) {
+      if (!bot) {
         this.stop_typing_loop(channel_id);
         void this.finalize_status_embed(channel_id);
         return;
+      }
+
+      // Detect stale OAuth mid-session. The initial check in handle_message()
+      // can miss this due to a race: the CLI hasn't tried the token yet when
+      // the daemon first checks. By checking here every tick, we catch it
+      // within 4 seconds and recycle the bot.
+      if (this._pool.has_stale_oauth(bot.id)) {
+        console.warn(
+          `[discord] Stale OAuth detected for pool-${String(bot.id)} during typing loop — recycling`,
+        );
+        this.stop_typing_loop(channel_id);
+        void this.finalize_status_embed(channel_id);
+        this._pool.kill_stale_session(bot.id);
+        void this._pool.release_with_history(bot.id).then(() => {
+          void this.send(
+            channel_id,
+            "Session expired — send your message again and a fresh bot will pick it up.",
+          );
+        });
+        return;
+      }
+
+      if (this._pool.is_bot_idle(bot)) {
+        consecutive_idle++;
+        if (consecutive_idle >= IDLE_THRESHOLD) {
+          this.stop_typing_loop(channel_id);
+          void this.finalize_status_embed(channel_id);
+          return;
+        }
+      } else {
+        consecutive_idle = 0;
       }
 
       void this.send_typing(channel_id);
 
       // Parse tmux output and update the status embed if activity changed
       void this.update_status_embed_from_tmux(channel_id, bot.tmux_session);
-    }, 8000);
+    }, 4000);
 
     this.typing_loops.set(channel_id, interval);
   }
