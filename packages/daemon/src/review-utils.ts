@@ -454,6 +454,9 @@ export const MAX_CI_FIX_ATTEMPTS = 3;
  * Lower than CI fix cap — deploy failures on main are higher stakes. */
 export const MAX_DEPLOY_FIX_ATTEMPTS = 2;
 
+/** Maximum number of Sentry auto-fix attempts before requiring human pickup (#250). */
+export const MAX_SENTRY_FIX_ATTEMPTS = 2;
+
 // ── CI failure log fetching (#196) ──
 
 /** Max number of lines to keep per failed job's log output. */
@@ -653,6 +656,67 @@ export function build_deploy_triage_prompt(
     "- Do NOT attempt rollbacks (git revert on main) without human approval.",
     "- If GitHub Actions logs are insufficient, note this and recommend checking CloudWatch.",
     "- Keep fixes minimal and targeted.",
+  );
+
+  return lines.join("\n");
+}
+
+// ── Sentry auto-fix prompt (#250) ──
+
+/**
+ * Build the prompt given to Bob (builder) when auto-fixing a Sentry error
+ * after Ray's triage diagnosis.
+ *
+ * Takes the triage verdict (severity, fix approach, issue number) and
+ * Sentry issue details (title, URL, stack trace, culprit) to construct
+ * a targeted fix prompt.
+ */
+export function build_sentry_fix_prompt(
+  verdict: { severity: string; fix_approach: string | null; github_issue: number | null },
+  issue_details: { title: string; web_url: string; stack_trace: string; culprit: string },
+): string {
+  const lines = [
+    "## Sentry Error Auto-Fix",
+    "",
+    `**Error:** ${issue_details.title}`,
+    `**Severity:** ${verdict.severity}`,
+    `**Culprit:** ${issue_details.culprit}`,
+    `**Sentry URL:** ${issue_details.web_url}`,
+  ];
+
+  if (verdict.github_issue != null) {
+    lines.push(`**GitHub Issue:** #${String(verdict.github_issue)}`);
+  }
+
+  lines.push("", "## Stack Trace", "", "```", issue_details.stack_trace, "```", "");
+
+  if (verdict.fix_approach) {
+    lines.push("## Diagnosis & Fix Approach", "", verdict.fix_approach, "");
+  }
+
+  lines.push(
+    "## Instructions",
+    "",
+    "1. Read the source files referenced in the stack trace above",
+    "2. Understand the root cause based on the diagnosis",
+    "3. Implement a minimal, targeted fix",
+    "4. Add or update tests if applicable",
+    "5. Create a feature branch, commit your changes, and open a PR",
+  );
+
+  if (verdict.github_issue != null) {
+    lines.push(`6. Include \`Closes #${String(verdict.github_issue)}\` in the PR body`);
+  }
+
+  lines.push(
+    "",
+    "## Rules",
+    "",
+    "- Keep changes minimal and targeted — fix the bug, nothing else.",
+    "- Do NOT touch auth, permissions, encryption, or user data handling beyond what the diagnosis calls for.",
+    "- Do NOT make architectural changes or refactor unrelated code.",
+    "- Do NOT merge the PR — the AutoReviewer will handle review and merge.",
+    "- If you are unsure about the fix or it requires broader changes, post your analysis to #alerts and stop.",
   );
 
   return lines.join("\n");

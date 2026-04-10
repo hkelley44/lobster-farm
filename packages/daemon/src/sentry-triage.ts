@@ -9,6 +9,11 @@
  *   4. Fetches full Sentry issue details via the API
  *   5. Spawns a Ray (operator) session with a structured prompt
  *   6. Tracks triage state in memory and on disk
+ *   7. Parses Ray's structured verdict and auto-spawns Bob to fix (#250)
+ *
+ * Self-healing flow (added in #250):
+ *   Sentry webhook → Ray diagnoses → structured verdict → daemon parses
+ *   → Bob fixes → PR → AutoReviewer merges
  *
  * Pattern mirrors webhook-handler.ts (GitHub PR review handler):
  * receive event → enrich with API → spawn session → track → handle completion.
@@ -21,6 +26,7 @@ import { expand_home, lobsterfarm_dir } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import type { DiscordBot } from "./discord.js";
 import type { EntityRegistry } from "./registry.js";
+import { MAX_SENTRY_FIX_ATTEMPTS, build_sentry_fix_prompt } from "./review-utils.js";
 import { type SentryIssueDetails, fetch_sentry_issue_details } from "./sentry-api.js";
 import * as sentry from "./sentry.js";
 import type { ActiveSession, ClaudeSessionManager, SessionResult } from "./session.js";
@@ -126,6 +132,13 @@ export interface SentryTriageRecord {
   triaged_at: string; // ISO timestamp
   status: "investigating" | "tracked" | "dismissed" | "auto-resolved";
   sentry_url: string;
+  // Auto-fix fields (#250)
+  severity?: "P0" | "P1" | "P2";
+  auto_fixable?: boolean;
+  fix_approach?: string;
+  fix_attempts?: number;
+  fix_session_id?: string;
+  fix_status?: "pending" | "fixing" | "fixed" | "failed";
 }
 
 export interface SentryTriageState {
@@ -238,6 +251,78 @@ async function should_triage(
   }
 
   return { proceed: true, reason: "" };
+}
+
+// ── Verdict parsing (#250) ──
+
+export interface TriageVerdict {
+  severity: "P0" | "P1" | "P2";
+  auto_fixable: boolean;
+  github_issue: number | null;
+  fix_approach: string | null;
+}
+
+const VERDICT_MARKER = "SENTRY_TRIAGE_VERDICT:";
+
+/**
+ * Parse a structured verdict from Ray's triage output.
+ *
+ * Searches output_lines in reverse for the SENTRY_TRIAGE_VERDICT: marker,
+ * then parses the JSON payload after it. Returns null on any failure
+ * (missing marker, malformed JSON, missing required fields).
+ *
+ * Null = no auto-fix = safe fallback.
+ */
+export function parse_triage_verdict(output_lines: string[] | undefined): TriageVerdict | null {
+  if (!output_lines || output_lines.length === 0) return null;
+
+  // Search in reverse — the verdict should be the last thing Ray outputs
+  for (let i = output_lines.length - 1; i >= 0; i--) {
+    const line = output_lines[i]!;
+    const marker_idx = line.indexOf(VERDICT_MARKER);
+    if (marker_idx === -1) continue;
+
+    const json_str = line.slice(marker_idx + VERDICT_MARKER.length).trim();
+    try {
+      const parsed = JSON.parse(json_str) as Record<string, unknown>;
+
+      // Validate required fields
+      const severity = parsed.severity;
+      if (severity !== "P0" && severity !== "P1" && severity !== "P2") return null;
+
+      if (typeof parsed.auto_fixable !== "boolean") return null;
+
+      const github_issue =
+        parsed.github_issue === null || parsed.github_issue === undefined
+          ? null
+          : typeof parsed.github_issue === "number"
+            ? parsed.github_issue
+            : null;
+
+      // github_issue must be null or a number — reject other types
+      if (
+        parsed.github_issue !== null &&
+        parsed.github_issue !== undefined &&
+        typeof parsed.github_issue !== "number"
+      ) {
+        return null;
+      }
+
+      const fix_approach = typeof parsed.fix_approach === "string" ? parsed.fix_approach : null;
+
+      return {
+        severity,
+        auto_fixable: parsed.auto_fixable,
+        github_issue,
+        fix_approach,
+      };
+    } catch {
+      // Malformed JSON — safe fallback
+      return null;
+    }
+  }
+
+  return null;
 }
 
 // ── Entity resolution ──
@@ -367,6 +452,15 @@ ${contexts_text}
 
 7. **If P0 (Critical):** After creating the issue, post an urgent message to #alerts flagging it for immediate human attention.
 
+8. **Output a structured verdict** as the very last line of your session. This MUST be a single line in exactly this format:
+
+SENTRY_TRIAGE_VERDICT:{"severity":"P0|P1|P2","auto_fixable":boolean,"github_issue":number|null,"fix_approach":"string or null"}
+
+Rules for auto_fixable:
+- true ONLY if: clear code bug with identifiable fix path in this repo.
+- false if: involves auth/permissions/encryption, touches user data, requires infra changes, involves third-party deps, root cause is ambiguous, or fix requires architectural decisions.
+- When in doubt, false.
+
 Do NOT attempt to fix the code yourself. Diagnose only.`;
 }
 
@@ -477,10 +571,46 @@ async function spawn_triage_session(
 
     active_triages.delete(sentry_issue_id);
 
-    // Update state: mark completed (Ray will have posted its own diagnosis/issue)
-    void update_triage_state(sentry_issue_id, { status: "tracked" }, ctx.config).catch((err) => {
-      console.error(`[sentry-triage] Failed to update state after completion: ${String(err)}`);
-    });
+    // Parse structured verdict from Ray's output (#250)
+    const verdict = parse_triage_verdict(result.output_lines);
+
+    if (verdict) {
+      // Update state with verdict data
+      void update_triage_state(
+        sentry_issue_id,
+        {
+          status: "tracked",
+          severity: verdict.severity,
+          auto_fixable: verdict.auto_fixable,
+          fix_approach: verdict.fix_approach ?? undefined,
+          github_issue: verdict.github_issue ?? undefined,
+        },
+        ctx.config,
+      )
+        .then(() => {
+          // Spawn auto-fix if eligible: auto_fixable, not P0, has a GitHub issue
+          if (verdict.auto_fixable && verdict.severity !== "P0" && verdict.github_issue != null) {
+            return spawn_sentry_fix(
+              sentry_issue_id,
+              entity_id,
+              verdict,
+              issue_details,
+              repo_path,
+              ctx,
+            );
+          }
+        })
+        .catch((err) => {
+          console.error(
+            `[sentry-triage] Failed to update state / spawn fix after completion: ${String(err)}`,
+          );
+        });
+    } else {
+      // No verdict parsed — legacy behavior: mark as tracked
+      void update_triage_state(sentry_issue_id, { status: "tracked" }, ctx.config).catch((err) => {
+        console.error(`[sentry-triage] Failed to update state after completion: ${String(err)}`);
+      });
+    }
 
     // Drain the queue now that a slot opened
     void process_queue(ctx).catch((err) => {
@@ -512,6 +642,124 @@ async function spawn_triage_session(
 
   ctx.session_manager.on("session:completed", on_complete);
   ctx.session_manager.on("session:failed", on_fail);
+}
+
+// ── Auto-fix spawning (#250) ──
+
+/**
+ * Spawn a Bob (builder) session to auto-fix a Sentry error after triage.
+ *
+ * Only called when Ray's verdict indicates the error is auto_fixable,
+ * not P0, and has an associated GitHub issue.
+ *
+ * Fix sessions do NOT count against the triage concurrency cap
+ * (MAX_CONCURRENT_TRIAGES) — they are separate work.
+ */
+async function spawn_sentry_fix(
+  sentry_issue_id: string,
+  entity_id: string,
+  verdict: TriageVerdict,
+  issue_details: SentryIssueDetails,
+  repo_path: string,
+  ctx: SentryTriageContext,
+): Promise<void> {
+  // Load current state to check fix_attempts
+  const state = await load_triage_state(ctx.config);
+  const record = state.triages[sentry_issue_id];
+  const current_attempts = record?.fix_attempts ?? 0;
+
+  if (current_attempts >= MAX_SENTRY_FIX_ATTEMPTS) {
+    console.log(
+      `[sentry-triage] Fix attempt cap reached for ${sentry_issue_id} ` +
+        `(${String(current_attempts)}/${String(MAX_SENTRY_FIX_ATTEMPTS)}) — skipping auto-fix`,
+    );
+    return;
+  }
+
+  const attempt = current_attempts + 1;
+
+  // Update state: increment attempts, mark as fixing
+  await update_triage_state(
+    sentry_issue_id,
+    { fix_attempts: attempt, fix_status: "fixing" },
+    ctx.config,
+  );
+
+  const prompt = build_sentry_fix_prompt(verdict, {
+    title: issue_details.title,
+    web_url: issue_details.web_url,
+    stack_trace: issue_details.stack_trace,
+    culprit: issue_details.culprit,
+  });
+
+  console.log(
+    `[sentry-triage] Spawning Bob for Sentry fix in ${entity_id} ` +
+      `(issue ${sentry_issue_id}, attempt ${String(attempt)}/${String(MAX_SENTRY_FIX_ATTEMPTS)})`,
+  );
+
+  let fix_session: ActiveSession;
+  try {
+    fix_session = await ctx.session_manager.spawn({
+      entity_id,
+      feature_id: `sentry-fix-${sentry_issue_id}`,
+      archetype: "builder",
+      dna: ["coding-dna"],
+      model: { model: "opus", think: "high" },
+      worktree_path: repo_path,
+      prompt,
+      interactive: false,
+    });
+  } catch (err) {
+    console.error(
+      `[sentry-triage] Failed to spawn fix session for ${sentry_issue_id}: ${String(err)}`,
+    );
+    sentry.captureException(err, {
+      tags: { module: "sentry-triage", entity: entity_id, action: "spawn_sentry_fix" },
+      contexts: { issue: { id: sentry_issue_id, title: issue_details.title } },
+    });
+    await update_triage_state(sentry_issue_id, { fix_status: "failed" }, ctx.config);
+    return;
+  }
+
+  // Update state with session ID
+  await update_triage_state(
+    sentry_issue_id,
+    { fix_session_id: fix_session.session_id },
+    ctx.config,
+  );
+
+  // ── Fix session lifecycle listeners ──
+
+  const on_fix_complete = (result: SessionResult): void => {
+    if (result.session_id !== fix_session.session_id) return;
+    ctx.session_manager.removeListener("session:completed", on_fix_complete);
+    ctx.session_manager.removeListener("session:failed", on_fix_fail);
+
+    console.log(`[sentry-triage] Fix session completed for ${sentry_issue_id}`);
+
+    void update_triage_state(sentry_issue_id, { fix_status: "fixed" }, ctx.config).catch((err) => {
+      console.error(`[sentry-triage] Failed to update state after fix completion: ${String(err)}`);
+    });
+  };
+
+  const on_fix_fail = (session_id: string, error: string): void => {
+    if (session_id !== fix_session.session_id) return;
+    ctx.session_manager.removeListener("session:completed", on_fix_complete);
+    ctx.session_manager.removeListener("session:failed", on_fix_fail);
+
+    console.error(`[sentry-triage] Fix session failed for ${sentry_issue_id}: ${error}`);
+    sentry.captureException(new Error(error), {
+      tags: { module: "sentry-triage", entity: entity_id, action: "sentry_fix_failed" },
+      contexts: { issue: { id: sentry_issue_id } },
+    });
+
+    void update_triage_state(sentry_issue_id, { fix_status: "failed" }, ctx.config).catch((e) => {
+      console.error(`[sentry-triage] Failed to update state after fix failure: ${String(e)}`);
+    });
+  };
+
+  ctx.session_manager.on("session:completed", on_fix_complete);
+  ctx.session_manager.on("session:failed", on_fix_fail);
 }
 
 // ── Main entry point ──
