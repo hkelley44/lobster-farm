@@ -44,6 +44,7 @@ vi.mock("../sentry-api.js", async (importOriginal) => {
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import type { DiscordBot } from "../discord.js";
 import type { EntityRegistry } from "../registry.js";
+import { build_sentry_fix_prompt } from "../review-utils.js";
 import { format_stack_trace } from "../sentry-api.js";
 import type { SentryIssueDetails } from "../sentry-api.js";
 import {
@@ -53,6 +54,7 @@ import {
   handle_sentry_resolved,
   handle_sentry_triage_event,
   load_triage_state,
+  parse_triage_verdict,
   save_triage_state,
 } from "../sentry-triage.js";
 import type { ClaudeSessionManager } from "../session.js";
@@ -777,5 +779,428 @@ describe("state persistence", () => {
     expect(state.triages).toEqual({});
     expect(state.stats.total_triaged).toBe(0);
     expect(state.stats.last_triage_at).toBe("");
+  });
+});
+
+// ── parse_triage_verdict tests (#250) ──
+
+describe("parse_triage_verdict", () => {
+  it("parses valid verdict JSON", () => {
+    const lines = [
+      "Some diagnostic output...",
+      'SENTRY_TRIAGE_VERDICT:{"severity":"P1","auto_fixable":true,"github_issue":42,"fix_approach":"Fix the null check in handler.ts"}',
+    ];
+
+    const verdict = parse_triage_verdict(lines);
+
+    expect(verdict).toEqual({
+      severity: "P1",
+      auto_fixable: true,
+      github_issue: 42,
+      fix_approach: "Fix the null check in handler.ts",
+    });
+  });
+
+  it("returns null for malformed JSON", () => {
+    const lines = ["SENTRY_TRIAGE_VERDICT:{invalid json}"];
+
+    expect(parse_triage_verdict(lines)).toBeNull();
+  });
+
+  it("returns null when marker is missing", () => {
+    const lines = [
+      "Some output",
+      "More output",
+      '{"severity":"P1","auto_fixable":true,"github_issue":42}',
+    ];
+
+    expect(parse_triage_verdict(lines)).toBeNull();
+  });
+
+  it("finds verdict on non-last line (searches in reverse)", () => {
+    const lines = [
+      "Diagnostic output line 1",
+      'SENTRY_TRIAGE_VERDICT:{"severity":"P2","auto_fixable":false,"github_issue":null,"fix_approach":null}',
+      "Some trailing output after verdict",
+    ];
+
+    const verdict = parse_triage_verdict(lines);
+
+    expect(verdict).toEqual({
+      severity: "P2",
+      auto_fixable: false,
+      github_issue: null,
+      fix_approach: null,
+    });
+  });
+
+  it("returns null when severity is invalid", () => {
+    const lines = [
+      'SENTRY_TRIAGE_VERDICT:{"severity":"P3","auto_fixable":true,"github_issue":42,"fix_approach":"fix it"}',
+    ];
+
+    expect(parse_triage_verdict(lines)).toBeNull();
+  });
+
+  it("returns null when auto_fixable is not a boolean", () => {
+    const lines = [
+      'SENTRY_TRIAGE_VERDICT:{"severity":"P1","auto_fixable":"yes","github_issue":42,"fix_approach":"fix it"}',
+    ];
+
+    expect(parse_triage_verdict(lines)).toBeNull();
+  });
+
+  it("returns null when github_issue is a string instead of number", () => {
+    const lines = [
+      'SENTRY_TRIAGE_VERDICT:{"severity":"P1","auto_fixable":true,"github_issue":"42","fix_approach":"fix it"}',
+    ];
+
+    expect(parse_triage_verdict(lines)).toBeNull();
+  });
+
+  it("handles missing optional fields gracefully", () => {
+    const lines = ['SENTRY_TRIAGE_VERDICT:{"severity":"P1","auto_fixable":false}'];
+
+    const verdict = parse_triage_verdict(lines);
+
+    expect(verdict).toEqual({
+      severity: "P1",
+      auto_fixable: false,
+      github_issue: null,
+      fix_approach: null,
+    });
+  });
+
+  it("returns null for empty output_lines", () => {
+    expect(parse_triage_verdict([])).toBeNull();
+  });
+});
+
+// ── Auto-fix spawning tests (#250) ──
+
+describe("auto-fix spawning", () => {
+  /**
+   * Helper: trigger a triage event, let it complete with a given verdict,
+   * and return the session manager for assertions.
+   */
+  async function triage_with_verdict(
+    verdict_json: string,
+    overrides: Partial<SentryTriageContext> = {},
+  ) {
+    const session_manager = make_session_manager();
+    const ctx = make_context({ session_manager, ...overrides });
+    const sm = session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    let spawn_count = 0;
+    sm.spawn.mockImplementation(async () => {
+      spawn_count++;
+      return {
+        session_id: `session-${String(spawn_count)}`,
+        entity_id: "test-entity",
+        feature_id: `sentry-triage-${String(spawn_count)}`,
+        archetype: spawn_count === 1 ? "operator" : "builder",
+        started_at: new Date(),
+        pid: 10000 + spawn_count,
+      };
+    });
+
+    // Trigger triage
+    await handle_sentry_triage_event("ISSUE-FIX", "test-backend", "created", ctx);
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+
+    // Complete the triage session with verdict
+    (session_manager as unknown as EventEmitter).emit("session:completed", {
+      session_id: "session-1",
+      exit_code: 0,
+      output_lines: ["Diagnostic output...", `SENTRY_TRIAGE_VERDICT:${verdict_json}`],
+    });
+
+    // Wait for async state updates and potential fix spawn
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    return { sm, session_manager, ctx };
+  }
+
+  it("spawns auto-fix when P1 + auto_fixable + has github_issue", async () => {
+    const { sm } = await triage_with_verdict(
+      '{"severity":"P1","auto_fixable":true,"github_issue":42,"fix_approach":"Fix null check"}',
+    );
+
+    // Should have spawned 2 sessions: 1 triage (Ray) + 1 fix (Bob)
+    expect(sm.spawn).toHaveBeenCalledTimes(2);
+
+    // Verify the fix session was spawned as builder
+    const fix_call = sm.spawn.mock.calls[1]![0] as Record<string, unknown>;
+    expect(fix_call.archetype).toBe("builder");
+    expect(fix_call.dna).toEqual(["coding-dna"]);
+    expect(fix_call.feature_id).toBe("sentry-fix-ISSUE-FIX");
+  });
+
+  it("spawns auto-fix when P2 + auto_fixable + has github_issue", async () => {
+    const { sm } = await triage_with_verdict(
+      '{"severity":"P2","auto_fixable":true,"github_issue":99,"fix_approach":"Edge case fix"}',
+    );
+
+    expect(sm.spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("does NOT spawn auto-fix when P0 (regardless of auto_fixable)", async () => {
+    const { sm } = await triage_with_verdict(
+      '{"severity":"P0","auto_fixable":true,"github_issue":42,"fix_approach":"Critical fix"}',
+    );
+
+    // Only 1 session: triage only, no fix
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT spawn auto-fix when auto_fixable is false", async () => {
+    const { sm } = await triage_with_verdict(
+      '{"severity":"P1","auto_fixable":false,"github_issue":42,"fix_approach":"Needs manual review"}',
+    );
+
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT spawn auto-fix when github_issue is null", async () => {
+    const { sm } = await triage_with_verdict(
+      '{"severity":"P1","auto_fixable":true,"github_issue":null,"fix_approach":"Fix something"}',
+    );
+
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT spawn auto-fix when no verdict is parsed (graceful degradation)", async () => {
+    const session_manager = make_session_manager();
+    const ctx = make_context({ session_manager });
+    const sm = session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    await handle_sentry_triage_event("ISSUE-NO-VERDICT", "test-backend", "created", ctx);
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+
+    // Resolve the spawned session to get its session_id
+    const spawned = (await sm.spawn.mock.results[0]!.value) as { session_id: string };
+
+    // Complete without a verdict line
+    (session_manager as unknown as EventEmitter).emit("session:completed", {
+      session_id: spawned.session_id,
+      exit_code: 0,
+      output_lines: ["Diagnostic output only", "No verdict here"],
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // Should not have spawned a fix session
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+
+    // State should still be updated to "tracked" (legacy behavior)
+    const state = await load_triage_state(ctx.config);
+    expect(state.triages["ISSUE-NO-VERDICT"]!.status).toBe("tracked");
+  });
+
+  it("skips auto-fix when fix attempt cap (2) is reached", async () => {
+    const config = make_config();
+    const session_manager = make_session_manager();
+    const ctx = make_context({ session_manager, config });
+    const sm = session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    // Pre-seed state: 2 fix attempts already used
+    const state_dir = join(temp_dir, "state");
+    await mkdir(state_dir, { recursive: true });
+    const state: SentryTriageState = {
+      triages: {
+        "ISSUE-CAPPED": {
+          entity_id: "test-entity",
+          project_slug: "test-backend",
+          error_title: "Some error",
+          triaged_at: new Date().toISOString(),
+          status: "tracked",
+          sentry_url: "https://sentry.io/issues/ISSUE-CAPPED/",
+          severity: "P1",
+          auto_fixable: true,
+          fix_attempts: 2,
+          fix_status: "failed",
+        },
+      },
+      stats: {
+        total_triaged: 1,
+        issues_created: 1,
+        dismissed: 0,
+        last_triage_at: new Date().toISOString(),
+      },
+    };
+    await save_triage_state(state, config);
+
+    let spawn_count = 0;
+    sm.spawn.mockImplementation(async () => {
+      spawn_count++;
+      return {
+        session_id: `session-${String(spawn_count)}`,
+        entity_id: "test-entity",
+        feature_id: `triage-${String(spawn_count)}`,
+        archetype: "operator",
+        started_at: new Date(),
+        pid: 10000 + spawn_count,
+      };
+    });
+
+    await handle_sentry_triage_event("ISSUE-CAPPED", "test-backend", "regression", ctx);
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+
+    // Complete with auto_fixable verdict
+    (session_manager as unknown as EventEmitter).emit("session:completed", {
+      session_id: "session-1",
+      exit_code: 0,
+      output_lines: [
+        'SENTRY_TRIAGE_VERDICT:{"severity":"P1","auto_fixable":true,"github_issue":42,"fix_approach":"Try again"}',
+      ],
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // Fix should NOT have been spawned — at cap
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("updates fix_status to 'fixed' on fix session completion", async () => {
+    const config = make_config();
+    const { sm, session_manager, ctx } = await triage_with_verdict(
+      '{"severity":"P1","auto_fixable":true,"github_issue":42,"fix_approach":"Fix null check"}',
+    );
+
+    expect(sm.spawn).toHaveBeenCalledTimes(2);
+
+    // Complete the fix session
+    (session_manager as unknown as EventEmitter).emit("session:completed", {
+      session_id: "session-2",
+      exit_code: 0,
+      output_lines: ["Fixed the issue"],
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const state = await load_triage_state(config);
+    expect(state.triages["ISSUE-FIX"]!.fix_status).toBe("fixed");
+  });
+
+  it("updates fix_status to 'failed' on fix session failure", async () => {
+    const config = make_config();
+    const { sm, session_manager, ctx } = await triage_with_verdict(
+      '{"severity":"P1","auto_fixable":true,"github_issue":42,"fix_approach":"Fix null check"}',
+    );
+
+    expect(sm.spawn).toHaveBeenCalledTimes(2);
+
+    // Fail the fix session
+    (session_manager as unknown as EventEmitter).emit(
+      "session:failed",
+      "session-2",
+      "tmux crashed",
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const state = await load_triage_state(config);
+    expect(state.triages["ISSUE-FIX"]!.fix_status).toBe("failed");
+  });
+});
+
+// ── build_sentry_fix_prompt tests (#250) ──
+
+describe("build_sentry_fix_prompt", () => {
+  it("includes Closes #N when github_issue is provided", () => {
+    const verdict = {
+      severity: "P1",
+      fix_approach: "Fix the null check",
+      github_issue: 42,
+    };
+    const issue_details = {
+      title: "TypeError: Cannot read property 'foo'",
+      web_url: "https://sentry.io/issues/12345/",
+      stack_trace: "at handler.ts:42",
+      culprit: "src/handler.ts",
+    };
+
+    const prompt = build_sentry_fix_prompt(verdict, issue_details);
+
+    expect(prompt).toContain("Closes #42");
+    expect(prompt).toContain("**GitHub Issue:** #42");
+  });
+
+  it("omits Closes #N when github_issue is null", () => {
+    const verdict = {
+      severity: "P2",
+      fix_approach: "Fix edge case",
+      github_issue: null,
+    };
+    const issue_details = {
+      title: "Error: edge case",
+      web_url: "https://sentry.io/issues/99/",
+      stack_trace: "at util.ts:10",
+      culprit: "src/util.ts",
+    };
+
+    const prompt = build_sentry_fix_prompt(verdict, issue_details);
+
+    expect(prompt).not.toContain("Closes #");
+    expect(prompt).not.toContain("**GitHub Issue:**");
+  });
+
+  it("includes fix approach when provided", () => {
+    const verdict = {
+      severity: "P1",
+      fix_approach: "Add null guard before accessing response.data",
+      github_issue: 10,
+    };
+    const issue_details = {
+      title: "TypeError",
+      web_url: "https://sentry.io/issues/1/",
+      stack_trace: "at api.ts:5",
+      culprit: "src/api.ts",
+    };
+
+    const prompt = build_sentry_fix_prompt(verdict, issue_details);
+
+    expect(prompt).toContain("Add null guard before accessing response.data");
+    expect(prompt).toContain("## Diagnosis & Fix Approach");
+  });
+
+  it("omits fix approach section when fix_approach is null", () => {
+    const verdict = {
+      severity: "P1",
+      fix_approach: null,
+      github_issue: 10,
+    };
+    const issue_details = {
+      title: "Error",
+      web_url: "https://sentry.io/issues/1/",
+      stack_trace: "at x.ts:1",
+      culprit: "src/x.ts",
+    };
+
+    const prompt = build_sentry_fix_prompt(verdict, issue_details);
+
+    expect(prompt).not.toContain("## Diagnosis & Fix Approach");
+  });
+
+  it("includes error details and stack trace", () => {
+    const verdict = {
+      severity: "P1",
+      fix_approach: null,
+      github_issue: 5,
+    };
+    const issue_details = {
+      title: "RangeError: out of bounds",
+      web_url: "https://sentry.io/issues/555/",
+      stack_trace: "RangeError: out of bounds\n  at Array.push (native)\n  at handler.ts:99",
+      culprit: "src/handler.ts in process",
+    };
+
+    const prompt = build_sentry_fix_prompt(verdict, issue_details);
+
+    expect(prompt).toContain("**Error:** RangeError: out of bounds");
+    expect(prompt).toContain("**Severity:** P1");
+    expect(prompt).toContain("**Culprit:** src/handler.ts in process");
+    expect(prompt).toContain("at handler.ts:99");
+    expect(prompt).toContain("Do NOT merge the PR");
   });
 });
