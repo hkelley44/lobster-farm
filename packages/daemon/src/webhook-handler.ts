@@ -206,16 +206,27 @@ function review_key_prefix(entity_id: string, pr_number: number): string {
   return `${entity_id}:${String(pr_number)}:`;
 }
 
-/** Find the in-flight/completed review (if any) for a given PR, regardless of SHA. */
+/**
+ * Find the in-flight/completed review (if any) for a given PR, regardless of SHA.
+ *
+ * When multiple entries exist (e.g. a completed SHA-A and an in-flight SHA-B
+ * coexisting during the TTL hold window), always prefer the in_flight entry.
+ * Returning a completed entry when an in_flight one also exists would bypass
+ * the dedup gate and allow a duplicate reviewer to spawn. See #258.
+ */
 function find_review_for_pr(
   entity_id: string,
   pr_number: number,
 ): { key: string; review: ActiveWebhookReview } | null {
   const prefix = review_key_prefix(entity_id, pr_number);
+  let completed_entry: { key: string; review: ActiveWebhookReview } | null = null;
   for (const [key, review] of active_reviews) {
-    if (key.startsWith(prefix)) return { key, review };
+    if (key.startsWith(prefix)) {
+      if (review.state === "in_flight") return { key, review };
+      completed_entry ??= { key, review };
+    }
   }
-  return null;
+  return completed_entry;
 }
 
 const REVIEW_TIMEOUT_MS = 30 * 60 * 1000;

@@ -460,6 +460,77 @@ describe("attempt_auto_merge", () => {
     expect(result.error).toMatch(/timeout|Rebase failed/i);
   });
 
+  it("falls through to update-branch/rebase when PR transitions to BEHIND during policy-lag backoff", async () => {
+    // Regression test: when retry_merge_with_backoff detects a BEHIND transition
+    // mid-loop, it must NOT return early — the outer flow needs to reach Step 3
+    // (update-branch + local rebase fallback) to actually fix the BEHIND state.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    try {
+      let merge_count = 0;
+      let pr_view_count = 0;
+      let update_branch_called = false;
+
+      route_exec({
+        "gh pr view": () => {
+          pr_view_count++;
+          if (pr_view_count <= 2) {
+            // Initial state + post-direct: BLOCKED + MERGEABLE → enters backoff
+            return {
+              stdout: JSON.stringify({
+                mergeable: "MERGEABLE",
+                mergeStateStatus: "BLOCKED",
+              }),
+            };
+          }
+          if (pr_view_count === 3) {
+            // First backoff poll: PR transitioned to BEHIND
+            return {
+              stdout: JSON.stringify({
+                mergeable: "MERGEABLE",
+                mergeStateStatus: "BEHIND",
+              }),
+            };
+          }
+          // After update-branch: MERGEABLE
+          return { stdout: "MERGEABLE" };
+        },
+        "gh pr merge": () => {
+          merge_count++;
+          // First attempt (direct): fails with policy-lag
+          if (merge_count === 1) {
+            return new Error(
+              "X Pull request is not mergeable: the base branch policy prohibits the merge.",
+            );
+          }
+          // After update-branch: succeeds
+          return { stdout: "" };
+        },
+        "gh repo view": () => ({ stdout: "test-org/test-repo" }),
+        "gh api": (args) => {
+          if (args.some((a) => a.includes("update-branch"))) {
+            update_branch_called = true;
+            return { stdout: "" };
+          }
+          return new Error("unknown api call");
+        },
+      });
+
+      const promise = attempt_auto_merge(42, "feature/test", "/repo", "gh");
+      // Advance through the first backoff interval (10s)
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      const result = await promise;
+
+      // Should have fallen through to update-branch (Step 3), not returned early
+      expect(update_branch_called).toBe(true);
+      expect(result.merged).toBe(true);
+      expect(result.method).toBe("update-branch");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("falls through to local rebase when update-branch succeeds but merge still fails", async () => {
     let merge_count = 0;
     let rebase_attempted = false;

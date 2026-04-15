@@ -869,6 +869,106 @@ describe("handle_github_webhook", () => {
       // Still exactly one spawn — the duplicate was dropped during the hold
       expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
     });
+
+    it("prefers in_flight entry over completed entry when both exist for the same PR", async () => {
+      // Regression for #258: after a requeue, SHA-A's entry is `completed` (inserted
+      // first) and SHA-B's entry is `in_flight` (inserted second). If a third SHA-C
+      // webhook arrives, find_review_for_pr must return SHA-B's in_flight entry,
+      // not SHA-A's completed entry — otherwise the dedup gate is bypassed and a
+      // duplicate reviewer spawns while SHA-B's review is still running.
+
+      const ctx = make_context();
+
+      // Step 1: SHA-A opens a review
+      const body1 = make_pr_payload(
+        "opened",
+        603,
+        "test-org/lobster-farm",
+        {},
+        { head_sha: "sha-aaa" },
+      );
+      const req1 = make_request(body1, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body1),
+      });
+      await handle_github_webhook(req1, make_response(), ctx);
+
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
+
+      // Step 2: SHA-B arrives while SHA-A is in-flight → requeue
+      const body2 = make_pr_payload(
+        "synchronize",
+        603,
+        "test-org/lobster-farm",
+        {},
+        { head_sha: "sha-bbb" },
+      );
+      const req2 = make_request(body2, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body2),
+      });
+      await handle_github_webhook(req2, make_response(), ctx);
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Still one spawn, SHA-A is requeue-flagged
+      expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+
+      // Step 3: SHA-A's review completes → transitions to `completed`, spawns SHA-B
+      const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
+      (ctx.session_manager as any).emit("session:completed", {
+        session_id: spawn_result.session_id,
+        exit_code: 0,
+      });
+
+      // Wait for SHA-B's review to be spawned via requeue
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(2);
+        },
+        { timeout: 2000 },
+      );
+
+      // Now: SHA-A entry is `completed` (TTL hold), SHA-B entry is `in_flight`.
+      // Verify both exist in the expected states.
+      const active = get_active_webhook_reviews();
+      const sha_a = active.find((r) => r.head_sha === "sha-aaa");
+      const sha_b = active.find((r) => r.head_sha === "sha-bbb");
+      expect(sha_a).toBeDefined();
+      expect(sha_a!.state).toBe("completed");
+      expect(sha_b).toBeDefined();
+      expect(sha_b!.state).toBe("in_flight");
+
+      // Step 4: SHA-C arrives during the 60s TTL window. find_review_for_pr must
+      // find SHA-B (in_flight), NOT SHA-A (completed). So SHA-C should be queued
+      // as a requeue on SHA-B, NOT spawn a third reviewer.
+      const body3 = make_pr_payload(
+        "synchronize",
+        603,
+        "test-org/lobster-farm",
+        {},
+        { head_sha: "sha-ccc" },
+      );
+      const req3 = make_request(body3, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body3),
+      });
+      await handle_github_webhook(req3, make_response(), ctx);
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Must NOT have spawned a third reviewer — SHA-C should be requeued on SHA-B
+      expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(2);
+
+      // SHA-B's entry should now be marked for requeue with SHA-C
+      const active_after = get_active_webhook_reviews();
+      const sha_b_after = active_after.find((r) => r.head_sha === "sha-bbb");
+      expect(sha_b_after).toBeDefined();
+      expect(sha_b_after!.needs_requeue).toBe(true);
+    });
   });
 
   describe("spawner error paths", () => {

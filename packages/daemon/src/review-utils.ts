@@ -285,8 +285,8 @@ export async function attempt_auto_merge(
       env,
       exec_opts,
     );
-    if (retry_result.merged) return retry_result;
-    return retry_result;
+    if (retry_result.merged || retry_result.failure !== "BEHIND") return retry_result;
+    // Fall through to Step 3 — PR transitioned to BEHIND during backoff
   }
 
   // Step 3: BEHIND or fall-through → update-branch + local rebase fallback.
@@ -347,11 +347,9 @@ export async function attempt_auto_merge(
   const final_state = await fetch_merge_state(pr_number, repo_path, gh_bin, env);
   const raw_error = rebase_result.error ?? direct_error;
   const final_failure = classify_merge_failure(final_state, raw_error);
-  // Preserve the raw rebase error when it's more specific than the canned
-  // classification message (e.g. "Rebase failed: timeout..." surfaces a real
-  // diagnostic that "branch is behind" obscures). Only override the raw
-  // error when classification identified a specific, actionable category
-  // that's more useful than the raw text.
+  // Prefer the raw rebase error (e.g. "Rebase failed: timeout") over the
+  // re-classified message, UNLESS the raw text IS the canned "rebase conflicts"
+  // string that we want to replace with the accurate classification.
   const use_raw =
     rebase_result.error != null &&
     !/rebase conflicts require manual resolution/i.test(rebase_result.error);
