@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { access, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { access, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
@@ -166,7 +166,6 @@ export async function session_jsonl_exists(
  * pool-state.json on daemon restart, where the original cwd (e.g. a feature
  * worktree) may differ from the entity_dir the restart will actually use. */
 export async function session_jsonl_exists_anywhere(session_id: string): Promise<boolean> {
-  const { readdir } = await import("node:fs/promises");
   const projects_dir = join(homedir(), ".claude", "projects");
   const filename = `${session_id}.jsonl`;
   try {
@@ -1713,8 +1712,18 @@ export class BotPool extends EventEmitter {
       }
 
       const exists = await this.check_session_jsonl_exists(working_dir, session_id);
+
+      // Re-check after await: bot may have been reassigned during the async
+      // suspension — cancel_session_watcher only stops future ticks, not an
+      // in-flight continuation. (#256)
+      const still_current = this.bots.find((b) => b.id === bot_id);
+      if (!still_current || still_current.session_id !== session_id) {
+        this.session_watchers.delete(bot_id);
+        return;
+      }
+
       if (exists) {
-        current.session_confirmed = true;
+        still_current.session_confirmed = true;
         this.session_watchers.delete(bot_id);
         console.log(
           `[pool] pool-${String(bot_id)} session ${session_id.slice(0, 8)} confirmed — JSONL on disk, persisting`,
