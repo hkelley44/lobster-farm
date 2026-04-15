@@ -1985,10 +1985,11 @@ export class BotPool extends EventEmitter {
 
       if (!pane_cwd) return;
 
-      // Check if the directory still exists
+      // Check if the directory still exists and is actually a directory
       try {
-        await stat(pane_cwd);
-        return; // Directory exists — all good
+        const st = await stat(pane_cwd);
+        if (st.isDirectory()) return; // Directory exists — all good
+        // Path exists but is not a directory — need to recover
       } catch {
         // Directory doesn't exist — need to recover
       }

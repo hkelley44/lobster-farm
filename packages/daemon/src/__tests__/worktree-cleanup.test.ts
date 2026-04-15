@@ -3,13 +3,15 @@ import {
   cleanup_after_merge,
   find_worktree_for_branch,
   parse_worktree_list,
+  relocate_sessions_from_path,
   remove_worktree,
   sweep_stale_worktrees,
 } from "../worktree-cleanup.js";
 
-// ── Mock child_process.execFile ──
+// ── Mock child_process.execFile and execFileSync ──
 
 const mock_exec_file = vi.fn();
+const mock_exec_file_sync = vi.fn();
 
 vi.mock("node:child_process", () => ({
   execFile: (...args: unknown[]) => {
@@ -24,6 +26,9 @@ vi.mock("node:child_process", () => ({
       }
     }
     return undefined;
+  },
+  execFileSync: (...args: unknown[]) => {
+    return mock_exec_file_sync(args[0], args[1], args[2]);
   },
 }));
 
@@ -133,6 +138,118 @@ beforeEach(() => {
   vi.clearAllMocks();
   mock_stat.mockResolvedValue({ isDirectory: () => true });
   mock_readdir.mockResolvedValue([]);
+  // Default: tmux not running (execFileSync throws)
+  mock_exec_file_sync.mockImplementation(() => {
+    throw new Error("no server running on /tmp/tmux-501/default");
+  });
+});
+
+describe("relocate_sessions_from_path", () => {
+  it("returns 0 and does not throw when tmux is not running", async () => {
+    // Default mock throws (tmux not running)
+    const result = await relocate_sessions_from_path("/some/worktree", "/repo");
+    expect(result).toBe(0);
+  });
+
+  it("returns 0 when no panes have a matching cwd", async () => {
+    mock_exec_file_sync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "tmux" && args[0] === "list-panes") {
+        return "session1 %0 /other/path\nsession2 %1 /another/path\n";
+      }
+      return "";
+    });
+
+    const result = await relocate_sessions_from_path("/target/worktree", "/repo");
+    expect(result).toBe(0);
+
+    // Should not have sent any cd commands
+    const send_keys_calls = mock_exec_file_sync.mock.calls.filter(
+      (c: unknown[]) => (c[0] as string) === "tmux" && (c[1] as string[])[0] === "send-keys",
+    );
+    expect(send_keys_calls).toHaveLength(0);
+  });
+
+  it("relocates a pane whose cwd is exactly the target path", async () => {
+    mock_exec_file_sync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "tmux" && args[0] === "list-panes") {
+        return "session1 %0 /target/worktree\nsession2 %1 /other/path\n";
+      }
+      return "";
+    });
+
+    const result = await relocate_sessions_from_path("/target/worktree", "/repo");
+    expect(result).toBe(1);
+
+    // Should have sent cd to the matching pane using its pane ID
+    expect(mock_exec_file_sync).toHaveBeenCalledWith(
+      "tmux",
+      ["send-keys", "-t", "%0", expect.stringContaining("cd"), "Enter"],
+      expect.objectContaining({ timeout: 2000 }),
+    );
+  });
+
+  it("relocates panes inside a subdirectory of the target path", async () => {
+    mock_exec_file_sync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "tmux" && args[0] === "list-panes") {
+        return "session1 %0 /target/worktree/src/deep/dir\n";
+      }
+      return "";
+    });
+
+    const result = await relocate_sessions_from_path("/target/worktree", "/repo");
+    expect(result).toBe(1);
+  });
+
+  it("does NOT relocate a pane whose path is a prefix but not inside the target", async () => {
+    // /foo/bar-baz should NOT match target /foo/bar (trailing-slash guard)
+    mock_exec_file_sync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "tmux" && args[0] === "list-panes") {
+        return "session1 %0 /foo/bar-baz\n";
+      }
+      return "";
+    });
+
+    const result = await relocate_sessions_from_path("/foo/bar", "/repo");
+    expect(result).toBe(0);
+  });
+
+  it("handles multiple matching panes across sessions", async () => {
+    mock_exec_file_sync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "tmux" && args[0] === "list-panes") {
+        return [
+          "gary %0 /worktree/path",
+          "bob %1 /worktree/path/src",
+          "other %2 /different/path",
+          "bob %3 /worktree/path",
+        ].join("\n");
+      }
+      return "";
+    });
+
+    const result = await relocate_sessions_from_path("/worktree/path", "/repo");
+    expect(result).toBe(3);
+  });
+
+  it("continues relocating other panes when one send-keys fails", async () => {
+    let send_keys_count = 0;
+    mock_exec_file_sync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "tmux" && args[0] === "list-panes") {
+        return "s1 %0 /wt/path\ns2 %1 /wt/path\n";
+      }
+      if (cmd === "tmux" && args[0] === "send-keys") {
+        send_keys_count++;
+        if (send_keys_count === 1) {
+          throw new Error("session not found");
+        }
+        return "";
+      }
+      return "";
+    });
+
+    const result = await relocate_sessions_from_path("/wt/path", "/repo");
+    // First pane fails, second succeeds — only 1 relocated
+    expect(result).toBe(1);
+  });
 });
 
 describe("parse_worktree_list", () => {

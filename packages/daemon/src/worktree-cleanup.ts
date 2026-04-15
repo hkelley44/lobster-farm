@@ -42,13 +42,14 @@ export async function relocate_sessions_from_path(
   // This prevents false positives like /foo/bar-baz matching /foo/bar.
   const target_prefix = target_path.endsWith("/") ? target_path : `${target_path}/`;
 
-  let sessions: string[];
+  let pane_lines: string[];
   try {
-    const result = execFileSync("tmux", ["list-sessions", "-F", "#{session_name}"], {
-      encoding: "utf-8",
-      timeout: 5000,
-    });
-    sessions = result.trim().split("\n").filter(Boolean);
+    const result = execFileSync(
+      "tmux",
+      ["list-panes", "-a", "-F", "#{session_name} #{pane_id} #{pane_current_path}"],
+      { encoding: "utf-8", timeout: 5000 },
+    );
+    pane_lines = result.trim().split("\n").filter(Boolean);
   } catch {
     // tmux not running or no sessions — nothing to relocate
     return 0;
@@ -56,27 +57,28 @@ export async function relocate_sessions_from_path(
 
   let relocated = 0;
 
-  for (const session of sessions) {
-    try {
-      const pane_cwd = execFileSync(
-        "tmux",
-        ["display-message", "-t", session, "-p", "#{pane_current_path}"],
-        { encoding: "utf-8", timeout: 2000 },
-      ).trim();
+  for (const line of pane_lines) {
+    // Each line: "session_name %N /path/to/cwd"
+    const [session, pane_id, ...path_parts] = line.split(" ");
+    if (!session || !pane_id) continue;
+    const pane_cwd = path_parts.join(" "); // handles paths with spaces
 
+    try {
       // Check if the pane's cwd is inside (or exactly at) the target path
       if (pane_cwd === target_path || pane_cwd.startsWith(target_prefix)) {
-        execFileSync("tmux", ["send-keys", "-t", session, `cd ${sq(safe_path)}`, "Enter"], {
+        execFileSync("tmux", ["send-keys", "-t", pane_id, `cd ${sq(safe_path)}`, "Enter"], {
           timeout: 2000,
         });
-        console.log(`[worktree-cleanup] Relocated ${session}: ${pane_cwd} → ${safe_path}`);
+        console.log(
+          `[worktree-cleanup] Relocated pane ${pane_id} (${session}): ${pane_cwd} → ${safe_path}`,
+        );
         relocated++;
       }
     } catch (err) {
-      // Per-session errors are non-fatal — the session may have died between
+      // Per-pane errors are non-fatal — the pane may have died between
       // listing and querying, or it may be in a state that rejects send-keys.
       console.log(
-        `[worktree-cleanup] Could not check/relocate session ${session}: ${String(err instanceof Error ? err.message : err)}`,
+        `[worktree-cleanup] Could not relocate pane ${pane_id} (${session}): ${String(err instanceof Error ? err.message : err)}`,
       );
     }
   }
