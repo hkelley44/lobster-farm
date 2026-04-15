@@ -350,13 +350,15 @@ export async function attempt_auto_merge(
   // Prefer the raw rebase error (e.g. "Rebase failed: timeout") over the
   // re-classified message, UNLESS the raw text IS the canned "rebase conflicts"
   // string that we want to replace with the accurate classification.
-  const use_raw =
+  const is_canned_conflict_message =
     rebase_result.error != null &&
-    !/rebase conflicts require manual resolution/i.test(rebase_result.error);
+    /rebase conflicts require manual resolution/i.test(rebase_result.error);
   return {
     merged: false,
     failure: final_failure,
-    error: use_raw ? rebase_result.error! : format_merge_failure(final_failure, raw_error),
+    error: is_canned_conflict_message
+      ? format_merge_failure(final_failure, raw_error)
+      : (rebase_result.error ?? format_merge_failure(final_failure, raw_error)),
   };
 }
 

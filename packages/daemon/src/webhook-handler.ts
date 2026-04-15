@@ -206,6 +206,11 @@ function review_key_prefix(entity_id: string, pr_number: number): string {
   return `${entity_id}:${String(pr_number)}:`;
 }
 
+/** Persistent PR state key — SHA-independent. Tracks retry counts across commits. */
+function ci_retry_key(entity_id: string, pr_number: number): string {
+  return `${entity_id}:${String(pr_number)}`;
+}
+
 /**
  * Find the in-flight/completed review (if any) for a given PR, regardless of SHA.
  *
@@ -857,9 +862,7 @@ async function spawn_ci_fixer(
   ctx: WebhookContext,
   installation_id?: string,
 ): Promise<void> {
-  // Persistent PR state key — NOT the dedup key. Tracks retry counts across
-  // commits, so it's intentionally SHA-independent.
-  const key = `${entity_id}:${String(pr.number)}`;
+  const key = ci_retry_key(entity_id, pr.number);
 
   // Check retry cap
   const pr_state = await load_pr_reviews(ctx.config);
