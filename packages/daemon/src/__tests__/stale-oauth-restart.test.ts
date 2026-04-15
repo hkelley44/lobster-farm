@@ -26,6 +26,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     archetype: null,
     channel_type: null,
     session_id: null,
+    session_confirmed: true,
     tmux_session: `pool-${String(overrides.id)}`,
     last_active: null,
     assigned_at: null,
@@ -76,6 +77,18 @@ class TestBotPool extends BotPool {
   /** Override is_pane_stale_oauth to use test-controlled map instead of tmux. */
   protected override is_pane_stale_oauth(session_name: string): boolean {
     return this.pane_stale_overrides.get(session_name) ?? false;
+  }
+
+  /** Default to "JSONL present" in tests so existing pre-#256 expectations hold. */
+  protected override check_session_jsonl_exists_anywhere(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  protected override check_session_jsonl_exists(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  /** Disable the background JSONL confirmation watcher in tests. */
+  protected override watch_session_confirmation(bot: PoolBot): void {
+    bot.session_confirmed = true;
   }
 }
 
