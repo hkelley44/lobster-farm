@@ -1677,4 +1677,111 @@ describe("handle_github_webhook", () => {
       );
     });
   });
+
+  // Issue #261 — AutoReviewer two-pass review.
+  // Pass 1 (spec compliance) is a hard gate that blocks Pass 2 (code quality).
+  // The prompt is a single-session instruction block — we are asserting the
+  // structural elements of that block, not runtime behavior (the reviewer
+  // session itself interprets the prompt).
+  describe("build_reviewer_prompt two-pass structure (issue #261)", () => {
+    const make_pr = () => ({
+      number: 42,
+      title: "Test PR",
+      head: { ref: "feature/test" },
+      body: null,
+      user: { login: "testuser" },
+    });
+
+    const issue_context = [
+      "## Acceptance Criteria",
+      "- [ ] Does the thing",
+      "- [ ] Does the other thing",
+    ].join("\n");
+
+    describe("with a linked issue", () => {
+      const prompt = build_reviewer_prompt(
+        make_pr(),
+        "/tmp/repo",
+        "test-org/test-repo",
+        issue_context,
+      );
+
+      it("contains a Pass 1 instruction block labelled 'Pass 1 — Spec Compliance'", () => {
+        expect(prompt).toContain("Pass 1 — Spec Compliance");
+        // A labelled heading, not just an incidental mention.
+        expect(prompt).toMatch(/### Pass 1 — Spec Compliance/);
+      });
+
+      it("contains a Pass 2 instruction block labelled 'Pass 2 — Code Quality'", () => {
+        expect(prompt).toContain("Pass 2 — Code Quality");
+        expect(prompt).toMatch(/### Pass 2 — Code Quality/);
+      });
+
+      it("instructs the reviewer to halt after Pass 1 failure (do NOT run Pass 2)", () => {
+        // The hard-gate language must be present. Case-sensitive "NOT" is the
+        // spec's emphasis convention.
+        expect(prompt).toMatch(/do NOT run Pass 2/i);
+        // And the stop-immediately instruction.
+        expect(prompt.toLowerCase()).toContain("stop immediately");
+      });
+
+      it("instructs the reviewer to check for under-building (missing acceptance criteria)", () => {
+        expect(prompt.toLowerCase()).toContain("missing");
+        expect(prompt.toLowerCase()).toContain("partial");
+        expect(prompt).toMatch(/acceptance criter/i);
+      });
+
+      it("instructs the reviewer to check for over-building (unrequested scope)", () => {
+        expect(prompt.toLowerCase()).toContain("over-build");
+        expect(prompt.toLowerCase()).toContain("out of scope");
+      });
+
+      it("defines the Pass 1 CHANGES REQUESTED marker line verbatim", () => {
+        expect(prompt).toContain("## Pass 1 — Spec Compliance: CHANGES REQUESTED");
+      });
+
+      it("defines the Pass 1 PASSED marker line verbatim", () => {
+        expect(prompt).toContain("## Pass 1 — Spec Compliance: PASSED");
+      });
+
+      it("defines the Pass 2 marker line verbatim", () => {
+        expect(prompt).toContain("## Pass 2 — Code Quality");
+      });
+
+      it("places the linked issue context BEFORE the Pass 1 instructions", () => {
+        // The reviewer must read the spec before being told what to do with
+        // it — this is a spec requirement, not cosmetic.
+        const issue_idx = prompt.indexOf("## Linked Issue Context");
+        const pass1_idx = prompt.indexOf("### Pass 1 — Spec Compliance");
+        expect(issue_idx).toBeGreaterThanOrEqual(0);
+        expect(pass1_idx).toBeGreaterThan(issue_idx);
+      });
+
+      it("preserves the three-case CI handling from #268", () => {
+        // Failing / pending / passing must all still be distinguished in the
+        // prompt. Regression guard against accidentally reverting #268.
+        expect(prompt).toContain("FAILING required checks");
+        expect(prompt).toContain("PENDING required checks");
+        expect(prompt).toContain("PASSING required checks");
+      });
+    });
+
+    describe("with no linked issue", () => {
+      const prompt = build_reviewer_prompt(make_pr(), "/tmp/repo", "test-org/test-repo", "");
+
+      it("treats Pass 1 as a documented no-op and defines the SKIPPED marker", () => {
+        expect(prompt).toContain("## Pass 1 — Spec Compliance: SKIPPED (no linked issue)");
+        expect(prompt.toLowerCase()).toContain("no linked issue");
+      });
+
+      it("still includes Pass 2 (code quality runs on unlinked PRs)", () => {
+        expect(prompt).toMatch(/### Pass 2 — Code Quality/);
+        expect(prompt).toContain("## Pass 2 — Code Quality");
+      });
+
+      it("does not include the linked-issue context section", () => {
+        expect(prompt).not.toContain("## Linked Issue Context");
+      });
+    });
+  });
 });
