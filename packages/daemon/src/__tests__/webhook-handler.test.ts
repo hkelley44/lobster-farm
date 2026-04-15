@@ -1433,6 +1433,62 @@ describe("handle_github_webhook", () => {
     });
   });
 
+  describe("dismissed review outcome", () => {
+    it("defers to cron instead of spawning inline when outcome is dismissed", async () => {
+      const { detect_review_outcome } = await import("../actions.js");
+      vi.mocked(detect_review_outcome).mockResolvedValueOnce("dismissed" as any);
+
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      try {
+        const body = make_pr_payload("opened", 500, "test-org/lobster-farm");
+        const req = make_request(body, {
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": sign_payload(body),
+        });
+        const res = make_response();
+        const ctx = make_context();
+
+        await handle_github_webhook(req, res, ctx);
+
+        // Wait for reviewer to be spawned
+        await vi.waitFor(
+          () => {
+            expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+          },
+          { timeout: 2000 },
+        );
+
+        // Simulate reviewer session completion
+        const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
+        (ctx.session_manager as any).emit("session:completed", {
+          session_id: spawn_result.session_id,
+          exit_code: 0,
+        });
+
+        // Wait for post-review handling to complete
+        await vi.waitFor(
+          () => {
+            expect(log_spy).toHaveBeenCalledWith(
+              expect.stringContaining("will be re-reviewed next cycle"),
+            );
+          },
+          { timeout: 2000 },
+        );
+
+        // Should NOT have spawned a second reviewer inline — defers to cron
+        expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+
+        // active_reviews entry should be cleaned up by .finally()
+        const active = get_active_webhook_reviews();
+        const matching = active.filter((r) => r.pr_number === 500);
+        expect(matching).toHaveLength(0);
+      } finally {
+        log_spy.mockRestore();
+      }
+    });
+  });
+
   describe("reviewer prompt content", () => {
     it("includes pre-existing review check instruction", async () => {
       const body = make_pr_payload("opened", 300, "test-org/lobster-farm");
@@ -1458,6 +1514,8 @@ describe("handle_github_webhook", () => {
       // Pre-existing review check (suggestion 2 from review)
       expect(prompt).toContain("Before posting your review, check for any existing reviews");
       expect(prompt).toContain('select(.user.login | endswith("[bot]"))');
+      // API URL uses correct PR number
+      expect(prompt).toContain("gh api repos/test-org/lobster-farm/pulls/300/reviews");
     });
 
     it("includes echo verification in review commands", async () => {
@@ -1486,6 +1544,8 @@ describe("handle_github_webhook", () => {
       expect(prompt).toContain(
         "Never dismiss, delete, or modify reviews you have already posted.",
       );
+      // Review commands use correct PR number
+      expect(prompt).toContain("gh pr review 301 --");
     });
 
     it("includes post-review verification API call", async () => {
@@ -1579,6 +1639,9 @@ describe("handle_github_webhook", () => {
         },
         { timeout: 2000 },
       );
+
+      // The gh api call for has_existing_bot_review should NOT have been made
+      expect(execFile_mock).not.toHaveBeenCalled();
     });
 
     it("proceeds with spawn when pre-spawn dedup check fails", async () => {

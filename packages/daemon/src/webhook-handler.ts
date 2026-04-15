@@ -799,16 +799,18 @@ async function handle_review_completion(
     }
   } else if (outcome === "dismissed") {
     // All reviews were dismissed (e.g., duplicate cleanup gone wrong).
-    // Spawn a fresh review so the PR doesn't get stuck in limbo.
+    // Don't spawn a new review inline — cleanup_and_maybe_requeue runs in
+    // .finally() after this function resolves and would delete the new
+    // review's active_reviews entry, leaving it untracked. Instead, let
+    // the next pr-cron cycle pick it up (same strategy as pr-cron.ts).
     console.log(
-      `[webhook] All reviews dismissed on PR #${String(pr.number)} — spawning fresh review`,
+      `[webhook] All reviews dismissed on PR #${String(pr.number)} — will be re-reviewed next cycle`,
     );
     await notify_alerts(
       entity_id,
-      `PR #${String(pr.number)}: "${pr.title}" — all reviews dismissed, re-reviewing`,
+      `PR #${String(pr.number)}: "${pr.title}" — all reviews dismissed, will re-review next cycle`,
       ctx,
     );
-    await spawn_review(entity_id, repo_path, repo_full_name, pr, ctx, installation_id);
   } else {
     await notify_alerts(
       entity_id,
