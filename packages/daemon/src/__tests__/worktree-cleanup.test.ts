@@ -147,7 +147,7 @@ beforeEach(() => {
 describe("relocate_sessions_from_path", () => {
   it("returns 0 and does not throw when tmux is not running", async () => {
     // Default mock throws (tmux not running)
-    const result = await relocate_sessions_from_path("/some/worktree", "/repo");
+    const result = relocate_sessions_from_path("/some/worktree", "/repo");
     expect(result).toBe(0);
   });
 
@@ -159,7 +159,7 @@ describe("relocate_sessions_from_path", () => {
       return "";
     });
 
-    const result = await relocate_sessions_from_path("/target/worktree", "/repo");
+    const result = relocate_sessions_from_path("/target/worktree", "/repo");
     expect(result).toBe(0);
 
     // Should not have sent any cd commands
@@ -177,7 +177,7 @@ describe("relocate_sessions_from_path", () => {
       return "";
     });
 
-    const result = await relocate_sessions_from_path("/target/worktree", "/repo");
+    const result = relocate_sessions_from_path("/target/worktree", "/repo");
     expect(result).toBe(1);
 
     // Should have sent cd to the matching pane using its pane ID
@@ -196,7 +196,7 @@ describe("relocate_sessions_from_path", () => {
       return "";
     });
 
-    const result = await relocate_sessions_from_path("/target/worktree", "/repo");
+    const result = relocate_sessions_from_path("/target/worktree", "/repo");
     expect(result).toBe(1);
   });
 
@@ -209,7 +209,7 @@ describe("relocate_sessions_from_path", () => {
       return "";
     });
 
-    const result = await relocate_sessions_from_path("/foo/bar", "/repo");
+    const result = relocate_sessions_from_path("/foo/bar", "/repo");
     expect(result).toBe(0);
   });
 
@@ -226,7 +226,7 @@ describe("relocate_sessions_from_path", () => {
       return "";
     });
 
-    const result = await relocate_sessions_from_path("/worktree/path", "/repo");
+    const result = relocate_sessions_from_path("/worktree/path", "/repo");
     expect(result).toBe(3);
   });
 
@@ -246,7 +246,7 @@ describe("relocate_sessions_from_path", () => {
       return "";
     });
 
-    const result = await relocate_sessions_from_path("/wt/path", "/repo");
+    const result = relocate_sessions_from_path("/wt/path", "/repo");
     // First pane fails, second succeeds — only 1 relocated
     expect(result).toBe(1);
   });

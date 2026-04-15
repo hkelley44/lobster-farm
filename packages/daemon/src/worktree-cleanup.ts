@@ -262,7 +262,7 @@ export async function cleanup_after_merge(repo_path: string, branch: string): Pr
   const worktree_path = await find_worktree_for_branch(repo_path, branch);
   if (worktree_path) {
     // Relocate any sessions whose cwd is inside this worktree before removal
-    const relocated = await relocate_sessions_from_path(worktree_path, repo_path);
+    const relocated = relocate_sessions_from_path(worktree_path, repo_path);
     if (relocated > 0) {
       console.log(
         `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${worktree_path}`,
@@ -316,7 +316,7 @@ async function cleanup_claude_worktrees(repo_path: string, branch: string): Prom
         const wt_path = join(claude_wt_dir, entry.name);
         console.log(`[worktree-cleanup] Found .claude/worktrees/ match: ${wt_path}`);
         // Relocate any sessions whose cwd is inside this worktree before removal
-        const relocated = await relocate_sessions_from_path(wt_path, repo_path);
+        const relocated = relocate_sessions_from_path(wt_path, repo_path);
         if (relocated > 0) {
           console.log(
             `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${wt_path}`,
@@ -443,7 +443,7 @@ async function sweep_repo(repo_path: string): Promise<number> {
 
     if (should_clean) {
       // Relocate any sessions whose cwd is inside this worktree before removal
-      const relocated = await relocate_sessions_from_path(entry.path, repo_path);
+      const relocated = relocate_sessions_from_path(entry.path, repo_path);
       if (relocated > 0) {
         console.log(
           `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${entry.path}`,
