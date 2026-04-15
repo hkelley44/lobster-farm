@@ -557,6 +557,17 @@ export class PRReviewCron {
 
     const outcome = await detect_review_outcome(pr.number, repo_path, gh_token);
 
+    // Don't persist "dismissed" — the dedup check (`pr.updatedAt <= prior.reviewed_at`)
+    // would skip the PR on the next cycle, breaking the "will be re-reviewed" promise.
+    // Treating dismissed as unreviewed lets the next cron cycle pick it up naturally.
+    if (outcome === "dismissed") {
+      console.log(
+        `[pr-cron] Dismissed outcome for PR #${String(pr.number)} — not persisting, will re-review next cycle`,
+      );
+      await this.handle_review_completion(entity_id, repo_path, pr, outcome, gh_token);
+      return;
+    }
+
     this.processed[key] = {
       entity_id,
       pr_number: pr.number,

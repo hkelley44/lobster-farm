@@ -1570,9 +1570,10 @@ describe("handle_github_webhook", () => {
       const prompt: string = spawn_args.prompt;
 
       expect(prompt).toContain(
-        "gh api repos/test-org/lobster-farm/pulls/302/reviews --jq '.[-1].state'",
+        `gh api repos/test-org/lobster-farm/pulls/302/reviews --jq '[.[] | select(.user.login | endswith("[bot]"))] | last | .state // "NOT_FOUND"'`,
       );
       expect(prompt).toContain("your review is confirmed. Move on.");
+      expect(prompt).toContain("If the state is DISMISSED or NOT_FOUND, something went wrong");
     });
   });
 
