@@ -119,8 +119,42 @@ export function build_review_fix_prompt(
 
 export interface AutoMergeResult {
   merged: boolean;
-  method?: "direct" | "update-branch" | "local-rebase";
+  method?: "direct" | "update-branch" | "local-rebase" | "policy-retry";
   error?: string;
+  /** Machine-readable classification of the failure (when merged=false). */
+  failure?: MergeFailure;
+}
+
+/**
+ * Classification of why a merge failed. Drives user-facing messages and
+ * retry behavior. See classify_merge_failure().
+ *
+ * - CONFLICT              → real rebase/merge conflict; needs human resolution
+ * - REQUIRED_CHECKS_PENDING → CI still running; retry when it completes
+ * - POLICY_LAG            → "base branch policy prohibits the merge" despite
+ *                           checks reported complete — GitHub branch-protection
+ *                           eval hasn't caught up; retry with backoff
+ * - BEHIND                → branch is behind base; needs update-branch/rebase
+ * - UNKNOWN               → anything else; surfaced verbatim
+ */
+export type MergeFailure =
+  | "CONFLICT"
+  | "REQUIRED_CHECKS_PENDING"
+  | "POLICY_LAG"
+  | "BEHIND"
+  | "UNKNOWN";
+
+export interface MergeState {
+  mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  mergeStateStatus:
+    | "CLEAN"
+    | "BLOCKED"
+    | "BEHIND"
+    | "DIRTY"
+    | "DRAFT"
+    | "HAS_HOOKS"
+    | "UNKNOWN"
+    | "UNSTABLE";
 }
 
 /** How long to wait for GitHub to recompute mergeable state after an update. */
@@ -128,14 +162,77 @@ const MERGEABLE_POLL_TIMEOUT_MS = 30_000;
 const MERGEABLE_POLL_INTERVAL_MS = 5_000;
 
 /**
- * Attempt to merge an approved PR, rebasing if necessary.
- * Returns { merged: true } if merge succeeded, { merged: false } if manual intervention needed.
+ * Policy-lag retry budget. Exponential backoff capped at ~10 minutes total.
+ * Intervals: 10s, 20s, 40s, 80s, 160s, 300s (cap) = ~610s ≈ 10m.
+ * The daemon path is the primary retry mechanism when pr-cron is disabled;
+ * this is long enough to absorb GitHub's branch-protection evaluation lag
+ * without blocking the webhook handler indefinitely.
+ */
+const POLICY_RETRY_BACKOFF_MS = [10_000, 20_000, 40_000, 80_000, 160_000, 300_000];
+
+/**
+ * Classify a merge failure given the PR's GraphQL state and any error text.
  *
- * Strategy (in order):
- * 1. Try direct merge (maybe reviewer hit a transient error)
- * 2. If that fails: try GitHub's update-branch API (merge-update from base)
- * 3. If update-branch fails: attempt local git rebase in a temp dir
- * 4. If rebase has real conflicts: give up, return false
+ * Pure function — no I/O, safe to unit-test exhaustively. The classification
+ * drives both the user-facing alert message and whether the daemon retries.
+ *
+ * Order of precedence:
+ * 1. `mergeable === "CONFLICTING"` — always a real conflict, regardless of status
+ * 2. `mergeStateStatus === "BEHIND"` — rebase onto base is the correct recovery
+ * 3. Error text matches "base branch policy prohibits" — GitHub's branch-protection
+ *    evaluation hasn't caught up; retry with backoff
+ * 4. `mergeStateStatus === "BLOCKED"` with mergeable MERGEABLE — required checks
+ *    pending or reviewers missing; retry on check completion
+ * 5. Anything else → UNKNOWN (surfaced to #alerts as-is)
+ */
+export function classify_merge_failure(state: MergeState, error_text: string): MergeFailure {
+  if (state.mergeable === "CONFLICTING") return "CONFLICT";
+  if (state.mergeStateStatus === "BEHIND") return "BEHIND";
+
+  // Policy-lag text match is more specific than BLOCKED — check first so we
+  // can distinguish "GitHub eval lag" from "genuinely waiting on CI".
+  if (/base branch policy prohibits the merge/i.test(error_text)) return "POLICY_LAG";
+
+  if (state.mergeStateStatus === "BLOCKED" && state.mergeable === "MERGEABLE") {
+    return "REQUIRED_CHECKS_PENDING";
+  }
+  return "UNKNOWN";
+}
+
+/** Map a MergeFailure to a human-readable explanation for #alerts. */
+export function format_merge_failure(failure: MergeFailure, error_text: string): string {
+  switch (failure) {
+    case "CONFLICT":
+      return "Rebase conflicts require manual resolution";
+    case "REQUIRED_CHECKS_PENDING":
+      return "Branch protection checks still pending — will retry when CI completes";
+    case "POLICY_LAG":
+      return "GitHub branch-protection evaluation did not converge within retry window";
+    case "BEHIND":
+      return "Branch is behind base and rebase/update failed";
+    default:
+      return error_text.slice(0, 200) || "Unknown merge failure";
+  }
+}
+
+/**
+ * Attempt to merge an approved PR, correctly diagnosing and recovering from
+ * each merge-state failure class.
+ *
+ * Flow:
+ * 1. Fetch current mergeable + mergeStateStatus from GitHub
+ * 2. Short-circuit on CONFLICTING (real conflict) — skip the fallback chain;
+ *    a rebase cannot fix a rebase conflict GitHub already knows about
+ * 3. For BLOCKED+MERGEABLE, try a direct merge first (cheap path when the
+ *    blocker has just cleared). If direct fails with "base branch policy
+ *    prohibits the merge", enter the exponential-backoff retry loop to absorb
+ *    GitHub's branch-protection evaluation lag
+ * 4. For BEHIND or after-the-fact BEHIND transitions, run the
+ *    update-branch → local-rebase fallback chain
+ * 5. Every failure is classified via `classify_merge_failure` and surfaced
+ *    with an accurate user-facing message
+ *
+ * See the MergeFailure enum for the full classification taxonomy.
  */
 export async function attempt_auto_merge(
   pr_number: number,
@@ -148,21 +245,59 @@ export async function attempt_auto_merge(
   const env = gh_token ? { ...process.env, GH_TOKEN: gh_token } : process.env;
   const exec_opts = { cwd: repo_path, env, timeout: 30_000 };
 
-  // Step 1: Direct merge retry
+  // Step 0: Fetch current merge state so we can route intelligently.
+  const initial_state = await fetch_merge_state(pr_number, repo_path, gh_bin, env);
+
+  // Short-circuit real conflicts — rebase cannot fix what GitHub already sees.
+  if (initial_state.mergeable === "CONFLICTING") {
+    return {
+      merged: false,
+      failure: "CONFLICT",
+      error: format_merge_failure("CONFLICT", ""),
+    };
+  }
+
+  // Step 1: Direct merge attempt.
+  // Fast path when state is CLEAN, and cheap probe when state is BLOCKED
+  // (branch protection may have just cleared between our poll and the merge).
+  let direct_error = "";
   try {
     await exec_async(gh_bin, ["pr", "merge", pr, "--squash", "--delete-branch"], exec_opts);
     return { merged: true, method: "direct" };
   } catch (err) {
-    console.log(
-      `[auto-merge] Direct merge failed for PR #${pr}: ${String(err instanceof Error ? err.message : err)}`,
-    );
+    direct_error = err instanceof Error ? err.message : String(err);
+    console.log(`[auto-merge] Direct merge failed for PR #${pr}: ${direct_error}`);
   }
 
-  // Step 2: GitHub API update-branch (merge-update, not rebase)
-  // Derive owner/repo from the git remote
+  // Refresh state — it may have transitioned since our initial read.
+  const post_direct_state = await fetch_merge_state(pr_number, repo_path, gh_bin, env);
+  const failure = classify_merge_failure(post_direct_state, direct_error);
+
+  // Step 2: Recoverable pending/lag states → exponential backoff retry.
+  // Both REQUIRED_CHECKS_PENDING and POLICY_LAG resolve when GitHub finishes
+  // evaluating branch protection against the head SHA. No merge action on our
+  // part will speed this up — we just have to wait.
+  if (failure === "REQUIRED_CHECKS_PENDING" || failure === "POLICY_LAG") {
+    const retry_result = await retry_merge_with_backoff(
+      pr_number,
+      repo_path,
+      gh_bin,
+      env,
+      exec_opts,
+    );
+    if (retry_result.merged) return retry_result;
+    return retry_result;
+  }
+
+  // Step 3: BEHIND or fall-through → update-branch + local rebase fallback.
+  // Derive owner/repo from the git remote.
   const nwo = await get_repo_nwo(repo_path, gh_bin, env);
   if (!nwo) {
-    return { merged: false, error: "Could not determine repo owner/name from remote" };
+    return {
+      merged: false,
+      failure: "UNKNOWN",
+      error: "Could not determine repo owner/name from remote",
+    };
   }
 
   const update_branch_ok = await try_update_branch(nwo, pr_number, gh_bin, env);
@@ -182,7 +317,7 @@ export async function attempt_auto_merge(
     }
   }
 
-  // Step 3: Local git rebase fallback
+  // Step 4: Local git rebase fallback
   const rebase_result = await try_local_rebase(branch, repo_path, env);
   if (rebase_result.success) {
     // Wait for GitHub to process the force-push, then merge
@@ -192,16 +327,142 @@ export async function attempt_auto_merge(
         await exec_async(gh_bin, ["pr", "merge", pr, "--squash", "--delete-branch"], exec_opts);
         return { merged: true, method: "local-rebase" };
       } catch (err) {
+        const err_text = err instanceof Error ? err.message : String(err);
         return {
           merged: false,
-          error: `Rebase succeeded but merge still failed: ${String(err instanceof Error ? err.message : err)}`,
+          failure: "UNKNOWN",
+          error: `Rebase succeeded but merge still failed: ${err_text}`,
         };
       }
     }
-    return { merged: false, error: "Rebase succeeded but PR not mergeable after update" };
+    return {
+      merged: false,
+      failure: "UNKNOWN",
+      error: "Rebase succeeded but PR not mergeable after update",
+    };
   }
 
-  return { merged: false, error: rebase_result.error };
+  // Both update-branch and local-rebase exhausted. Re-classify with the fresh
+  // rebase error text so a real conflict surfaces accurately.
+  const final_state = await fetch_merge_state(pr_number, repo_path, gh_bin, env);
+  const raw_error = rebase_result.error ?? direct_error;
+  const final_failure = classify_merge_failure(final_state, raw_error);
+  // Preserve the raw rebase error when it's more specific than the canned
+  // classification message (e.g. "Rebase failed: timeout..." surfaces a real
+  // diagnostic that "branch is behind" obscures). Only override the raw
+  // error when classification identified a specific, actionable category
+  // that's more useful than the raw text.
+  const use_raw =
+    rebase_result.error != null &&
+    !/rebase conflicts require manual resolution/i.test(rebase_result.error);
+  return {
+    merged: false,
+    failure: final_failure,
+    error: use_raw ? rebase_result.error! : format_merge_failure(final_failure, raw_error),
+  };
+}
+
+/**
+ * Retry `gh pr merge` on a policy-lag or required-checks-pending failure.
+ *
+ * Uses exponential backoff (see POLICY_RETRY_BACKOFF_MS). Before each attempt
+ * we re-read mergeStateStatus — if it transitions to CLEAN we merge; if it
+ * transitions to CONFLICTING or BEHIND we fall out (the main flow will catch
+ * those on the next classification). Any other state keeps us in the loop.
+ *
+ * Returns an AutoMergeResult. On exhaustion, returns merged=false with
+ * failure=POLICY_LAG (the most specific explanation for "we waited and it
+ * still wouldn't merge").
+ */
+async function retry_merge_with_backoff(
+  pr_number: number,
+  repo_path: string,
+  gh_bin: string,
+  env: NodeJS.ProcessEnv,
+  exec_opts: { cwd: string; env: NodeJS.ProcessEnv; timeout: number },
+): Promise<AutoMergeResult> {
+  const pr = String(pr_number);
+  let last_error = "";
+
+  for (let attempt = 0; attempt < POLICY_RETRY_BACKOFF_MS.length; attempt++) {
+    const delay = POLICY_RETRY_BACKOFF_MS[attempt]!;
+    console.log(
+      `[auto-merge] Policy retry ${String(attempt + 1)}/${String(POLICY_RETRY_BACKOFF_MS.length)} ` +
+        `for PR #${pr} in ${String(delay / 1000)}s`,
+    );
+    await sleep(delay);
+
+    const state = await fetch_merge_state(pr_number, repo_path, gh_bin, env);
+
+    // Hard fail cases we should drop out on.
+    if (state.mergeable === "CONFLICTING") {
+      return { merged: false, failure: "CONFLICT", error: format_merge_failure("CONFLICT", "") };
+    }
+    if (state.mergeStateStatus === "BEHIND") {
+      // Let the outer flow handle update-branch/rebase.
+      return {
+        merged: false,
+        failure: "BEHIND",
+        error: format_merge_failure("BEHIND", ""),
+      };
+    }
+
+    // If state is CLEAN, merge should succeed. If still BLOCKED, try anyway —
+    // branch protection might clear between the poll and the merge call.
+    try {
+      await exec_async(gh_bin, ["pr", "merge", pr, "--squash", "--delete-branch"], exec_opts);
+      console.log(
+        `[auto-merge] Policy retry succeeded for PR #${pr} on attempt ${String(attempt + 1)}`,
+      );
+      return { merged: true, method: "policy-retry" };
+    } catch (err) {
+      last_error = err instanceof Error ? err.message : String(err);
+      console.log(
+        `[auto-merge] Policy retry ${String(attempt + 1)} failed for PR #${pr}: ${last_error}`,
+      );
+    }
+  }
+
+  // Exhausted budget. Re-classify in case the state has drifted.
+  const state = await fetch_merge_state(pr_number, repo_path, gh_bin, env);
+  const failure = classify_merge_failure(state, last_error);
+  const final: MergeFailure =
+    failure === "UNKNOWN" || failure === "REQUIRED_CHECKS_PENDING" ? "POLICY_LAG" : failure;
+  return {
+    merged: false,
+    failure: final,
+    error: format_merge_failure(final, last_error),
+  };
+}
+
+/**
+ * Fetch current mergeable + mergeStateStatus for a PR.
+ * Returns UNKNOWN state on error so the caller can fall through to the
+ * regular fallback chain rather than crash on transient gh failures.
+ */
+export async function fetch_merge_state(
+  pr_number: number,
+  repo_path: string,
+  gh_bin: string,
+  env: NodeJS.ProcessEnv,
+): Promise<MergeState> {
+  try {
+    const { stdout } = await exec_async(
+      gh_bin,
+      ["pr", "view", String(pr_number), "--json", "mergeable,mergeStateStatus"],
+      { cwd: repo_path, env, timeout: 15_000 },
+    );
+    const parsed = JSON.parse(stdout) as {
+      mergeable?: string;
+      mergeStateStatus?: string;
+    };
+    return {
+      mergeable: (parsed.mergeable ?? "UNKNOWN") as MergeState["mergeable"],
+      mergeStateStatus: (parsed.mergeStateStatus ?? "UNKNOWN") as MergeState["mergeStateStatus"],
+    };
+  } catch {
+    return { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
+  }
 }
 
 /**
@@ -332,14 +593,25 @@ async function try_local_rebase(
     // Attempt rebase
     try {
       await exec_async("git", ["rebase", "origin/main"], { cwd: tmp_dir, env, timeout: 60_000 });
-    } catch {
+    } catch (err) {
       // Rebase failed — abort and clean up
       try {
         await exec_async("git", ["rebase", "--abort"], { cwd: tmp_dir, env, timeout: 10_000 });
       } catch {
         // Abort failed too — best-effort
       }
-      return { success: false, error: "Rebase conflicts require manual resolution" };
+      // Differentiate real content conflicts from transient git errors
+      // (timeouts, network failures, unreachable remotes). Only the first
+      // category warrants a "rebase conflicts" user-facing message; the
+      // others get their actual error surfaced so we don't send false alarms.
+      const msg = err instanceof Error ? err.message : String(err);
+      const is_conflict = /CONFLICT|could not apply|Merge conflict/i.test(msg);
+      return {
+        success: false,
+        error: is_conflict
+          ? "Rebase conflicts require manual resolution"
+          : `Rebase failed: ${msg.slice(0, 200)}`,
+      };
     }
 
     // Rebase succeeded — force-push with lease

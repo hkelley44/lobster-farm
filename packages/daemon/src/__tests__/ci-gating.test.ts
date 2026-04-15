@@ -101,7 +101,11 @@ import type { EntityRegistry } from "../registry.js";
 // Import after mocks are registered
 import { check_ci_status } from "../review-utils.js";
 import type { ClaudeSessionManager } from "../session.js";
-import { type WebhookContext, handle_github_webhook } from "../webhook-handler.js";
+import {
+  type WebhookContext,
+  _reset_active_reviews_for_testing,
+  handle_github_webhook,
+} from "../webhook-handler.js";
 
 // ── check_ci_status tests ──
 
@@ -375,6 +379,9 @@ describe("webhook handler — workflow_run events", () => {
     vi.clearAllMocks();
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
+    // Reset module-level dedup table so same-PR events across tests don't
+    // get dropped as duplicates of an earlier test's state.
+    _reset_active_reviews_for_testing();
   });
 
   it("sends alert when workflow_run fails on main from a push event", async () => {
@@ -556,6 +563,9 @@ describe("webhook handler — CI gating on review completion", () => {
     vi.clearAllMocks();
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
+    // Reset module-level dedup table so same-PR events across tests don't
+    // get dropped as duplicates of an earlier test's state.
+    _reset_active_reviews_for_testing();
   });
 
   /**
