@@ -168,6 +168,7 @@ export type NoopReason =
   | "missing_check_suite"
   | "no_repository"
   | "unknown_repo"
+  | "pr_fetch_failed"
   | "fork_pr"
   | "no_pull_requests"
   | "v1_entity"
@@ -258,7 +259,7 @@ export async function handle_check_suite(
       tags: { module: "check-suite", entity: match.entity.entity.id, action: "fetch_pr" },
       contexts: { pr: { number: pr_ref.number } },
     });
-    return { kind: "noop", reason: "unknown_repo" };
+    return { kind: "noop", reason: "pr_fetch_failed" };
   }
 
   // Decision 3: skip fork PRs entirely. Out of scope for v2.

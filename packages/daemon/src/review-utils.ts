@@ -523,9 +523,30 @@ export async function fetch_pr_mergeability(
     headRefOid: string;
   };
 
+  const VALID_MERGEABLE = new Set(["MERGEABLE", "CONFLICTING", "UNKNOWN"]);
+  const VALID_MERGE_STATE = new Set([
+    "CLEAN",
+    "HAS_HOOKS",
+    "BLOCKED",
+    "BEHIND",
+    "DIRTY",
+    "UNSTABLE",
+    "UNKNOWN",
+  ]);
+
+  const mergeable = data.mergeable.toUpperCase();
+  const merge_state_status = data.mergeStateStatus.toUpperCase();
+
+  if (!VALID_MERGEABLE.has(mergeable)) {
+    throw new Error(`Unexpected mergeable value from GitHub: "${data.mergeable}"`);
+  }
+  if (!VALID_MERGE_STATE.has(merge_state_status)) {
+    throw new Error(`Unexpected mergeStateStatus value from GitHub: "${data.mergeStateStatus}"`);
+  }
+
   return {
-    mergeable: data.mergeable.toUpperCase() as PRMergeability["mergeable"],
-    merge_state_status: data.mergeStateStatus.toUpperCase() as MergeStateStatus,
+    mergeable: mergeable as PRMergeability["mergeable"],
+    merge_state_status: merge_state_status as MergeStateStatus,
     head_sha: data.headRefOid,
   };
 }

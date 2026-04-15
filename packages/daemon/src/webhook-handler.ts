@@ -74,7 +74,7 @@ export interface WebhookContext {
 }
 
 /** Minimal PR shape from webhook payload. */
-interface WebhookPR {
+export interface WebhookPR {
   number: number;
   title: string;
   head: { ref: string; sha: string };
@@ -890,7 +890,7 @@ async function handle_review_completion(
  *   dispatch on. We do NOT fall through to the v1 rebase/retry loop.
  * - anything else: just alert; a new event will eventually drive the next step.
  */
-async function handle_v2_review_completion(
+export async function handle_v2_review_completion(
   entity_id: string,
   repo_path: string,
   repo_full_name: string,

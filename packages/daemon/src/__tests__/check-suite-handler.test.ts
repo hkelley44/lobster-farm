@@ -594,6 +594,27 @@ describe("handle_check_suite — cancelled / other conclusions", () => {
     if (result.kind === "alerted") expect(result.reason).toBe("timed_out");
   });
 
+  it("alerts on conclusion=action_required", async () => {
+    const deps = make_deps();
+    const ctx = make_ctx();
+    const result = await handle_check_suite(
+      make_payload({ conclusion: "action_required" }),
+      ctx,
+      deps,
+    );
+
+    expect(result).toEqual({
+      kind: "alerted",
+      pr_number: 42,
+      reason: "action_required",
+    });
+    expect(deps.spawn_session).not.toHaveBeenCalled();
+    expect(deps.notify_alerts).toHaveBeenCalledWith(
+      ENTITY_ID,
+      expect.stringContaining("action_required"),
+    );
+  });
+
   it("no-ops on conclusion=neutral / stale / skipped", async () => {
     const deps = make_deps();
     const ctx = make_ctx();
@@ -622,14 +643,12 @@ describe("handle_check_suite — resilience", () => {
     expect(deps.spawn_session).not.toHaveBeenCalled();
   });
 
-  it("no-ops if gh pr view fails", async () => {
+  it("no-ops with pr_fetch_failed if gh pr view fails", async () => {
     const deps = make_deps({ pr_detail_error: new Error("pr not found") });
     const ctx = make_ctx();
     const result = await handle_check_suite(make_payload(), ctx, deps);
 
-    // We return noop with reason unknown_repo here — the handler can't make
-    // any decisions without the PR detail, so it bails silently.
-    expect(result.kind).toBe("noop");
+    expect(result).toEqual({ kind: "noop", reason: "pr_fetch_failed" });
     expect(deps.spawn_session).not.toHaveBeenCalled();
   });
 });

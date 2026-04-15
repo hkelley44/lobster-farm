@@ -47,8 +47,14 @@ export interface MergeGateInput {
  *
  * - `merged` — successful merge, branch deleted.
  * - `ci_regressed` — CI was green at review time but is now failing on the
- *   latest SHA. The flake-retry path (or the next check_suite) will retry.
- * - `ci_pending` — CI is still running. Wait for the next check_suite.
+ *   latest SHA. Automated retry is NOT possible on the same SHA because the
+ *   check-suite handler's dedup key (`v2_last_dispatched_sha`) prevents
+ *   re-dispatch. A new commit (new SHA) is needed to re-enter the cycle.
+ * - `ci_pending` — CI is still running. Automated retry on the same SHA is
+ *   blocked by the dedup key — a new `check_suite.completed` event for the
+ *   same SHA will be deduped out. In practice, this resolves when the pending
+ *   check completes and fires its own event (which may carry a new SHA if
+ *   triggered by a follow-up push).
  * - `sha_changed` — new commits landed between review and merge. Re-review
  *   needed; the next check_suite will fire.
  * - `rebased_awaiting_ci` — branch was behind, rebase succeeded, force-push
