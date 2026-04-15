@@ -1757,7 +1757,7 @@ export class BotPool extends EventEmitter {
 
   /** Cancel any pending session-confirmation watcher for a bot. Safe to call
    * when no watcher exists. */
-  protected cancel_session_watcher(bot_id: number): void {
+  private cancel_session_watcher(bot_id: number): void {
     const timer = this.session_watchers.get(bot_id);
     if (timer) {
       clearTimeout(timer);
@@ -1932,6 +1932,11 @@ export class BotPool extends EventEmitter {
     //     trigger an interactive approval modal. See issue #260.
     //   - /tmp       — standard scratch dir. Lets bots stage intermediate
     //     artifacts without polluting the entity worktree's git status.
+    //     Security note: /tmp is world-writable. We accept this because pool
+    //     bots already run under bypassPermissions for the entity worktree —
+    //     the threat model assumes a trusted single-user environment. If
+    //     multi-tenant isolation is ever required, replace with a per-entity
+    //     temp dir.
     // Both paths are already world-accessible to this user — adding them to
     // the trusted set doesn't widen the blast radius, it just stops the
     // modal stalls. We resolve ~ via homedir() because tmux command-string

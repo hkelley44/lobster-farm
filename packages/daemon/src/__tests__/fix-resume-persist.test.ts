@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
+import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 let temp_dir: string;
 
@@ -20,7 +20,7 @@ function make_config(): LobsterFarmConfig {
  * Test-friendly subclass that exposes internals and stubs side effects.
  * Tracks persist() and kill_tmux() calls for assertion.
  */
-class TestBotPool extends BotPool {
+class TestBotPool extends BotPoolTestBase {
   persist_calls = 0;
   kill_tmux_calls: string[] = [];
   private persist_order: string[] = [];
@@ -53,18 +53,6 @@ class TestBotPool extends BotPool {
 
   protected override is_bot_idle(/* _bot: PoolBot */): boolean {
     return true;
-  }
-
-  /** Default to "JSONL present" in tests so existing pre-#256 expectations hold. */
-  protected override check_session_jsonl_exists_anywhere(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  protected override check_session_jsonl_exists(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  /** Disable the background JSONL confirmation watcher in tests. */
-  protected override watch_session_confirmation(bot: PoolBot): void {
-    bot.session_confirmed = true;
   }
 }
 

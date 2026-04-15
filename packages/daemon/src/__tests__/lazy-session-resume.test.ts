@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
+import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 // ── Test helpers ──
 
@@ -43,7 +43,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
  * Test-friendly BotPool subclass that stubs tmux/filesystem side effects and
  * exposes internals for assertion. Follows the same pattern as existing test files.
  */
-class TestBotPool extends BotPool {
+class TestBotPool extends BotPoolTestBase {
   private tmux_alive_overrides = new Map<string, boolean>();
 
   inject_bots(bots: PoolBot[]): void {
@@ -71,18 +71,6 @@ class TestBotPool extends BotPool {
   /** Expose check_assigned_health for direct invocation in tests. */
   async run_health_check(): Promise<void> {
     await this.check_assigned_health();
-  }
-
-  /** Default to "JSONL present" in tests so existing pre-#256 expectations hold. */
-  protected override check_session_jsonl_exists_anywhere(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  protected override check_session_jsonl_exists(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  /** Disable the background JSONL confirmation watcher in tests. */
-  protected override watch_session_confirmation(bot: PoolBot): void {
-    bot.session_confirmed = true;
   }
 }
 

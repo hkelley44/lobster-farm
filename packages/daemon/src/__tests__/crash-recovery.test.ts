@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
+import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 // Mock actions.ts — notify is imported by pool.ts for alerting
 vi.mock("../actions.js", () => ({
@@ -64,7 +64,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
  * Test-friendly subclass that stubs tmux/filesystem operations and
  * exposes internals needed for crash recovery assertions.
  */
-class TestBotPool extends BotPool {
+class TestBotPool extends BotPoolTestBase {
   inject_bots(bots: PoolBot[]): void {
     (this as unknown as { bots: PoolBot[] }).bots = bots;
   }
@@ -89,18 +89,6 @@ class TestBotPool extends BotPool {
   /** Override is_bot_idle — not relevant for crash recovery tests. */
   protected override is_bot_idle(): boolean {
     return true;
-  }
-
-  /** Default to "JSONL present" in tests so existing pre-#256 expectations hold. */
-  protected override check_session_jsonl_exists_anywhere(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  protected override check_session_jsonl_exists(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  /** Disable the background JSONL confirmation watcher in tests. */
-  protected override watch_session_confirmation(bot: PoolBot): void {
-    bot.session_confirmed = true;
   }
 }
 

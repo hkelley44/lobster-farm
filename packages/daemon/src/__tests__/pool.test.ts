@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
+import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 let temp_dir: string;
 
@@ -20,7 +20,7 @@ function make_config(): LobsterFarmConfig {
  * Test-friendly subclass of BotPool that exposes internals for unit testing.
  * Overrides tmux/filesystem operations to avoid real side effects.
  */
-class TestBotPool extends BotPool {
+class TestBotPool extends BotPoolTestBase {
   // Override the tmux-dependent methods to make tests deterministic.
   // The real pool checks tmux pane output; we control what is_bot_idle returns
   // by mapping bot IDs to idle status.
@@ -44,19 +44,6 @@ class TestBotPool extends BotPool {
    */
   protected override is_bot_idle(bot: PoolBot): boolean {
     return this.idle_overrides.get(bot.id) ?? true;
-  }
-
-  /** Default to "JSONL present" in tests so existing pre-#256 expectations hold. */
-  protected override check_session_jsonl_exists_anywhere(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  protected override check_session_jsonl_exists(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  /** Disable the background JSONL confirmation watcher in tests — its deferred
-   * persist() can race with afterEach teardown and cause ENOTEMPTY on rmdir. */
-  protected override watch_session_confirmation(bot: PoolBot): void {
-    bot.session_confirmed = true;
   }
 }
 

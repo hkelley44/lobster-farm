@@ -458,3 +458,174 @@ describe("start_tmux --add-dir defaults (#260)", () => {
     await rm(temp_dir, { recursive: true, force: true });
   });
 });
+
+// ── watch_session_confirmation timer loop ──
+// These tests exercise the REAL watcher (no override) with fake timers
+// to verify the poll loop's branching: confirmation, exhaustion, and
+// mid-poll reassignment.
+
+describe("watch_session_confirmation timer loop", () => {
+  /**
+   * Subclass that runs the REAL watch_session_confirmation — only the JSONL
+   * check is overridden, returning results from a test-controlled Set.
+   */
+  class RealWatcherTestPool extends BotPool {
+    public existing_sessions = new Set<string>();
+
+    /** Hook fired inside check_session_jsonl_exists — lets tests simulate
+     * side effects during the async suspension window (e.g. bot reassignment). */
+    public on_check_hook: (() => void) | null = null;
+
+    inject_bots(bots: PoolBot[]): void {
+      (this as unknown as { bots: PoolBot[] }).bots = bots;
+    }
+
+    get_bots(): PoolBot[] {
+      return (this as unknown as { bots: PoolBot[] }).bots;
+    }
+
+    protected override is_bot_idle(): boolean {
+      return true;
+    }
+
+    protected override check_session_jsonl_exists_anywhere(session_id: string): Promise<boolean> {
+      return Promise.resolve(this.existing_sessions.has(session_id));
+    }
+
+    protected override async check_session_jsonl_exists(
+      _working_dir: string,
+      session_id: string,
+    ): Promise<boolean> {
+      // Fire the hook before returning — simulates work happening during
+      // the async suspension in the real watcher tick.
+      this.on_check_hook?.();
+      return this.existing_sessions.has(session_id);
+    }
+  }
+
+  let pool: RealWatcherTestPool;
+
+  function make_watcher_bot(overrides?: Partial<PoolBot>): PoolBot {
+    return {
+      id: 1,
+      state: "assigned",
+      channel_id: "ch-1",
+      entity_id: "e1",
+      archetype: "builder",
+      channel_type: "general",
+      session_id: "sess-watch-test",
+      session_confirmed: false,
+      tmux_session: "pool-1",
+      last_active: null,
+      assigned_at: null,
+      state_dir: "/tmp/pool-1",
+      model: null,
+      effort: null,
+      last_avatar_archetype: null,
+      last_avatar_set_at: null,
+      ...overrides,
+    };
+  }
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    temp_dir = await mkdtemp(join(tmpdir(), "pool-watcher-test-"));
+    const config = make_config();
+    pool = new RealWatcherTestPool(config);
+  });
+
+  afterEach(async () => {
+    // Cancel any in-flight watchers so timers don't leak into other tests
+    await (pool as unknown as { shutdown: () => Promise<void> }).shutdown();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    await rm(temp_dir, { recursive: true, force: true });
+  });
+
+  it("promotes session_confirmed and calls persist when JSONL appears on tick 3", async () => {
+    const bot = make_watcher_bot();
+    pool.inject_bots([bot]);
+    const persist_spy = vi
+      .spyOn(pool as unknown as { persist: () => Promise<void> }, "persist" as never)
+      .mockResolvedValue(undefined as never);
+    const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    // Start the real watcher
+    (
+      pool as unknown as {
+        watch_session_confirmation: (b: PoolBot, wd: string, sid: string) => void;
+      }
+    ).watch_session_confirmation(bot, "/tmp/work", "sess-watch-test");
+
+    // Tick 1 (t=0): JSONL not found
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bot.session_confirmed).toBe(false);
+
+    // Tick 2 (t=500): JSONL still not found
+    await vi.advanceTimersByTimeAsync(500);
+    expect(bot.session_confirmed).toBe(false);
+
+    // JSONL appears before tick 3
+    pool.existing_sessions.add("sess-watch-test");
+
+    // Tick 3 (t=1000): JSONL found → confirmed
+    await vi.advanceTimersByTimeAsync(500);
+    expect(bot.session_confirmed).toBe(true);
+    expect(persist_spy).toHaveBeenCalledOnce();
+    expect(log_spy).toHaveBeenCalledWith(expect.stringContaining("confirmed"));
+  });
+
+  it("gives up after max_attempts without setting session_confirmed", async () => {
+    const bot = make_watcher_bot();
+    pool.inject_bots([bot]);
+    const persist_spy = vi
+      .spyOn(pool as unknown as { persist: () => Promise<void> }, "persist" as never)
+      .mockResolvedValue(undefined as never);
+    const warn_spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    (
+      pool as unknown as {
+        watch_session_confirmation: (b: PoolBot, wd: string, sid: string) => void;
+      }
+    ).watch_session_confirmation(bot, "/tmp/work", "sess-watch-test");
+
+    // Advance past all 120 attempts: first tick at 0ms, then 119 * 500ms = 59500ms
+    // Use 61000ms to ensure we're past the full window.
+    await vi.advanceTimersByTimeAsync(61_000);
+
+    expect(bot.session_confirmed).toBe(false);
+    expect(persist_spy).not.toHaveBeenCalled();
+    expect(warn_spy).toHaveBeenCalledWith(expect.stringContaining("unconfirmed"));
+  });
+
+  it("aborts when bot is reassigned during the async check_session_jsonl_exists call", async () => {
+    const bot = make_watcher_bot();
+    pool.inject_bots([bot]);
+    const persist_spy = vi
+      .spyOn(pool as unknown as { persist: () => Promise<void> }, "persist" as never)
+      .mockResolvedValue(undefined as never);
+
+    // During the JSONL check, reassign the bot to a different session —
+    // simulates a message arriving while the filesystem call is in flight.
+    pool.on_check_hook = () => {
+      bot.session_id = "sess-different";
+    };
+
+    // Make the JSONL exist for the original session — the watcher should
+    // still abort because the bot was reassigned mid-check.
+    pool.existing_sessions.add("sess-watch-test");
+
+    (
+      pool as unknown as {
+        watch_session_confirmation: (b: PoolBot, wd: string, sid: string) => void;
+      }
+    ).watch_session_confirmation(bot, "/tmp/work", "sess-watch-test");
+
+    // First tick fires and hits the post-await re-check guard
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Bot should NOT be confirmed — the session_id changed mid-tick
+    expect(bot.session_confirmed).toBe(false);
+    expect(persist_spy).not.toHaveBeenCalled();
+  });
+});

@@ -4,8 +4,9 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AVATAR_COOLDOWN_MS, BotPool } from "../pool.js";
+import { AVATAR_COOLDOWN_MS } from "../pool.js";
 import type { AvatarHandler, PoolBot } from "../pool.js";
+import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 let temp_dir: string;
 
@@ -17,7 +18,7 @@ function make_config(): LobsterFarmConfig {
 }
 
 /** Test-friendly subclass that overrides tmux operations. */
-class TestBotPool extends BotPool {
+class TestBotPool extends BotPoolTestBase {
   private idle_overrides = new Map<number, boolean>();
 
   inject_bots(bots: PoolBot[]): void {
@@ -26,18 +27,6 @@ class TestBotPool extends BotPool {
 
   protected override is_bot_idle(bot: PoolBot): boolean {
     return this.idle_overrides.get(bot.id) ?? true;
-  }
-
-  /** Default to "JSONL present" in tests so existing pre-#256 expectations hold. */
-  protected override check_session_jsonl_exists_anywhere(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  protected override check_session_jsonl_exists(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  /** Disable the background JSONL confirmation watcher in tests. */
-  protected override watch_session_confirmation(bot: PoolBot): void {
-    bot.session_confirmed = true;
   }
 }
 

@@ -11,9 +11,9 @@ import {
   save_pr_reviews,
 } from "../persistence.js";
 import type { PersistedPoolBot } from "../persistence.js";
-import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 import type { EntityRegistry } from "../registry.js";
+import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 // ── Test helpers ──
 
@@ -47,7 +47,7 @@ function make_persisted_bot(
  * Test-friendly subclass that stubs tmux/filesystem/persistence side effects.
  * Mirrors TestBotPool from pool.test.ts but adds persistence visibility.
  */
-class TestBotPool extends BotPool {
+class TestBotPool extends BotPoolTestBase {
   private idle_overrides = new Map<number, boolean>();
 
   /** Track persist() calls for assertions. */
@@ -71,18 +71,6 @@ class TestBotPool extends BotPool {
 
   protected override is_bot_idle(bot: PoolBot): boolean {
     return this.idle_overrides.get(bot.id) ?? true;
-  }
-
-  /** Default to "JSONL present" in tests so existing pre-#256 expectations hold. */
-  protected override check_session_jsonl_exists_anywhere(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  protected override check_session_jsonl_exists(): Promise<boolean> {
-    return Promise.resolve(true);
-  }
-  /** Disable the background JSONL confirmation watcher in tests. */
-  protected override watch_session_confirmation(bot: PoolBot): void {
-    bot.session_confirmed = true;
   }
 }
 
