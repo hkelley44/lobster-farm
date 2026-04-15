@@ -68,7 +68,7 @@ export interface WebhookContext {
 interface WebhookPR {
   number: number;
   title: string;
-  head: { ref: string };
+  head: { ref: string; sha: string };
   body: string | null;
   user: { login: string };
   merged?: boolean;
@@ -95,12 +95,33 @@ interface WebhookPayload {
   installation?: { id: number };
 }
 
+/**
+ * State of a webhook review, keyed by {entity, pr, head_sha}.
+ *
+ * Lifecycle:
+ * - `in_flight`: a reviewer session is currently running for this SHA
+ * - `completed`: a review for this SHA finished within the dedup hold window
+ *
+ * While `in_flight`, any webhook event for the same SHA is dropped (it's
+ * already being reviewed). After completion, we hold the entry for a short
+ * TTL (REVIEW_DEDUP_HOLD_MS) so back-to-back events for the same SHA don't
+ * re-trigger review. When HEAD actually moves the new SHA gets its own key.
+ *
+ * `needs_requeue` marks an in-flight review that should be re-run after it
+ * finishes — set when a NEW head_sha arrived mid-review.
+ */
 interface ActiveWebhookReview {
   entity_id: string;
   pr_number: number;
-  /** Set to true if a new event arrived while this review was in-flight. */
+  head_sha: string;
+  state: "in_flight" | "completed";
+  /** When set, the stored `requeue_*` fields describe the review to run next. */
   needs_requeue: boolean;
+  requeue_head_sha?: string;
+  requeue_pr?: WebhookPR;
   created_at: number;
+  /** Set when state transitions to `completed`. Used by the TTL sweep. */
+  completed_at?: number;
 }
 
 // ── Helpers ──
@@ -168,20 +189,76 @@ function resolve_token(
 }
 
 // ── Active review tracking ──
+//
+// Dedup key is {entity, pr_number, head_sha} — NOT just {entity, pr}. Two
+// webhook events (e.g. `opened` + `synchronize`) for the same HEAD SHA must
+// coalesce into a single review. HEAD SHA movement is the only thing that
+// should trigger a fresh review. See #258 for the race this fixes.
 
 const active_reviews = new Map<string, ActiveWebhookReview>();
 
-function review_key(entity_id: string, pr_number: number): string {
+function review_key(entity_id: string, pr_number: number, head_sha: string): string {
+  return `${entity_id}:${String(pr_number)}:${head_sha}`;
+}
+
+/** Key prefix used to find any entry for a given PR regardless of SHA. */
+function review_key_prefix(entity_id: string, pr_number: number): string {
+  return `${entity_id}:${String(pr_number)}:`;
+}
+
+/** Persistent PR state key — SHA-independent. Tracks retry counts across commits. */
+function ci_retry_key(entity_id: string, pr_number: number): string {
   return `${entity_id}:${String(pr_number)}`;
+}
+
+/**
+ * Find the in-flight/completed review (if any) for a given PR, regardless of SHA.
+ *
+ * When multiple entries exist (e.g. a completed SHA-A and an in-flight SHA-B
+ * coexisting during the TTL hold window), always prefer the in_flight entry.
+ * Returning a completed entry when an in_flight one also exists would bypass
+ * the dedup gate and allow a duplicate reviewer to spawn. See #258.
+ */
+function find_review_for_pr(
+  entity_id: string,
+  pr_number: number,
+): { key: string; review: ActiveWebhookReview } | null {
+  const prefix = review_key_prefix(entity_id, pr_number);
+  let completed_entry: { key: string; review: ActiveWebhookReview } | null = null;
+  for (const [key, review] of active_reviews) {
+    if (key.startsWith(prefix)) {
+      if (review.state === "in_flight") return { key, review };
+      completed_entry ??= { key, review };
+    }
+  }
+  return completed_entry;
 }
 
 const REVIEW_TIMEOUT_MS = 30 * 60 * 1000;
 
+/**
+ * How long we keep a completed review in the dedup table. Any webhook for
+ * the same head_sha arriving during this window is dropped.
+ * 60s is long enough to catch clustered `opened`+`synchronize` bursts and
+ * webhook retries, without holding stale state indefinitely.
+ */
+const REVIEW_DEDUP_HOLD_MS = 60_000;
+
 function cleanup_stale_reviews(): void {
   const now = Date.now();
   for (const [key, review] of active_reviews) {
-    if (now - review.created_at > REVIEW_TIMEOUT_MS) {
-      console.log(`[webhook] Cleaning up stale review entry: ${key}`);
+    // In-flight reviews age out on the session timeout.
+    if (review.state === "in_flight" && now - review.created_at > REVIEW_TIMEOUT_MS) {
+      console.log(`[webhook] Cleaning up stale in-flight review entry: ${key}`);
+      active_reviews.delete(key);
+      continue;
+    }
+    // Completed reviews age out on the dedup hold window.
+    if (
+      review.state === "completed" &&
+      review.completed_at != null &&
+      now - review.completed_at > REVIEW_DEDUP_HOLD_MS
+    ) {
       active_reviews.delete(key);
     }
   }
@@ -338,15 +415,42 @@ async function route_event(
     data: { entity: match.entity_id, pr_number: pr.number, action },
   });
 
-  // Deduplicate: if review already in-flight for this PR, mark for requeue
-  const key = review_key(match.entity_id, pr.number);
-  const existing = active_reviews.get(key);
-  if (existing) {
-    console.log(`[webhook] Review already in-flight for ${key} — marking for requeue`);
-    existing.needs_requeue = true;
+  // Deduplicate keyed on {entity, pr, head_sha}. See ActiveWebhookReview.
+  const head_sha = pr.head.sha;
+  if (!head_sha) {
+    console.log(
+      `[webhook] pull_request.${action} for #${String(pr.number)} missing head.sha — skipping dedup`,
+    );
+  }
+  const sha_key = review_key(match.entity_id, pr.number, head_sha ?? "unknown");
+  const sha_entry = active_reviews.get(sha_key);
+
+  if (sha_entry) {
+    // Same SHA, already reviewed (or being reviewed) — drop as redundant.
+    // This coalesces opened+synchronize bursts and webhook retries (#258).
+    console.log(
+      `[webhook] Dropping duplicate ${action} for #${String(pr.number)} @ ${head_sha?.slice(0, 7) ?? "unknown"} ` +
+        `(state=${sha_entry.state})`,
+    );
     return;
   }
 
+  // Different SHA than the in-flight/completed entry (if any) — new HEAD, new review.
+  const pr_entry = find_review_for_pr(match.entity_id, pr.number);
+  if (pr_entry && pr_entry.review.state === "in_flight") {
+    // An earlier SHA is currently being reviewed. Queue a requeue with the
+    // new SHA; the old review's completion handler will spawn it.
+    console.log(
+      `[webhook] In-flight review for #${String(pr.number)} @ ${pr_entry.review.head_sha.slice(0, 7)} ` +
+        `— requeueing as ${head_sha?.slice(0, 7) ?? "unknown"}`,
+    );
+    pr_entry.review.needs_requeue = true;
+    pr_entry.review.requeue_head_sha = head_sha;
+    pr_entry.review.requeue_pr = pr;
+    return;
+  }
+
+  // No in-flight review for this SHA — spawn fresh.
   await spawn_review(match.entity_id, match.repo_path, repo_full_name, pr, ctx, installation_id);
 }
 
@@ -360,12 +464,15 @@ async function spawn_review(
   ctx: WebhookContext,
   installation_id?: string,
 ): Promise<void> {
-  const key = review_key(entity_id, pr.number);
+  const head_sha = pr.head.sha || "unknown";
+  const key = review_key(entity_id, pr.number, head_sha);
 
   // Track active review
   active_reviews.set(key, {
     entity_id,
     pr_number: pr.number,
+    head_sha,
+    state: "in_flight",
     needs_requeue: false,
     created_at: Date.now(),
   });
@@ -568,9 +675,10 @@ async function handle_review_completion(
               ctx,
             );
           } else {
+            const failure_tag = result.failure ? ` [${result.failure}]` : "";
             await notify_alerts(
               entity_id,
-              `PR #${String(pr.number)}: ${pr.title} — approved but CI checks pending and pr-cron is disabled. Merge failed: ${result.error ?? "manual intervention needed."}`,
+              `PR #${String(pr.number)}: ${pr.title} — approved but CI checks pending and pr-cron is disabled. Merge failed${failure_tag}: ${result.error ?? "manual intervention needed."}`,
               ctx,
             );
           }
@@ -604,9 +712,10 @@ async function handle_review_completion(
             ctx,
           );
         } else {
+          const failure_tag = result.failure ? ` [${result.failure}]` : "";
           await notify_alerts(
             entity_id,
-            `PR #${String(pr.number)}: ${pr.title} — approved but merge failed after rebase attempt. ${result.error ?? "Manual intervention needed."}`,
+            `PR #${String(pr.number)}: ${pr.title} — approved but merge failed${failure_tag}. ${result.error ?? "Manual intervention needed."}`,
             ctx,
           );
         }
@@ -635,8 +744,12 @@ async function handle_review_completion(
 }
 
 /**
- * Remove the active review entry and, if new events arrived mid-review,
- * spawn a fresh review.
+ * Transition the in-flight review to `completed` with a TTL hold (for dedup),
+ * then spawn a requeued review if a new HEAD SHA arrived mid-review.
+ *
+ * The completed entry stays in the map until the TTL sweep removes it — this
+ * is what blocks back-to-back webhook events for the same SHA from spawning
+ * duplicate reviews. See REVIEW_DEDUP_HOLD_MS and #258.
  */
 function cleanup_and_maybe_requeue(
   key: string,
@@ -648,18 +761,27 @@ function cleanup_and_maybe_requeue(
   installation_id?: string,
 ): void {
   const review = active_reviews.get(key);
-  active_reviews.delete(key);
+  if (review) {
+    // Mark completed and start the TTL hold window.
+    review.state = "completed";
+    review.completed_at = Date.now();
+  }
 
   if (review?.needs_requeue) {
+    // A new HEAD SHA arrived while this review was in-flight. Spawn a fresh
+    // review for the new SHA — not the old one. Use the stored requeue_pr
+    // if available so we pass the new head ref/sha through correctly.
+    const next_pr = review.requeue_pr ?? pr;
     console.log(
-      `[webhook] Re-reviewing PR #${String(pr.number)} — new commits arrived during previous review`,
+      `[webhook] Re-reviewing PR #${String(next_pr.number)} — new commits arrived during previous review ` +
+        `(${review.head_sha.slice(0, 7)} → ${(review.requeue_head_sha ?? next_pr.head.sha).slice(0, 7)})`,
     );
-    void spawn_review(entity_id, repo_path, repo_full_name, pr, ctx, installation_id).catch(
+    void spawn_review(entity_id, repo_path, repo_full_name, next_pr, ctx, installation_id).catch(
       (err) => {
-        console.error(`[webhook] Requeue failed for PR #${String(pr.number)}: ${String(err)}`);
+        console.error(`[webhook] Requeue failed for PR #${String(next_pr.number)}: ${String(err)}`);
         sentry.captureException(err, {
           tags: { module: "webhook", entity: entity_id, action: "requeue" },
-          contexts: { pr: { number: pr.number, title: pr.title } },
+          contexts: { pr: { number: next_pr.number, title: next_pr.title } },
         });
       },
     );
@@ -740,7 +862,7 @@ async function spawn_ci_fixer(
   ctx: WebhookContext,
   installation_id?: string,
 ): Promise<void> {
-  const key = review_key(entity_id, pr.number);
+  const key = ci_retry_key(entity_id, pr.number);
 
   // Check retry cap
   const pr_state = await load_pr_reviews(ctx.config);
@@ -1289,12 +1411,25 @@ export function get_active_webhook_reviews(): Array<{
   key: string;
   entity_id: string;
   pr_number: number;
+  head_sha: string;
+  state: "in_flight" | "completed";
   needs_requeue: boolean;
 }> {
   return [...active_reviews.entries()].map(([key, review]) => ({
     key,
     entity_id: review.entity_id,
     pr_number: review.pr_number,
+    head_sha: review.head_sha,
+    state: review.state,
     needs_requeue: review.needs_requeue,
   }));
+}
+
+/**
+ * Reset active reviews map. Test-only helper — do not call from production code.
+ * Vitest's vi.clearAllMocks() does not clear module-level state like this map,
+ * so tests that depend on a clean dedup table must call this in beforeEach.
+ */
+export function _reset_active_reviews_for_testing(): void {
+  active_reviews.clear();
 }

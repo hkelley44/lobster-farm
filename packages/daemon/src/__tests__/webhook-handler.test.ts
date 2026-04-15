@@ -7,6 +7,7 @@ import type { EntityRegistry } from "../registry.js";
 import type { ClaudeSessionManager } from "../session.js";
 import {
   type WebhookContext,
+  _reset_active_reviews_for_testing,
   get_active_webhook_reviews,
   handle_github_webhook,
 } from "../webhook-handler.js";
@@ -59,17 +60,32 @@ function make_pr_payload(
   pr_number = 42,
   repo_full_name = "test-org/lobster-farm",
   overrides: Record<string, unknown> = {},
-  options: { installation_id?: number } = {},
+  options: { installation_id?: number; head_sha?: string } = {},
 ): string {
+  // Default SHA is deterministic per PR so same-PR events collide by default.
+  // Tests that exercise HEAD movement pass an explicit head_sha override.
+  const head_sha = options.head_sha ?? `sha-${String(pr_number)}-abcdef`;
+
+  // Build the head object. Allow overrides.head to take precedence (some
+  // existing tests override `head.ref`), but always fill in a sha if missing.
+  const override_head = (overrides.head as { ref?: string; sha?: string } | undefined) ?? {};
+  const head = {
+    ref: override_head.ref ?? "feature/test",
+    sha: override_head.sha ?? head_sha,
+  };
+
+  const pr_overrides = { ...overrides };
+  delete pr_overrides.head;
+
   const payload: Record<string, unknown> = {
     action,
     pull_request: {
       number: pr_number,
       title: "Test PR",
-      head: { ref: "feature/test" },
+      head,
       body: "Closes #10",
       user: { login: "testuser" },
-      ...overrides,
+      ...pr_overrides,
     },
     repository: { full_name: repo_full_name },
   };
@@ -189,6 +205,9 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
 describe("handle_github_webhook", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Module-level dedup table must be reset between tests — vi.clearAllMocks()
+    // does not touch plain Maps in imported modules.
+    _reset_active_reviews_for_testing();
   });
 
   describe("signature verification", () => {
@@ -645,9 +664,20 @@ describe("handle_github_webhook", () => {
   });
 
   describe("deduplication", () => {
-    it("marks review for requeue when synchronize arrives during active review", async () => {
-      // First request: opens a review
-      const body1 = make_pr_payload("opened", 600, "test-org/lobster-farm");
+    it("marks review for requeue when synchronize with NEW head_sha arrives during active review", async () => {
+      // Regression for #258: a real HEAD movement (new SHA) should requeue,
+      // but only a NEW SHA does — same-SHA events are dropped (tested below).
+
+      // First request: opens a review on SHA "sha-aaa"
+      const body1 = make_pr_payload(
+        "opened",
+        600,
+        "test-org/lobster-farm",
+        {},
+        {
+          head_sha: "sha-aaa",
+        },
+      );
       const req1 = make_request(body1, {
         "x-github-event": "pull_request",
         "x-hub-signature-256": sign_payload(body1),
@@ -668,8 +698,16 @@ describe("handle_github_webhook", () => {
         { timeout: 2000 },
       );
 
-      // Second request: synchronize event for same PR
-      const body2 = make_pr_payload("synchronize", 600, "test-org/lobster-farm");
+      // Second request: synchronize event for same PR with a DIFFERENT head_sha
+      const body2 = make_pr_payload(
+        "synchronize",
+        600,
+        "test-org/lobster-farm",
+        {},
+        {
+          head_sha: "sha-bbb",
+        },
+      );
       const req2 = make_request(body2, {
         "x-github-event": "pull_request",
         "x-hub-signature-256": sign_payload(body2),
@@ -681,14 +719,255 @@ describe("handle_github_webhook", () => {
       // Give async processing time
       await new Promise((r) => setTimeout(r, 100));
 
-      // Should NOT have spawned a second reviewer
+      // Should NOT have spawned a second reviewer (the old one is still running)
       expect((hanging_manager as any).spawn).toHaveBeenCalledTimes(1);
 
-      // The active review should be marked for requeue
+      // The active in-flight review should be marked for requeue
       const active = get_active_webhook_reviews();
-      const review = active.find((r) => r.entity_id === "lobster-farm" && r.pr_number === 600);
+      const review = active.find(
+        (r) => r.entity_id === "lobster-farm" && r.pr_number === 600 && r.state === "in_flight",
+      );
       expect(review).toBeDefined();
+      expect(review!.head_sha).toBe("sha-aaa");
       expect(review!.needs_requeue).toBe(true);
+    });
+
+    it("coalesces back-to-back same-SHA events (opened + synchronize) into one review", async () => {
+      // Regression for #258: two events for the same HEAD SHA must not spawn
+      // two reviewers, and must not set needs_requeue (there's nothing new to
+      // review). This is the #258 "duplicate back-to-back reviews" fix.
+
+      const ctx = make_context();
+
+      // First event: opened
+      const body1 = make_pr_payload(
+        "opened",
+        601,
+        "test-org/lobster-farm",
+        {},
+        {
+          head_sha: "sha-same",
+        },
+      );
+      const req1 = make_request(body1, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body1),
+      });
+      const res1 = make_response();
+      await handle_github_webhook(req1, res1, ctx);
+
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
+
+      // Second event: synchronize with the SAME head_sha (e.g. webhook retry,
+      // or clustered GitHub delivery). Must be dropped as a duplicate.
+      const body2 = make_pr_payload(
+        "synchronize",
+        601,
+        "test-org/lobster-farm",
+        {},
+        {
+          head_sha: "sha-same",
+        },
+      );
+      const req2 = make_request(body2, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body2),
+      });
+      const res2 = make_response();
+      await handle_github_webhook(req2, res2, ctx);
+
+      // Give async processing time
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Only ONE spawn total — the duplicate was dropped
+      expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+
+      // And the in-flight review should NOT be flagged for requeue — there is
+      // nothing new to review.
+      const active = get_active_webhook_reviews();
+      const review = active.find((r) => r.entity_id === "lobster-farm" && r.pr_number === 601);
+      expect(review).toBeDefined();
+      expect(review!.needs_requeue).toBe(false);
+    });
+
+    it("drops same-SHA events that arrive after review completion (TTL hold)", async () => {
+      // After a review completes, the entry transitions to `completed` with a
+      // TTL hold. Any webhook for the same SHA arriving during that hold must
+      // be dropped to prevent the #258 "back-to-back review on identical
+      // commit" bug.
+
+      const ctx = make_context();
+
+      // First event: opened — spawns reviewer
+      const body1 = make_pr_payload(
+        "opened",
+        602,
+        "test-org/lobster-farm",
+        {},
+        {
+          head_sha: "sha-hold",
+        },
+      );
+      const req1 = make_request(body1, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body1),
+      });
+      const res1 = make_response();
+      await handle_github_webhook(req1, res1, ctx);
+
+      // Wait for spawn
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
+
+      // Simulate the reviewer session completing (session:completed event)
+      const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
+      (ctx.session_manager as any).emit("session:completed", {
+        session_id: spawn_result.session_id,
+        exit_code: 0,
+      });
+
+      // Wait until the active review transitions to `completed`
+      await vi.waitFor(
+        () => {
+          const entry = get_active_webhook_reviews().find((r) => r.pr_number === 602);
+          expect(entry).toBeDefined();
+          expect(entry!.state).toBe("completed");
+        },
+        { timeout: 2000 },
+      );
+
+      // Second event: another synchronize with the SAME sha. Because the
+      // completed entry is still in the TTL hold window, this must be dropped.
+      const body2 = make_pr_payload(
+        "synchronize",
+        602,
+        "test-org/lobster-farm",
+        {},
+        {
+          head_sha: "sha-hold",
+        },
+      );
+      const req2 = make_request(body2, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body2),
+      });
+      const res2 = make_response();
+      await handle_github_webhook(req2, res2, ctx);
+
+      // Give async processing time
+      await new Promise((r) => setTimeout(r, 150));
+
+      // Still exactly one spawn — the duplicate was dropped during the hold
+      expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+    });
+
+    it("prefers in_flight entry over completed entry when both exist for the same PR", async () => {
+      // Regression for #258: after a requeue, SHA-A's entry is `completed` (inserted
+      // first) and SHA-B's entry is `in_flight` (inserted second). If a third SHA-C
+      // webhook arrives, find_review_for_pr must return SHA-B's in_flight entry,
+      // not SHA-A's completed entry — otherwise the dedup gate is bypassed and a
+      // duplicate reviewer spawns while SHA-B's review is still running.
+
+      const ctx = make_context();
+
+      // Step 1: SHA-A opens a review
+      const body1 = make_pr_payload(
+        "opened",
+        603,
+        "test-org/lobster-farm",
+        {},
+        { head_sha: "sha-aaa" },
+      );
+      const req1 = make_request(body1, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body1),
+      });
+      await handle_github_webhook(req1, make_response(), ctx);
+
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
+
+      // Step 2: SHA-B arrives while SHA-A is in-flight → requeue
+      const body2 = make_pr_payload(
+        "synchronize",
+        603,
+        "test-org/lobster-farm",
+        {},
+        { head_sha: "sha-bbb" },
+      );
+      const req2 = make_request(body2, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body2),
+      });
+      await handle_github_webhook(req2, make_response(), ctx);
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Still one spawn, SHA-A is requeue-flagged
+      expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+
+      // Step 3: SHA-A's review completes → transitions to `completed`, spawns SHA-B
+      const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
+      (ctx.session_manager as any).emit("session:completed", {
+        session_id: spawn_result.session_id,
+        exit_code: 0,
+      });
+
+      // Wait for SHA-B's review to be spawned via requeue
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(2);
+        },
+        { timeout: 2000 },
+      );
+
+      // Now: SHA-A entry is `completed` (TTL hold), SHA-B entry is `in_flight`.
+      // Verify both exist in the expected states.
+      const active = get_active_webhook_reviews();
+      const sha_a = active.find((r) => r.head_sha === "sha-aaa");
+      const sha_b = active.find((r) => r.head_sha === "sha-bbb");
+      expect(sha_a).toBeDefined();
+      expect(sha_a!.state).toBe("completed");
+      expect(sha_b).toBeDefined();
+      expect(sha_b!.state).toBe("in_flight");
+
+      // Step 4: SHA-C arrives during the 60s TTL window. find_review_for_pr must
+      // find SHA-B (in_flight), NOT SHA-A (completed). So SHA-C should be queued
+      // as a requeue on SHA-B, NOT spawn a third reviewer.
+      const body3 = make_pr_payload(
+        "synchronize",
+        603,
+        "test-org/lobster-farm",
+        {},
+        { head_sha: "sha-ccc" },
+      );
+      const req3 = make_request(body3, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body3),
+      });
+      await handle_github_webhook(req3, make_response(), ctx);
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Must NOT have spawned a third reviewer — SHA-C should be requeued on SHA-B
+      expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(2);
+
+      // SHA-B's entry should now be marked for requeue with SHA-C
+      const active_after = get_active_webhook_reviews();
+      const sha_b_after = active_after.find((r) => r.head_sha === "sha-bbb");
+      expect(sha_b_after).toBeDefined();
+      expect(sha_b_after!.needs_requeue).toBe(true);
     });
   });
 

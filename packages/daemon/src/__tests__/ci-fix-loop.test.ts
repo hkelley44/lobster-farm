@@ -105,7 +105,11 @@ import type { EntityRegistry } from "../registry.js";
 // Import after mocks are registered
 import { type CIFailureLog, build_ci_fix_prompt, fetch_ci_failure_logs } from "../review-utils.js";
 import type { ClaudeSessionManager } from "../session.js";
-import { type WebhookContext, handle_github_webhook } from "../webhook-handler.js";
+import {
+  type WebhookContext,
+  _reset_active_reviews_for_testing,
+  handle_github_webhook,
+} from "../webhook-handler.js";
 
 // ── fetch_ci_failure_logs tests ──
 
@@ -450,6 +454,9 @@ describe("webhook handler — CI fix loop", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
     mock_pr_state = {};
+    // Module-level dedup table must be reset between tests so same-PR events
+    // across tests don't get dropped as duplicates of an earlier test's state.
+    _reset_active_reviews_for_testing();
   });
 
   it("spawns a builder when CI checks fail on an approved PR", async () => {
