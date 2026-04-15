@@ -8,6 +8,7 @@ import type { ClaudeSessionManager } from "../session.js";
 import {
   type WebhookContext,
   _reset_active_reviews_for_testing,
+  build_reviewer_prompt,
   get_active_webhook_reviews,
   handle_github_webhook,
 } from "../webhook-handler.js";
@@ -1343,6 +1344,55 @@ describe("handle_github_webhook", () => {
         log_spy.mockRestore();
         error_spy.mockRestore();
       }
+    });
+  });
+
+  // Regression: reviewer deadlock on pending CI.
+  // Before this fix, the prompt told the reviewer "if any required checks are
+  // failing or pending, do NOT merge" and request changes. When CI hadn't
+  // started yet at review time, the reviewer would post CHANGES_REQUESTED,
+  // the fix loop would push a commit, the webhook would fire again, a fresh
+  // reviewer would see pending CI again, and the cycle would never terminate.
+  // PRs #237 and #263 had to be force-merged to break the loop.
+  describe("build_reviewer_prompt CI guidance (regression: pending-CI deadlock)", () => {
+    const make_pr = () => ({
+      number: 42,
+      title: "Test PR",
+      head: { ref: "feature/test" },
+      body: null,
+      user: { login: "testuser" },
+    });
+
+    it("does not instruct the reviewer to block merge on pending checks", () => {
+      const prompt = build_reviewer_prompt(make_pr(), "/tmp/repo", "");
+
+      // The exact buggy phrase must be gone.
+      expect(prompt).not.toContain("failing or pending");
+
+      // And no variant that conflates pending with a blocker should remain.
+      // We match case-insensitively on "pending" adjacent to block/merge
+      // language (do NOT merge, request changes, etc.) within a small window.
+      const dangerous_patterns: RegExp[] = [
+        /pending[^.\n]{0,80}\bdo not merge\b/i,
+        /pending[^.\n]{0,80}request changes/i,
+        /\bdo not merge\b[^.\n]{0,80}pending/i,
+        /request changes[^.\n]{0,80}pending/i,
+      ];
+      for (const pattern of dangerous_patterns) {
+        expect(
+          prompt,
+          `Prompt still contains a blocking instruction tied to pending CI: ${String(pattern)}`,
+        ).not.toMatch(pattern);
+      }
+    });
+
+    it("still instructs the reviewer to block merge on failing checks", () => {
+      const prompt = build_reviewer_prompt(make_pr(), "/tmp/repo", "");
+
+      // Failing checks are still a blocker — this distinguishes the fix from
+      // a careless "just delete anything mentioning CI" edit.
+      expect(prompt.toLowerCase()).toContain("failing");
+      expect(prompt).toMatch(/request changes/i);
     });
   });
 });
