@@ -1364,7 +1364,7 @@ describe("handle_github_webhook", () => {
     });
 
     it("does not instruct the reviewer to block merge on pending checks", () => {
-      const prompt = build_reviewer_prompt(make_pr(), "/tmp/repo", "");
+      const prompt = build_reviewer_prompt(make_pr(), "/tmp/repo", undefined, "");
 
       // The exact buggy phrase must be gone.
       expect(prompt).not.toContain("failing or pending");
@@ -1387,7 +1387,7 @@ describe("handle_github_webhook", () => {
     });
 
     it("still instructs the reviewer to block merge on failing checks", () => {
-      const prompt = build_reviewer_prompt(make_pr(), "/tmp/repo", "");
+      const prompt = build_reviewer_prompt(make_pr(), "/tmp/repo", undefined, "");
 
       // Failing checks are still a blocker — this distinguishes the fix from
       // a careless "just delete anything mentioning CI" edit.

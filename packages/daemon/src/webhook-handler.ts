@@ -499,7 +499,7 @@ async function spawn_review(
   }
 
   // Build reviewer prompt
-  const prompt = build_reviewer_prompt(pr, repo_path, issue_context);
+  const prompt = build_reviewer_prompt(pr, repo_path, repo_full_name, issue_context);
 
   console.log(`[webhook] Spawning reviewer for PR #${String(pr.number)} in ${entity_id}`);
 
@@ -1102,7 +1102,7 @@ async function spawn_deploy_triage(
  * by reading the git remote URL. Returns null when the remote is missing or
  * doesn't point at GitHub — callers should degrade gracefully.
  */
-function get_repo_full_name(repo_path: string): string | null {
+export function get_repo_full_name(repo_path: string): string | null {
   try {
     const stdout = execFileSync("git", ["remote", "get-url", "origin"], {
       cwd: repo_path,
@@ -1115,9 +1115,14 @@ function get_repo_full_name(repo_path: string): string | null {
   }
 }
 
-export function build_reviewer_prompt(pr: WebhookPR, repo_path: string, issue_context: string): string {
+export function build_reviewer_prompt(
+  pr: WebhookPR,
+  repo_path: string,
+  repo_full_name: string | undefined,
+  issue_context: string,
+): string {
   const n = String(pr.number);
-  const repo_full_name = get_repo_full_name(repo_path);
+
   const lines = [
     `Review PR #${n}: "${pr.title}" on branch ${pr.head.ref}.`,
     `Repository: ${repo_path}`,
