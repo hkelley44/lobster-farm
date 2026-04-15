@@ -181,7 +181,7 @@ describe("run_merge_gate", () => {
     expect(deps.gh_pr_merge).not.toHaveBeenCalled();
   });
 
-  it("BEHIND state with successful rebase → sha_changed (next check_suite drives merge)", async () => {
+  it("BEHIND state with successful rebase → rebased_awaiting_ci (next check_suite drives merge)", async () => {
     // BEHIND triggers rebase. After force-push the SHA changes, so we abort
     // and wait for the new check_suite — we never blindly merge a freshly-
     // rebased SHA without re-running CI.
@@ -195,7 +195,7 @@ describe("run_merge_gate", () => {
     });
     const result = await run_merge_gate(make_input(), deps);
 
-    expect(result.kind).toBe("sha_changed");
+    expect(result.kind).toBe("rebased_awaiting_ci");
     expect(deps.try_local_rebase).toHaveBeenCalledTimes(1);
     expect(deps.gh_pr_merge).not.toHaveBeenCalled();
   });

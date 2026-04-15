@@ -25,7 +25,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ArchetypeRole, EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
-import { expand_home } from "@lobster-farm/shared";
 import type { DiscordBot } from "./discord.js";
 import type { GitHubAppAuth } from "./github-app.js";
 import { extract_first_linked_issue, fetch_issue_context } from "./issue-utils.js";
@@ -36,6 +35,7 @@ import {
   save_pr_reviews,
 } from "./persistence.js";
 import type { EntityRegistry } from "./registry.js";
+import { find_entity_for_repo } from "./repo-utils.js";
 import { MAX_CI_FIX_ATTEMPTS, build_ci_fix_prompt, fetch_ci_failure_logs } from "./review-utils.js";
 import * as sentry from "./sentry.js";
 import type { ClaudeSessionManager } from "./session.js";
@@ -348,7 +348,7 @@ export async function handle_check_suite(
 async function dispatch_success(
   entity: EntityConfig,
   repo_path: string,
-  repo_full_name: string,
+  _repo_full_name: string,
   pr: PRDetail,
   gh_token: string,
   ctx: CheckSuiteContext,
@@ -415,7 +415,6 @@ async function dispatch_success(
     return { kind: "alerted", pr_number: pr.number, reason: "spawn_failed" };
   }
 
-  void repo_full_name; // currently unused; reserved for future watcher hooks
   return {
     kind: "spawned_reviewer",
     pr_number: pr.number,
@@ -447,10 +446,19 @@ async function dispatch_failure(
   const flake_attempts = flake_sha === pr.head_sha ? (existing?.v2_flake_retries ?? 0) : 0;
 
   if (flake_attempts < 1) {
-    // First failure on this SHA — try a rerun before escalating.
+    // First failure on this SHA — record flake retry WITHOUT touching
+    // v2_last_dispatched_sha. The dedup key is only meaningful when we've
+    // spawned a reviewer or ci-fixer; setting it here would permanently
+    // block the follow-up failure from reaching the ci-fixer path (the
+    // rerequested suite runs on the exact same SHA).
     const updated = { ...state };
     updated[state_key] = {
-      ...stamp_dispatch(existing, entity_id, pr),
+      ...(existing ?? {
+        entity_id,
+        pr_number: pr.number,
+        reviewed_at: new Date().toISOString(),
+        outcome: "pending" as const,
+      }),
       v2_flake_retries: flake_attempts + 1,
       v2_flake_retry_sha: pr.head_sha,
     };
@@ -688,26 +696,6 @@ export async function record_v2_review_feedback(
     v2_last_review_sha: head_sha,
   };
   await save_pr_reviews(state, config);
-}
-
-// ── Repo → entity matching ──
-
-interface RepoMatch {
-  entity: EntityConfig;
-  repo_path: string;
-}
-
-function find_entity_for_repo(full_name: string, registry: EntityRegistry): RepoMatch | null {
-  const lower = full_name.toLowerCase();
-  for (const entity of registry.get_active()) {
-    for (const repo of entity.entity.repos) {
-      const url = repo.url.toLowerCase();
-      if (url.includes(lower) || url.includes(lower.replace("/", ":"))) {
-        return { entity, repo_path: expand_home(repo.path) };
-      }
-    }
-  }
-  return null;
 }
 
 function error_message(err: unknown): string {

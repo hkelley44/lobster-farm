@@ -51,6 +51,8 @@ export interface MergeGateInput {
  * - `ci_pending` — CI is still running. Wait for the next check_suite.
  * - `sha_changed` — new commits landed between review and merge. Re-review
  *   needed; the next check_suite will fire.
+ * - `rebased_awaiting_ci` — branch was behind, rebase succeeded, force-push
+ *   done. Waiting for a fresh check_suite on the rebased SHA before merging.
  * - `rebase_conflict` — branch is behind and cannot be cleanly rebased. Real
  *   conflict — needs human resolution.
  * - `branch_protected` — branch protection is blocking (missing required review
@@ -65,6 +67,7 @@ export type MergeGateOutcome =
   | { kind: "ci_regressed"; failures: string[] }
   | { kind: "ci_pending" }
   | { kind: "sha_changed"; observed_sha: string }
+  | { kind: "rebased_awaiting_ci" }
   | { kind: "rebase_conflict"; error: string }
   | { kind: "branch_protected"; merge_state_status: PRMergeability["merge_state_status"] }
   | { kind: "mergeable_unknown" }
@@ -180,7 +183,7 @@ async function rebase_then_merge(
   // the new SHA; abort this merge attempt and let that drive the next pass.
   // This is intentional — merging right after a force-push without re-running
   // CI on the rebased SHA defeats the whole point of the v2 lifecycle.
-  return { kind: "sha_changed", observed_sha: "(rebased — awaiting fresh check_suite)" };
+  return { kind: "rebased_awaiting_ci" };
 }
 
 async function execute_merge(

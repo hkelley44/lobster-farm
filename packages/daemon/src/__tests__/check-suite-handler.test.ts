@@ -433,6 +433,10 @@ describe("handle_check_suite — failure path (Decision 4: flake retry)", () => 
     const saved = deps._state[`${ENTITY_ID}:42`];
     expect(saved?.v2_flake_retries).toBe(1);
     expect(saved?.v2_flake_retry_sha).toBe(SHA_A);
+    // v2_last_dispatched_sha must NOT be set — the rerequested suite runs on
+    // the same SHA, so setting the dedup key here would permanently block the
+    // ci-fixer from ever spawning on the follow-up failure.
+    expect(saved?.v2_last_dispatched_sha).toBeUndefined();
   });
 
   it("second failure on the SAME SHA → spawns ci-fixer (no more retries)", async () => {

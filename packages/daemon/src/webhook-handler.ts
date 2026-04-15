@@ -42,6 +42,7 @@ import type { DeployTriageEntry } from "./persistence.js";
 import type { BotPool } from "./pool.js";
 import type { PRWatchStore } from "./pr-watches.js";
 import type { EntityRegistry } from "./registry.js";
+import { find_entity_for_repo as find_entity_for_repo_full } from "./repo-utils.js";
 import {
   MAX_CI_FIX_ATTEMPTS,
   MAX_DEPLOY_FIX_ATTEMPTS,
@@ -154,33 +155,16 @@ function read_body(req: IncomingMessage): Promise<string> {
 
 /**
  * Map a GitHub repo full_name (e.g. "my-org/my-repo") to an entity.
- * Checks each entity's repo URLs for a match.
+ * Thin wrapper over the shared `find_entity_for_repo` that returns the
+ * flattened `{ entity_id, repo_path }` shape used throughout this module.
  */
 function find_entity_for_repo(
   full_name: string,
   registry: EntityRegistry,
 ): { entity_id: string; repo_path: string } | null {
-  // Normalize: "owner/repo" matches against various URL formats
-  const lower = full_name.toLowerCase();
-
-  for (const entity of registry.get_active()) {
-    for (const repo of entity.entity.repos) {
-      // Match against HTTPS URL: https://github.com/owner/repo.git
-      // Match against SSH URL: git@github.com:owner/repo.git
-      const url = repo.url.toLowerCase();
-      if (
-        url.includes(lower) ||
-        url.includes(lower.replace("/", ":")) // SSH format uses colon
-      ) {
-        return {
-          entity_id: entity.entity.id,
-          repo_path: expand_home(repo.path),
-        };
-      }
-    }
-  }
-
-  return null;
+  const match = find_entity_for_repo_full(full_name, registry);
+  if (!match) return null;
+  return { entity_id: match.entity.entity.id, repo_path: match.repo_path };
 }
 
 /**
@@ -1037,11 +1021,19 @@ async function handle_v2_review_completion(
         return;
 
       case "sha_changed":
-        // Either a new commit landed or rebase force-pushed. Either way, the
-        // next check_suite.completed event will drive the next review pass.
+        // A new commit landed between review and merge attempt. The next
+        // check_suite.completed event will drive a fresh review pass.
         console.log(
           `[webhook:v2] merge-gate: SHA changed for PR #${String(pr.number)} — ` +
             `observed ${gate_outcome.observed_sha}`,
+        );
+        return;
+
+      case "rebased_awaiting_ci":
+        // Branch was behind, rebase succeeded, force-push done. The fresh
+        // check_suite on the rebased SHA will drive the next review pass.
+        console.log(
+          `[webhook:v2] merge-gate: rebased PR #${String(pr.number)} — awaiting fresh check_suite`,
         );
         return;
 
