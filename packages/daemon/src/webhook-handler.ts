@@ -953,6 +953,15 @@ export async function handle_v2_review_completion(
   }
 
   if (outcome === "approved") {
+    if (!gh_token) {
+      await notify_alerts(
+        entity_id,
+        `PR #${String(pr.number)}: ${pr.title} — approved but no GH token available for merge-gate. Manual intervention needed.`,
+        ctx,
+      );
+      return;
+    }
+
     // Fetch the approved head SHA so the merge-gate can detect drift.
     let approved_sha: string;
     try {
@@ -966,15 +975,6 @@ export async function handle_v2_review_completion(
         tags: { module: "webhook", entity: entity_id, action: "v2_fetch_sha" },
         contexts: { pr: { number: pr.number } },
       });
-      return;
-    }
-
-    if (!gh_token) {
-      await notify_alerts(
-        entity_id,
-        `PR #${String(pr.number)}: ${pr.title} — approved but no GH token available for merge-gate. Manual intervention needed.`,
-        ctx,
-      );
       return;
     }
 
@@ -1009,7 +1009,7 @@ export async function handle_v2_review_completion(
       case "ci_regressed":
         await notify_alerts(
           entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — approved but CI regressed on gate check (${gate_outcome.failures.join(", ")}). Waiting for next check_suite.`,
+          `PR #${String(pr.number)}: ${pr.title} — approved but CI regressed on gate check (${gate_outcome.failures.join(", ")}). A new commit on this PR is required to re-enter the review cycle.`,
           ctx,
         );
         return;

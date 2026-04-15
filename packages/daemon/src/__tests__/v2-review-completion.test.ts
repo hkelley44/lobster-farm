@@ -361,7 +361,7 @@ describe("handle_v2_review_completion — approved", () => {
     );
   });
 
-  it("alerts when no gh_token is available — no merge attempted", async () => {
+  it("alerts when no gh_token is available — no merge attempted, no mergeability fetch", async () => {
     const pr = make_pr();
     const ctx = make_ctx();
 
@@ -375,6 +375,8 @@ describe("handle_v2_review_completion — approved", () => {
       ctx,
     );
 
+    // Guard fires before fetch_pr_mergeability — it should never be called
+    expect(fetch_pr_mergeability).not.toHaveBeenCalled();
     expect(run_merge_gate).not.toHaveBeenCalled();
     expect(cleanup_after_merge).not.toHaveBeenCalled();
     expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
