@@ -124,7 +124,18 @@ export async function run_merge_gate(
     return { kind: "ci_pending" };
   }
 
-  // Step 3: branch protection / mergeable state dispatch
+  // Step 3: UNKNOWN mergeability is almost always transient — GitHub is still
+  // computing. Retry once after a short delay before entering the dispatch.
+  if (mergeability.merge_state_status === "UNKNOWN") {
+    await deps.sleep(5_000);
+    try {
+      mergeability = await deps.fetch_pr_mergeability(pr_number, repo_path, gh_token);
+    } catch {
+      // Retry failed — proceed with UNKNOWN, the switch will return mergeable_unknown.
+    }
+  }
+
+  // Step 4: branch protection / mergeable state dispatch
   switch (mergeability.merge_state_status) {
     case "CLEAN":
     case "HAS_HOOKS":
@@ -162,7 +173,7 @@ export async function run_merge_gate(
       };
   }
 
-  // Step 4: actually merge
+  // Step 5: actually merge
   return await execute_merge(input, "direct", deps);
 }
 
@@ -224,6 +235,8 @@ export interface MergeGateDeps {
   check_ci_status: typeof check_ci_status;
   try_local_rebase: typeof try_local_rebase;
   gh_pr_merge: (pr_number: number, repo_path: string, gh_token: string) => Promise<void>;
+  /** Delay function for the UNKNOWN mergeability retry. Injectable for tests. */
+  sleep: (ms: number) => Promise<void>;
 }
 
 async function default_gh_pr_merge(
@@ -244,4 +257,5 @@ export const default_deps: MergeGateDeps = {
   check_ci_status,
   try_local_rebase,
   gh_pr_merge: default_gh_pr_merge,
+  sleep: (ms: number) => new Promise((r) => setTimeout(r, ms)),
 };

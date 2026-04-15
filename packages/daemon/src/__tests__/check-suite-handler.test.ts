@@ -615,6 +615,41 @@ describe("handle_check_suite — cancelled / other conclusions", () => {
     );
   });
 
+  it("cancelled does NOT stamp v2_last_dispatched_sha — re-queued CI on same SHA dispatches", async () => {
+    // This is the blocking fix: cancelled/timed_out/action_required must not
+    // set the dedup key, so a user can re-queue CI on the same SHA and the
+    // handler will dispatch on the fresh check_suite event.
+    const deps = make_deps();
+    const ctx = make_ctx();
+
+    // Step 1: cancelled check_suite
+    const result1 = await handle_check_suite(make_payload({ conclusion: "cancelled" }), ctx, deps);
+    expect(result1.kind).toBe("alerted");
+
+    // Verify state was persisted WITHOUT v2_last_dispatched_sha
+    const saved = vi.mocked(deps.save_pr_reviews).mock.calls[0]?.[0];
+    const state_entry = saved?.[`${ENTITY_ID}:42`];
+    expect(state_entry).toBeDefined();
+    expect(state_entry?.v2_last_dispatched_sha).toBeUndefined();
+
+    // Step 2: user re-queues CI, same SHA fires check_suite.completed=success
+    // The handler should NOT dedup — it should dispatch the reviewer.
+    const result2 = await handle_check_suite(make_payload({ conclusion: "success" }), ctx, deps);
+    expect(result2.kind).toBe("spawned_reviewer");
+    expect(deps.spawn_session).toHaveBeenCalledTimes(1);
+  });
+
+  it("timed_out does NOT stamp v2_last_dispatched_sha", async () => {
+    const deps = make_deps();
+    const ctx = make_ctx();
+
+    await handle_check_suite(make_payload({ conclusion: "timed_out" }), ctx, deps);
+
+    const saved = vi.mocked(deps.save_pr_reviews).mock.calls[0]?.[0];
+    const state_entry = saved?.[`${ENTITY_ID}:42`];
+    expect(state_entry?.v2_last_dispatched_sha).toBeUndefined();
+  });
+
   it("no-ops on conclusion=neutral / stale / skipped", async () => {
     const deps = make_deps();
     const ctx = make_ctx();

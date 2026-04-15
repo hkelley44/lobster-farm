@@ -53,6 +53,7 @@ function make_deps(fixtures: DepFixtures = {}): MergeGateDeps {
     gh_pr_merge: vi.fn(async () => {
       if (fixtures.merge_error) throw fixtures.merge_error;
     }),
+    sleep: vi.fn(async () => {}),
   };
 }
 
@@ -167,7 +168,7 @@ describe("run_merge_gate", () => {
     expect(deps.gh_pr_merge).not.toHaveBeenCalled();
   });
 
-  it("UNKNOWN mergeable state → mergeable_unknown, wait", async () => {
+  it("UNKNOWN mergeable state → retries once, still UNKNOWN → mergeable_unknown", async () => {
     const deps = make_deps({
       mergeability: {
         mergeable: "UNKNOWN",
@@ -178,7 +179,49 @@ describe("run_merge_gate", () => {
     const result = await run_merge_gate(make_input(), deps);
 
     expect(result).toEqual({ kind: "mergeable_unknown" });
+    // fetch_pr_mergeability called twice: initial + retry
+    expect(deps.fetch_pr_mergeability).toHaveBeenCalledTimes(2);
     expect(deps.gh_pr_merge).not.toHaveBeenCalled();
+  });
+
+  it("UNKNOWN mergeable state → retries once, resolves to CLEAN → merges", async () => {
+    const unknown_mergeability: PRMergeability = {
+      mergeable: "UNKNOWN",
+      merge_state_status: "UNKNOWN",
+      head_sha: APPROVED_SHA,
+    };
+    const clean_mergeability: PRMergeability = {
+      mergeable: "MERGEABLE",
+      merge_state_status: "CLEAN",
+      head_sha: APPROVED_SHA,
+    };
+    const deps = make_deps();
+    vi.mocked(deps.fetch_pr_mergeability)
+      .mockResolvedValueOnce(unknown_mergeability)
+      .mockResolvedValueOnce(clean_mergeability);
+
+    const result = await run_merge_gate(make_input(), deps);
+
+    expect(result).toEqual({ kind: "merged", method: "direct" });
+    expect(deps.fetch_pr_mergeability).toHaveBeenCalledTimes(2);
+    expect(deps.gh_pr_merge).toHaveBeenCalledTimes(1);
+  });
+
+  it("UNKNOWN mergeable state → retry throws → mergeable_unknown (no crash)", async () => {
+    const unknown_mergeability: PRMergeability = {
+      mergeable: "UNKNOWN",
+      merge_state_status: "UNKNOWN",
+      head_sha: APPROVED_SHA,
+    };
+    const deps = make_deps();
+    vi.mocked(deps.fetch_pr_mergeability)
+      .mockResolvedValueOnce(unknown_mergeability)
+      .mockRejectedValueOnce(new Error("rate limit"));
+
+    const result = await run_merge_gate(make_input(), deps);
+
+    expect(result).toEqual({ kind: "mergeable_unknown" });
+    expect(deps.fetch_pr_mergeability).toHaveBeenCalledTimes(2);
   });
 
   it("BEHIND state with successful rebase → rebased_awaiting_ci (next check_suite drives merge)", async () => {

@@ -647,7 +647,14 @@ export type LocalRebaseResult =
   | { success: true }
   | {
       success: false;
-      kind: "conflict" | "no_remote" | "no_tmp_dir" | "clone_failed" | "push_failed" | "other";
+      kind:
+        | "conflict"
+        | "no_remote"
+        | "no_tmp_dir"
+        | "clone_failed"
+        | "fetch_failed"
+        | "push_failed"
+        | "other";
       error: string;
     };
 
@@ -710,7 +717,7 @@ export async function try_local_rebase(
     } catch (err) {
       return {
         success: false,
-        kind: "other",
+        kind: "fetch_failed",
         error: `Fetch failed: ${String(err instanceof Error ? err.message : err)}`,
       };
     }

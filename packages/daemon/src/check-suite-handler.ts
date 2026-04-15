@@ -275,12 +275,22 @@ export async function handle_check_suite(
   // Only act on PRs targeting the default branch. Stacked PRs against feature
   // branches shouldn't trigger merge attempts.
   if (pr.base_ref !== "main" && pr.base_ref !== "master") {
+    console.warn(
+      `[check-suite] PR #${String(pr.number)} targets base "${pr.base_ref}" — skipping (only main/master supported). If this repo uses a different default branch, the v2 lifecycle will silently ignore all its PRs.`,
+    );
     return { kind: "noop", reason: "non_default_base" };
   }
 
   // Dedup: if we already dispatched on this exact head SHA for this PR, ignore.
   // Multiple workflows on the same SHA fire multiple check_suite.completed
   // events; we only want to act once.
+  //
+  // NOTE: This handles sequential duplicates (second webhook arrives after the
+  // first saves). Two truly concurrent webhooks — both calling load_pr_reviews
+  // before either completes save_pr_reviews — will both read stale state and
+  // both dispatch. The window is small (milliseconds) and the pre-existing v1
+  // path had no dedup at all, so this is not a regression. File-level locking
+  // would close the gap if it ever causes double-dispatch in practice.
   const state_key = pr_state_key(match.entity.entity.id, pr.number);
   const state = await deps.load_pr_reviews(ctx.config);
   const existing = state[state_key];
@@ -319,8 +329,19 @@ export async function handle_check_suite(
     case "timed_out":
     case "action_required": {
       const reason = suite.conclusion;
+      // Do NOT stamp v2_last_dispatched_sha — the user may re-queue CI on the
+      // same SHA and we want to dispatch on the fresh check_suite event.
+      // We only persist the outcome field for tracking, not the dedup key.
       const updated = { ...state };
-      updated[state_key] = stamp_dispatch(existing, match.entity.entity.id, pr);
+      updated[state_key] = {
+        ...(existing ?? {
+          entity_id: match.entity.entity.id,
+          pr_number: pr.number,
+          reviewed_at: new Date().toISOString(),
+          outcome: "pending" as const,
+        }),
+        outcome: "pending" as const,
+      };
       await deps.save_pr_reviews(updated, ctx.config);
       await deps.notify_alerts(
         match.entity.entity.id,
