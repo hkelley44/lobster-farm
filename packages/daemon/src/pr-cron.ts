@@ -3,7 +3,7 @@ import { stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { ArchetypeRole, EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { expand_home } from "@lobster-farm/shared";
-import { detect_review_outcome } from "./actions.js";
+import { type ReviewOutcome, detect_review_outcome } from "./actions.js";
 import type { DiscordBot } from "./discord.js";
 import { resolve_binary } from "./env.js";
 import type { GitHubAppAuth } from "./github-app.js";
@@ -575,7 +575,7 @@ export class PRReviewCron {
     entity_id: string,
     repo_path: string,
     pr: OpenPR,
-    review_outcome?: "approved" | "changes_requested" | "pending",
+    review_outcome?: ReviewOutcome,
     gh_token?: string,
   ): Promise<void> {
     const review_state =
@@ -666,6 +666,16 @@ export class PRReviewCron {
           `External PR #${String(pr.number)} from @${pr.author.login}: ${pr.title} — approved, awaiting human merge`,
         );
       }
+    } else if (review_state === "dismissed") {
+      // All reviews were dismissed — PR needs a fresh review.
+      // The next cron cycle will pick it up since there's no valid outcome.
+      console.log(
+        `[pr-cron] All reviews dismissed on PR #${String(pr.number)} — will be re-reviewed next cycle`,
+      );
+      await this.notify_alerts(
+        entity_id,
+        `PR #${String(pr.number)}: "${pr.title}" — all reviews dismissed, will re-review next cycle`,
+      );
     } else {
       // Notify completion without specific action
       await this.notify_alerts(

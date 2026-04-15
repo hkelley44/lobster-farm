@@ -188,6 +188,44 @@ function resolve_token(
     : github_app.get_token();
 }
 
+// ── Pre-spawn review dedup ──
+
+/**
+ * Check whether a non-dismissed review from a bot account already exists on
+ * a PR. Used as a pre-spawn guard to avoid duplicate reviews after daemon
+ * restarts or re-delivered webhooks.
+ *
+ * Returns true if a bot review with state APPROVED or CHANGES_REQUESTED exists.
+ */
+async function has_existing_bot_review(
+  repo_full_name: string,
+  pr_number: number,
+  repo_path: string,
+  gh_token: string,
+): Promise<boolean> {
+  try {
+    const env = { ...process.env, GH_TOKEN: gh_token };
+    const { stdout } = await exec(
+      "gh",
+      [
+        "api",
+        `repos/${repo_full_name}/pulls/${String(pr_number)}/reviews`,
+        "--jq",
+        '[.[] | select((.state == "APPROVED" or .state == "CHANGES_REQUESTED") and (.user.login | endswith("[bot]")))] | length',
+      ],
+      { cwd: repo_path, timeout: 15_000, env },
+    );
+    return parseInt(stdout.trim(), 10) > 0;
+  } catch (err) {
+    // On error, allow the review to proceed — better to risk a duplicate
+    // than to silently skip a needed review.
+    console.warn(
+      `[webhook] Failed to check existing reviews for PR #${String(pr_number)}: ${String(err)}`,
+    );
+    return false;
+  }
+}
+
 // ── Active review tracking ──
 //
 // Dedup key is {entity, pr_number, head_sha} — NOT just {entity, pr}. Two
@@ -448,6 +486,31 @@ async function route_event(
     pr_entry.review.requeue_head_sha = head_sha;
     pr_entry.review.requeue_pr = pr;
     return;
+  }
+
+  // Pre-spawn dedup: for non-synchronize events (opened, reopened, ready_for_review),
+  // check whether a non-dismissed bot review already exists on the PR. This catches
+  // duplicate reviews after daemon restarts or re-delivered webhooks. Synchronize
+  // events (new commits pushed) always get a fresh review.
+  if (action !== "synchronize") {
+    try {
+      const gh_token = await resolve_token(ctx.github_app, installation_id);
+      const already_reviewed = await has_existing_bot_review(
+        repo_full_name,
+        pr.number,
+        match.repo_path,
+        gh_token,
+      );
+      if (already_reviewed) {
+        console.log(
+          `[webhook] Non-dismissed bot review already exists on PR #${String(pr.number)} — skipping spawn`,
+        );
+        return;
+      }
+    } catch (err) {
+      // Token resolution failed — proceed with spawn rather than silently skipping
+      console.warn(`[webhook] Pre-spawn dedup check failed: ${String(err)}`);
+    }
   }
 
   // No in-flight review for this SHA — spawn fresh.
@@ -734,6 +797,18 @@ async function handle_review_completion(
         ctx,
       );
     }
+  } else if (outcome === "dismissed") {
+    // All reviews were dismissed (e.g., duplicate cleanup gone wrong).
+    // Spawn a fresh review so the PR doesn't get stuck in limbo.
+    console.log(
+      `[webhook] All reviews dismissed on PR #${String(pr.number)} — spawning fresh review`,
+    );
+    await notify_alerts(
+      entity_id,
+      `PR #${String(pr.number)}: "${pr.title}" — all reviews dismissed, re-reviewing`,
+      ctx,
+    );
+    await spawn_review(entity_id, repo_path, repo_full_name, pr, ctx, installation_id);
   } else {
     await notify_alerts(
       entity_id,
@@ -1100,7 +1175,7 @@ async function spawn_deploy_triage(
 export function build_reviewer_prompt(
   pr: WebhookPR,
   repo_path: string,
-  repo_full_name: string | undefined,
+  repo_full_name: string,
   issue_context: string,
 ): string {
   const n = String(pr.number);
@@ -1114,6 +1189,11 @@ export function build_reviewer_prompt(
     "Post your review on the PR using gh cli.",
     "You are authenticated as the LobsterFarm Reviewer GitHub App.",
     "",
+    "Before posting your review, check for any existing reviews you've already posted:",
+    `  gh api repos/${repo_full_name}/pulls/${n}/reviews --jq '.[] | select(.user.login | endswith("[bot]")) | {state, submitted_at}'`,
+    "If a review already exists with state APPROVED or CHANGES_REQUESTED, skip posting",
+    "and go directly to the merge step (if approved) or stop (if changes requested).",
+    "",
     "Review standards:",
     "- Every piece of actionable feedback should be included.",
     "- If there is ANY actionable feedback, request changes:",
@@ -1121,19 +1201,10 @@ export function build_reviewer_prompt(
     "- If the code is genuinely clean with no improvements needed, approve:",
     `  gh pr review ${n} --approve --body "Looks good." && echo "✓ Review posted"`,
     "",
-  ];
-
-  // Verification step — only possible when we know owner/repo
-  if (repo_full_name) {
-    lines.push(
-      "After posting your review, verify it landed:",
-      `  gh api repos/${repo_full_name}/pulls/${n}/reviews --jq '.[-1].state'`,
-      "If the state is CHANGES_REQUESTED or APPROVED, your review is confirmed. Move on.",
-      "",
-    );
-  }
-
-  lines.push(
+    "After posting your review, verify it landed:",
+    `  gh api repos/${repo_full_name}/pulls/${n}/reviews --jq '.[-1].state'`,
+    "If the state is CHANGES_REQUESTED or APPROVED, your review is confirmed. Move on.",
+    "",
     "IMPORTANT:",
     "- Post your review ONCE. Do not retry if the command exits 0.",
     "- Never dismiss, delete, or modify reviews you have already posted.",
@@ -1176,7 +1247,7 @@ export function build_reviewer_prompt(
     `  3. Then retry: gh pr merge ${n} --squash --delete-branch`,
     "  4. If rebase has conflicts: git rebase --abort — do NOT force push conflict markers",
     "- If you requested changes, do NOT merge.",
-  );
+  ];
 
   if (issue_context) {
     lines.push("", "## Linked Issue Context", "", issue_context);

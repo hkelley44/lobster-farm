@@ -578,6 +578,21 @@ describe("detect_review_outcome", () => {
     expect(result).toBe("pending");
   });
 
+  it("returns 'dismissed' when reviewDecision is DISMISSED", async () => {
+    exec_mock_impl = async (_cmd, args) => {
+      if (args.includes("state")) {
+        return { stdout: "OPEN", stderr: "" };
+      }
+      if (args.includes("reviewDecision")) {
+        return { stdout: "DISMISSED", stderr: "" };
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    const result = await detect_review_outcome(42, "/repos/test-repo");
+    expect(result).toBe("dismissed");
+  });
+
   it("returns 'pending' and reports to Sentry on gh CLI failure", async () => {
     exec_mock_impl = async () => {
       throw new Error("gh: not authenticated");
