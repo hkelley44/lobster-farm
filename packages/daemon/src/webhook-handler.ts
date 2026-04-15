@@ -9,7 +9,7 @@
  * once the current reviewer finishes.
  */
 
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { promisify } from "node:util";
 import type { ArchetypeRole } from "@lobster-farm/shared";
@@ -1096,24 +1096,6 @@ async function spawn_deploy_triage(
 }
 
 // ── Prompt building ──
-
-/**
- * Derive owner/repo (e.g. "ultim88888888/lobster-farm") from a local checkout
- * by reading the git remote URL. Returns null when the remote is missing or
- * doesn't point at GitHub — callers should degrade gracefully.
- */
-export function get_repo_full_name(repo_path: string): string | null {
-  try {
-    const stdout = execFileSync("git", ["remote", "get-url", "origin"], {
-      cwd: repo_path,
-      encoding: "utf-8",
-      timeout: 5000,
-    });
-    return nwo_from_url(stdout.trim()) ?? null;
-  } catch {
-    return null;
-  }
-}
 
 export function build_reviewer_prompt(
   pr: WebhookPR,
