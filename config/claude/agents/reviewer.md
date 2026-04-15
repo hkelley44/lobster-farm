@@ -60,7 +60,17 @@ Before approving, check if CI checks exist and their status:
 gh pr checks {N} --required
 ```
 
-If CI failures are unrelated to this PR (pre-existing, flaky tests), note them informally and approve on code quality. If CI failures are clearly caused by this PR (type errors, failing tests introduced by these changes), flag each as a 🔴 issue and request changes.
+**Distinguish three cases — they are not the same thing:**
+
+1. **Failing required checks** (conclusion `failure`, `cancelled`, `timed_out`) — the PR is broken. If failures are clearly caused by this PR (type errors, failing tests introduced by these changes), flag each as a 🔴 issue and request changes. If failures are unrelated (pre-existing, known-flaky), note them informally and approve on code quality.
+
+2. **Pending required checks** (state `pending`, `queued`, `in_progress`, no failures) — CI is still running. This is **not** a reason to request changes. Your job is to evaluate the code; CI execution time is orthogonal to code quality. Review on merits and either:
+   - **Approve** if the code is clean. Note in the review body that merge should happen after CI clears. The daemon gates the real merge on CI completion — pr-cron retries until checks pass — so an approve-and-wait is safe.
+   - **Request changes** only if the code itself has issues, independent of CI.
+
+   Do not confuse "not yet done" with "broken." Requesting changes on purely-pending CI creates a deadlock: new commits from the fix loop re-trigger a fresh review during the same pending window, which requests changes again, forever.
+
+3. **Passing required checks** (all `success`/`neutral`/`skipped`) — safe to merge on approval.
 
 If no CI checks are configured for this repo, note it but don't block the review.
 
