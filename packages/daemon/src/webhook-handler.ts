@@ -16,6 +16,12 @@ import type { ArchetypeRole } from "@lobster-farm/shared";
 import { expand_home } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { detect_review_outcome } from "./actions.js";
+import {
+  type CheckSuiteWebhookPayload,
+  handle_check_suite,
+  make_default_deps as make_check_suite_deps,
+  record_v2_review_feedback,
+} from "./check-suite-handler.js";
 import type { DiscordBot } from "./discord.js";
 import type { GitHubAppAuth } from "./github-app.js";
 import {
@@ -25,6 +31,7 @@ import {
   fetch_issue_context,
   nwo_from_url,
 } from "./issue-utils.js";
+import { run_merge_gate } from "./merge-gate.js";
 import {
   load_deploy_triage,
   load_pr_reviews,
@@ -44,6 +51,7 @@ import {
   build_review_fix_prompt,
   check_ci_status,
   fetch_ci_failure_logs,
+  fetch_pr_mergeability,
   fetch_review_comments,
 } from "./review-utils.js";
 import * as sentry from "./sentry.js";
@@ -173,6 +181,23 @@ function find_entity_for_repo(
   }
 
   return null;
+}
+
+/**
+ * Look up the pr_lifecycle flag ("v1" | "v2") for an entity.
+ *
+ * Uses `get_active()` rather than `get()` because many tests stub the
+ * registry with just `get_active` — keeping the single accessor avoids
+ * a test surface regression. Returns "v1" (the safe default) when the
+ * entity is missing or doesn't have the flag.
+ */
+function get_pr_lifecycle(registry: EntityRegistry, entity_id: string): "v1" | "v2" {
+  for (const entity of registry.get_active()) {
+    if (entity.entity.id === entity_id) {
+      return entity.entity.pr_lifecycle ?? "v1";
+    }
+  }
+  return "v1";
 }
 
 /**
@@ -372,6 +397,24 @@ async function route_event(
     return;
   }
 
+  // Handle check_suite events — v2 PR lifecycle (#257).
+  // Entities opted into pr_lifecycle=v2 dispatch their entire PR review /
+  // merge / fix loop from check_suite.completed instead of pull_request.opened.
+  // The handler itself gates on the feature flag — entities on v1 no-op.
+  if (event_type === "check_suite") {
+    const cs_payload = payload as unknown as CheckSuiteWebhookPayload;
+    const cs_ctx = {
+      registry: ctx.registry,
+      config: ctx.config,
+      github_app: ctx.github_app,
+      session_manager: ctx.session_manager,
+      discord: ctx.discord,
+    };
+    const outcome = await handle_check_suite(cs_payload, cs_ctx, make_check_suite_deps(cs_ctx));
+    console.log(`[webhook] check_suite outcome: ${JSON.stringify(outcome)}`);
+    return;
+  }
+
   if (event_type !== "pull_request") {
     console.log(`[webhook] Ignoring event: ${event_type}`);
     return;
@@ -433,6 +476,16 @@ async function route_event(
   const reviewable_actions = ["opened", "synchronize", "reopened", "ready_for_review"];
   if (!reviewable_actions.includes(action)) {
     console.log(`[webhook] Ignoring pull_request.${action} for #${String(pr.number)}`);
+    return;
+  }
+
+  // v2 entities drive review from check_suite.completed — pull_request.opened
+  // is a no-op because CI hasn't started yet. Skipping avoids the original
+  // race condition where the reviewer ran against a PR with no CI reported.
+  if (get_pr_lifecycle(ctx.registry, match.entity_id) === "v2") {
+    console.log(
+      `[webhook] Skipping pull_request.${action} for #${String(pr.number)} — entity ${match.entity_id} is on pr_lifecycle=v2 (check_suite will drive review)`,
+    );
     return;
   }
 
@@ -674,6 +727,26 @@ async function handle_review_completion(
 
   console.log(`[webhook] Review completed for PR #${String(pr.number)} — outcome: ${outcome}`);
 
+  // v2 entities use the event-driven lifecycle (#257):
+  //   - changes_requested → record feedback, spawn builder; the builder's push
+  //     fires a fresh check_suite cycle which drives the next review pass.
+  //   - approved → run the merge-gate (re-verifies CI + mergeability on the
+  //     exact reviewed SHA, then merges via gh pr merge --squash).
+  // We deliberately bypass the v1 CI-check + rebase + retry logic below.
+  if (get_pr_lifecycle(ctx.registry, entity_id) === "v2") {
+    await handle_v2_review_completion(
+      entity_id,
+      repo_path,
+      repo_full_name,
+      pr,
+      outcome,
+      gh_token,
+      ctx,
+      installation_id,
+    );
+    return;
+  }
+
   // Route outcome
   if (outcome === "changes_requested") {
     // Spawn builder to fix
@@ -818,6 +891,199 @@ async function handle_review_completion(
       ctx,
     );
   }
+}
+
+/**
+ * v2 post-review dispatch (#257).
+ *
+ * Called from handle_review_completion when the entity is on pr_lifecycle=v2.
+ * - changes_requested: capture the review body so the next reviewer pass can
+ *   verify the builder addressed it (Decision 5). Then spawn the builder fix
+ *   session; the push that follows fires a fresh check_suite that drives the
+ *   next review cycle automatically.
+ * - approved: run the merge-gate. It re-verifies CI + mergeability on the
+ *   exact reviewed SHA and either merges or returns a tagged outcome we
+ *   dispatch on. We do NOT fall through to the v1 rebase/retry loop.
+ * - anything else: just alert; a new event will eventually drive the next step.
+ */
+async function handle_v2_review_completion(
+  entity_id: string,
+  repo_path: string,
+  repo_full_name: string,
+  pr: WebhookPR,
+  outcome: "approved" | "changes_requested" | "pending",
+  gh_token: string | undefined,
+  ctx: WebhookContext,
+  installation_id?: string,
+): Promise<void> {
+  if (outcome === "changes_requested") {
+    // Fetch current head SHA + the review body so the next pass can echo
+    // feedback back at the reviewer.
+    let head_sha = "";
+    try {
+      const mergeability = await fetch_pr_mergeability(pr.number, repo_path, gh_token);
+      head_sha = mergeability.head_sha;
+    } catch (err) {
+      console.warn(
+        `[webhook:v2] Could not fetch head SHA for PR #${String(pr.number)}: ${String(err)}`,
+      );
+    }
+
+    let feedback_body = "";
+    try {
+      feedback_body = await fetch_review_comments(pr.number, repo_path);
+    } catch (err) {
+      console.warn(
+        `[webhook:v2] Could not fetch review body for PR #${String(pr.number)}: ${String(err)}`,
+      );
+    }
+
+    if (head_sha && feedback_body) {
+      try {
+        await record_v2_review_feedback(entity_id, pr.number, head_sha, feedback_body, ctx.config);
+      } catch (err) {
+        console.error(
+          `[webhook:v2] Failed to record review feedback for PR #${String(pr.number)}: ${String(err)}`,
+        );
+        sentry.captureException(err, {
+          tags: { module: "webhook", entity: entity_id, action: "record_v2_feedback" },
+          contexts: { pr: { number: pr.number } },
+        });
+      }
+    }
+
+    await spawn_fixer(entity_id, repo_path, pr, ctx, installation_id);
+    await notify_alerts(
+      entity_id,
+      `PR #${String(pr.number)}: ${pr.title} — changes requested, spawning builder to fix`,
+      ctx,
+    );
+    await notify_pr_watcher(
+      repo_full_name,
+      pr.number,
+      `PR #${String(pr.number)} ("${pr.title}") received review feedback: changes requested. The fix loop is handling it.`,
+      ctx,
+      false,
+    );
+    return;
+  }
+
+  if (outcome === "approved") {
+    // Fetch the approved head SHA so the merge-gate can detect drift.
+    let approved_sha: string;
+    try {
+      const mergeability = await fetch_pr_mergeability(pr.number, repo_path, gh_token);
+      approved_sha = mergeability.head_sha;
+    } catch (err) {
+      console.error(
+        `[webhook:v2] Could not fetch head SHA for approved PR #${String(pr.number)}: ${String(err)}`,
+      );
+      sentry.captureException(err, {
+        tags: { module: "webhook", entity: entity_id, action: "v2_fetch_sha" },
+        contexts: { pr: { number: pr.number } },
+      });
+      return;
+    }
+
+    if (!gh_token) {
+      await notify_alerts(
+        entity_id,
+        `PR #${String(pr.number)}: ${pr.title} — approved but no GH token available for merge-gate. Manual intervention needed.`,
+        ctx,
+      );
+      return;
+    }
+
+    const gate_outcome = await run_merge_gate({
+      pr_number: pr.number,
+      branch: pr.head.ref,
+      approved_sha,
+      repo_path,
+      gh_token,
+    });
+
+    console.log(
+      `[webhook:v2] merge-gate outcome for PR #${String(pr.number)}: ${JSON.stringify(gate_outcome)}`,
+    );
+
+    switch (gate_outcome.kind) {
+      case "merged":
+        await post_auto_merge_cleanup(pr, entity_id, repo_path, ctx, installation_id);
+        await notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — approved, merge-gate passed, merged (${gate_outcome.method})`,
+          ctx,
+        );
+        await notify_pr_watcher(
+          repo_full_name,
+          pr.number,
+          `PR #${String(pr.number)} ("${pr.title}") was approved and merged to main. Continue your work.`,
+          ctx,
+        );
+        return;
+
+      case "ci_regressed":
+        await notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — approved but CI regressed on gate check (${gate_outcome.failures.join(", ")}). Waiting for next check_suite.`,
+          ctx,
+        );
+        return;
+
+      case "ci_pending":
+        console.log(
+          `[webhook:v2] merge-gate: CI pending for PR #${String(pr.number)} — waiting for next check_suite`,
+        );
+        return;
+
+      case "sha_changed":
+        // Either a new commit landed or rebase force-pushed. Either way, the
+        // next check_suite.completed event will drive the next review pass.
+        console.log(
+          `[webhook:v2] merge-gate: SHA changed for PR #${String(pr.number)} — ` +
+            `observed ${gate_outcome.observed_sha}`,
+        );
+        return;
+
+      case "rebase_conflict":
+        await notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — rebase conflict, manual resolution required. ${gate_outcome.error}`,
+          ctx,
+        );
+        return;
+
+      case "branch_protected":
+        await notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — blocked by branch protection (${gate_outcome.merge_state_status}). Human eyes required.`,
+          ctx,
+        );
+        return;
+
+      case "mergeable_unknown":
+        console.log(
+          `[webhook:v2] merge-gate: mergeability unknown for PR #${String(pr.number)} — waiting`,
+        );
+        return;
+
+      case "merge_failed":
+        await notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — merge-gate failed: ${gate_outcome.error}`,
+          ctx,
+        );
+        return;
+    }
+    return;
+  }
+
+  // outcome === "pending"
+  await notify_alerts(
+    entity_id,
+    `PR #${String(pr.number)} review completed: "${pr.title}" (${outcome})`,
+    ctx,
+  );
 }
 
 /**

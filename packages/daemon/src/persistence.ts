@@ -44,6 +44,24 @@ export interface ProcessedPR {
    * Incremented each time a builder is spawned to fix CI failures.
    * Reset when new commits arrive from a non-builder source. (#196) */
   ci_fix_attempts?: number;
+
+  // ── v2 PR lifecycle (#257) ──
+  /** Last head SHA the v2 check-suite-handler dispatched on.
+   * Used to deduplicate `check_suite.completed` events that fire multiple
+   * times for the same SHA (e.g., one per workflow). */
+  v2_last_dispatched_sha?: string;
+  /** Number of CI flake-retry rerun attempts for the current SHA.
+   * Resets when SHA changes. Cap = 1 per Decision 4 in the spec. */
+  v2_flake_retries?: number;
+  /** SHA that v2_flake_retries belongs to — reset counter when SHA changes. */
+  v2_flake_retry_sha?: string;
+  /** The most recent reviewer feedback body (set when the reviewer requested
+   * changes). Passed back to the reviewer on the next pass so it can verify
+   * the builder addressed the feedback (Decision 5). */
+  v2_last_review_feedback?: string;
+  /** SHA the previous review was performed against — paired with
+   * v2_last_review_feedback so we can show the reviewer "since SHA X". */
+  v2_last_review_sha?: string;
 }
 
 /** Keyed by "entity_id:pr_number" */

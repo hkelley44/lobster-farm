@@ -31,6 +31,14 @@ export const EntityConfigSchema = z.object({
     // channel structure, model defaults. Entity config only needs overrides.
     blueprint: z.string().optional(),
 
+    // PR review lifecycle version (#257).
+    //   "v1" — legacy: pull_request.opened spawns reviewer immediately, then
+    //          falls through to pr-cron / bypass branches when CI is pending.
+    //   "v2" — event-driven: pull_request.opened is a no-op; check_suite.completed
+    //          drives the entire lifecycle (CI → review → merge-gate).
+    // Default v1 during the rollout window. Cutover is per-entity.
+    pr_lifecycle: z.enum(["v1", "v2"]).default("v1"),
+
     repos: z
       .array(
         z.object({

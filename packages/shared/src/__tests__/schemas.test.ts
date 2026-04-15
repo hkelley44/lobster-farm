@@ -211,6 +211,29 @@ describe("EntityConfigSchema", () => {
       }),
     ).toThrow();
   });
+
+  // pr_lifecycle feature flag (#257)
+  it("defaults pr_lifecycle to v1", () => {
+    const config = EntityConfigSchema.parse(MINIMAL_ENTITY);
+    expect(config.entity.pr_lifecycle).toBe("v1");
+  });
+
+  it("accepts pr_lifecycle: v2", () => {
+    const config = EntityConfigSchema.parse({
+      ...MINIMAL_ENTITY,
+      entity: { ...MINIMAL_ENTITY.entity, pr_lifecycle: "v2" },
+    });
+    expect(config.entity.pr_lifecycle).toBe("v2");
+  });
+
+  it("rejects unknown pr_lifecycle values", () => {
+    expect(() =>
+      EntityConfigSchema.parse({
+        ...MINIMAL_ENTITY,
+        entity: { ...MINIMAL_ENTITY.entity, pr_lifecycle: "v3" },
+      }),
+    ).toThrow();
+  });
 });
 
 describe("TemplateVariablesSchema", () => {
