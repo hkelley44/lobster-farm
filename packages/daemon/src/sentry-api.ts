@@ -25,6 +25,12 @@ export interface SentryException {
   };
 }
 
+export interface SentryTopFrame {
+  filename: string;
+  lineno: number | null;
+  function: string;
+}
+
 export interface SentryIssueDetails {
   title: string;
   culprit: string;
@@ -33,9 +39,11 @@ export interface SentryIssueDetails {
   first_seen: string;
   last_seen: string;
   platform: string;
+  short_id: string | null;
   web_url: string;
   tags: Array<{ key: string; value: string }>;
   stack_trace: string;
+  top_frame: SentryTopFrame | null;
   contexts: Record<string, unknown>;
   request?: {
     method?: string;
@@ -209,11 +217,52 @@ export async function fetch_sentry_issue_details(
     first_seen: (issue.firstSeen as string) ?? "",
     last_seen: (issue.lastSeen as string) ?? "",
     platform: (issue.platform as string) ?? "",
+    short_id: (issue.shortId as string) ?? null,
     web_url: (issue.permalink as string) ?? (issue.web_url as string) ?? "",
     tags,
     stack_trace: format_stack_trace(latest_event),
+    top_frame: extract_top_frame_from_event(latest_event),
     contexts: (latest_event.contexts as Record<string, unknown>) ?? {},
     request,
     user,
+  };
+}
+
+// ── Top stack frame extraction ──
+
+/**
+ * Pick the innermost in-app stack frame from a Sentry event.
+ *
+ * Sentry frames are ordered bottom-up (caller first, innermost last).
+ * We walk from innermost outward and return the first in-app frame; if
+ * none are marked in-app, we fall back to the innermost frame regardless.
+ * Returns null when the event has no exception frames at all.
+ *
+ * Extracted here (rather than in sentry-alert-format) so SentryIssueDetails
+ * can be populated with `top_frame` at fetch time — callers get the frame
+ * for free without re-parsing the event. Used by the initial Discord alert
+ * enrichment (#259).
+ */
+export function extract_top_frame_from_event(
+  event: Record<string, unknown>,
+): SentryTopFrame | null {
+  const exception_entry = event.exception as Record<string, unknown> | undefined;
+  const values = exception_entry?.values as SentryException[] | undefined;
+  if (!values?.length) return null;
+
+  const first = values[0];
+  const frames = first?.stacktrace?.frames;
+  if (!frames?.length) return null;
+
+  // Walk innermost-first (reverse iteration).
+  const reversed = [...frames].reverse();
+  const in_app = reversed.find((f) => f.inApp === true);
+  const picked = in_app ?? reversed[0];
+  if (!picked) return null;
+
+  return {
+    filename: picked.filename ?? "?",
+    lineno: typeof picked.lineNo === "number" ? picked.lineNo : null,
+    function: picked.function ?? "<anonymous>",
   };
 }

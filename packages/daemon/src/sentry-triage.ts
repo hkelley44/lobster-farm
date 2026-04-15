@@ -27,6 +27,7 @@ import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import type { DiscordBot } from "./discord.js";
 import type { EntityRegistry } from "./registry.js";
 import { MAX_SENTRY_FIX_ATTEMPTS, build_sentry_fix_prompt } from "./review-utils.js";
+import { get_cached_issue_details } from "./sentry-alert-format.js";
 import { type SentryIssueDetails, fetch_sentry_issue_details } from "./sentry-api.js";
 import * as sentry from "./sentry.js";
 import type { ActiveSession, ClaudeSessionManager, SessionResult } from "./session.js";
@@ -808,7 +809,12 @@ export async function handle_sentry_triage_event(
 
   let issue_details: SentryIssueDetails;
   try {
-    issue_details = await fetch_sentry_issue_details(sentry_issue_id, auth_token, org_slug);
+    // Shared cache with the webhook alert enrichment path (#259) — if the
+    // webhook handler already fetched this issue in the last 30s, we reuse
+    // the result instead of hitting the Sentry API twice for the same event.
+    issue_details = await get_cached_issue_details(sentry_issue_id, () =>
+      fetch_sentry_issue_details(sentry_issue_id, auth_token, org_slug),
+    );
   } catch (err) {
     console.error(
       `[sentry-triage] Failed to fetch Sentry issue ${sentry_issue_id}: ${String(err)}`,
