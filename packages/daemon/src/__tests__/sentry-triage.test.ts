@@ -79,10 +79,12 @@ function make_issue_details(overrides: Partial<SentryIssueDetails> = {}): Sentry
     first_seen: "2026-04-06T10:00:00Z",
     last_seen: "2026-04-07T10:00:00Z",
     platform: "node",
+    short_id: "TEST-1",
     web_url: "https://sentry.io/issues/12345/",
     tags: [{ key: "environment", value: "production" }],
     stack_trace:
       "TypeError: Cannot read property 'foo' of undefined\n  at process_request (src/handler.ts:42:5)",
+    top_frame: null,
     contexts: { runtime: { name: "node", version: "20.0.0" } },
     ...overrides,
   };

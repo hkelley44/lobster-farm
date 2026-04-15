@@ -14,6 +14,12 @@ import { QueueFullError } from "./queue.js";
 import type { TaskQueue, TaskSubmission } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
 import {
+  format_sentry_alert,
+  format_sentry_alert_minimal,
+  get_cached_issue_details,
+} from "./sentry-alert-format.js";
+import { fetch_sentry_issue_details } from "./sentry-api.js";
+import {
   type SentryTriageContext,
   handle_sentry_resolved,
   handle_sentry_triage_event,
@@ -260,7 +266,6 @@ async function process_sentry_webhook(
   // assigned / archived   → ignore
 
   const triage_actions = ["created", "regression"];
-  const alert_only_actions = ["resolved", "unresolved"];
   const ignore_actions = ["assigned", "archived"];
 
   if (resource === "issue" && action && ignore_actions.includes(action)) {
@@ -304,13 +309,22 @@ async function process_sentry_webhook(
 
   // ── Alert forwarding ──
   // Always post an alert to Discord for issue events (except ignored ones).
-  // Triage-worthy events get both an alert AND a Ray session.
-  const env = (issue?.environment as string) ?? "";
-  const prefix = action === "resolved" ? "Resolved" : "Sentry";
-  const env_part = env ? ` | Env: ${env}` : "";
-  const action_label =
-    action && !alert_only_actions.includes(action) && action !== "created" ? ` [${action}]` : "";
-  const alert_message = `${prefix}${action_label}: ${error_title}\nProject: ${project_slug}${env_part}\n${issue_url}`;
+  // Triage-worthy events also get a Ray session (spawned above).
+  //
+  // The initial alert is enriched with data fetched from the Sentry API
+  // (#259) so it stands on its own without waiting for Ray's follow-up.
+  // Enrichment is cached for 30s so the triage path does not double-fetch.
+  // Any failure during enrichment falls back to the minimal legacy format —
+  // we never drop the alert.
+  const webhook_short_id = (issue?.shortId as string) ?? null;
+  const alert_message = await build_sentry_alert_message({
+    action,
+    sentry_issue_id,
+    webhook_short_id,
+    project_slug,
+    error_title,
+    issue_url,
+  });
 
   if (ctx.discord) {
     if (target_entity_id) {
@@ -325,6 +339,58 @@ async function process_sentry_webhook(
   }
 
   console.log(`[sentry-webhook] Processed: ${resource}.${action ?? "unknown"} — ${error_title}`);
+}
+
+/**
+ * Build the Discord alert message for a Sentry webhook event.
+ *
+ * Attempts to enrich via `fetch_sentry_issue_details()` (through the shared
+ * cache). On any failure — missing credentials, API error, timeout — falls
+ * back to the minimal legacy format so the alert is never dropped.
+ */
+async function build_sentry_alert_message(opts: {
+  action: string | undefined;
+  sentry_issue_id: string;
+  webhook_short_id: string | null;
+  project_slug: string;
+  error_title: string;
+  issue_url: string;
+}): Promise<string> {
+  const { action, sentry_issue_id, webhook_short_id, project_slug, error_title, issue_url } = opts;
+
+  const auth_token = process.env.SENTRY_AUTH_TOKEN;
+  const org_slug = process.env.SENTRY_ORG;
+
+  // No creds or no issue id → minimal format only, nothing to enrich with.
+  if (!sentry_issue_id || !auth_token || !org_slug) {
+    return format_sentry_alert_minimal({ action, error_title, project_slug, issue_url });
+  }
+
+  try {
+    const details = await get_cached_issue_details(sentry_issue_id, () =>
+      fetch_sentry_issue_details(sentry_issue_id, auth_token, org_slug),
+    );
+
+    return format_sentry_alert({
+      action,
+      short_id: details.short_id ?? webhook_short_id,
+      project_slug,
+      details,
+      top_frame: details.top_frame,
+    });
+  } catch (err) {
+    // Breadcrumb for postmortem; never throw past this point.
+    sentry.addBreadcrumb({
+      category: "sentry-webhook",
+      message: `Alert enrichment failed for issue ${sentry_issue_id}`,
+      level: "warning",
+      data: { error: String(err), project: project_slug },
+    });
+    console.warn(
+      `[sentry-webhook] Enrichment failed for ${sentry_issue_id}, falling back to minimal format: ${String(err)}`,
+    );
+    return format_sentry_alert_minimal({ action, error_title, project_slug, issue_url });
+  }
 }
 
 // ── Hook endpoints ──
