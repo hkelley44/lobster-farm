@@ -452,6 +452,47 @@ describe("cleanup_after_merge", () => {
     expect(removed_paths).not.toContain("/repo/.claude/worktrees/agent-999-other");
   });
 
+  it("relocates sessions before removing worktree", async () => {
+    const porcelain = make_porcelain(
+      { path: "/repo", branch: "refs/heads/main" },
+      { path: "/repo/worktrees/my-feature", branch: "refs/heads/feature/my-feature" },
+    );
+    setup_git_mocks({ worktree_list: porcelain });
+
+    // Track call order: relocation (execFileSync for list-panes) must happen
+    // before worktree removal (execFile for git worktree remove).
+    const call_order: string[] = [];
+
+    mock_exec_file_sync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "tmux" && args[0] === "list-panes") {
+        call_order.push("tmux:list-panes");
+        return "session1 %0 /repo/worktrees/my-feature/src\n";
+      }
+      if (cmd === "tmux" && args[0] === "send-keys") {
+        call_order.push("tmux:send-keys");
+        return "";
+      }
+      return "";
+    });
+
+    const original_impl = mock_exec_file.getMockImplementation()!;
+    mock_exec_file.mockImplementation((cmd: string, args: string[], opts: unknown) => {
+      if (cmd === "git" && args[0] === "worktree" && args[1] === "remove") {
+        call_order.push("git:worktree-remove");
+      }
+      return original_impl(cmd, args, opts);
+    });
+
+    await cleanup_after_merge("/repo", "feature/my-feature");
+
+    // Relocation must precede removal
+    const relocation_idx = call_order.indexOf("tmux:list-panes");
+    const removal_idx = call_order.indexOf("git:worktree-remove");
+    expect(relocation_idx).toBeGreaterThanOrEqual(0);
+    expect(removal_idx).toBeGreaterThanOrEqual(0);
+    expect(relocation_idx).toBeLessThan(removal_idx);
+  });
+
   it("does not throw when .claude/worktrees/ does not exist", async () => {
     setup_git_mocks({
       worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),

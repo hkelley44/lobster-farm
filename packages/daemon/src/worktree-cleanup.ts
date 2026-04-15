@@ -34,10 +34,7 @@ const GIT_TIMEOUT_MS = 30_000;
  *
  * @returns The number of sessions that were relocated.
  */
-export async function relocate_sessions_from_path(
-  target_path: string,
-  safe_path: string,
-): Promise<number> {
+export function relocate_sessions_from_path(target_path: string, safe_path: string): number {
   // Normalize: ensure target_path ends with / for prefix matching.
   // This prevents false positives like /foo/bar-baz matching /foo/bar.
   const target_prefix = target_path.endsWith("/") ? target_path : `${target_path}/`;
