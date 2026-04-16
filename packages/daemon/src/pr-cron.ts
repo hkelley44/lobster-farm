@@ -430,19 +430,15 @@ export class PRReviewCron {
       issue_context = contexts.filter(Boolean).join("\n\n---\n\n");
     }
 
+    // Dynamic per-PR prefix. Static mechanics (identity, posting rules,
+    // verdict format, echo / verify-landing safety) live in the reviewer
+    // agent's `initialPrompt` at `config/claude/agents/reviewer.md`.
     const prompt_lines = [
       `Review PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}.`,
       `Repository: ${repo_path}`,
       "",
-      "Run /ultrareview to do a comprehensive code review.",
-      "Post your review on the PR using gh cli.",
-      "",
-      "Review standards:",
-      "- Every piece of actionable feedback should be included.",
-      "- If there is ANY actionable feedback, request changes:",
-      `  gh pr review ${String(pr.number)} --request-changes --body "<your review>"`,
-      "- If the code is genuinely clean with no improvements needed, approve:",
-      `  gh pr review ${String(pr.number)} --approve --body "Looks good."`,
+      "Run /ultrareview to do a comprehensive code review, then post using the",
+      `commands from your initial instructions with PR #${String(pr.number)}.`,
       "",
       "Before merging, check CI status:",
       `  gh pr checks ${String(pr.number)} --required`,

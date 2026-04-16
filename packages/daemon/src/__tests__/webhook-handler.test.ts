@@ -1503,8 +1503,16 @@ describe("handle_github_webhook", () => {
     });
   });
 
-  describe("reviewer prompt content", () => {
-    it("includes pre-existing review check instruction", async () => {
+  // Issue #287 — the static review mechanics (identity, posting rules,
+  // echo-marker, verify-landing, never-dismiss) now live in the reviewer
+  // agent's `initialPrompt` frontmatter at `config/claude/agents/reviewer.md`.
+  // The dynamic per-PR prefix emitted by `build_reviewer_prompt` is piped via
+  // stdin and is prepended by `initialPrompt` at session start. These tests
+  // cover what's genuinely dynamic: the pre-existing-review dedup check
+  // (which references the repo / PR number) and the PR-numbered commands in
+  // the two-pass and merge sections.
+  describe("reviewer prompt content (dynamic per-PR prefix)", () => {
+    it("includes pre-existing review check instruction with correct API URL", async () => {
       const body = make_pr_payload("opened", 300, "test-org/lobster-farm");
       const req = make_request(body, {
         "x-github-event": "pull_request",
@@ -1525,14 +1533,12 @@ describe("handle_github_webhook", () => {
       const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
       const prompt: string = spawn_args.prompt;
 
-      // Pre-existing review check (suggestion 2 from review)
-      expect(prompt).toContain("Before posting your review, check for any existing reviews");
+      expect(prompt).toContain("Before posting, check for any existing reviews");
       expect(prompt).toContain('select(.user.login | endswith("[bot]"))');
-      // API URL uses correct PR number
       expect(prompt).toContain("gh api repos/test-org/lobster-farm/pulls/300/reviews");
     });
 
-    it("includes echo verification in review commands", async () => {
+    it("references the PR number in the two-pass review commands", async () => {
       const body = make_pr_payload("opened", 301, "test-org/lobster-farm");
       const req = make_request(body, {
         "x-github-event": "pull_request",
@@ -1553,14 +1559,14 @@ describe("handle_github_webhook", () => {
       const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
       const prompt: string = spawn_args.prompt;
 
-      expect(prompt).toContain('&& echo "✓ Review posted"');
-      expect(prompt).toContain("Post your review ONCE. Do not retry if the command exits 0.");
-      expect(prompt).toContain("Never dismiss, delete, or modify reviews you have already posted.");
-      // Review commands use correct PR number
-      expect(prompt).toContain("gh pr review 301 --");
+      // The dynamic prefix identifies the PR for the review workflow.
+      expect(prompt).toContain("PR #301");
+      // The prompt instructs the reviewer to use the initial-instruction
+      // commands for the combined Pass 2 posting (no PR-numbered duplicates).
+      expect(prompt).toContain("from your initial instructions");
     });
 
-    it("includes post-review verification API call", async () => {
+    it("includes merge instructions with PR number", async () => {
       const body = make_pr_payload("opened", 302, "test-org/lobster-farm");
       const req = make_request(body, {
         "x-github-event": "pull_request",
@@ -1581,11 +1587,8 @@ describe("handle_github_webhook", () => {
       const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
       const prompt: string = spawn_args.prompt;
 
-      expect(prompt).toContain(
-        `gh api repos/test-org/lobster-farm/pulls/302/reviews --jq '[.[] | select(.user.login | endswith("[bot]"))] | last | .state // "NOT_FOUND"'`,
-      );
-      expect(prompt).toContain("your review is confirmed. Move on.");
-      expect(prompt).toContain("If the state is DISMISSED or NOT_FOUND, something went wrong");
+      expect(prompt).toContain("gh pr merge 302 --squash --delete-branch");
+      expect(prompt).toContain("gh pr checks 302 --required");
     });
   });
 
