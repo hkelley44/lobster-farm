@@ -109,6 +109,15 @@ async function parse_session_usage(
   for (const line of lines) {
     try {
       const entry = JSON.parse(line) as Record<string, unknown>;
+
+      // Detect explicit compaction markers written by Claude Code.
+      // These appear immediately when /compact runs, so we catch compactions
+      // without waiting for the next assistant turn's token drop.
+      if (entry.type === "system" && entry.subtype === "compact_boundary") {
+        compactions++;
+        continue;
+      }
+
       if (entry.type !== "assistant") continue;
 
       const message = entry.message as Record<string, unknown> | undefined;

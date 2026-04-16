@@ -184,7 +184,7 @@ describe("fetch_subscription_usage", () => {
     expect(result).toBeNull();
   });
 
-  it("includes extra usage when enabled", async () => {
+  it("includes extra usage when enabled (cents to dollars)", async () => {
     keychain_result = {
       stdout: JSON.stringify({
         claudeAiOauth: { accessToken: "test-token", expiresAt: "2099-01-01T00:00:00Z" },
@@ -192,9 +192,15 @@ describe("fetch_subscription_usage", () => {
       error: null,
     };
 
+    // API returns used_credits and monthly_limit in cents
     const api_response: SubscriptionUsageResponse = {
       five_hour: { utilization: 10, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
-      extra_usage: { is_enabled: true, monthly_limit: 100, used_credits: 23.5, utilization: 23.5 },
+      extra_usage: {
+        is_enabled: true,
+        monthly_limit: 10000, // 10000 cents = $100
+        used_credits: 2350, // 2350 cents = $23.50
+        utilization: 23.5,
+      },
     };
 
     fetch_spy.mockResolvedValueOnce(
@@ -207,6 +213,36 @@ describe("fetch_subscription_usage", () => {
     const result = await fetch_subscription_usage();
     expect(result).not.toBeNull();
     expect(result!.summary).toContain("Extra: $23.50/$100");
+  });
+
+  it("formats extra usage with small cent amounts correctly", async () => {
+    keychain_result = {
+      stdout: JSON.stringify({
+        claudeAiOauth: { accessToken: "test-token", expiresAt: "2099-01-01T00:00:00Z" },
+      }),
+      error: null,
+    };
+
+    // Verify that 523 cents shows as $5.23, not $523.00
+    const api_response: SubscriptionUsageResponse = {
+      extra_usage: {
+        is_enabled: true,
+        monthly_limit: 10000, // $100
+        used_credits: 523, // $5.23
+        utilization: 5.23,
+      },
+    };
+
+    fetch_spy.mockResolvedValueOnce(
+      new Response(JSON.stringify(api_response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const result = await fetch_subscription_usage();
+    expect(result).not.toBeNull();
+    expect(result!.summary).toContain("Extra: $5.23/$100");
   });
 
   it("formats resets_in for weekly usage", async () => {

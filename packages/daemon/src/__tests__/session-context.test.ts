@@ -303,6 +303,123 @@ describe("session-context", () => {
       expect(result!.used_tokens).toBe(30_000);
     });
 
+    it("detects compaction via compact_boundary JSONL entries", async () => {
+      const session_id = "boundary-1234-5678-9012-123456789012";
+      const file_path = join(tmp_dir, ".claude", "projects", "test-project", `${session_id}.jsonl`);
+
+      // Simulate a session where Claude Code writes a compact_boundary marker
+      // between assistant turns. The marker should be counted as a compaction
+      // even if no token-drop is visible yet (e.g., checked before the next
+      // assistant turn lands).
+      const lines = [
+        // Turn 1: 100k context
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            usage: {
+              input_tokens: 80000,
+              cache_creation_input_tokens: 10000,
+              cache_read_input_tokens: 10000,
+              output_tokens: 500,
+            },
+          },
+        }),
+        // Compact boundary marker — written by Claude Code on /compact
+        JSON.stringify({
+          type: "system",
+          subtype: "compact_boundary",
+          content: "Conversation compacted",
+          timestamp: "2026-04-14T11:34:09.276Z",
+          compactMetadata: {
+            trigger: "auto",
+            preTokens: 167153,
+            postTokens: 8287,
+            durationMs: 132766,
+          },
+        }),
+      ];
+      await writeFile(file_path, lines.join("\n"));
+
+      const result = await read_session_context(session_id);
+      expect(result).not.toBeNull();
+      expect(result!.compactions).toBe(1);
+      // used_tokens is still from the last assistant turn (100k)
+      expect(result!.used_tokens).toBe(100_000);
+    });
+
+    it("counts both compact_boundary markers and token-drop compactions", async () => {
+      const session_id = "both-det-1234-5678-9012-123456789012";
+      const file_path = join(tmp_dir, ".claude", "projects", "test-project", `${session_id}.jsonl`);
+
+      // Session with one compact_boundary marker AND one token-drop compaction.
+      // The compact_boundary is the primary detection; the token-drop is fallback
+      // for older transcripts. Both should count independently.
+      const lines = [
+        // Turn 1: 100k context
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            usage: {
+              input_tokens: 80000,
+              cache_creation_input_tokens: 10000,
+              cache_read_input_tokens: 10000,
+              output_tokens: 500,
+            },
+          },
+        }),
+        // Explicit compact_boundary — compaction #1
+        JSON.stringify({
+          type: "system",
+          subtype: "compact_boundary",
+          content: "Conversation compacted",
+          timestamp: "2026-04-14T11:34:09.276Z",
+        }),
+        // Turn 2: post-compaction, much smaller — but this is an expected drop
+        // after a compact_boundary, so the token-drop heuristic also fires
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            usage: {
+              input_tokens: 8000,
+              cache_creation_input_tokens: 1000,
+              cache_read_input_tokens: 1000,
+              output_tokens: 200,
+            },
+          },
+        }),
+        // Turn 3: grows to 80k
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            usage: {
+              input_tokens: 60000,
+              cache_creation_input_tokens: 10000,
+              cache_read_input_tokens: 10000,
+              output_tokens: 400,
+            },
+          },
+        }),
+        // Turn 4: drops to 15k — token-drop compaction #2 (no boundary marker)
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            usage: {
+              input_tokens: 10000,
+              cache_creation_input_tokens: 2500,
+              cache_read_input_tokens: 2500,
+              output_tokens: 150,
+            },
+          },
+        }),
+      ];
+      await writeFile(file_path, lines.join("\n"));
+
+      const result = await read_session_context(session_id);
+      expect(result).not.toBeNull();
+      // 1 from compact_boundary + 1 from token-drop after turn 2 + 1 from token-drop after turn 4 = 3
+      expect(result!.compactions).toBe(3);
+    });
+
     it("does not count minor token decreases as compactions", async () => {
       const session_id = "no-cmpact-1234-5678-9012-123456789012";
       const file_path = join(tmp_dir, ".claude", "projects", "test-project", `${session_id}.jsonl`);
