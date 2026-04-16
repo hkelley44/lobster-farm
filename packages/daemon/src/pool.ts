@@ -203,6 +203,10 @@ export class BotPool extends EventEmitter {
   /** Queued messages for bots that weren't at the prompt when inject was attempted.
    * tmux_session → messages[]. Drained by the health check cycle (every 30s). */
   private pending_injections = new Map<string, string[]>();
+  /** Bot IDs that had a rate-limit modal dismissed on the last health check.
+   * Used to suppress duplicate alerts — only alert on first detection,
+   * clear when the bot is no longer showing the modal. */
+  private rate_limit_dismissed = new Set<number>();
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -1140,6 +1144,9 @@ export class BotPool extends EventEmitter {
       // Deliver any queued messages to bots that are now at the prompt
       this.drain_pending_injections();
 
+      // Dismiss rate-limit modals on bots that are stuck (alive tmux but blocked)
+      await this.check_rate_limit_stalls();
+
       for (const bot of this.bots) {
         if (bot.state !== "assigned") continue;
 
@@ -1191,6 +1198,69 @@ export class BotPool extends EventEmitter {
     } finally {
       this._health_check_running = false;
     }
+  }
+
+  // ── Rate-Limit Modal Recovery ──
+
+  /**
+   * Detect and auto-dismiss rate-limit modals on assigned bots.
+   * Claude Code shows a modal with "Switch to extra usage" or "exceeded" combined
+   * with "Esc to cancel" when the account hits rate limits. The modal blocks all
+   * input until manually dismissed. This method captures the tmux pane output,
+   * detects the modal, sends Escape to dismiss it, and alerts once per occurrence.
+   */
+  private async check_rate_limit_stalls(): Promise<void> {
+    const bots_still_showing = new Set<number>();
+
+    for (const bot of this.bots) {
+      if (bot.state !== "assigned") continue;
+
+      try {
+        const output = execFileSync(
+          "tmux",
+          ["capture-pane", "-t", bot.tmux_session, "-p", "-S", "-10"],
+          { encoding: "utf-8", timeout: 2000 },
+        );
+
+        const has_rate_limit =
+          output.includes("Switch to extra usage") || output.includes("exceeded");
+        const has_dismiss_hint = output.includes("Esc to cancel");
+
+        if (!has_rate_limit || !has_dismiss_hint) continue;
+
+        // Modal detected — send Escape to dismiss
+        bots_still_showing.add(bot.id);
+        execFileSync("tmux", ["send-keys", "-t", bot.tmux_session, "Escape"], {
+          stdio: "ignore",
+          timeout: 2000,
+        });
+
+        console.log(`[pool] Rate-limit modal detected on pool-${String(bot.id)} — auto-dismissed`);
+
+        // Only alert on first detection (not already in the dismissed set)
+        if (!this.rate_limit_dismissed.has(bot.id)) {
+          const entity_config = bot.entity_id ? this.registry?.get(bot.entity_id) : undefined;
+          try {
+            await notify(
+              "alerts",
+              `\u26a0\ufe0f Rate-limit modal detected on pool-${String(bot.id)} ` +
+                `(${bot.archetype ?? "unknown"}) for ${bot.entity_id ?? "unknown"} — auto-dismissed`,
+              entity_config,
+            );
+          } catch (notify_err) {
+            console.warn(
+              `[pool] Failed to alert #alerts for rate-limit on pool-${String(bot.id)}: ${String(notify_err)}`,
+            );
+          }
+        }
+      } catch {
+        // tmux capture failed for this bot — skip (fail open)
+      }
+    }
+
+    // Update tracking: bots no longer showing the modal are cleared,
+    // bots newly showing it are added
+    this.rate_limit_dismissed = bots_still_showing;
   }
 
   // ── Crash Recovery ──
