@@ -434,7 +434,7 @@ export class PRReviewCron {
       `Review PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}.`,
       `Repository: ${repo_path}`,
       "",
-      "Run /review to do a comprehensive code review.",
+      "Run /ultrareview to do a comprehensive code review.",
       "Post your review on the PR using gh cli.",
       "",
       "Review standards:",

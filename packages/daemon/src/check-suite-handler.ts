@@ -618,7 +618,7 @@ export function build_v2_reviewer_prompt(
     `Repository: ${repo_path}`,
     `Head SHA: ${pr.head_sha}`,
     "",
-    "Run /review to do a comprehensive code review.",
+    "Run /ultrareview to do a comprehensive code review.",
     "",
     "Post your review on the PR using gh cli.",
     "You are authenticated as the LobsterFarm Reviewer GitHub App.",

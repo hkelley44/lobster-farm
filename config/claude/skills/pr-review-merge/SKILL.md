@@ -40,7 +40,7 @@ Spawn a reviewer agent scoped to the PR.
 
 The reviewer:
 - Loads `review-dna` for our review standards (priority order, comment format, frontend criteria, CI awareness)
-- Runs `/review` (Claude Code's built-in PR review) for comprehensive analysis
+- Runs `/ultrareview` (Claude Code's parallel multi-agent PR review) for comprehensive analysis
 - Posts the review on the PR via `gh`
 - Verdict: **Approved** or **Changes Requested** — never ambiguous
 
@@ -99,7 +99,7 @@ This isn't about asking permission for every line of code. It's about being a co
 - Review code against standards
 - Fix review feedback
 - Decide what to escalate vs handle autonomously
-- Run `/review`, `/simplify`
+- Run `/ultrareview`, `/simplify`
 
 ## What NOT to Do
 
