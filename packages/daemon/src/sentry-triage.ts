@@ -440,22 +440,16 @@ ${contexts_text}
    - **P1 (High):** New error types affecting core flows, regressions from recent deploys. Same-day fix.
    - **P2 (Low):** Edge cases, non-critical UI errors, errors in non-core flows. Track and fix when convenient.
 
-4. **Post your diagnosis to #alerts.** Include:
-   - What went wrong (1-2 sentences)
-   - Root cause (code path, recent change, or external trigger)
-   - Severity classification with rationale
-   - Whether a GitHub issue is warranted
-
-5. **If P0 or P1:** Create a GitHub issue with:
+4. **Create a GitHub issue** if there is an actionable code fix — regardless of severity. Use:
    - Title: \`fix: {concise description}\`
    - Body: diagnosis, affected code paths, stack trace summary, suggested fix approach, link to Sentry issue
    - The issue body should include \`Sentry: ${issue_details.web_url}\` for traceability
 
-6. **If P2 or noise:** Post to #alerts only. If it's a known non-issue (expected error, operational noise), recommend adding it to Sentry's \`ignoreErrors\` or \`beforeSend\` filter.
+   Skip issue creation ONLY if: the error is truly transient (one-off network blip, no code change would help), already tracked in an existing issue, or is expected operational noise that should be filtered via Sentry's \`ignoreErrors\`/\`beforeSend\`.
 
-7. **If P0 (Critical):** After creating the issue, post an urgent message to #alerts flagging it for immediate human attention.
+5. **If P0 (Critical):** Flag the issue as urgent — it needs immediate human attention.
 
-8. **Output a structured verdict** as the very last line of your session. This MUST be a single line in exactly this format:
+6. **Output a structured verdict** as the very last line of your session. This MUST be a single line in exactly this format:
 
 SENTRY_TRIAGE_VERDICT:{"severity":"P0|P1|P2","auto_fixable":boolean,"github_issue":number|null,"fix_approach":"string or null"}
 
@@ -578,6 +572,27 @@ async function spawn_triage_session(
     const verdict = parse_triage_verdict(result.output_lines);
 
     if (verdict) {
+      // Post triage verdict to #alerts
+      if (ctx.alert_router) {
+        const fix_note = verdict.auto_fixable
+          ? `Auto-fix: yes → ${verdict.fix_approach ?? "approach TBD"}`
+          : "Auto-fix: no";
+        const issue_note = verdict.github_issue
+          ? `GitHub: #${String(verdict.github_issue)}`
+          : "No GitHub issue created";
+
+        void ctx.alert_router
+          .post_alert({
+            entity_id,
+            tier: verdict.severity === "P0" ? "action_required" : "routine",
+            title: `\u{1f50d} Sentry triage: ${verdict.severity} — ${issue_details.title}`,
+            body: [issue_details.web_url, issue_note, fix_note].join("\n"),
+          })
+          .catch((err) => {
+            console.error(`[sentry-triage] Failed to post verdict alert: ${String(err)}`);
+          });
+      }
+
       // Update state with verdict data
       void update_triage_state(
         sentry_issue_id,
@@ -609,6 +624,20 @@ async function spawn_triage_session(
           );
         });
     } else {
+      // Post no-verdict alert to #alerts
+      if (ctx.alert_router) {
+        void ctx.alert_router
+          .post_alert({
+            entity_id,
+            tier: "routine",
+            title: "\u26a0\ufe0f Sentry triage completed \u2014 no verdict parsed",
+            body: `Ray's session completed but didn't output a structured verdict.\n${issue_details.web_url}`,
+          })
+          .catch((err) => {
+            console.error(`[sentry-triage] Failed to post no-verdict alert: ${String(err)}`);
+          });
+      }
+
       // No verdict parsed — legacy behavior: mark as tracked
       void update_triage_state(sentry_issue_id, { status: "tracked" }, ctx.config).catch((err) => {
         console.error(`[sentry-triage] Failed to update state after completion: ${String(err)}`);
