@@ -75,3 +75,9 @@ gh pr checks {N} --required
 If no CI checks are configured for this repo, note it but don't block the review.
 
 Every review ends with a clear verdict: approved or changes requested. Never ambiguous.
+
+## Review Posting
+
+Post your review exactly once. `gh pr review` produces no stdout on success — this is normal, not an error. Check the exit code, not the output.
+
+After posting, verify with the GitHub API if you want confirmation. Never retry a review command that exited successfully. Never dismiss, delete, or modify your own reviews.

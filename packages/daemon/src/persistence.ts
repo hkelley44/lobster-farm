@@ -36,7 +36,7 @@ export interface ProcessedPR {
   entity_id: string;
   pr_number: number;
   reviewed_at: string; // ISO timestamp
-  outcome: "approved" | "changes_requested" | "pending";
+  outcome: "approved" | "changes_requested" | "dismissed" | "pending";
   /** JSON-stringified sorted failure names — used to deduplicate CI failure alerts.
    * Only set when a CI failure alert has been sent for this PR. */
   ci_failure_alerted?: string;

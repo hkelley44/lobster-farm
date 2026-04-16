@@ -350,12 +350,14 @@ export async function release_work_room(
 
 // ── Review outcome detection ──
 
-export type ReviewOutcome = "approved" | "changes_requested" | "pending";
+export type ReviewOutcome = "approved" | "changes_requested" | "dismissed" | "pending";
 
 /**
  * Detect the review outcome for a PR by querying GitHub.
- * Returns "approved", "changes_requested", or "pending".
+ * Returns "approved", "changes_requested", "dismissed", or "pending".
  * An already-merged PR is treated as "approved".
+ * A "dismissed" outcome means all reviews were dismissed (e.g., duplicate
+ * cleanup) — the caller should trigger a fresh review.
  *
  * @param gh_token - Optional GitHub token for cross-account authentication.
  *   Without this, `gh` inherits the daemon's default auth, which can't see
@@ -394,6 +396,8 @@ export async function detect_review_outcome(
         return "approved";
       case "CHANGES_REQUESTED":
         return "changes_requested";
+      case "DISMISSED":
+        return "dismissed";
       default:
         return "pending";
     }

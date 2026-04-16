@@ -13,6 +13,30 @@ import {
   handle_github_webhook,
 } from "../webhook-handler.js";
 
+// Mock node:child_process — needed for has_existing_bot_review and check_pr_merged.
+// vi.hoisted ensures the mock ref is available when the vi.mock factory runs.
+const { execFile_mock } = vi.hoisted(() => {
+  const mock = vi.fn();
+  const CUSTOM = Symbol.for("nodejs.util.promisify.custom");
+  Object.defineProperty(mock, CUSTOM, {
+    value: (...args: unknown[]) => {
+      return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        mock(...args, (err: Error | null, stdout: string, stderr: string) => {
+          if (err) reject(err);
+          else resolve({ stdout, stderr });
+        });
+      });
+    },
+    configurable: true,
+  });
+  return { execFile_mock: mock };
+});
+
+vi.mock("node:child_process", async () => {
+  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  return { ...actual, execFile: execFile_mock };
+});
+
 // Mock worktree-cleanup to avoid real git operations
 vi.mock("../worktree-cleanup.js", () => ({
   cleanup_after_merge: vi.fn(async () => {}),
@@ -209,6 +233,18 @@ describe("handle_github_webhook", () => {
     // Module-level dedup table must be reset between tests — vi.clearAllMocks()
     // does not touch plain Maps in imported modules.
     _reset_active_reviews_for_testing();
+    // Default: exec calls fail (fail-open — has_existing_bot_review returns false,
+    // check_pr_merged returns false). Override in specific tests as needed.
+    execFile_mock.mockImplementation((...args: unknown[]) => {
+      const cb = args[args.length - 1];
+      if (typeof cb === "function") {
+        (cb as (err: Error | null, stdout: string, stderr: string) => void)(
+          new Error("mock: exec not configured"),
+          "",
+          "",
+        );
+      }
+    });
   });
 
   describe("signature verification", () => {
@@ -1306,11 +1342,12 @@ describe("handle_github_webhook", () => {
         const res = make_response();
         const ctx = make_context();
 
-        // First call succeeds (for spawn_review), subsequent calls fail (for post-review)
+        // First two calls succeed (pre-spawn dedup check + spawn_review),
+        // subsequent calls fail (for post-review token resolution)
         let call_count = 0;
         (ctx.github_app.get_token as ReturnType<typeof vi.fn>).mockImplementation(() => {
           call_count++;
-          if (call_count === 1) return Promise.resolve("ghs_mock_token");
+          if (call_count <= 2) return Promise.resolve("ghs_mock_token");
           return Promise.reject(new Error("token expired"));
         });
 
@@ -1364,7 +1401,7 @@ describe("handle_github_webhook", () => {
     });
 
     it("does not instruct the reviewer to block merge on pending checks", () => {
-      const prompt = build_reviewer_prompt(make_pr(), "/tmp/repo", "");
+      const prompt = build_reviewer_prompt(make_pr(), "/tmp/repo", "test-org/test-repo", "");
 
       // The exact buggy phrase must be gone.
       expect(prompt).not.toContain("failing or pending");
@@ -1387,12 +1424,257 @@ describe("handle_github_webhook", () => {
     });
 
     it("still instructs the reviewer to block merge on failing checks", () => {
-      const prompt = build_reviewer_prompt(make_pr(), "/tmp/repo", "");
+      const prompt = build_reviewer_prompt(make_pr(), "/tmp/repo", "test-org/test-repo", "");
 
       // Failing checks are still a blocker — this distinguishes the fix from
       // a careless "just delete anything mentioning CI" edit.
       expect(prompt.toLowerCase()).toContain("failing");
       expect(prompt).toMatch(/request changes/i);
+    });
+  });
+
+  describe("dismissed review outcome", () => {
+    it("defers to cron instead of spawning inline when outcome is dismissed", async () => {
+      const { detect_review_outcome } = await import("../actions.js");
+      vi.mocked(detect_review_outcome).mockResolvedValueOnce("dismissed" as any);
+
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      try {
+        const body = make_pr_payload("opened", 500, "test-org/lobster-farm");
+        const req = make_request(body, {
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": sign_payload(body),
+        });
+        const res = make_response();
+        const ctx = make_context();
+
+        await handle_github_webhook(req, res, ctx);
+
+        // Wait for reviewer to be spawned
+        await vi.waitFor(
+          () => {
+            expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+          },
+          { timeout: 2000 },
+        );
+
+        // Simulate reviewer session completion
+        const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
+        (ctx.session_manager as any).emit("session:completed", {
+          session_id: spawn_result.session_id,
+          exit_code: 0,
+        });
+
+        // Wait for post-review handling to complete
+        await vi.waitFor(
+          () => {
+            expect(log_spy).toHaveBeenCalledWith(
+              expect.stringContaining("will be re-reviewed next cycle"),
+            );
+          },
+          { timeout: 2000 },
+        );
+
+        // Should NOT have spawned a second reviewer inline — defers to cron
+        expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+
+        // .finally() transitions the entry to "completed" (dedup hold window).
+        // It stays in the map until the TTL sweep removes it — see #258.
+        const active = get_active_webhook_reviews();
+        const matching = active.filter((r) => r.pr_number === 500);
+        expect(matching).toHaveLength(1);
+        expect(matching[0]!.state).toBe("completed");
+      } finally {
+        log_spy.mockRestore();
+      }
+    });
+  });
+
+  describe("reviewer prompt content", () => {
+    it("includes pre-existing review check instruction", async () => {
+      const body = make_pr_payload("opened", 300, "test-org/lobster-farm");
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      const res = make_response();
+      const ctx = make_context();
+
+      await handle_github_webhook(req, res, ctx);
+
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
+
+      const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
+      const prompt: string = spawn_args.prompt;
+
+      // Pre-existing review check (suggestion 2 from review)
+      expect(prompt).toContain("Before posting your review, check for any existing reviews");
+      expect(prompt).toContain('select(.user.login | endswith("[bot]"))');
+      // API URL uses correct PR number
+      expect(prompt).toContain("gh api repos/test-org/lobster-farm/pulls/300/reviews");
+    });
+
+    it("includes echo verification in review commands", async () => {
+      const body = make_pr_payload("opened", 301, "test-org/lobster-farm");
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      const res = make_response();
+      const ctx = make_context();
+
+      await handle_github_webhook(req, res, ctx);
+
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
+
+      const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
+      const prompt: string = spawn_args.prompt;
+
+      expect(prompt).toContain('&& echo "✓ Review posted"');
+      expect(prompt).toContain("Post your review ONCE. Do not retry if the command exits 0.");
+      expect(prompt).toContain("Never dismiss, delete, or modify reviews you have already posted.");
+      // Review commands use correct PR number
+      expect(prompt).toContain("gh pr review 301 --");
+    });
+
+    it("includes post-review verification API call", async () => {
+      const body = make_pr_payload("opened", 302, "test-org/lobster-farm");
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      const res = make_response();
+      const ctx = make_context();
+
+      await handle_github_webhook(req, res, ctx);
+
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
+
+      const spawn_args = (ctx.session_manager as any).spawn.mock.calls[0]![0];
+      const prompt: string = spawn_args.prompt;
+
+      expect(prompt).toContain(
+        `gh api repos/test-org/lobster-farm/pulls/302/reviews --jq '[.[] | select(.user.login | endswith("[bot]"))] | last | .state // "NOT_FOUND"'`,
+      );
+      expect(prompt).toContain("your review is confirmed. Move on.");
+      expect(prompt).toContain("If the state is DISMISSED or NOT_FOUND, something went wrong");
+    });
+  });
+
+  describe("pre-spawn dedup guard", () => {
+    it("skips spawn when non-dismissed bot review already exists (opened event)", async () => {
+      // Configure exec mock: gh api returns review count > 0
+      execFile_mock.mockImplementation(
+        (
+          _cmd: string,
+          _args: string[],
+          _opts: unknown,
+          cb: (err: Error | null, stdout: string, stderr: string) => void,
+        ) => {
+          cb(null, "1", "");
+        },
+      );
+
+      const body = make_pr_payload("opened", 400, "test-org/lobster-farm");
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      const res = make_response();
+      const ctx = make_context();
+
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        await handle_github_webhook(req, res, ctx);
+
+        // Allow async chains to settle
+        await vi.waitFor(
+          () => {
+            expect(log_spy).toHaveBeenCalledWith(
+              expect.stringContaining("Non-dismissed bot review already exists"),
+            );
+          },
+          { timeout: 2000 },
+        );
+
+        // Reviewer should NOT be spawned
+        expect((ctx.session_manager as any).spawn).not.toHaveBeenCalled();
+      } finally {
+        log_spy.mockRestore();
+      }
+    });
+
+    it("always spawns reviewer for synchronize events even when bot review exists", async () => {
+      // Configure exec mock: gh api returns review count > 0
+      execFile_mock.mockImplementation(
+        (
+          _cmd: string,
+          _args: string[],
+          _opts: unknown,
+          cb: (err: Error | null, stdout: string, stderr: string) => void,
+        ) => {
+          cb(null, "1", "");
+        },
+      );
+
+      const body = make_pr_payload("synchronize", 401, "test-org/lobster-farm");
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      const res = make_response();
+      const ctx = make_context();
+
+      await handle_github_webhook(req, res, ctx);
+
+      // synchronize should bypass the pre-spawn check and always spawn
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
+
+      // The gh api call for has_existing_bot_review should NOT have been made
+      expect(execFile_mock).not.toHaveBeenCalled();
+    });
+
+    it("proceeds with spawn when pre-spawn dedup check fails", async () => {
+      // Default: exec mock throws (already configured in beforeEach)
+      // has_existing_bot_review should catch and return false → proceed with spawn
+
+      const body = make_pr_payload("opened", 402, "test-org/lobster-farm");
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      const res = make_response();
+      const ctx = make_context();
+
+      await handle_github_webhook(req, res, ctx);
+
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
     });
   });
 });
