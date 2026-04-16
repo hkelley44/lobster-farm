@@ -31,7 +31,7 @@ describe("build_model_flags", () => {
   it("maps opus/high to correct flags", () => {
     const flags = build_model_flags({ model: "opus", think: "high" });
     expect(flags).toContain("--model");
-    expect(flags).toContain("claude-opus-4-6");
+    expect(flags).toContain("claude-opus-4-7");
     expect(flags).toContain("--effort");
     expect(flags).toContain("high");
   });
@@ -84,7 +84,7 @@ describe("ClaudeSessionManager", () => {
       expect(args).toContain("--agent");
       expect(args).toContain("bob"); // default builder name
       expect(args).toContain("--model");
-      expect(args).toContain("claude-opus-4-6");
+      expect(args).toContain("claude-opus-4-7");
       expect(args).toContain("--permission-mode");
       expect(args).toContain("bypassPermissions");
       expect(args).toContain("--session-id");
