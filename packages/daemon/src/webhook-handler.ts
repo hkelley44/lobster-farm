@@ -949,11 +949,12 @@ export async function handle_v2_review_completion(
     }
 
     await spawn_fixer(entity_id, repo_path, pr, ctx, installation_id);
-    await notify_alerts(
+    await ctx.alert_router?.post_alert({
       entity_id,
-      `PR #${String(pr.number)}: ${pr.title} — changes requested, spawning builder to fix`,
-      ctx,
-    );
+      tier: "routine",
+      title: `PR #${String(pr.number)} changes requested`,
+      body: `${pr.title} — spawning builder to fix`,
+    });
     await notify_pr_watcher(
       repo_full_name,
       pr.number,
@@ -966,11 +967,13 @@ export async function handle_v2_review_completion(
 
   if (outcome === "approved") {
     if (!gh_token) {
-      await notify_alerts(
+      await ctx.alert_router?.post_alert({
         entity_id,
-        `PR #${String(pr.number)}: ${pr.title} — approved but no GH token available for merge-gate. Manual intervention needed.`,
-        ctx,
-      );
+        tier: "action_required",
+        title: `\u26a0\ufe0f No GH token — PR #${String(pr.number)}`,
+        body: `${pr.title} — approved but no GH token available for merge-gate. Manual intervention needed.`,
+        embed_color: ALERT_COLOR_AMBER,
+      });
       return;
     }
 
@@ -994,11 +997,12 @@ export async function handle_v2_review_completion(
     switch (gate_outcome.kind) {
       case "merged":
         await post_auto_merge_cleanup(pr, entity_id, repo_path, ctx, installation_id);
-        await notify_alerts(
+        await ctx.alert_router?.post_alert({
           entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — approved, merge-gate passed, merged (${gate_outcome.method})`,
-          ctx,
-        );
+          tier: "routine",
+          title: `PR #${String(pr.number)} merged`,
+          body: `${pr.title} — approved, merge-gate passed, merged (${gate_outcome.method})`,
+        });
         await notify_pr_watcher(
           repo_full_name,
           pr.number,
@@ -1008,22 +1012,25 @@ export async function handle_v2_review_completion(
         return;
 
       case "ci_regressed":
-        await notify_alerts(
+        await ctx.alert_router?.post_alert({
           entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — approved but CI regressed on gate check (${gate_outcome.failures.join(", ")}). A new commit on this PR is required to re-enter the review cycle.`,
-          ctx,
-        );
+          tier: "action_required",
+          title: `\u26a0\ufe0f CI regressed — PR #${String(pr.number)}`,
+          body: `${pr.title} — CI regressed on gate check (${gate_outcome.failures.join(", ")}). A new commit is required to re-enter the review cycle.`,
+          embed_color: ALERT_COLOR_AMBER,
+        });
         return;
 
       case "ci_pending":
         console.log(
           `[webhook:v2] merge-gate: CI pending for PR #${String(pr.number)} — dedup blocks re-dispatch on same SHA`,
         );
-        await notify_alerts(
+        await ctx.alert_router?.post_alert({
           entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — approved but a CI check is still running on the reviewed SHA. Auto-merge is blocked until a new commit is pushed to re-enter the review cycle.`,
-          ctx,
-        );
+          tier: "routine",
+          title: `PR #${String(pr.number)} CI pending`,
+          body: `${pr.title} — approved but CI still running on reviewed SHA. Auto-merge blocked until new commit.`,
+        });
         return;
 
       case "sha_changed":
@@ -1044,19 +1051,23 @@ export async function handle_v2_review_completion(
         return;
 
       case "rebase_conflict":
-        await notify_alerts(
+        await ctx.alert_router?.post_alert({
           entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — rebase conflict, manual resolution required. ${gate_outcome.error}`,
-          ctx,
-        );
+          tier: "action_required",
+          title: `\u26a0\ufe0f Rebase conflict — PR #${String(pr.number)}`,
+          body: `${pr.title} — rebase conflict, manual resolution required. ${gate_outcome.error}`,
+          embed_color: ALERT_COLOR_AMBER,
+        });
         return;
 
       case "branch_protected":
-        await notify_alerts(
+        await ctx.alert_router?.post_alert({
           entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — blocked by branch protection (${gate_outcome.merge_state_status}). Human eyes required.`,
-          ctx,
-        );
+          tier: "action_required",
+          title: `\u{1f6d1} Branch protected — PR #${String(pr.number)}`,
+          body: `${pr.title} — blocked by branch protection (${gate_outcome.merge_state_status}). Human eyes required.`,
+          embed_color: ALERT_COLOR_RED,
+        });
         return;
 
       case "mergeable_unknown":
@@ -1066,11 +1077,13 @@ export async function handle_v2_review_completion(
         return;
 
       case "merge_failed":
-        await notify_alerts(
+        await ctx.alert_router?.post_alert({
           entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — merge-gate failed: ${gate_outcome.error}`,
-          ctx,
-        );
+          tier: "action_required",
+          title: `\u26a0\ufe0f Merge failed — PR #${String(pr.number)}`,
+          body: `${pr.title} — merge-gate failed: ${gate_outcome.error}`,
+          embed_color: ALERT_COLOR_AMBER,
+        });
         return;
     }
   }
@@ -1081,20 +1094,22 @@ export async function handle_v2_review_completion(
     console.log(
       `[webhook:v2] All reviews dismissed on PR #${String(pr.number)} — will be re-reviewed next cycle`,
     );
-    await notify_alerts(
+    await ctx.alert_router?.post_alert({
       entity_id,
-      `PR #${String(pr.number)}: "${pr.title}" — all reviews dismissed, will re-review next cycle`,
-      ctx,
-    );
+      tier: "routine",
+      title: `PR #${String(pr.number)} reviews dismissed`,
+      body: `"${pr.title}" — all reviews dismissed, will re-review next cycle`,
+    });
     return;
   }
 
   // outcome === "pending"
-  await notify_alerts(
+  await ctx.alert_router?.post_alert({
     entity_id,
-    `PR #${String(pr.number)} review completed: "${pr.title}" (${outcome})`,
-    ctx,
-  );
+    tier: "routine",
+    title: `PR #${String(pr.number)} review completed`,
+    body: `"${pr.title}" (${outcome})`,
+  });
 }
 
 /**
