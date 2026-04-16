@@ -17,6 +17,8 @@ const EFFORT_MAP: Record<ThinkLevel, string | null> = {
   none: "low",
   standard: "medium",
   high: "high",
+  xhigh: "xhigh",
+  max: "max",
 };
 
 /** Resolve a ModelTier to a Claude CLI model ID string. */
