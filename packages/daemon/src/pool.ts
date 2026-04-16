@@ -12,6 +12,7 @@ import { resolve_binary } from "./env.js";
 import { resolve_effort, resolve_model_id } from "./models.js";
 import { load_pool_state, save_pool_state } from "./persistence.js";
 import type { PersistedBotAvatarState, PersistedPoolBot } from "./persistence.js";
+import { scan_and_recover } from "./rate-limit-recovery.js";
 import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
 import { sq } from "./shell.js";
@@ -284,6 +285,8 @@ export class BotPool extends EventEmitter {
    * from false → true once Claude commits its first turn to disk. Cleared on
    * reassignment, release, or shutdown to prevent leaks. */
   private session_watchers = new Map<number, ReturnType<typeof setTimeout>>();
+  /** Timer for the rate-limit modal recovery scan (60s interval, issue #270). */
+  private rate_limit_timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -1286,6 +1289,64 @@ export class BotPool extends EventEmitter {
   }
 
   /**
+   * Start the rate-limit modal recovery monitor (issue #270).
+   *
+   * Every 60 seconds, captures the last lines of each assigned pool bot's tmux
+   * pane and checks for the Claude Code usage-limit modal. If detected, sends
+   * Escape to dismiss the modal and posts to the entity's alerts channel.
+   *
+   * Separate from the 30s health monitor because the concerns are different:
+   * health = dead sessions, rate-limit = stuck modals on live sessions.
+   */
+  start_rate_limit_monitor(): void {
+    if (this.rate_limit_timer) return; // already running
+
+    this.rate_limit_timer = setInterval(() => {
+      this.check_rate_limit_modals();
+    }, 60_000);
+
+    console.log("[pool] Rate-limit recovery monitor started (60s interval)");
+  }
+
+  /** Stop the rate-limit recovery monitor. */
+  stop_rate_limit_monitor(): void {
+    if (this.rate_limit_timer) {
+      clearInterval(this.rate_limit_timer);
+      this.rate_limit_timer = null;
+      console.log("[pool] Rate-limit recovery monitor stopped");
+    }
+  }
+
+  /**
+   * Scan assigned bots for rate-limit modals and dismiss them.
+   * Protected so tests can invoke directly without waiting for the interval.
+   */
+  protected async check_rate_limit_modals(): Promise<void> {
+    if (this._draining) return;
+
+    const assigned = this.bots.filter((b) => b.state === "assigned");
+    if (assigned.length === 0) return;
+
+    const recovered = scan_and_recover(assigned);
+
+    // Post alerts for each recovered bot
+    for (const result of recovered) {
+      const entity_config = result.entity_id ? this.registry?.get(result.entity_id) : undefined;
+      try {
+        await notify(
+          "alerts",
+          `\u26a0\ufe0f Pool bot ${String(result.bot_id)} hit rate-limit modal — auto-dismissed for ${result.entity_id ?? "unknown"}`,
+          entity_config,
+        );
+      } catch (err) {
+        console.warn(
+          `[rate-limit-recovery] Failed to alert for ${result.tmux_session}: ${String(err)}`,
+        );
+      }
+    }
+  }
+
+  /**
    * Check all assigned bots for dead tmux sessions.
    * When a dead session is found, attempts to restart it automatically.
    * If a bot crashes too often (>3 times in 1 hour), it's released instead
@@ -1768,6 +1829,7 @@ export class BotPool extends EventEmitter {
   /** Stop all pool bot sessions. Used during daemon shutdown. */
   async shutdown(): Promise<void> {
     this.stop_health_monitor();
+    this.stop_rate_limit_monitor();
 
     // Cancel all in-flight session confirmation watchers — we're about to
     // kill tmux anyway, and the timers would otherwise keep the event loop

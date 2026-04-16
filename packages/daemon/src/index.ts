@@ -158,6 +158,9 @@ async function main(): Promise<void> {
   // Start health monitor for detecting dead tmux sessions
   pool.start_health_monitor();
 
+  // Start rate-limit modal recovery monitor (issue #270)
+  pool.start_rate_limit_monitor();
+
   // Initialize Discord bot (optional — daemon works without it via HTTP API)
   const discord = new DiscordBot(config, registry);
   let discord_connected = false;
