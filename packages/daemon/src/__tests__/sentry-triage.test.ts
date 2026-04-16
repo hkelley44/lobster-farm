@@ -43,6 +43,7 @@ vi.mock("../sentry-api.js", async (importOriginal) => {
 
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import type { DiscordBot } from "../discord.js";
+import type { GitHubAppAuth } from "../github-app.js";
 import type { EntityRegistry } from "../registry.js";
 import { build_sentry_fix_prompt } from "../review-utils.js";
 import { format_stack_trace } from "../sentry-api.js";
@@ -144,6 +145,15 @@ function make_discord(): DiscordBot {
   return {
     send_to_entity: vi.fn().mockResolvedValue(undefined),
   } as unknown as DiscordBot;
+}
+
+function make_github_app(): GitHubAppAuth {
+  return {
+    get_token: vi.fn().mockResolvedValue("ghs_mock_token"),
+    get_token_for_installation: vi
+      .fn()
+      .mockImplementation((id: string) => Promise.resolve(`ghs_install_${id}`)),
+  } as unknown as GitHubAppAuth;
 }
 
 function make_context(overrides: Partial<SentryTriageContext> = {}): SentryTriageContext {
@@ -1205,5 +1215,146 @@ describe("build_sentry_fix_prompt", () => {
     expect(prompt).toContain("**Culprit:** src/handler.ts in process");
     expect(prompt).toContain("at handler.ts:99");
     expect(prompt).toContain("Do NOT merge the PR");
+  });
+});
+
+// ── GH_TOKEN injection tests ──
+
+describe("GH_TOKEN injection", () => {
+  it("passes GH_TOKEN to spawned Ray triage session", async () => {
+    const github_app = make_github_app();
+    const ctx = make_context({ github_app });
+    const sm = ctx.session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    await handle_sentry_triage_event("ISSUE-GH", "test-backend", "created", ctx);
+
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+    const triage_spawn = sm.spawn.mock.calls[0]![0] as { env: Record<string, string> };
+    expect(triage_spawn.env).toEqual({ GH_TOKEN: "ghs_mock_token" });
+  });
+
+  it("passes GH_TOKEN to spawned Bob fix session", async () => {
+    const github_app = make_github_app();
+    const session_manager = make_session_manager();
+    const ctx = make_context({ github_app, session_manager });
+    const sm = session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    let spawn_count = 0;
+    sm.spawn.mockImplementation(async () => {
+      spawn_count++;
+      return {
+        session_id: `session-${String(spawn_count)}`,
+        entity_id: "test-entity",
+        feature_id: spawn_count === 1 ? "sentry-triage-ISSUE-FIX-GH" : "sentry-fix-ISSUE-FIX-GH",
+        archetype: spawn_count === 1 ? "operator" : "builder",
+        started_at: new Date(),
+        pid: 10000 + spawn_count,
+      };
+    });
+
+    // Trigger triage
+    await handle_sentry_triage_event("ISSUE-FIX-GH", "test-backend", "created", ctx);
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+
+    // Complete triage with auto-fixable verdict
+    (session_manager as unknown as EventEmitter).emit("session:completed", {
+      session_id: "session-1",
+      exit_code: 0,
+      output_lines: [
+        'SENTRY_TRIAGE_VERDICT:{"severity":"P1","auto_fixable":true,"github_issue":42,"fix_approach":"Fix null check"}',
+      ],
+    });
+
+    // Wait for async fix spawn
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // Should have spawned 2 sessions: triage + fix
+    expect(sm.spawn).toHaveBeenCalledTimes(2);
+
+    // Verify the fix session (second spawn) got GH_TOKEN
+    const fix_spawn = sm.spawn.mock.calls[1]![0] as { env: Record<string, string> };
+    expect(fix_spawn.env).toEqual({ GH_TOKEN: "ghs_mock_token" });
+  });
+
+  it("spawns without GH_TOKEN when token resolution fails", async () => {
+    const github_app = make_github_app();
+    const ga = github_app as unknown as { get_token: ReturnType<typeof vi.fn> };
+    ga.get_token.mockRejectedValue(new Error("token refresh failed"));
+
+    const ctx = make_context({ github_app });
+    const sm = ctx.session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    await handle_sentry_triage_event("ISSUE-NO-GH", "test-backend", "created", ctx);
+
+    // Should still spawn — just without the token
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+    const triage_spawn = sm.spawn.mock.calls[0]![0] as { env: undefined };
+    expect(triage_spawn.env).toBeUndefined();
+  });
+
+  it("does not set env when github_app is null", async () => {
+    const ctx = make_context({ github_app: null });
+    const sm = ctx.session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    await handle_sentry_triage_event("ISSUE-NO-APP", "test-backend", "created", ctx);
+
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+    const triage_spawn = sm.spawn.mock.calls[0]![0] as { env: undefined };
+    expect(triage_spawn.env).toBeUndefined();
+  });
+
+  it("uses entity-specific installation ID when configured", async () => {
+    const github_app = make_github_app();
+    const registry = {
+      get_active: vi.fn().mockReturnValue([
+        {
+          entity: {
+            id: "test-entity",
+            name: "Test Entity",
+            accounts: {
+              sentry: {
+                projects: [{ slug: "test-backend", type: "backend", repo: "test-repo" }],
+              },
+              github: {
+                github_app_installation_id: "67890",
+              },
+            },
+            repos: [
+              {
+                name: "test-repo",
+                url: "https://github.com/test-org/test-repo.git",
+                path: "/tmp/test-repo",
+              },
+            ],
+          },
+        },
+      ]),
+      get: vi.fn().mockReturnValue({
+        entity: {
+          id: "test-entity",
+          name: "Test Entity",
+          accounts: {
+            github: {
+              github_app_installation_id: "67890",
+            },
+          },
+        },
+      }),
+    } as unknown as EntityRegistry;
+
+    const ctx = make_context({ github_app, registry });
+    const sm = ctx.session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    await handle_sentry_triage_event("ISSUE-INSTALL", "test-backend", "created", ctx);
+
+    expect(sm.spawn).toHaveBeenCalledTimes(1);
+    const triage_spawn = sm.spawn.mock.calls[0]![0] as { env: Record<string, string> };
+    expect(triage_spawn.env).toEqual({ GH_TOKEN: "ghs_install_67890" });
+
+    // Verify get_token_for_installation was called with the entity's override ID
+    const ga = github_app as unknown as {
+      get_token_for_installation: ReturnType<typeof vi.fn>;
+    };
+    expect(ga.get_token_for_installation).toHaveBeenCalledWith("67890");
   });
 });
