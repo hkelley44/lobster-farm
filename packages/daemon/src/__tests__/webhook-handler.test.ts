@@ -1479,10 +1479,12 @@ describe("handle_github_webhook", () => {
         // Should NOT have spawned a second reviewer inline — defers to cron
         expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
 
-        // active_reviews entry should be cleaned up by .finally()
+        // .finally() transitions the entry to "completed" (dedup hold window).
+        // It stays in the map until the TTL sweep removes it — see #258.
         const active = get_active_webhook_reviews();
         const matching = active.filter((r) => r.pr_number === 500);
-        expect(matching).toHaveLength(0);
+        expect(matching).toHaveLength(1);
+        expect(matching[0]!.state).toBe("completed");
       } finally {
         log_spy.mockRestore();
       }
@@ -1541,9 +1543,7 @@ describe("handle_github_webhook", () => {
 
       expect(prompt).toContain('&& echo "✓ Review posted"');
       expect(prompt).toContain("Post your review ONCE. Do not retry if the command exits 0.");
-      expect(prompt).toContain(
-        "Never dismiss, delete, or modify reviews you have already posted.",
-      );
+      expect(prompt).toContain("Never dismiss, delete, or modify reviews you have already posted.");
       // Review commands use correct PR number
       expect(prompt).toContain("gh pr review 301 --");
     });
@@ -1581,7 +1581,12 @@ describe("handle_github_webhook", () => {
     it("skips spawn when non-dismissed bot review already exists (opened event)", async () => {
       // Configure exec mock: gh api returns review count > 0
       execFile_mock.mockImplementation(
-        (_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+        (
+          _cmd: string,
+          _args: string[],
+          _opts: unknown,
+          cb: (err: Error | null, stdout: string, stderr: string) => void,
+        ) => {
           cb(null, "1", "");
         },
       );
@@ -1618,7 +1623,12 @@ describe("handle_github_webhook", () => {
     it("always spawns reviewer for synchronize events even when bot review exists", async () => {
       // Configure exec mock: gh api returns review count > 0
       execFile_mock.mockImplementation(
-        (_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+        (
+          _cmd: string,
+          _args: string[],
+          _opts: unknown,
+          cb: (err: Error | null, stdout: string, stderr: string) => void,
+        ) => {
           cb(null, "1", "");
         },
       );

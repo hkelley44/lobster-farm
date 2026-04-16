@@ -215,7 +215,7 @@ async function has_existing_bot_review(
       ],
       { cwd: repo_path, timeout: 15_000, env },
     );
-    return parseInt(stdout.trim(), 10) > 0;
+    return Number.parseInt(stdout.trim(), 10) > 0;
   } catch (err) {
     // On error, allow the review to proceed — better to risk a duplicate
     // than to silently skip a needed review.
