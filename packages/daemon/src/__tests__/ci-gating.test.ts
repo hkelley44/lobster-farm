@@ -359,6 +359,13 @@ function make_session_manager(): ClaudeSessionManager {
   return manager as unknown as ClaudeSessionManager;
 }
 
+function make_alert_router() {
+  return {
+    post_alert: vi.fn().mockResolvedValue({ message_id: null }),
+    resolve_incident: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
   return {
     github_app: make_github_app(),
@@ -370,6 +377,7 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
     } as WebhookContext["config"],
     pool: null,
     pr_watches: null,
+    alert_router: make_alert_router() as unknown as WebhookContext["alert_router"],
     ...overrides,
   };
 }
@@ -423,19 +431,15 @@ describe("webhook handler — workflow_run events", () => {
     await new Promise((resolve) => setTimeout(resolve, 150));
 
     expect(res._status).toBe(200);
-    const discord = ctx.discord as unknown as { send_to_entity: ReturnType<typeof vi.fn> };
-    // Updated in #199: alert now mentions Gary triaging instead of a raw failure message
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("Deploy failed on main"),
-      "reviewer",
-    );
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("Gary triaging"),
-      "reviewer",
+    const alert_router = ctx.alert_router as unknown as { post_alert: ReturnType<typeof vi.fn> };
+    // Updated in #199/#253: alert now posts a top-level embed via alert router
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: "test-entity",
+        tier: "action_required",
+        title: expect.stringContaining("Deploy failed on main"),
+        body: expect.stringContaining("Gary triaging"),
+      }),
     );
   });
 
@@ -623,11 +627,12 @@ describe("webhook handler — CI gating on review completion", () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     const discord = ctx.discord as unknown as { send_to_entity: ReturnType<typeof vi.fn> };
-    return { ctx, discord };
+    const alert_router = ctx.alert_router as unknown as { post_alert: ReturnType<typeof vi.fn> };
+    return { ctx, discord, alert_router };
   }
 
   it("blocks merge and spawns CI fixer when CI checks are failing", async () => {
-    const { discord } = await trigger_review_completion(() => ({
+    const { alert_router } = await trigger_review_completion(() => ({
       stdout: JSON.stringify([
         { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
         { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
@@ -635,17 +640,12 @@ describe("webhook handler — CI gating on review completion", () => {
     }));
 
     // Should alert about CI failure and spawn builder to fix (#196)
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("spawning builder to fix"),
-      "reviewer",
-    );
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("Build"),
-      "reviewer",
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: "test-entity",
+        tier: "routine",
+        body: expect.stringContaining("spawning builder"),
+      }),
     );
   });
 
@@ -676,7 +676,7 @@ describe("webhook handler — CI gating on review completion", () => {
 
     const merge_route = vi.fn(() => ({ stdout: "merged" }));
 
-    const { discord } = await trigger_review_completion(
+    const { alert_router } = await trigger_review_completion(
       () => ({
         stdout: JSON.stringify([{ name: "Build", state: "IN_PROGRESS", conclusion: "" }]),
       }),
@@ -694,11 +694,11 @@ describe("webhook handler — CI gating on review completion", () => {
 
     // Assert on success-specific text ("CI pending bypassed" only appears in the
     // success alert, not the failure one which says "Merge failed")
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("CI pending bypassed"),
-      "reviewer",
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: "test-entity",
+        body: expect.stringContaining("CI pending bypassed"),
+      }),
     );
   });
 
@@ -708,7 +708,7 @@ describe("webhook handler — CI gating on review completion", () => {
       pr_cron: { enabled: false },
     } as WebhookContext["config"];
 
-    const { discord } = await trigger_review_completion(
+    const { alert_router } = await trigger_review_completion(
       () => ({
         stdout: JSON.stringify([{ name: "Build", state: "IN_PROGRESS", conclusion: "" }]),
       }),
@@ -723,11 +723,11 @@ describe("webhook handler — CI gating on review completion", () => {
     );
 
     // Should alert about the failed merge with pr-cron disabled context
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("pr-cron is disabled"),
-      "reviewer",
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: "test-entity",
+        body: expect.stringContaining("pr-cron disabled"),
+      }),
     );
   });
 });

@@ -292,6 +292,13 @@ function make_session_manager(): ClaudeSessionManager {
   return manager as unknown as ClaudeSessionManager;
 }
 
+function make_alert_router() {
+  return {
+    post_alert: vi.fn().mockResolvedValue({ message_id: null }),
+    resolve_incident: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
   return {
     github_app: make_github_app(),
@@ -303,6 +310,7 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
     } as WebhookContext["config"],
     pool: null,
     pr_watches: null,
+    alert_router: make_alert_router() as unknown as WebhookContext["alert_router"],
     ...overrides,
   };
 }
@@ -379,18 +387,19 @@ describe("webhook handler — deploy triage", () => {
     const ctx = make_context();
     await send_workflow_run_webhook(ctx);
 
-    const discord = ctx.discord as unknown as { send_to_entity: ReturnType<typeof vi.fn> };
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("Gary triaging"),
-      "reviewer",
+    const alert_router = ctx.alert_router as unknown as { post_alert: ReturnType<typeof vi.fn> };
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: "test-entity",
+        tier: "action_required",
+        body: expect.stringContaining("Gary triaging"),
+      }),
     );
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("attempt 1/2"),
-      "reviewer",
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: "test-entity",
+        body: expect.stringContaining("attempt 1/2"),
+      }),
     );
   });
 
@@ -435,18 +444,14 @@ describe("webhook handler — deploy triage", () => {
     expect(sm.spawn).not.toHaveBeenCalled();
 
     // Should alert about exhaustion
-    const discord = ctx.discord as unknown as { send_to_entity: ReturnType<typeof vi.fn> };
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("Manual intervention needed"),
-      "reviewer",
-    );
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("fix loop exhausted"),
-      "reviewer",
+    const alert_router = ctx.alert_router as unknown as { post_alert: ReturnType<typeof vi.fn> };
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: "test-entity",
+        tier: "action_required",
+        title: expect.stringContaining("Deploy fix exhausted"),
+        body: expect.stringContaining("Manual intervention needed"),
+      }),
     );
   });
 
@@ -487,12 +492,13 @@ describe("webhook handler — deploy triage", () => {
     expect(sm.spawn).not.toHaveBeenCalled();
 
     // Should alert about safety valve
-    const discord = ctx.discord as unknown as { send_to_entity: ReturnType<typeof vi.fn> };
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("safety valve"),
-      "reviewer",
+    const alert_router = ctx.alert_router as unknown as { post_alert: ReturnType<typeof vi.fn> };
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: "test-entity",
+        tier: "action_required",
+        body: expect.stringContaining("safety valve"),
+      }),
     );
   });
 

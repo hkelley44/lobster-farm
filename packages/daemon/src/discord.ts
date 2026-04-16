@@ -1127,6 +1127,153 @@ export class DiscordBot extends EventEmitter {
     }
   }
 
+  // ── Alert router helpers ──
+  // These methods support the tiered alert system (alert-router.ts).
+  // They expose lower-level Discord primitives that the router composes.
+
+  /** Resolve the channel ID for a given entity and channel type. Returns null if not found. */
+  get_entity_channel_id(entity_id: string, channel_type: ChannelType): string | null {
+    const entity_map = this.entity_channels.get(entity_id);
+    if (!entity_map) return null;
+    return entity_map.get(channel_type) ?? null;
+  }
+
+  /** Send a Discord embed to a channel. Returns the message ID, or null on failure. */
+  async send_embed(channel_id: string, embed: EmbedBuilder): Promise<string | null> {
+    if (!this.connected) {
+      console.log(`[discord:offline] Would send embed to ${channel_id}`);
+      return null;
+    }
+
+    try {
+      const channel = await this.client.channels.fetch(channel_id);
+      if (channel?.isTextBased()) {
+        const msg = await (channel as TextChannel).send({ embeds: [embed] });
+        return msg.id;
+      }
+      return null;
+    } catch (err) {
+      console.error(`[discord] Failed to send embed to ${channel_id}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "send_embed" },
+      });
+      return null;
+    }
+  }
+
+  /** Create a thread from an existing message. Returns the thread ID, or null on failure. */
+  async create_thread_from_message(
+    channel_id: string,
+    message_id: string,
+    name: string,
+  ): Promise<string | null> {
+    if (!this.connected) {
+      console.log(`[discord:offline] Would create thread "${name}" from message ${message_id}`);
+      return null;
+    }
+
+    try {
+      const channel = await this.client.channels.fetch(channel_id);
+      if (!channel?.isTextBased()) return null;
+
+      const message = await (channel as TextChannel).messages.fetch(message_id);
+      const thread = await message.startThread({
+        name: name.slice(0, 100), // Discord thread name max 100 chars
+        autoArchiveDuration: 1440, // 24 hours
+      });
+      console.log(`[discord] Created thread "${name}" (${thread.id}) from message ${message_id}`);
+      return thread.id;
+    } catch (err) {
+      console.error(`[discord] Failed to create thread from message ${message_id}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "create_thread_from_message" },
+      });
+      return null;
+    }
+  }
+
+  /** Post a text message to a thread. */
+  async send_to_thread(thread_id: string, content: string): Promise<void> {
+    if (!this.connected) {
+      console.log(`[discord:offline] Would send to thread ${thread_id}: ${content}`);
+      return;
+    }
+
+    try {
+      const thread = await this.client.channels.fetch(thread_id);
+      if (thread?.isThread()) {
+        // Unarchive if archived so we can post
+        if (thread.archived) {
+          await thread.setArchived(false);
+        }
+        await thread.send(content);
+      }
+    } catch (err) {
+      console.error(`[discord] Failed to send to thread ${thread_id}: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "send_to_thread" },
+      });
+    }
+  }
+
+  /** Edit an existing message's embed. Returns true on success. */
+  async edit_message_embed(
+    channel_id: string,
+    message_id: string,
+    embed: EmbedBuilder,
+  ): Promise<boolean> {
+    if (!this.connected) {
+      console.log(`[discord:offline] Would edit embed on message ${message_id}`);
+      return false;
+    }
+
+    try {
+      const channel = await this.client.channels.fetch(channel_id);
+      if (!channel?.isTextBased()) return false;
+
+      const message = await (channel as TextChannel).messages.fetch(message_id);
+      await message.edit({ embeds: [embed] });
+      return true;
+    } catch (err) {
+      console.error(
+        `[discord] Failed to edit message ${message_id} in ${channel_id}: ${String(err)}`,
+      );
+      sentry.captureException(err, {
+        tags: { module: "discord", action: "edit_message_embed" },
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Find a thread in a channel by exact name match. Searches active (non-archived)
+   * threads first. Returns the thread ID, or null if not found.
+   */
+  async find_thread_by_name(channel_id: string, name: string): Promise<string | null> {
+    if (!this.connected) return null;
+
+    try {
+      const channel = await this.client.channels.fetch(channel_id);
+      if (!channel?.isTextBased()) return null;
+
+      // Search active threads in the channel
+      const text_channel = channel as TextChannel;
+      const active = await text_channel.threads.fetchActive();
+      const match = active.threads.find((t) => t.name === name);
+      if (match) return match.id;
+
+      // Also check recently archived threads (covers daemon restart case)
+      const archived = await text_channel.threads.fetchArchived({ limit: 50 });
+      const archived_match = archived.threads.find((t) => t.name === name);
+      if (archived_match) return archived_match.id;
+
+      return null;
+    } catch (err) {
+      console.error(`[discord] Failed to find thread "${name}" in ${channel_id}: ${String(err)}`);
+      return null;
+    }
+  }
+
   // ── Channel management ──
 
   /** Create a text channel under a category. Returns the channel ID, or null on failure. */

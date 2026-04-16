@@ -24,6 +24,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { expand_home, lobsterfarm_dir } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import type { AlertRouter } from "./alert-router.js";
 import type { DiscordBot } from "./discord.js";
 import type { EntityRegistry } from "./registry.js";
 import { MAX_SENTRY_FIX_ATTEMPTS, build_sentry_fix_prompt } from "./review-utils.js";
@@ -46,6 +47,7 @@ export interface SentryTriageContext {
   registry: EntityRegistry;
   discord: DiscordBot | null;
   config: LobsterFarmConfig;
+  alert_router: AlertRouter | null;
 }
 
 // ── Sentry webhook payload shapes ──
@@ -840,16 +842,15 @@ export async function handle_sentry_triage_event(
         `[sentry-triage] Queue full (${String(MAX_QUEUE_DEPTH)} items) — ` +
           `dropping triage for ${sentry_issue_id}. Too many errors arriving simultaneously.`,
       );
-      if (ctx.discord) {
-        await ctx.discord
-          .send_to_entity(
+      if (ctx.alert_router) {
+        await ctx.alert_router
+          .post_alert({
             entity_id,
-            "alerts",
-            `Sentry triage queue full (${String(MAX_QUEUE_DEPTH)} items). ` +
-              `Dropping triage for: ${issue_details.title}\n${issue_details.web_url}`,
-            "system",
-          )
-          .catch((e) => console.error(`[sentry-triage] Discord alert error: ${String(e)}`));
+            tier: "action_required",
+            title: "\u26a0\ufe0f Sentry triage queue full",
+            body: `${String(MAX_QUEUE_DEPTH)} items queued. Dropping triage for: ${issue_details.title}\n${issue_details.web_url}`,
+          })
+          .catch((e) => console.error(`[sentry-triage] Alert router error: ${String(e)}`));
       }
       return;
     }

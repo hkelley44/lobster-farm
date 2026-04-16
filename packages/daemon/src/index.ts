@@ -1,5 +1,6 @@
 import type { Server } from "node:http";
 import { set_discord_bot, set_pool } from "./actions.js";
+import { AlertRouter } from "./alert-router.js";
 import { CommanderProcess } from "./commander-process.js";
 import { load_config } from "./config.js";
 import { DiscordBot, resolve_bot_token } from "./discord.js";
@@ -247,6 +248,10 @@ async function main(): Promise<void> {
   const pr_watches = new PRWatchStore(config);
   await pr_watches.initialize();
 
+  // Initialize tiered alert router (#253)
+  const discord_for_routing = discord_connected ? discord : null;
+  const alert_router = new AlertRouter(discord_for_routing, config);
+
   // Start HTTP server
   const server = start_server(
     registry,
@@ -254,10 +259,11 @@ async function main(): Promise<void> {
     session_manager,
     queue,
     commander,
-    discord_connected ? discord : null,
+    discord_for_routing,
     pool,
     github_app,
     pr_watches,
+    alert_router,
   );
 
   // Start PR review cron (safety net — 30 min when webhooks are active, 5 min otherwise)
@@ -265,9 +271,10 @@ async function main(): Promise<void> {
     registry,
     session_manager,
     config,
-    discord_connected ? discord : null,
+    discord_for_routing,
     github_app,
     pr_watches,
+    alert_router,
   );
   const pr_cron_enabled = config.pr_cron?.enabled !== false; // default true for backward compat
   if (pr_cron_enabled) {

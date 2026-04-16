@@ -141,6 +141,9 @@ function make_ctx(overrides: Partial<WebhookContext> = {}): WebhookContext {
     } as WebhookContext["config"],
     pool: null,
     pr_watches: null,
+    alert_router: {
+      post_alert: vi.fn(async () => ({ message_id: null })),
+    } as unknown as WebhookContext["alert_router"],
     ...overrides,
   };
 }
@@ -185,12 +188,13 @@ describe("handle_v2_review_completion — changes_requested", () => {
     const spawn_call = (ctx.session_manager as any).spawn.mock.calls[0]![0];
     expect(spawn_call.archetype).toBe("builder");
 
-    // Should alert
-    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
-      ENTITY_ID,
-      "alerts",
-      expect.stringContaining("changes requested"),
-      expect.any(String),
+    // Should alert via alert_router
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: ENTITY_ID,
+        tier: "routine",
+        title: expect.stringContaining("changes requested"),
+      }),
     );
 
     // Should NOT call the merge-gate
@@ -273,11 +277,12 @@ describe("handle_v2_review_completion — approved", () => {
     expect(cleanup_after_merge).toHaveBeenCalledWith(REPO_PATH, "feature/42-x");
 
     // Alert should mention merge
-    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
-      ENTITY_ID,
-      "alerts",
-      expect.stringContaining("merged"),
-      expect.any(String),
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: ENTITY_ID,
+        tier: "routine",
+        title: expect.stringContaining("merged"),
+      }),
     );
   });
 
@@ -301,11 +306,12 @@ describe("handle_v2_review_completion — approved", () => {
     );
 
     expect(cleanup_after_merge).not.toHaveBeenCalled();
-    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
-      ENTITY_ID,
-      "alerts",
-      expect.stringContaining("CI regressed"),
-      expect.any(String),
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: ENTITY_ID,
+        tier: "action_required",
+        title: expect.stringContaining("CI regressed"),
+      }),
     );
   });
 
@@ -329,8 +335,8 @@ describe("handle_v2_review_completion — approved", () => {
     );
 
     expect(cleanup_after_merge).not.toHaveBeenCalled();
-    // sha_changed is a log, not an alert — discord should NOT be called for alerts
-    expect((ctx.discord as any).send_to_entity).not.toHaveBeenCalled();
+    // sha_changed is a log, not an alert — alert_router should NOT be called
+    expect((ctx.alert_router as any).post_alert).not.toHaveBeenCalled();
   });
 
   it("alerts on rebase_conflict", async () => {
@@ -353,11 +359,12 @@ describe("handle_v2_review_completion — approved", () => {
     );
 
     expect(cleanup_after_merge).not.toHaveBeenCalled();
-    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
-      ENTITY_ID,
-      "alerts",
-      expect.stringContaining("rebase conflict"),
-      expect.any(String),
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: ENTITY_ID,
+        tier: "action_required",
+        title: expect.stringContaining("Rebase conflict"),
+      }),
     );
   });
 
@@ -379,11 +386,12 @@ describe("handle_v2_review_completion — approved", () => {
     expect(fetch_pr_mergeability).not.toHaveBeenCalled();
     expect(run_merge_gate).not.toHaveBeenCalled();
     expect(cleanup_after_merge).not.toHaveBeenCalled();
-    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
-      ENTITY_ID,
-      "alerts",
-      expect.stringContaining("no GH token"),
-      expect.any(String),
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: ENTITY_ID,
+        tier: "action_required",
+        title: expect.stringContaining("No GH token"),
+      }),
     );
   });
 
@@ -407,11 +415,12 @@ describe("handle_v2_review_completion — approved", () => {
     );
 
     expect(cleanup_after_merge).not.toHaveBeenCalled();
-    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
-      ENTITY_ID,
-      "alerts",
-      expect.stringContaining("merge-gate failed"),
-      expect.any(String),
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: ENTITY_ID,
+        tier: "action_required",
+        title: expect.stringContaining("Merge failed"),
+      }),
     );
   });
 
@@ -435,11 +444,12 @@ describe("handle_v2_review_completion — approved", () => {
     );
 
     expect(cleanup_after_merge).not.toHaveBeenCalled();
-    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
-      ENTITY_ID,
-      "alerts",
-      expect.stringContaining("branch protection"),
-      expect.any(String),
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: ENTITY_ID,
+        tier: "action_required",
+        title: expect.stringContaining("Branch protected"),
+      }),
     );
   });
 
@@ -461,7 +471,7 @@ describe("handle_v2_review_completion — approved", () => {
 
     expect(cleanup_after_merge).not.toHaveBeenCalled();
     // rebased_awaiting_ci is a log, not an alert
-    expect((ctx.discord as any).send_to_entity).not.toHaveBeenCalled();
+    expect((ctx.alert_router as any).post_alert).not.toHaveBeenCalled();
   });
 
   it("handles ci_pending — alerts, no merge", async () => {
@@ -483,11 +493,12 @@ describe("handle_v2_review_completion — approved", () => {
     expect(cleanup_after_merge).not.toHaveBeenCalled();
     // ci_pending alerts because dedup blocks re-dispatch on the same SHA —
     // without a new commit, the PR would be stuck forever
-    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
-      ENTITY_ID,
-      "alerts",
-      expect.stringContaining("CI check is still running"),
-      expect.any(String),
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: ENTITY_ID,
+        tier: "routine",
+        title: expect.stringContaining("CI pending"),
+      }),
     );
   });
 
@@ -508,7 +519,7 @@ describe("handle_v2_review_completion — approved", () => {
     );
 
     expect(cleanup_after_merge).not.toHaveBeenCalled();
-    expect((ctx.discord as any).send_to_entity).not.toHaveBeenCalled();
+    expect((ctx.alert_router as any).post_alert).not.toHaveBeenCalled();
   });
 
   // Note: the "returns early if fetch_pr_mergeability fails" test was removed —
@@ -532,11 +543,12 @@ describe("handle_v2_review_completion — pending", () => {
     );
 
     // Should alert but not spawn or merge
-    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
-      ENTITY_ID,
-      "alerts",
-      expect.stringContaining("pending"),
-      expect.any(String),
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: ENTITY_ID,
+        tier: "routine",
+        body: expect.stringContaining("pending"),
+      }),
     );
     expect(run_merge_gate).not.toHaveBeenCalled();
     expect((ctx.session_manager as any).spawn).not.toHaveBeenCalled();
@@ -558,12 +570,13 @@ describe("handle_v2_review_completion — dismissed", () => {
       ctx,
     );
 
-    // Should alert
-    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
-      ENTITY_ID,
-      "alerts",
-      expect.stringContaining("all reviews dismissed"),
-      expect.any(String),
+    // Should alert via alert_router
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: ENTITY_ID,
+        tier: "routine",
+        body: expect.stringContaining("all reviews dismissed"),
+      }),
     );
 
     // Should NOT spawn a builder or run the merge-gate

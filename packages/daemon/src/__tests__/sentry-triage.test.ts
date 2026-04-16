@@ -146,12 +146,20 @@ function make_discord(): DiscordBot {
   } as unknown as DiscordBot;
 }
 
+function make_alert_router() {
+  return {
+    post_alert: vi.fn().mockResolvedValue({ message_id: null }),
+    resolve_incident: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 function make_context(overrides: Partial<SentryTriageContext> = {}): SentryTriageContext {
   return {
     session_manager: make_session_manager(),
     registry: make_registry(),
     discord: make_discord(),
     config: make_config(),
+    alert_router: make_alert_router() as unknown as SentryTriageContext["alert_router"],
     ...overrides,
   };
 }
@@ -560,13 +568,14 @@ describe("rate limiting", () => {
     // Still 2 spawned (no new spawn)
     expect(sm.spawn).toHaveBeenCalledTimes(2);
 
-    // Discord should have been alerted about the drop
-    const send = discord as unknown as { send_to_entity: ReturnType<typeof vi.fn> };
-    expect(send.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("queue full"),
-      "system",
+    // Alert router should have been called about the drop
+    const alert_router = ctx.alert_router as unknown as { post_alert: ReturnType<typeof vi.fn> };
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: "test-entity",
+        tier: "action_required",
+        title: expect.stringContaining("queue full"),
+      }),
     );
   });
 });
