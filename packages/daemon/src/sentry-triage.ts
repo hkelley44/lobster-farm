@@ -584,7 +584,10 @@ async function spawn_triage_session(
         void ctx.alert_router
           .post_alert({
             entity_id,
-            tier: verdict.severity === "P0" ? "action_required" : "routine",
+            tier:
+              verdict.severity === "P0" || verdict.severity === "P1"
+                ? "action_required"
+                : "routine",
             title: `\u{1f50d} Sentry triage: ${verdict.severity} — ${issue_details.title}`,
             body: [issue_details.web_url, issue_note, fix_note].join("\n"),
           })
@@ -631,7 +634,7 @@ async function spawn_triage_session(
             entity_id,
             tier: "routine",
             title: "\u26a0\ufe0f Sentry triage completed \u2014 no verdict parsed",
-            body: `Ray's session completed but didn't output a structured verdict.\n${issue_details.web_url}`,
+            body: `Ray's session completed but didn't output a structured verdict.\n${issue_details.title}\n${issue_details.web_url}`,
           })
           .catch((err) => {
             console.error(`[sentry-triage] Failed to post no-verdict alert: ${String(err)}`);
@@ -662,6 +665,20 @@ async function spawn_triage_session(
     });
 
     active_triages.delete(sentry_issue_id);
+
+    // Alert on session failure — more urgent than no-verdict since Ray didn't run at all
+    if (ctx.alert_router) {
+      void ctx.alert_router
+        .post_alert({
+          entity_id,
+          tier: "action_required",
+          title: "\u274c Sentry triage session failed",
+          body: `Ray's triage session crashed.\n${issue_details.title}\n${issue_details.web_url}\nError: ${error}`,
+        })
+        .catch((err) => {
+          console.error(`[sentry-triage] Failed to post failure alert: ${String(err)}`);
+        });
+    }
 
     void update_triage_state(sentry_issue_id, { status: "dismissed" }, ctx.config).catch((e) => {
       console.error(`[sentry-triage] Failed to update state after failure: ${String(e)}`);
