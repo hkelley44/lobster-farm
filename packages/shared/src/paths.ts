@@ -103,6 +103,10 @@ export function claude_settings_path(config?: Partial<PathConfig>): string {
   return join(claude_dir(config), "settings.json");
 }
 
+export function claude_hooks_dir(config?: Partial<PathConfig>): string {
+  return join(claude_dir(config), "hooks");
+}
+
 export function claude_md_path(config?: Partial<PathConfig>): string {
   return join(claude_dir(config), "CLAUDE.md");
 }
