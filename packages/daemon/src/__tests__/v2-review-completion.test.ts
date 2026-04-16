@@ -89,7 +89,7 @@ function make_pr(overrides: Partial<WebhookPR> = {}): WebhookPR {
   return {
     number: 42,
     title: "Add feature X",
-    head: { ref: "feature/42-x" },
+    head: { ref: "feature/42-x", sha: "abc12340" },
     body: "Closes #10",
     user: { login: "testuser" },
     ...overrides,
@@ -263,7 +263,7 @@ describe("handle_v2_review_completion — approved", () => {
     expect(run_merge_gate).toHaveBeenCalledWith({
       pr_number: 42,
       branch: "feature/42-x",
-      approved_sha: "deadbeef",
+      approved_sha: "abc12340",
       repo_path: REPO_PATH,
       gh_token: "ghs_token",
     });
@@ -464,7 +464,7 @@ describe("handle_v2_review_completion — approved", () => {
     expect((ctx.discord as any).send_to_entity).not.toHaveBeenCalled();
   });
 
-  it("handles ci_pending — logs, no merge", async () => {
+  it("handles ci_pending — alerts, no merge", async () => {
     vi.mocked(run_merge_gate).mockResolvedValueOnce({ kind: "ci_pending" });
 
     const pr = make_pr();
@@ -481,8 +481,14 @@ describe("handle_v2_review_completion — approved", () => {
     );
 
     expect(cleanup_after_merge).not.toHaveBeenCalled();
-    // ci_pending is a log, not an alert
-    expect((ctx.discord as any).send_to_entity).not.toHaveBeenCalled();
+    // ci_pending alerts because dedup blocks re-dispatch on the same SHA —
+    // without a new commit, the PR would be stuck forever
+    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
+      ENTITY_ID,
+      "alerts",
+      expect.stringContaining("CI check is still running"),
+      expect.any(String),
+    );
   });
 
   it("handles mergeable_unknown — logs, waits", async () => {
@@ -505,26 +511,9 @@ describe("handle_v2_review_completion — approved", () => {
     expect((ctx.discord as any).send_to_entity).not.toHaveBeenCalled();
   });
 
-  it("returns early if fetch_pr_mergeability fails for approved PR", async () => {
-    vi.mocked(fetch_pr_mergeability).mockRejectedValueOnce(new Error("rate limit"));
-
-    const pr = make_pr();
-    const ctx = make_ctx();
-
-    await handle_v2_review_completion(
-      ENTITY_ID,
-      REPO_PATH,
-      REPO_FULL_NAME,
-      pr,
-      "approved",
-      "ghs_token",
-      ctx,
-    );
-
-    // Should bail early — no merge-gate call
-    expect(run_merge_gate).not.toHaveBeenCalled();
-    expect(cleanup_after_merge).not.toHaveBeenCalled();
-  });
+  // Note: the "returns early if fetch_pr_mergeability fails" test was removed —
+  // the approved path now uses pr.head.sha directly instead of fetching fresh,
+  // so there's no API call to fail. The merge-gate handles its own fetch internally.
 });
 
 describe("handle_v2_review_completion — pending", () => {
@@ -551,5 +540,35 @@ describe("handle_v2_review_completion — pending", () => {
     );
     expect(run_merge_gate).not.toHaveBeenCalled();
     expect((ctx.session_manager as any).spawn).not.toHaveBeenCalled();
+  });
+});
+
+describe("handle_v2_review_completion — dismissed", () => {
+  it("alerts on dismissed — no spawn, no merge", async () => {
+    const pr = make_pr();
+    const ctx = make_ctx();
+
+    await handle_v2_review_completion(
+      ENTITY_ID,
+      REPO_PATH,
+      REPO_FULL_NAME,
+      pr,
+      "dismissed",
+      "ghs_token",
+      ctx,
+    );
+
+    // Should alert
+    expect((ctx.discord as any).send_to_entity).toHaveBeenCalledWith(
+      ENTITY_ID,
+      "alerts",
+      expect.stringContaining("all reviews dismissed"),
+      expect.any(String),
+    );
+
+    // Should NOT spawn a builder or run the merge-gate
+    expect((ctx.session_manager as any).spawn).not.toHaveBeenCalled();
+    expect(run_merge_gate).not.toHaveBeenCalled();
+    expect(cleanup_after_merge).not.toHaveBeenCalled();
   });
 });

@@ -962,21 +962,10 @@ export async function handle_v2_review_completion(
       return;
     }
 
-    // Fetch the approved head SHA so the merge-gate can detect drift.
-    let approved_sha: string;
-    try {
-      const mergeability = await fetch_pr_mergeability(pr.number, repo_path, gh_token);
-      approved_sha = mergeability.head_sha;
-    } catch (err) {
-      console.error(
-        `[webhook:v2] Could not fetch head SHA for approved PR #${String(pr.number)}: ${String(err)}`,
-      );
-      sentry.captureException(err, {
-        tags: { module: "webhook", entity: entity_id, action: "v2_fetch_sha" },
-        contexts: { pr: { number: pr.number } },
-      });
-      return;
-    }
+    // Use the SHA from the webhook payload — this is the SHA the reviewer
+    // actually reviewed. Fetching fresh from the API would miss drift if a
+    // commit lands between review and this handler running.
+    const approved_sha = pr.head.sha;
 
     const gate_outcome = await run_merge_gate({
       pr_number: pr.number,
@@ -1016,7 +1005,12 @@ export async function handle_v2_review_completion(
 
       case "ci_pending":
         console.log(
-          `[webhook:v2] merge-gate: CI pending for PR #${String(pr.number)} — waiting for next check_suite`,
+          `[webhook:v2] merge-gate: CI pending for PR #${String(pr.number)} — dedup blocks re-dispatch on same SHA`,
+        );
+        await notify_alerts(
+          entity_id,
+          `PR #${String(pr.number)}: ${pr.title} — approved but a CI check is still running on the reviewed SHA. Auto-merge is blocked until a new commit is pushed to re-enter the review cycle.`,
+          ctx,
         );
         return;
 
@@ -1067,12 +1061,11 @@ export async function handle_v2_review_completion(
         );
         return;
     }
-    return;
   }
 
   if (outcome === "dismissed") {
     // All reviews were dismissed (e.g., duplicate cleanup). Don't spawn a new
-    // review inline — let the next pr-cron or check_suite cycle pick it up.
+    // review inline — let the next check_suite cycle pick it up.
     console.log(
       `[webhook:v2] All reviews dismissed on PR #${String(pr.number)} — will be re-reviewed next cycle`,
     );
