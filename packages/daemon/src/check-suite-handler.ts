@@ -594,7 +594,13 @@ interface PriorReviewFeedback {
 }
 
 /**
- * Build the v2 reviewer prompt.
+ * Build the v2 reviewer prompt (dynamic per-PR prefix).
+ *
+ * The reviewer agent's `initialPrompt` (see `config/claude/agents/reviewer.md`)
+ * carries the static mechanics — identity, posting rules, verdict format,
+ * echo / verify-landing safety. This function emits only the per-PR prefix:
+ * header, optional prior-feedback block, optional linked-issue context, and
+ * v2-specific procedural notes (CI already green, don't merge, run /review).
  *
  * Differences from the v1 prompt:
  *
@@ -620,22 +626,13 @@ export function build_v2_reviewer_prompt(
     "",
     "Run /ultrareview to do a comprehensive code review.",
     "",
-    "Post your review on the PR using gh cli.",
-    "You are authenticated as the LobsterFarm Reviewer GitHub App.",
-    "",
-    "Review standards:",
-    "- Every piece of actionable feedback should be included.",
-    "- If there is ANY actionable feedback, request changes:",
-    `  gh pr review ${String(pr.number)} --request-changes --body "<your review>"`,
-    "- If the code is genuinely clean with no improvements needed, approve:",
-    `  gh pr review ${String(pr.number)} --approve --body "Looks good."`,
-    "",
     "CI status: GREEN. CI has already completed successfully against this exact",
     "head SHA. Do NOT run `gh pr checks` or attempt to gate on CI yourself —",
     "the check_suite-driven lifecycle has already verified it.",
     "",
     "Do NOT run `gh pr merge`. The merge-gate handles merging after approval —",
-    "your job is the review, not the merge.",
+    `your job is the review, not the merge. Post using PR #${String(pr.number)}`,
+    "with the commands from your initial instructions.",
   ];
 
   if (prior_feedback) {

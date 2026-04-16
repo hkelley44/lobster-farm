@@ -701,10 +701,11 @@ describe("build_v2_reviewer_prompt", () => {
     expect(prompt).toContain("Do NOT run `gh pr merge`");
   });
 
-  it("emits approve and request-changes gh commands with the PR number", () => {
+  it("includes PR header with number for dynamic context", () => {
     const prompt = build_v2_reviewer_prompt(pr, REPO_PATH, "");
-    expect(prompt).toContain("gh pr review 42 --request-changes");
-    expect(prompt).toContain("gh pr review 42 --approve");
+    // gh pr review command templates now live in the agent's initialPrompt
+    // frontmatter — the dynamic prefix only needs to identify which PR.
+    expect(prompt).toContain("PR #42");
   });
 
   it("includes prior feedback section when provided (Decision 5)", () => {

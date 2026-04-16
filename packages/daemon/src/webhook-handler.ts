@@ -1470,6 +1470,19 @@ async function spawn_deploy_triage(
 
 // ── Prompt building ──
 
+/**
+ * Builds the dynamic per-PR prefix for the v1 (pull_request webhook) reviewer
+ * lifecycle. The reviewer agent's `initialPrompt` (see
+ * `config/claude/agents/reviewer.md`) carries the static mechanics — identity,
+ * posting rules, verdict format, echo / verify-landing safety. This function
+ * emits only what changes per PR: header, pre-existing-review dedup check,
+ * linked-issue context, the two-pass procedure, and v1-specific merge steps.
+ *
+ * The effective first user turn the reviewer sees is:
+ *     <initialPrompt from frontmatter>  ← prepended automatically
+ *     <blank line>
+ *     <this builder's output, piped via stdin>
+ */
 export function build_reviewer_prompt(
   pr: WebhookPR,
   repo_path: string,
@@ -1485,10 +1498,7 @@ export function build_reviewer_prompt(
     `Review PR #${pr_num}: "${pr.title}" on branch ${pr.head.ref}.`,
     `Repository: ${repo_path}`,
     "",
-    "You are authenticated as the LobsterFarm Reviewer GitHub App.",
-    "Post your review via `gh` CLI.",
-    "",
-    "Before posting your review, check for any existing reviews you've already posted:",
+    "Before posting, check for any existing reviews you've already posted:",
     `  gh api repos/${repo_full_name}/pulls/${pr_num}/reviews --jq '[.[] | select(.user.login | endswith("[bot]"))] | { count: length, reviews: map({state, submitted_at}) }'`,
     "If a review already exists with state APPROVED or CHANGES_REQUESTED, skip posting",
     "and go directly to the merge step (if approved) or stop (if changes requested).",
@@ -1623,23 +1633,10 @@ export function build_reviewer_prompt(
   }
 
   lines.push(
-    "Post the combined review using the existing approve / request-changes",
-    "logic:",
-    "",
-    "- If there is ANY actionable code-quality feedback, request changes:",
-    `    gh pr review ${pr_num} --request-changes --body "<combined body>" && echo "✓ Review posted"`,
-    "- If the code is genuinely clean with no improvements needed, approve:",
-    `    gh pr review ${pr_num} --approve --body "<combined body>" && echo "✓ Review posted"`,
-    "",
-    "After posting your review, verify it landed:",
-    `  gh api repos/${repo_full_name}/pulls/${pr_num}/reviews --jq '[.[] | select(.user.login | endswith("[bot]"))] | last | .state // "NOT_FOUND"'`,
-    "If the state is CHANGES_REQUESTED or APPROVED, your review is confirmed. Move on.",
-    "If the state is DISMISSED or NOT_FOUND, something went wrong — do NOT retry, just stop.",
-    "",
-    "IMPORTANT:",
-    "- Post your review ONCE. Do not retry if the command exits 0.",
-    "- Never dismiss, delete, or modify reviews you have already posted.",
-    "- If you accidentally post duplicate reviews, leave them — do not try to clean up.",
+    "Post the combined review using the approve / request-changes commands",
+    "from your initial instructions — one post, echo marker, verify it",
+    `landed. Use PR #${pr_num} in the command and \`${repo_full_name}\` in`,
+    "the verify API call.",
     "",
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     "### CI status & merge (only relevant if Pass 2 approved)",
