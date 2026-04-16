@@ -4,12 +4,14 @@ import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { type Mock, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PersistedPoolBot } from "../persistence.js";
-import { type PoolBot, pending_file_path } from "../pool.js";
+import { type PoolBot, pending_json_path } from "../pool.js";
 import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 // ── Mocks ──
 
-// Mock node:fs/promises — writeFile is the key assertion target
+// Mock node:fs/promises — writeFile is the key assertion target. The hook
+// contract is "daemon writes JSON pending file before spawn, sets env var" —
+// that's what we verify here.
 vi.mock("node:fs/promises", async () => {
   const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
   return {
@@ -22,25 +24,23 @@ vi.mock("node:fs/promises", async () => {
   };
 });
 
-// Mock node:child_process — controls tmux readiness simulation
+// Mock node:child_process — we assert send-keys is NOT called for message
+// bridging (the whole point of #290). execFileSync is still used by other
+// code paths (capture-pane, has-session) so we keep a no-op default.
 vi.mock("node:child_process", async () => {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
   return {
     ...actual,
-    execFileSync: vi.fn().mockImplementation(() => {
-      throw new Error("not mocked");
-    }),
+    execFileSync: vi.fn().mockReturnValue(""),
     spawn: vi.fn(),
   };
 });
 
 import { execFileSync } from "node:child_process";
-import { access, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 
 // ── Test helpers ──
 
-// Use a static temp path per test run — mkdtemp is not mocked but we use a
-// unique-enough path since fs writes are already mocked in this file.
 let temp_dir: string;
 
 function make_config(): LobsterFarmConfig {
@@ -71,6 +71,18 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
   };
 }
 
+/** Find the start_tmux call for a given bot and return the extra_env arg. */
+function extra_env_from_start_tmux_calls(
+  start_tmux: Mock,
+  tmux_session: string,
+): Record<string, string> | undefined {
+  const call = start_tmux.mock.calls.find((c: unknown[]) => {
+    const bot = c[0] as { tmux_session: string } | undefined;
+    return bot?.tmux_session === tmux_session;
+  });
+  return call?.[6] as Record<string, string> | undefined;
+}
+
 /**
  * Test-friendly BotPool subclass. Stubs tmux/filesystem side effects
  * and exposes internals for resume_parked_bots testing.
@@ -95,18 +107,15 @@ class TestBotPool extends BotPoolTestBase {
 
 // ── Tests ──
 
-describe("resume nudge (issue #156)", () => {
+describe("resume nudge via SessionStart hook (issue #290)", () => {
   let config: LobsterFarmConfig;
   let pool: TestBotPool;
+  let start_tmux_spy: Mock;
 
   beforeEach(() => {
     vi.clearAllMocks();
-    // Use fake timers so we can skip the readiness polling delays
     vi.useFakeTimers({ shouldAdvanceTime: true });
 
-    // Use a unique temp path to isolate config from production ~/.lobsterfarm.
-    // mkdtemp is not available here (fs mocked), but mkdir is also mocked so
-    // the directory doesn't need to actually exist — we just need a non-production path.
     temp_dir = join(tmpdir(), `resume-nudge-test-${Date.now()}`);
     config = make_config();
     pool = new TestBotPool(config);
@@ -127,33 +136,22 @@ describe("resume nudge (issue #156)", () => {
       pool as unknown as Record<string, unknown>,
       "set_bot_avatar" as never,
     ).mockResolvedValue(undefined);
-    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never).mockResolvedValue(
-      undefined,
-    );
+    start_tmux_spy = vi
+      .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
+      .mockResolvedValue(undefined) as unknown as Mock;
     vi.spyOn(pool as unknown as Record<string, unknown>, "is_tmux_alive" as never).mockReturnValue(
       false,
     );
     vi.spyOn(pool as unknown as Record<string, unknown>, "persist" as never).mockResolvedValue(
       undefined,
     );
-
-    // Default: tmux capture-pane returns a ready prompt (bot is ready)
-    (execFileSync as Mock).mockImplementation((cmd: string, args: string[]) => {
-      if (cmd === "tmux" && args[0] === "capture-pane") {
-        return "Listening for channel messages\n❯ ";
-      }
-      if (cmd === "tmux" && args[0] === "has-session") {
-        throw new Error("no session");
-      }
-      return "";
-    });
   });
 
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it("writes nudge file after successful resume", async () => {
+  it("writes a JSON pending nudge file before spawn", async () => {
     const bot = make_bot({
       id: 3,
       state: "parked",
@@ -177,24 +175,16 @@ describe("resume nudge (issue #156)", () => {
     ]);
 
     await pool.resume_parked_bots();
-    // Let the fire-and-forget nudge promise settle
-    await vi.advanceTimersByTimeAsync(25_000);
 
+    // JSON pending file was written with the nudge content
     expect(writeFile).toHaveBeenCalledWith(
-      pending_file_path("pool-3"),
+      pending_json_path("pool-3"),
       expect.stringContaining("daemon restarted"),
       "utf-8",
     );
-
-    // The actual delivery mechanism: tmux send-keys injects the prompt
-    expect(execFileSync).toHaveBeenCalledWith(
-      "tmux",
-      ["send-keys", "-t", "pool-3", expect.stringContaining(pending_file_path("pool-3")), "Enter"],
-      expect.objectContaining({ stdio: "ignore", timeout: 5000 }),
-    );
   });
 
-  it("nudge content includes instruction to continue work", async () => {
+  it("passes LF_PENDING_FILE to start_tmux for the resumed bot", async () => {
     const bot = make_bot({
       id: 0,
       state: "parked",
@@ -218,32 +208,54 @@ describe("resume nudge (issue #156)", () => {
     ]);
 
     await pool.resume_parked_bots();
-    await vi.advanceTimersByTimeAsync(25_000);
+
+    const extra_env = extra_env_from_start_tmux_calls(start_tmux_spy, "pool-0");
+    expect(extra_env).toBeDefined();
+    expect(extra_env?.LF_PENDING_FILE).toBe(pending_json_path("pool-0"));
+  });
+
+  it("nudge JSON payload includes continue-work instruction", async () => {
+    const bot = make_bot({
+      id: 6,
+      state: "parked",
+      channel_id: "ch-6",
+      entity_id: "e1",
+      archetype: "builder",
+      session_id: "sess-6",
+    });
+    pool.inject_bots([bot]);
+    pool.inject_resume_candidates([
+      {
+        id: 6,
+        state: "assigned",
+        channel_id: "ch-6",
+        entity_id: "e1",
+        archetype: "builder",
+        channel_type: null,
+        session_id: "sess-6",
+        last_active: new Date().toISOString(),
+      },
+    ]);
+
+    await pool.resume_parked_bots();
 
     const write_calls = (writeFile as Mock).mock.calls;
     const nudge_call = write_calls.find((c: unknown[]) =>
-      (c[0] as string).includes("lf-pending-pool-0"),
+      (c[0] as string).includes("lf-pending-pool-6"),
     );
     expect(nudge_call).toBeDefined();
 
-    const content = nudge_call![1] as string;
-    expect(content).toContain("continue any in-progress work");
-
-    // send-keys must also be called to deliver the nudge
-    expect(execFileSync).toHaveBeenCalledWith(
-      "tmux",
-      [
-        "send-keys",
-        "-t",
-        "pool-0",
-        expect.stringContaining(`Read ${pending_file_path("pool-0")}`),
-        "Enter",
-      ],
-      expect.objectContaining({ stdio: "ignore", timeout: 5000 }),
-    );
+    // Body is JSON — parse it and assert on the content field
+    const payload = JSON.parse((nudge_call![1] as string).trim());
+    expect(payload).toMatchObject({
+      user: "lobsterfarm-daemon",
+      channel_id: "ch-6",
+    });
+    expect(payload.content).toContain("continue any in-progress work");
+    expect(typeof payload.ts).toBe("string");
   });
 
-  it("nudge file path matches bot ID", async () => {
+  it("JSON file path matches bot ID", async () => {
     const bot = make_bot({
       id: 7,
       state: "assigned",
@@ -267,23 +279,64 @@ describe("resume nudge (issue #156)", () => {
     ]);
 
     await pool.resume_parked_bots();
-    await vi.advanceTimersByTimeAsync(25_000);
 
     expect(writeFile).toHaveBeenCalledWith(
-      pending_file_path("pool-7"),
+      pending_json_path("pool-7"),
       expect.any(String),
       "utf-8",
     );
 
-    // send-keys targets the correct tmux session
-    expect(execFileSync).toHaveBeenCalledWith(
-      "tmux",
-      ["send-keys", "-t", "pool-7", expect.stringContaining(pending_file_path("pool-7")), "Enter"],
-      expect.objectContaining({ stdio: "ignore", timeout: 5000 }),
-    );
+    const extra_env = extra_env_from_start_tmux_calls(start_tmux_spy, "pool-7");
+    expect(extra_env?.LF_PENDING_FILE).toBe(pending_json_path("pool-7"));
   });
 
-  it("does not write nudge file if start_tmux fails", async () => {
+  it("does NOT invoke tmux send-keys for message bridging (the whole point of #290)", async () => {
+    const bot = make_bot({
+      id: 9,
+      state: "parked",
+      channel_id: "ch-9",
+      entity_id: "e1",
+      archetype: "planner",
+      session_id: "sess-9",
+    });
+    pool.inject_bots([bot]);
+    pool.inject_resume_candidates([
+      {
+        id: 9,
+        state: "assigned",
+        channel_id: "ch-9",
+        entity_id: "e1",
+        archetype: "planner",
+        channel_type: null,
+        session_id: "sess-9",
+        last_active: new Date().toISOString(),
+      },
+    ]);
+
+    await pool.resume_parked_bots();
+    // Let any fire-and-forget promises settle — there shouldn't be any
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    // Filter specifically for send-keys targeting the resumed bot's session.
+    // Other send-keys calls (trust dialog auto-accept after start_tmux) are
+    // fine — we just forbid the legacy message-injection pattern.
+    const send_keys_calls = (execFileSync as Mock).mock.calls.filter(
+      (c: unknown[]) =>
+        c[0] === "tmux" &&
+        Array.isArray(c[1]) &&
+        (c[1] as string[])[0] === "send-keys" &&
+        (c[1] as string[])[2] === "pool-9",
+    );
+
+    // Check none of them inject the pending-file read prompt (the legacy pattern)
+    for (const call of send_keys_calls) {
+      const payload = String((call[1] as string[])[3] ?? "");
+      expect(payload).not.toContain("lf-pending");
+      expect(payload).not.toContain("Read ");
+    }
+  });
+
+  it("start_tmux failure before write is handled (write happens first)", async () => {
     const bot = make_bot({
       id: 2,
       state: "parked",
@@ -306,146 +359,25 @@ describe("resume nudge (issue #156)", () => {
       },
     ]);
 
-    // Make start_tmux throw
-    vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never).mockRejectedValue(
-      new Error("tmux failed"),
-    );
+    start_tmux_spy.mockRejectedValue(new Error("tmux failed"));
 
     await pool.resume_parked_bots();
-    await vi.advanceTimersByTimeAsync(25_000);
 
-    // writeFile should NOT have been called with the pending nudge path
-    const write_calls = (writeFile as Mock).mock.calls;
-    const nudge_call = write_calls.find((c: unknown[]) =>
-      (c[0] as string).includes("lf-pending-pool-2"),
-    );
-    expect(nudge_call).toBeUndefined();
-
-    // send-keys should NOT have been called for this bot
-    const send_calls = (execFileSync as Mock).mock.calls.filter(
+    // The pending file is written before start_tmux is attempted — that's
+    // acceptable for the hook model because the stale file just sits in
+    // /tmp until the next spawn overwrites it (or drain_pending_files
+    // removes the legacy .txt variant, not applicable here). What we
+    // MUST NOT do is fall back to tmux send-keys for delivery.
+    const send_keys_calls = (execFileSync as Mock).mock.calls.filter(
       (c: unknown[]) =>
         c[0] === "tmux" &&
+        Array.isArray(c[1]) &&
         (c[1] as string[])[0] === "send-keys" &&
         (c[1] as string[])[2] === "pool-2",
     );
-    expect(send_calls).toHaveLength(0);
-  });
-
-  it("does not nudge if bot is not ready within timeout", async () => {
-    const bot = make_bot({
-      id: 4,
-      state: "parked",
-      channel_id: "ch-4",
-      entity_id: "e1",
-      archetype: "planner",
-      session_id: "sess-slow",
-    });
-    pool.inject_bots([bot]);
-    pool.inject_resume_candidates([
-      {
-        id: 4,
-        state: "assigned",
-        channel_id: "ch-4",
-        entity_id: "e1",
-        archetype: "planner",
-        channel_type: null,
-        session_id: "sess-slow",
-        last_active: new Date().toISOString(),
-      },
-    ]);
-
-    // tmux capture-pane never returns the ready indicator.
-    // has-session throws — simulates dead session, causing early bail after first attempt.
-    (execFileSync as Mock).mockImplementation((cmd: string, args: string[]) => {
-      if (cmd === "tmux" && args[0] === "capture-pane") {
-        return "Loading conversation history...";
-      }
-      if (cmd === "tmux" && args[0] === "has-session") {
-        throw new Error("no session");
-      }
-      return "";
-    });
-
-    await pool.resume_parked_bots();
-    // wait_for_bot_ready_with_retries uses 30s timeout per attempt (3 attempts max).
-    // With has-session throwing, it bails after the first 30s attempt.
-    await vi.advanceTimersByTimeAsync(35_000);
-
-    // Pending file IS written (before readiness check) so drain_pending_files
-    // can recover it later if the bot becomes ready on a subsequent health tick
-    const write_calls = (writeFile as Mock).mock.calls;
-    const nudge_call = write_calls.find((c: unknown[]) =>
-      (c[0] as string).includes("lf-pending-pool-4"),
-    );
-    expect(nudge_call).toBeDefined();
-
-    // send-keys should NOT have been called for this bot
-    const send_calls = (execFileSync as Mock).mock.calls.filter(
-      (c: unknown[]) =>
-        c[0] === "tmux" &&
-        (c[1] as string[])[0] === "send-keys" &&
-        (c[1] as string[])[2] === "pool-4",
-    );
-    expect(send_calls).toHaveLength(0);
-  });
-
-  it("skips send-keys when drain already claimed the pending file", async () => {
-    // Scenario: bridge writes the pending file, starts readiness polling.
-    // Meanwhile, drain_pending_files (health-check timer) claims and delivers
-    // the file. When bridge's readiness wait succeeds, the file is gone.
-    // Bridge should bail silently — no double-delivery.
-    const bot = make_bot({
-      id: 5,
-      state: "parked",
-      channel_id: "ch-5",
-      entity_id: "e1",
-      archetype: "planner",
-      session_id: "sess-drained",
-    });
-    pool.inject_bots([bot]);
-    pool.inject_resume_candidates([
-      {
-        id: 5,
-        state: "assigned",
-        channel_id: "ch-5",
-        entity_id: "e1",
-        archetype: "planner",
-        channel_type: null,
-        session_id: "sess-drained",
-        last_active: new Date().toISOString(),
-      },
-    ]);
-
-    // Bot becomes ready — wait_for_bot_ready_with_retries will return true
-    (execFileSync as Mock).mockImplementation((cmd: string, args: string[]) => {
-      if (cmd === "tmux" && args[0] === "capture-pane") {
-        return "Listening for channel messages\n❯ ";
-      }
-      return "";
-    });
-
-    // Simulate drain having already deleted the pending file:
-    // writeFile succeeds (bridge writes it), but access() fails (file gone by
-    // the time bridge checks after readiness wait completes).
-    (access as Mock).mockRejectedValue(new Error("ENOENT"));
-
-    await pool.resume_parked_bots();
-    await vi.advanceTimersByTimeAsync(25_000);
-
-    // Pending file was written (before readiness check)
-    const write_calls = (writeFile as Mock).mock.calls;
-    const nudge_call = write_calls.find((c: unknown[]) =>
-      (c[0] as string).includes("lf-pending-pool-5"),
-    );
-    expect(nudge_call).toBeDefined();
-
-    // send-keys should NOT have been called — drain already delivered
-    const send_calls = (execFileSync as Mock).mock.calls.filter(
-      (c: unknown[]) =>
-        c[0] === "tmux" &&
-        (c[1] as string[])[0] === "send-keys" &&
-        (c[1] as string[])[2] === "pool-5",
-    );
-    expect(send_calls).toHaveLength(0);
+    for (const call of send_keys_calls) {
+      const payload = String((call[1] as string[])[3] ?? "");
+      expect(payload).not.toContain("lf-pending");
+    }
   });
 });

@@ -33,11 +33,7 @@ import {
   type Webhook,
 } from "discord.js";
 import { PAT_TMUX_SESSION } from "./commander-process.js";
-import {
-  is_tmux_session_idle,
-  pending_file_path,
-  wait_for_bot_ready_with_retries,
-} from "./pool.js";
+import { is_tmux_session_idle } from "./pool.js";
 import type { BotPool, PoolBot } from "./pool.js";
 import type { TaskQueue } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
@@ -1894,21 +1890,25 @@ export class DiscordBot extends EventEmitter {
           /* ignore */
         }
 
+        // Pass the user's message as a pending_message so the SessionStart
+        // hook can inject it as additionalContext when the Claude CLI
+        // starts (issue #290). No tmux send-keys bridging required.
         const result = await this._pool.assign(
           message.channelId,
           entry.entity_id,
           archetype,
           undefined, // resume_session_id — pool handles auto-resume from parked bots + session_history
           entry.channel_type,
+          undefined, // working_dir — use entity default
+          {
+            user: message.author.displayName,
+            channel_id: message.channelId,
+            message_id: message.id,
+            content: message.content,
+            ts: new Date(message.createdTimestamp).toISOString(),
+          },
         );
         if (result) {
-          // Bridge the first message: write to file, wait for bot, send via tmux
-          await this.bridge_first_message(
-            result.tmux_session,
-            message.content,
-            message.author.displayName,
-            message.channelId,
-          );
           try {
             await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
             await message.react("👀");
@@ -2302,100 +2302,6 @@ export class DiscordBot extends EventEmitter {
     }
   }
 
-  /**
-   * Bridge a message to a freshly spawned pool bot via tmux send-keys.
-   *
-   * Uses wait_for_bot_ready_with_retries for robust readiness detection
-   * (3 attempts, 30s each = ~90s total). If all retries fail, the pending
-   * file is left in place for the health-check drain to recover, and a
-   * fallback message is posted to the Discord channel so the user knows.
-   */
-  private async bridge_first_message(
-    tmux_session: string,
-    content: string,
-    author_name: string,
-    channel_id?: string,
-  ): Promise<void> {
-    const { execFileSync } = await import("node:child_process");
-    const {
-      access: accessAsync,
-      writeFile: writeFileAsync,
-      unlink,
-    } = await import("node:fs/promises");
-    const pending_path = pending_file_path(tmux_session);
-
-    try {
-      // Write the message to a file (avoids tmux escaping issues)
-      await writeFileAsync(pending_path, `${author_name}: ${content}`, "utf-8");
-
-      // Wait for the bot to be ready with retries (~90s total coverage)
-      const ready = await wait_for_bot_ready_with_retries(tmux_session);
-
-      if (!ready) {
-        console.log(
-          `[discord] Bot ${tmux_session} not ready after all retries — message not bridged`,
-        );
-
-        // Pending file stays in place — health check drain_pending_files()
-        // will deliver it if the bot becomes ready later.
-
-        // Post a fallback message so the user knows something went wrong
-        if (channel_id) {
-          try {
-            await this.send(
-              channel_id,
-              "Your message will be delivered once the bot finishes starting up. If you don't get a response within a few minutes, please resend.",
-            );
-          } catch {
-            /* best effort */
-          }
-        }
-        return;
-      }
-
-      // Guard against drain having already delivered while we were polling.
-      // drain_pending_files runs on the 30s health-check timer and may have
-      // claimed and sent the file during the ~90s readiness wait.
-      try {
-        await accessAsync(pending_path);
-      } catch {
-        console.log(
-          `[discord] Pending file already claimed by drain for ${tmux_session} — skipping bridge send`,
-        );
-        return;
-      }
-
-      // Small extra delay for the plugin to fully connect
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-
-      // Send the prompt to the bot's tmux session
-      const prompt = `A user just messaged you in Discord. Read ${pending_path} for their message and respond to them.`;
-      execFileSync("tmux", ["send-keys", "-t", tmux_session, prompt, "Enter"], {
-        stdio: "ignore",
-        timeout: 5000,
-      });
-
-      console.log(`[discord] Bridged first message to ${tmux_session}`);
-
-      // Clean up shortly after — Claude has the prompt and will read it within seconds.
-      // Mark as draining to prevent drain_pending_files from re-delivering during
-      // the cleanup window.
-      if (this._pool) {
-        const cleanup = this._pool.mark_draining(tmux_session, pending_path);
-        setTimeout(cleanup, 5_000);
-      } else {
-        setTimeout(() => {
-          void unlink(pending_path).catch(() => {});
-        }, 5_000);
-      }
-    } catch (err) {
-      console.error(`[discord] Bridge failed: ${String(err)}`);
-      sentry.captureException(err, {
-        tags: { module: "discord", action: "bridge" },
-      });
-    }
-  }
-
   private async handle_swap_command(args: string[], target: CommandTarget): Promise<void> {
     if (!this._pool) {
       await target.reply("Bot pool not available.");
@@ -2531,29 +2437,31 @@ export class DiscordBot extends EventEmitter {
     await this.persist_entity_config(entity_config);
     this.build_channel_map();
 
-    // Assign a pool bot (planner by default)
+    // Assign a pool bot (planner by default). If the /room command carried
+    // initial context, inject it via the SessionStart hook (issue #290).
+    const pending_message = context
+      ? {
+          user: target.author_name,
+          channel_id,
+          message_id: "",
+          content: context,
+          ts: new Date().toISOString(),
+        }
+      : undefined;
     const assignment = await this._pool.assign(
       channel_id,
       routed.entity_id,
       "planner",
       undefined,
       "work_room",
+      undefined,
+      pending_message,
     );
 
     // Post confirmation in both source channel and new room
     await target.reply(`Room **#${name}** created. Session started.`);
     if (assignment) {
       await this.send(channel_id, "Room created. Session started.");
-
-      // Bridge initial context if provided
-      if (context) {
-        await this.bridge_first_message(
-          assignment.tmux_session,
-          context,
-          target.author_name,
-          channel_id,
-        );
-      }
     }
   }
 

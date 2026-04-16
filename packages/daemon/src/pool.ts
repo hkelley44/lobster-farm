@@ -115,11 +115,47 @@ export function is_tmux_session_idle(tmux_session: string): boolean {
   }
 }
 
-// ── Pending file path ──
+// ── Pending file paths ──
 
-/** Canonical path for the pending-message file used by bridge and drain. */
+/** Canonical path for the legacy pending-message .txt file used by the
+ * tmux send-keys drain path. Retained for backward compatibility with
+ * drain_pending_files() (belt-and-suspenders — see issue #279). */
 export function pending_file_path(tmux_session: string): string {
   return `/tmp/lf-pending-${tmux_session}.txt`;
+}
+
+/** Canonical path for the SessionStart-hook pending-message JSON file.
+ * Written by the daemon before spawning `claude`; consumed by the
+ * session-start-inject.sh hook during Claude CLI init. See issue #290. */
+export function pending_json_path(tmux_session: string): string {
+  return `/tmp/lf-pending-${tmux_session}.json`;
+}
+
+/** Payload written to pending_json_path(). Keep field names stable —
+ * session-start-inject.sh parses this directly via jq. */
+export interface PendingMessage {
+  /** Display name of the Discord user who sent the message. */
+  user: string;
+  /** Discord channel ID where the message was sent. */
+  channel_id: string;
+  /** Discord message ID (Snowflake), for future reply-to support. */
+  message_id: string;
+  /** Raw message content. */
+  content: string;
+  /** ISO-8601 timestamp of when the daemon received the message. */
+  ts: string;
+}
+
+/** Write a PendingMessage to the session's JSON pending-file path.
+ * Returns the absolute file path so callers can set LF_PENDING_FILE on the
+ * spawn env. Best-effort — throws only on unexpected filesystem errors. */
+export async function write_pending_message(
+  tmux_session: string,
+  msg: PendingMessage,
+): Promise<string> {
+  const path = pending_json_path(tmux_session);
+  await writeFile(path, `${JSON.stringify(msg)}\n`, "utf-8");
+  return path;
 }
 
 // ── Bot readiness polling ──
@@ -786,6 +822,28 @@ export class BotPool extends EventEmitter {
           }
         }
 
+        // Write a resume-nudge pending message and point LF_PENDING_FILE at
+        // it. The SessionStart hook (session-start-inject.sh) delivers it
+        // during Claude init as additionalContext — replacing the legacy
+        // bridge_resume_nudge() tmux send-keys path that raced against
+        // MCP plugin readiness. See issue #290.
+        try {
+          const nudge_path = await write_pending_message(bot.tmux_session, {
+            user: "lobsterfarm-daemon",
+            channel_id: candidate.channel_id,
+            message_id: "",
+            content:
+              "The daemon restarted and your session was resumed. Check where you left off and continue any in-progress work.",
+            ts: new Date().toISOString(),
+          });
+          extra_env.LF_PENDING_FILE = nudge_path;
+        } catch (err) {
+          console.warn(
+            `[pool] Failed to write resume nudge for pool-${String(bot.id)}: ${String(err)}`,
+          );
+          // Non-fatal: the session still resumes, just without the nudge.
+        }
+
         // Spawn a fresh Claude process with --resume — establishes a new MCP
         // connection to this daemon while preserving conversation context
         const working_dir = entity_dir(this.config.paths, candidate.entity_id);
@@ -820,14 +878,6 @@ export class BotPool extends EventEmitter {
           channel_id: bot.channel_id,
           entity_id: bot.entity_id,
         });
-
-        // Bridge a continuation nudge so the resumed session doesn't sit idle.
-        // Fire-and-forget — don't let a nudge failure block the resume loop.
-        this.bridge_resume_nudge(bot).catch((nudge_err) => {
-          console.warn(
-            `[pool] Failed to nudge pool-${String(bot.id)} after resume: ${String(nudge_err)}`,
-          );
-        });
       } catch (err) {
         console.error(`[pool] Failed to resume pool-${String(bot.id)}: ${String(err)}`);
         sentry.captureException(err, {
@@ -851,7 +901,14 @@ export class BotPool extends EventEmitter {
     }
   }
 
-  /** Assign a pool bot to a channel with a specific archetype. */
+  /** Assign a pool bot to a channel with a specific archetype.
+   *
+   * If `pending_message` is provided, the daemon writes it to a JSON file and
+   * sets `LF_PENDING_FILE` on the spawned Claude CLI's env. The
+   * SessionStart hook (session-start-inject.sh) reads it during Claude init
+   * and injects the message as additionalContext — replacing the legacy
+   * tmux send-keys bridging that raced against MCP plugin readiness
+   * (issue #290). */
   async assign(
     channel_id: string,
     entity_id: string,
@@ -859,6 +916,7 @@ export class BotPool extends EventEmitter {
     resume_session_id?: string,
     channel_type?: ChannelType,
     working_dir?: string,
+    pending_message?: PendingMessage,
   ): Promise<PoolAssignment | null> {
     if (this._draining) {
       console.log("[pool] Rejecting assignment — draining");
@@ -1034,6 +1092,23 @@ export class BotPool extends EventEmitter {
         } catch (err) {
           console.warn(`[pool] Failed to resolve GH_TOKEN for ${entity_id}: ${String(err)}`);
           // Non-fatal: session starts without GH_TOKEN
+        }
+      }
+
+      // If a pending message was provided, write it to the JSON file and
+      // point the spawn's LF_PENDING_FILE env var at it. The SessionStart
+      // hook (session-start-inject.sh) will pick it up during Claude CLI
+      // init and inject it as additionalContext — no tmux bridging needed.
+      // See issue #290.
+      if (pending_message) {
+        try {
+          const path = await write_pending_message(bot.tmux_session, pending_message);
+          extra_env.LF_PENDING_FILE = path;
+        } catch (err) {
+          console.warn(
+            `[pool] Failed to write pending message for pool-${String(bot.id)}: ${String(err)}`,
+          );
+          // Non-fatal: session still starts, just without the initial context.
         }
       }
 
@@ -1469,9 +1544,11 @@ export class BotPool extends EventEmitter {
       // Deliver any queued messages to bots that are now at the prompt
       this.drain_pending_injections();
 
-      // Safety net: recover undelivered pending files left by failed bridge attempts.
-      // If bridge_first_message or bridge_resume_nudge timed out but the bot later
-      // became ready, deliver the pending file content via tmux send-keys.
+      // Safety net: recover undelivered legacy .txt pending files left by
+      // any older spawn path. The canonical SessionStart-hook injection
+      // (issue #290) uses .json files consumed by the hook script and
+      // doesn't need drain recovery — but we keep this logic for the
+      // legacy .txt format as belt-and-suspenders per the issue spec.
       await this.drain_pending_files();
 
       for (const bot of this.bots) {
@@ -2417,13 +2494,13 @@ export class BotPool extends EventEmitter {
   }
 
   /**
-   * Safety net for failed bridge attempts.
+   * Safety net for legacy .txt pending files (pre-#290 tmux bridge path).
    *
    * Scans assigned bots for orphaned /tmp/lf-pending-{session}.txt files.
    * If the bot is alive and at the prompt, delivers the message via tmux
-   * send-keys and removes the file. This catches the case where
-   * bridge_first_message or bridge_resume_nudge timed out but the bot
-   * became ready later.
+   * send-keys and removes the file. Kept as belt-and-suspenders even
+   * though the canonical injection path is now the SessionStart hook —
+   * see issue #290.
    */
   private async drain_pending_files(): Promise<void> {
     for (const bot of this.bots) {
@@ -2458,72 +2535,6 @@ export class BotPool extends EventEmitter {
         console.warn(`[pool] Failed to drain pending file for ${bot.tmux_session}: ${String(err)}`);
       }
     }
-  }
-
-  /**
-   * Bridge a continuation nudge to a resumed bot's Claude Code process.
-   * Writes a pending message file that the MCP Discord plugin picks up,
-   * using the same mechanism as bridge_first_message in discord.ts.
-   *
-   * Uses wait_for_bot_ready_with_retries for robust readiness detection
-   * with up to 3 attempts (~90s total coverage).
-   */
-  private async bridge_resume_nudge(bot: PoolBot): Promise<void> {
-    const pending_path = pending_file_path(bot.tmux_session);
-    const nudge =
-      "The daemon restarted and your session was resumed. " +
-      "Check where you left off and continue any in-progress work.";
-
-    // Write file first so drain_pending_files can recover it if readiness times out
-    await writeFile(pending_path, nudge, "utf-8");
-
-    const ready = await wait_for_bot_ready_with_retries(bot.tmux_session);
-
-    if (!ready) {
-      console.log(
-        `[pool] Bot ${bot.tmux_session} not ready after all retries — resume nudge not sent`,
-      );
-      // pending_path stays in place for drain_pending_files to recover
-      return;
-    }
-
-    // Guard against drain having already delivered while we were polling.
-    // drain_pending_files runs on the 30s health-check timer and may have
-    // claimed and sent the file during the ~90s readiness wait.
-    try {
-      await access(pending_path);
-    } catch {
-      console.log(
-        `[pool] Pending file already claimed by drain for ${bot.tmux_session} — skipping nudge send`,
-      );
-      return;
-    }
-
-    // Small extra delay for the MCP plugin to fully connect
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-
-    // Deliver the nudge via tmux send-keys — the file alone is not enough.
-    // The send-keys call injects a prompt into Claude's stdin telling it
-    // to read the pending file (same pattern as bridge_first_message).
-    execFileSync(
-      "tmux",
-      [
-        "send-keys",
-        "-t",
-        bot.tmux_session,
-        `Your session was resumed after a daemon restart. Read ${pending_path} and continue any in-progress work.`,
-        "Enter",
-      ],
-      { stdio: "ignore", timeout: 5000 },
-    );
-
-    console.log(`[pool] Bridged resume nudge to ${bot.tmux_session}`);
-
-    // Clean up shortly after — Claude has the prompt and will read it within seconds.
-    // Keep this well under the 30s health-check interval to prevent drain_pending_files
-    // from re-delivering the same message after Claude finishes processing.
-    const cleanup = this.mark_draining(bot.tmux_session, pending_path);
-    setTimeout(cleanup, 5_000);
   }
 
   /**

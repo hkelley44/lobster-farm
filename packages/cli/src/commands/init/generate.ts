@@ -1,5 +1,5 @@
 import { statSync } from "node:fs";
-import { copyFile, mkdir, readdir, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -7,6 +7,7 @@ import {
   type PathConfig,
   type TemplateVariables,
   agents_dir,
+  claude_hooks_dir,
   claude_md_path,
   claude_settings_path,
   dna_versions_dir,
@@ -121,11 +122,41 @@ export async function generate_config_files(
     // skills directory might not exist — not fatal
   }
 
+  // ── Hooks: copy all hook scripts and chmod +x ──
+  // Hooks are tiny shell scripts invoked by Claude Code during lifecycle
+  // events (SessionStart, PreToolUse, Stop, etc.). See generate_settings()
+  // for the settings.json registration that wires them up.
+  const hooks_src = join(config_dir, "claude", "hooks");
+  try {
+    const hook_entries = await readdir(hooks_src, { withFileTypes: true });
+    const dest_hooks_dir = claude_hooks_dir(path_overrides);
+    await mkdir(dest_hooks_dir, { recursive: true });
+    for (const entry of hook_entries) {
+      if (!entry.isFile()) continue;
+      const src_file = join(hooks_src, entry.name);
+      const dest_file = join(dest_hooks_dir, entry.name);
+      await copyFile(src_file, dest_file);
+      // Preserve executability — copyFile doesn't always carry perms across
+      // filesystems, so set +x explicitly on shell scripts.
+      if (entry.name.endsWith(".sh")) {
+        await chmod(dest_file, 0o755);
+      }
+      created.push(dest_file);
+    }
+  } catch {
+    // hooks directory might not exist — not fatal
+  }
+
   return created;
 }
 
 /** Generate the ~/.claude/settings.json with bypass permissions and hooks. */
 export async function generate_settings(path_overrides?: Partial<PathConfig>): Promise<string> {
+  // Absolute path to the deployed SessionStart hook. We use an absolute path
+  // rather than relying on $HOME expansion because Claude Code's hook runner
+  // doesn't guarantee a shell wrapper.
+  const session_start_hook = join(claude_hooks_dir(path_overrides), "session-start-inject.sh");
+
   const settings = {
     permissions: {
       defaultMode: "bypassPermissions",
@@ -133,6 +164,23 @@ export async function generate_settings(path_overrides?: Partial<PathConfig>): P
     effortLevel: "high",
     skipDangerousModePermissionPrompt: true,
     hooks: {
+      SessionStart: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "command",
+              // Deployed by generate_config_files() from
+              // config/claude/hooks/session-start-inject.sh. Reads the
+              // LF_PENDING_FILE env var (set by the daemon before spawn)
+              // and emits the pending Discord message as additionalContext.
+              // No-ops if the env var is unset or the file is missing.
+              command: session_start_hook,
+              timeout: 5,
+            },
+          ],
+        },
+      ],
       PreToolUse: [
         {
           matcher: "Edit|Write",
@@ -191,6 +239,7 @@ export async function create_directory_structure(
     dna_versions_dir(path_overrides),
     agents_dir(path_overrides),
     skills_dir(path_overrides),
+    claude_hooks_dir(path_overrides),
   ];
 
   for (const dir of dirs) {
