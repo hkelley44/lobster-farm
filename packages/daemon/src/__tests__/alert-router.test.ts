@@ -397,3 +397,84 @@ describe("post_alert — no alerts channel", () => {
     expect(discord.send_embed).not.toHaveBeenCalled();
   });
 });
+
+// ── Daily thread cache eviction on date rollover ──
+
+describe("daily thread cache eviction", () => {
+  it("evicts stale entries from previous days on new-day access", async () => {
+    const discord = make_discord_mock();
+    const daily_threads = new Map<string, string>();
+    // Pre-populate with yesterday's entry
+    daily_threads.set("test-entity:2026-04-14", "old-thread-id");
+    const router = new AlertRouter(discord as unknown as any, config, { daily_threads });
+
+    // Post a routine alert "today" (April 15)
+    const now = new Date(2026, 3, 15, 10, 0, 0);
+    // We can't inject `now` into post_alert directly — it flows through resolve_daily_thread.
+    // But we can verify the cache state after a routine event by checking thread creation behavior.
+    // The stale entry for 2026-04-14 should be evicted, and a new thread created for 2026-04-15.
+
+    await router.post_alert({
+      entity_id: "test-entity",
+      tier: "routine",
+      title: "PR merged",
+      body: "feat: something",
+    });
+
+    // Yesterday's key should be evicted
+    expect(daily_threads.has("test-entity:2026-04-14")).toBe(false);
+    // Today's key should exist (created during the routine post)
+    // The exact key depends on the current date since we can't inject `now` into post_alert,
+    // but the map should have exactly 1 entry (stale one evicted, new one added)
+    expect(daily_threads.size).toBe(1);
+  });
+});
+
+// ── resolve_incident title-strip regex ──
+
+describe("resolve_incident title regex", () => {
+  it("strips leading emoji from incident title", async () => {
+    const discord = make_discord_mock();
+    const router = new AlertRouter(discord as unknown as any, config);
+
+    const incidents: ActiveIncidentsState = {
+      "thread-001": {
+        entity_id: "test-entity",
+        thread_id: "thread-001",
+        message_id: "msg-001",
+        channel_id: "alerts-channel-123",
+        title: "🔴 P0: NullRef in order_executor.py",
+        created_at: new Date().toISOString(),
+      },
+    };
+    await save_active_incidents(incidents, config);
+
+    await router.resolve_incident("thread-001", "Fixed in PR #99");
+
+    const embed_arg = discord.edit_message_embed.mock.calls[0]![2] as EmbedBuilder;
+    // Should strip the emoji prefix, preserving "P0: NullRef..."
+    expect(embed_arg.data.title).toBe("✅ Resolved: P0: NullRef in order_executor.py");
+  });
+
+  it("preserves title when no leading emoji", async () => {
+    const discord = make_discord_mock();
+    const router = new AlertRouter(discord as unknown as any, config);
+
+    const incidents: ActiveIncidentsState = {
+      "thread-002": {
+        entity_id: "test-entity",
+        thread_id: "thread-002",
+        message_id: "msg-002",
+        channel_id: "alerts-channel-123",
+        title: "P1: Connection pool exhaustion",
+        created_at: new Date().toISOString(),
+      },
+    };
+    await save_active_incidents(incidents, config);
+
+    await router.resolve_incident("thread-002", "Increased pool size");
+
+    const embed_arg = discord.edit_message_embed.mock.calls[0]![2] as EmbedBuilder;
+    expect(embed_arg.data.title).toBe("✅ Resolved: P1: Connection pool exhaustion");
+  });
+});

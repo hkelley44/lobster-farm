@@ -1263,7 +1263,7 @@ export class DiscordBot extends EventEmitter {
       if (match) return match.id;
 
       // Also check recently archived threads (covers daemon restart case)
-      const archived = await text_channel.threads.fetchArchived({ limit: 10 });
+      const archived = await text_channel.threads.fetchArchived({ limit: 50 });
       const archived_match = archived.threads.find((t) => t.name === name);
       if (archived_match) return archived_match.id;
 
