@@ -48,6 +48,22 @@ describe("build_model_flags", () => {
     expect(flags).toContain("--effort");
     expect(flags).toContain("low");
   });
+
+  it("maps opus/xhigh to correct flags", () => {
+    const flags = build_model_flags({ model: "opus", think: "xhigh" });
+    expect(flags).toContain("--model");
+    expect(flags).toContain("claude-opus-4-7");
+    expect(flags).toContain("--effort");
+    expect(flags).toContain("xhigh");
+  });
+
+  it("maps opus/max to correct flags", () => {
+    const flags = build_model_flags({ model: "opus", think: "max" });
+    expect(flags).toContain("--model");
+    expect(flags).toContain("claude-opus-4-7");
+    expect(flags).toContain("--effort");
+    expect(flags).toContain("max");
+  });
 });
 
 describe("ClaudeSessionManager", () => {
