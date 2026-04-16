@@ -174,6 +174,8 @@ export function generate_plist(
   <true/>
   <key>RunAtLoad</key>
   <true/>
+  <key>ExitTimeout</key>
+  <integer>300</integer>
 </dict>
 </plist>`;
 }

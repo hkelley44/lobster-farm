@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { LAUNCHD_LABEL, pid_file_path } from "@lobster-farm/shared";
 import { Command } from "commander";
-import { generate_wrapper_sh } from "../lib/launchd.js";
+import { generate_plist, generate_wrapper_sh, plist_path } from "../lib/launchd.js";
 import { is_service_loaded } from "../lib/launchd.js";
 import { is_process_running, read_pid_file } from "../lib/process.js";
 import { resolve_daemon_path } from "./start.js";
@@ -30,23 +30,32 @@ export const restart_command = new Command("restart")
       return;
     }
 
-    // Regenerate the wrapper script before restarting so the new process
-    // picks up any changes (heap size, op run integration, daemon path).
+    // Regenerate the wrapper script and plist before restarting so the new
+    // process picks up any changes (heap size, op run integration, daemon
+    // path, ExitTimeout for graceful drain).
     const home = homedir();
     const wrapper_path = join(home, ".lobsterfarm", "bin", "start-daemon.sh");
+    const log_path = join(home, ".lobsterfarm", "logs", "daemon.log");
+    const working_dir = join(home, ".lobsterfarm");
+
     const wrapper_content = generate_wrapper_sh(resolve_node_path(), resolve_daemon_path());
     await writeFile(wrapper_path, wrapper_content, { encoding: "utf-8", mode: 0o755 });
     await chmod(wrapper_path, 0o755);
-    console.log("Regenerated wrapper script.");
+
+    const plist_content = generate_plist(wrapper_path, log_path, working_dir);
+    await writeFile(plist_path(), plist_content, { encoding: "utf-8" });
+
+    console.log("Regenerated wrapper script and plist.");
 
     // launchctl kickstart -k sends SIGTERM to the running process and
-    // immediately starts a fresh one.  Because the daemon's shutdown handler
-    // no longer kills tmux sessions, pool bots survive the restart and are
-    // rediscovered on startup via pool-state.json + tmux has-session checks.
+    // starts a fresh one after ExitTimeout.  The daemon's shutdown handler
+    // drains active sessions before exiting — pool bots survive the restart
+    // and are rediscovered on startup via pool-state.json + tmux checks.
+    // Send a second SIGTERM (kill the PID) to force immediate shutdown.
     const uid = process.getuid?.() ?? 501;
     execFileSync("launchctl", ["kickstart", "-k", `gui/${uid}/${LAUNCHD_LABEL}`]);
 
-    console.log("Daemon restarting... tmux sessions preserved.");
+    console.log("Daemon restarting — draining active sessions (up to 5 min)...");
 
     // Poll for the new process to start and write its PID file.
     const POLL_INTERVAL_MS = 500;
