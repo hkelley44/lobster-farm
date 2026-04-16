@@ -16,6 +16,7 @@ import type { ArchetypeRole } from "@lobster-farm/shared";
 import { expand_home } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { type ReviewOutcome, detect_review_outcome } from "./actions.js";
+import { ALERT_COLOR_AMBER, ALERT_COLOR_RED, type AlertRouter } from "./alert-router.js";
 import {
   type CheckSuiteWebhookPayload,
   handle_check_suite,
@@ -71,6 +72,7 @@ export interface WebhookContext {
   config: LobsterFarmConfig;
   pool: BotPool | null;
   pr_watches: PRWatchStore | null;
+  alert_router: AlertRouter | null;
 }
 
 /** Minimal PR shape from webhook payload. */
@@ -735,11 +737,12 @@ async function handle_review_completion(
   if (outcome === "changes_requested") {
     // Spawn builder to fix
     await spawn_fixer(entity_id, repo_path, pr, ctx, installation_id);
-    await notify_alerts(
+    await ctx.alert_router?.post_alert({
       entity_id,
-      `PR #${String(pr.number)}: ${pr.title} — changes requested, spawning builder to fix`,
-      ctx,
-    );
+      tier: "routine",
+      title: `PR #${String(pr.number)} changes requested`,
+      body: `${pr.title} — spawning builder to fix`,
+    });
     // Informational: let the watching bot know review feedback arrived.
     // Not terminal — the fix loop will push new commits, triggering re-review.
     // The watch stays alive so the bot gets the final merged/closed event.
@@ -783,11 +786,12 @@ async function handle_review_completion(
 
           if (result.merged) {
             await post_auto_merge_cleanup(pr, entity_id, repo_path, ctx, installation_id);
-            await notify_alerts(
+            await ctx.alert_router?.post_alert({
               entity_id,
-              `PR #${String(pr.number)}: ${pr.title} — approved and merged (pr-cron disabled, CI pending bypassed)`,
-              ctx,
-            );
+              tier: "routine",
+              title: `PR #${String(pr.number)} merged`,
+              body: `${pr.title} — approved and merged (CI pending bypassed)`,
+            });
             await notify_pr_watcher(
               repo_full_name,
               pr.number,
@@ -796,11 +800,13 @@ async function handle_review_completion(
             );
           } else {
             const failure_tag = result.failure ? ` [${result.failure}]` : "";
-            await notify_alerts(
+            await ctx.alert_router?.post_alert({
               entity_id,
-              `PR #${String(pr.number)}: ${pr.title} — approved but CI checks pending and pr-cron is disabled. Merge failed${failure_tag}: ${result.error ?? "manual intervention needed."}`,
-              ctx,
-            );
+              tier: "action_required",
+              title: `\u26a0\ufe0f Merge failed — PR #${String(pr.number)}`,
+              body: `${pr.title} — CI pending, pr-cron disabled. Merge failed${failure_tag}: ${result.error ?? "manual intervention needed."}`,
+              embed_color: ALERT_COLOR_AMBER,
+            });
           }
         }
       } else if (ci.failures.length > 0) {
@@ -819,11 +825,12 @@ async function handle_review_completion(
         if (result.merged) {
           // Post-merge cleanup: close linked issues and clean up worktrees
           await post_auto_merge_cleanup(pr, entity_id, repo_path, ctx, installation_id);
-          await notify_alerts(
+          await ctx.alert_router?.post_alert({
             entity_id,
-            `PR #${String(pr.number)}: ${pr.title} — approved, auto-rebased (${result.method}), and merged`,
-            ctx,
-          );
+            tier: "routine",
+            title: `PR #${String(pr.number)} merged`,
+            body: `${pr.title} — approved, auto-rebased (${result.method}), and merged`,
+          });
           // Auto-merged — notify watching bot
           await notify_pr_watcher(
             repo_full_name,
@@ -833,19 +840,22 @@ async function handle_review_completion(
           );
         } else {
           const failure_tag = result.failure ? ` [${result.failure}]` : "";
-          await notify_alerts(
+          await ctx.alert_router?.post_alert({
             entity_id,
-            `PR #${String(pr.number)}: ${pr.title} — approved but merge failed${failure_tag}. ${result.error ?? "Manual intervention needed."}`,
-            ctx,
-          );
+            tier: "action_required",
+            title: `\u26a0\ufe0f Merge failed — PR #${String(pr.number)}`,
+            body: `${pr.title} — approved but merge failed${failure_tag}. ${result.error ?? "Manual intervention needed."}`,
+            embed_color: ALERT_COLOR_AMBER,
+          });
         }
       }
     } else {
-      await notify_alerts(
+      await ctx.alert_router?.post_alert({
         entity_id,
-        `PR #${String(pr.number)}: ${pr.title} — approved and merged`,
-        ctx,
-      );
+        tier: "routine",
+        title: `PR #${String(pr.number)} merged`,
+        body: `${pr.title} — approved and merged`,
+      });
       // Reviewer already merged — notify watching bot
       await notify_pr_watcher(
         repo_full_name,
@@ -863,17 +873,19 @@ async function handle_review_completion(
     console.log(
       `[webhook] All reviews dismissed on PR #${String(pr.number)} — will be re-reviewed next cycle`,
     );
-    await notify_alerts(
+    await ctx.alert_router?.post_alert({
       entity_id,
-      `PR #${String(pr.number)}: "${pr.title}" — all reviews dismissed, will re-review next cycle`,
-      ctx,
-    );
+      tier: "routine",
+      title: `PR #${String(pr.number)} reviews dismissed`,
+      body: `"${pr.title}" — all reviews dismissed, will re-review next cycle`,
+    });
   } else {
-    await notify_alerts(
+    await ctx.alert_router?.post_alert({
       entity_id,
-      `PR #${String(pr.number)} review completed: "${pr.title}" (${outcome})`,
-      ctx,
-    );
+      tier: "routine",
+      title: `PR #${String(pr.number)} review completed`,
+      body: `"${pr.title}" (${outcome})`,
+    });
   }
 }
 
@@ -1212,11 +1224,12 @@ async function spawn_ci_fixer(
   const attempts = entry?.ci_fix_attempts ?? 0;
 
   if (attempts >= MAX_CI_FIX_ATTEMPTS) {
-    await notify_alerts(
+    await ctx.alert_router?.post_alert({
       entity_id,
-      `PR #${String(pr.number)}: ${pr.title} — CI fix failed after ${String(MAX_CI_FIX_ATTEMPTS)} attempts. Needs human intervention. Failed checks: ${failed_checks.join(", ")}`,
-      ctx,
-    );
+      tier: "action_required",
+      title: `\u{1f6d1} CI fix exhausted — PR #${String(pr.number)}`,
+      body: `${pr.title} — failed after ${String(MAX_CI_FIX_ATTEMPTS)} attempts. Needs human intervention. Failed: ${failed_checks.join(", ")}`,
+    });
     return;
   }
 
@@ -1262,11 +1275,12 @@ async function spawn_ci_fixer(
     `[webhook] Spawning CI fix builder for PR #${String(pr.number)} in ${entity_id} (attempt ${String(attempts + 1)}/${String(MAX_CI_FIX_ATTEMPTS)})`,
   );
 
-  await notify_alerts(
+  await ctx.alert_router?.post_alert({
     entity_id,
-    `PR #${String(pr.number)}: ${pr.title} — approved but CI failed (${failed_checks.join(", ")}), spawning builder to fix (attempt ${String(attempts + 1)}/${String(MAX_CI_FIX_ATTEMPTS)})`,
-    ctx,
-  );
+    tier: "routine",
+    title: `PR #${String(pr.number)} CI fix spawned`,
+    body: `${pr.title} — CI failed (${failed_checks.join(", ")}), spawning builder (attempt ${String(attempts + 1)}/${String(MAX_CI_FIX_ATTEMPTS)})`,
+  });
 
   try {
     await ctx.session_manager.spawn({
@@ -1324,12 +1338,12 @@ async function spawn_deploy_triage(
       `[webhook] Deploy triage exhausted for ${triage_key} ` +
         `(${String(existing.fix_attempts)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)}) — skipping`,
     );
-    await notify_alerts(
+    await ctx.alert_router?.post_alert({
       entity_id,
-      `Deploy fix loop exhausted for workflow "${workflow.name}" ` +
-        `(${String(MAX_DEPLOY_FIX_ATTEMPTS)} attempts). Manual intervention needed. ${workflow.html_url}`,
-      ctx,
-    );
+      tier: "action_required",
+      title: `\u{1f6d1} Deploy fix exhausted — ${workflow.name}`,
+      body: `${String(MAX_DEPLOY_FIX_ATTEMPTS)} attempts failed. Manual intervention needed. ${workflow.html_url}`,
+    });
     return;
   }
 
@@ -1349,12 +1363,12 @@ async function spawn_deploy_triage(
       `[webhook] Deploy safety valve triggered for ${entity_id} ` +
         `(${String(entity_attempts_24h)} attempts in 24h) — skipping`,
     );
-    await notify_alerts(
+    await ctx.alert_router?.post_alert({
       entity_id,
-      `Deploy auto-triage paused for ${entity_id}: ${String(entity_attempts_24h)} fix attempts ` +
-        `in 24h (safety valve = ${String(DEPLOY_SAFETY_VALVE)}). Manual intervention needed.`,
-      ctx,
-    );
+      tier: "action_required",
+      title: `\u{1f6d1} Deploy safety valve — ${entity_id}`,
+      body: `${String(entity_attempts_24h)} fix attempts in 24h (safety valve = ${String(DEPLOY_SAFETY_VALVE)}). Auto-triage paused. Manual intervention needed.`,
+    });
     return;
   }
 
@@ -1408,11 +1422,13 @@ async function spawn_deploy_triage(
       `(run ${String(workflow.id)}, attempt ${String(attempt)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)})`,
   );
 
-  await notify_alerts(
+  await ctx.alert_router?.post_alert({
     entity_id,
-    `\u26a0\ufe0f Deploy failed on main — Gary triaging (attempt ${String(attempt)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)}). ${workflow.html_url}`,
-    ctx,
-  );
+    tier: "action_required",
+    title: "\u26a0\ufe0f Deploy failed on main",
+    body: `Gary triaging "${workflow.name}" (attempt ${String(attempt)}/${String(MAX_DEPLOY_FIX_ATTEMPTS)}). ${workflow.html_url}`,
+    embed_color: ALERT_COLOR_RED,
+  });
 
   try {
     await ctx.session_manager.spawn({
@@ -1854,16 +1870,7 @@ async function handle_workflow_run(payload: WebhookPayload, ctx: WebhookContext)
 
 // ── Utility helpers ──
 
-async function notify_alerts(
-  entity_id: string,
-  message: string,
-  ctx: WebhookContext,
-): Promise<void> {
-  console.log(`[webhook:alerts] ${message}`);
-  if (ctx.discord) {
-    await ctx.discord.send_to_entity(entity_id, "alerts", message, "reviewer" as ArchetypeRole);
-  }
-}
+// notify_alerts removed — all call sites migrated to ctx.alert_router.post_alert()
 
 /**
  * Check if any bot is watching this PR and, if so, inject the event message

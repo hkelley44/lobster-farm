@@ -477,6 +477,13 @@ function make_entity_with_github_user(github_user: string): EntityConfig {
  * Create a PRReviewCron instance with private methods patched for testing
  * the retry_approved_unmerged pass without needing real gh CLI calls.
  */
+function make_mock_alert_router() {
+  return {
+    post_alert: vi.fn().mockResolvedValue({ message_id: null }),
+    resolve_incident: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 function make_retry_test_cron(
   opts: {
     discord?: DiscordBot | null;
@@ -485,6 +492,7 @@ function make_retry_test_cron(
   } = {},
 ): {
   cron: PRReviewCron;
+  alert_router: ReturnType<typeof make_mock_alert_router>;
   get_processed: () => Record<string, ProcessedPR>;
   call_retry: (
     entity_id: string,
@@ -494,12 +502,15 @@ function make_retry_test_cron(
   ) => Promise<void>;
 } {
   const config = make_config();
+  const alert_router = make_mock_alert_router();
   const cron = new PRReviewCron(
     { get_active: () => [], get: vi.fn() } as never,
     { spawn: vi.fn(), on: vi.fn(), removeListener: vi.fn() } as never,
     config,
     opts.discord ?? null,
-    null,
+    null, // github_app
+    null, // pr_watches
+    alert_router as never,
   );
 
   // Patch private methods that require gh CLI or GitHub App auth
@@ -519,9 +530,6 @@ function make_retry_test_cron(
   // close_issues_for_merged_pr — no-op
   cron_any.close_issues_for_merged_pr = vi.fn().mockResolvedValue(undefined);
 
-  // notify_alerts — no-op (or spy on discord mock)
-  cron_any.notify_alerts = vi.fn().mockResolvedValue(undefined);
-
   // Seed processed state
   if (opts.processed) {
     cron_any.processed = { ...opts.processed };
@@ -529,6 +537,7 @@ function make_retry_test_cron(
 
   return {
     cron,
+    alert_router,
     get_processed: () => cron_any.processed as Record<string, ProcessedPR>,
     call_retry: (entity_id, repo_path, prs, entity_config) =>
       (
@@ -630,7 +639,7 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
       failures: ["Build", "Test"],
     });
 
-    const { cron, call_retry, get_processed } = make_retry_test_cron({
+    const { alert_router, call_retry, get_processed } = make_retry_test_cron({
       processed: {
         [`${entity_id}:42`]: {
           entity_id,
@@ -644,12 +653,11 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     await call_retry(entity_id, repo_path, [pr], entity_config);
 
     expect(mock_auto_merge).not.toHaveBeenCalled();
-    const notify_alerts = (cron as unknown as Record<string, unknown>).notify_alerts as ReturnType<
-      typeof vi.fn
-    >;
-    expect(notify_alerts).toHaveBeenCalledWith(
-      entity_id,
-      expect.stringContaining("spawning builder to fix"),
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id,
+        body: expect.stringContaining("spawning builder"),
+      }),
     );
 
     // Should record the failure set for deduplication
@@ -669,7 +677,7 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
       failures: ["Build", "Test"],
     });
 
-    const { cron, call_retry } = make_retry_test_cron({
+    const { alert_router, call_retry } = make_retry_test_cron({
       processed: {
         [`${entity_id}:42`]: {
           entity_id,
@@ -684,10 +692,7 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     await call_retry(entity_id, repo_path, [pr], entity_config);
 
     // Should NOT alert again — same failure set
-    const notify_alerts = (cron as unknown as Record<string, unknown>).notify_alerts as ReturnType<
-      typeof vi.fn
-    >;
-    expect(notify_alerts).not.toHaveBeenCalled();
+    expect(alert_router.post_alert).not.toHaveBeenCalled();
     expect(mock_auto_merge).not.toHaveBeenCalled();
   });
 
@@ -702,7 +707,7 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
       failures: ["Lint", "Deploy"],
     });
 
-    const { cron, call_retry, get_processed } = make_retry_test_cron({
+    const { alert_router, call_retry, get_processed } = make_retry_test_cron({
       processed: {
         [`${entity_id}:42`]: {
           entity_id,
@@ -717,12 +722,11 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
     await call_retry(entity_id, repo_path, [pr], entity_config);
 
     // Should alert — different failure set
-    const notify_alerts = (cron as unknown as Record<string, unknown>).notify_alerts as ReturnType<
-      typeof vi.fn
-    >;
-    expect(notify_alerts).toHaveBeenCalledWith(
-      entity_id,
-      expect.stringContaining("spawning builder to fix"),
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id,
+        body: expect.stringContaining("spawning builder"),
+      }),
     );
 
     // Should update the recorded failure set
@@ -836,6 +840,7 @@ function make_ci_fixer_test_cron(
 ): {
   cron: PRReviewCron;
   session_manager: { spawn: ReturnType<typeof vi.fn> };
+  alert_router: ReturnType<typeof make_mock_alert_router>;
   get_processed: () => Record<string, ProcessedPR>;
   get_active_reviews: () => Map<string, unknown>;
   resolve_entity_token: ReturnType<typeof vi.fn>;
@@ -848,6 +853,7 @@ function make_ci_fixer_test_cron(
   ) => Promise<boolean>;
 } {
   const config = make_config();
+  const alert_router = make_mock_alert_router();
   const mock_spawn = vi.fn().mockResolvedValue({
     session_id: "ci-fix-session-123",
     entity_id: "test-entity",
@@ -865,8 +871,10 @@ function make_ci_fixer_test_cron(
     { get_active: () => [], get: vi.fn() } as never,
     session_manager as never,
     config,
-    null,
-    null,
+    null, // discord
+    null, // github_app
+    null, // pr_watches
+    alert_router as never,
   );
 
   const cron_any = cron as unknown as Record<string, unknown>;
@@ -877,9 +885,6 @@ function make_ci_fixer_test_cron(
     : vi.fn().mockResolvedValue("ghs_test_token");
   cron_any.resolve_entity_token = resolve_token_mock;
 
-  // notify_alerts — no-op spy
-  cron_any.notify_alerts = vi.fn().mockResolvedValue(undefined);
-
   // Seed processed state
   if (opts.processed) {
     cron_any.processed = { ...opts.processed };
@@ -888,6 +893,7 @@ function make_ci_fixer_test_cron(
   return {
     cron,
     session_manager,
+    alert_router,
     get_processed: () => cron_any.processed as Record<string, ProcessedPR>,
     get_active_reviews: () => cron_any.active_reviews as Map<string, unknown>,
     resolve_entity_token: resolve_token_mock,
@@ -953,7 +959,7 @@ describe("PRReviewCron.spawn_ci_fixer", () => {
     const pr = make_test_pr();
     const entity_config = make_entity_with_github_user("test-user");
 
-    const { cron, session_manager, call_spawn_ci_fixer } = make_ci_fixer_test_cron({
+    const { alert_router, session_manager, call_spawn_ci_fixer } = make_ci_fixer_test_cron({
       processed: {
         [`${entity_id}:42`]: {
           entity_id,
@@ -971,12 +977,12 @@ describe("PRReviewCron.spawn_ci_fixer", () => {
     expect(session_manager.spawn).not.toHaveBeenCalled();
 
     // Should alert about max attempts
-    const notify_alerts = (cron as unknown as Record<string, unknown>).notify_alerts as ReturnType<
-      typeof vi.fn
-    >;
-    expect(notify_alerts).toHaveBeenCalledWith(
-      entity_id,
-      expect.stringContaining("CI fix failed after 3 attempts"),
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id,
+        tier: "action_required",
+        body: expect.stringContaining("failed after 3 attempts"),
+      }),
     );
   });
 

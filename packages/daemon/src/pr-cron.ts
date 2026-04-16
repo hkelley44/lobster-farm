@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { promisify } from "node:util";
-import type { ArchetypeRole, EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
+import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { expand_home } from "@lobster-farm/shared";
 import { type ReviewOutcome, detect_review_outcome } from "./actions.js";
+import { ALERT_COLOR_AMBER, type AlertRouter } from "./alert-router.js";
 import type { DiscordBot } from "./discord.js";
 import { resolve_binary } from "./env.js";
 import type { GitHubAppAuth } from "./github-app.js";
@@ -115,9 +116,10 @@ export class PRReviewCron {
     private registry: EntityRegistry,
     private session_manager: ClaudeSessionManager,
     private config: LobsterFarmConfig,
-    private discord: DiscordBot | null = null,
+    _discord: DiscordBot | null = null,
     private github_app: GitHubAppAuth | null = null,
     private pr_watches: PRWatchStore | null = null,
+    private alert_router: AlertRouter | null = null,
   ) {}
 
   /** Start the polling cron. Loads persisted review state before first poll. */
@@ -599,17 +601,13 @@ export class PRReviewCron {
 
     if (review_state === "changes_requested") {
       await this.spawn_external_pr_fixer(entity_id, repo_path, pr, entity_config);
-      if (is_internal) {
-        await this.notify_alerts(
-          entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — needs changes, spawning builder to fix`,
-        );
-      } else {
-        await this.notify_alerts(
-          entity_id,
-          `External PR #${String(pr.number)} from @${pr.author.login}: ${pr.title} — needs changes, spawning builder to fix`,
-        );
-      }
+      const prefix = is_internal ? "" : `External (from @${pr.author.login}) `;
+      await this.alert_router?.post_alert({
+        entity_id,
+        tier: "routine",
+        title: `${prefix}PR #${String(pr.number)} changes requested`,
+        body: `${pr.title} — spawning builder to fix`,
+      });
     } else if (review_state === "approved") {
       // Check if the reviewer already merged (they're instructed to merge on approval)
       const is_merged = await this.check_pr_merged(repo_path, pr.number, gh_token);
@@ -617,18 +615,13 @@ export class PRReviewCron {
       if (is_merged) {
         // Reviewer merged — close linked issues and notify
         await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
-
-        if (is_internal) {
-          await this.notify_alerts(
-            entity_id,
-            `PR #${String(pr.number)}: ${pr.title} — approved and merged to main`,
-          );
-        } else {
-          await this.notify_alerts(
-            entity_id,
-            `External PR #${String(pr.number)} from @${pr.author.login}: ${pr.title} — approved and merged to main`,
-          );
-        }
+        const prefix = is_internal ? "" : `External (from @${pr.author.login}) `;
+        await this.alert_router?.post_alert({
+          entity_id,
+          tier: "routine",
+          title: `${prefix}PR #${String(pr.number)} merged`,
+          body: `${pr.title} — approved and merged to main`,
+        });
 
         // Clean up local worktrees for the merged branch
         await try_cleanup_worktree(repo_path, pr.headRefName, pr.number);
@@ -656,26 +649,34 @@ export class PRReviewCron {
 
           if (result.merged) {
             await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
-            await this.notify_alerts(
+            await this.alert_router?.post_alert({
               entity_id,
-              `PR #${String(pr.number)}: ${pr.title} — approved, auto-rebased (${result.method}), and merged to main`,
-            );
+              tier: "routine",
+              title: `PR #${String(pr.number)} merged`,
+              body: `${pr.title} — approved, auto-rebased (${result.method}), and merged to main`,
+            });
 
             // Clean up local worktrees for the merged branch
             await try_cleanup_worktree(repo_path, pr.headRefName, pr.number);
           } else {
-            await this.notify_alerts(
+            await this.alert_router?.post_alert({
               entity_id,
-              `PR #${String(pr.number)}: ${pr.title} — approved but merge failed after rebase attempt. ${result.error ?? "Manual intervention needed."}`,
-            );
+              tier: "action_required",
+              title: `\u26a0\ufe0f Merge failed — PR #${String(pr.number)}`,
+              body: `${pr.title} — approved but merge failed. ${result.error ?? "Manual intervention needed."}`,
+              embed_color: ALERT_COLOR_AMBER,
+            });
           }
         }
       } else {
         // External, not yet merged — escalate to human
-        await this.notify_alerts(
+        await this.alert_router?.post_alert({
           entity_id,
-          `External PR #${String(pr.number)} from @${pr.author.login}: ${pr.title} — approved, awaiting human merge`,
-        );
+          tier: "action_required",
+          title: `\u26a0\ufe0f External PR awaiting merge — PR #${String(pr.number)}`,
+          body: `From @${pr.author.login}: ${pr.title} — approved, awaiting human merge`,
+          embed_color: ALERT_COLOR_AMBER,
+        });
       }
     } else if (review_state === "dismissed") {
       // All reviews were dismissed — PR needs a fresh review.
@@ -683,16 +684,20 @@ export class PRReviewCron {
       console.log(
         `[pr-cron] All reviews dismissed on PR #${String(pr.number)} — will be re-reviewed next cycle`,
       );
-      await this.notify_alerts(
+      await this.alert_router?.post_alert({
         entity_id,
-        `PR #${String(pr.number)}: "${pr.title}" — all reviews dismissed, will re-review next cycle`,
-      );
+        tier: "routine",
+        title: `PR #${String(pr.number)} reviews dismissed`,
+        body: `"${pr.title}" — all reviews dismissed, will re-review next cycle`,
+      });
     } else {
       // Notify completion without specific action
-      await this.notify_alerts(
+      await this.alert_router?.post_alert({
         entity_id,
-        `PR #${String(pr.number)} review completed: "${pr.title}"`,
-      );
+        tier: "routine",
+        title: `PR #${String(pr.number)} review completed`,
+        body: `"${pr.title}"`,
+      });
     }
   }
 
@@ -828,18 +833,23 @@ export class PRReviewCron {
         await save_pr_reviews(this.processed, this.config);
 
         await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
-        await this.notify_alerts(
+        await this.alert_router?.post_alert({
           entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — CI passed, auto-merged (${result.method})`,
-        );
+          tier: "routine",
+          title: `PR #${String(pr.number)} merged`,
+          body: `${pr.title} — CI passed, auto-merged (${result.method})`,
+        });
 
         // Clean up local worktrees for the merged branch
         await try_cleanup_worktree(repo_path, pr.headRefName, pr.number);
       } else {
-        await this.notify_alerts(
+        await this.alert_router?.post_alert({
           entity_id,
-          `PR #${String(pr.number)}: ${pr.title} — approved, CI passed, but merge failed. ${result.error ?? "Manual intervention needed."}`,
-        );
+          tier: "action_required",
+          title: `\u26a0\ufe0f Merge failed — PR #${String(pr.number)}`,
+          body: `${pr.title} — approved, CI passed, but merge failed. ${result.error ?? "Manual intervention needed."}`,
+          embed_color: ALERT_COLOR_AMBER,
+        });
       }
     }
   }
@@ -927,10 +937,12 @@ export class PRReviewCron {
     const attempts = this.processed[key]?.ci_fix_attempts ?? 0;
 
     if (attempts >= MAX_CI_FIX_ATTEMPTS) {
-      await this.notify_alerts(
+      await this.alert_router?.post_alert({
         entity_id,
-        `PR #${String(pr.number)}: ${pr.title} — CI fix failed after ${String(MAX_CI_FIX_ATTEMPTS)} attempts. Needs human intervention. Failed checks: ${failed_checks.join(", ")}`,
-      );
+        tier: "action_required",
+        title: `\u{1f6d1} CI fix exhausted — PR #${String(pr.number)}`,
+        body: `${pr.title} — failed after ${String(MAX_CI_FIX_ATTEMPTS)} attempts. Needs human intervention. Failed: ${failed_checks.join(", ")}`,
+      });
       return true; // handled — cap reached, don't retry this failure set
     }
 
@@ -994,10 +1006,12 @@ export class PRReviewCron {
       `[pr-cron] Spawning CI fix builder for PR #${String(pr.number)} in ${entity_id} (attempt ${String(attempts + 1)}/${String(MAX_CI_FIX_ATTEMPTS)})`,
     );
 
-    await this.notify_alerts(
+    await this.alert_router?.post_alert({
       entity_id,
-      `PR #${String(pr.number)}: ${pr.title} — approved but CI failed (${failed_checks.join(", ")}), spawning builder to fix (attempt ${String(attempts + 1)}/${String(MAX_CI_FIX_ATTEMPTS)})`,
-    );
+      tier: "routine",
+      title: `PR #${String(pr.number)} CI fix spawned`,
+      body: `${pr.title} — CI failed (${failed_checks.join(", ")}), spawning builder (attempt ${String(attempts + 1)}/${String(MAX_CI_FIX_ATTEMPTS)})`,
+    });
 
     let fix_env: Record<string, string> | undefined;
     if (gh_token) {
@@ -1029,13 +1043,7 @@ export class PRReviewCron {
     return true;
   }
 
-  /** Send a notification to the entity's alerts channel. */
-  private async notify_alerts(entity_id: string, message: string): Promise<void> {
-    console.log(`[pr-cron:alerts] ${message}`);
-    if (this.discord) {
-      await this.discord.send_to_entity(entity_id, "alerts", message, "reviewer" as ArchetypeRole);
-    }
-  }
+  // notify_alerts removed — all call sites migrated to this.alert_router.post_alert()
 
   /** Check if a PR has been merged. */
   private async check_pr_merged(

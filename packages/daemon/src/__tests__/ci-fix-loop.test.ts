@@ -365,6 +365,13 @@ function make_session_manager(): ClaudeSessionManager {
   return manager as unknown as ClaudeSessionManager;
 }
 
+function make_alert_router() {
+  return {
+    post_alert: vi.fn().mockResolvedValue({ message_id: null }),
+    resolve_incident: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
   return {
     github_app: make_github_app(),
@@ -376,6 +383,7 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
     } as WebhookContext["config"],
     pool: null,
     pr_watches: null,
+    alert_router: make_alert_router() as unknown as WebhookContext["alert_router"],
     ...overrides,
   };
 }
@@ -445,7 +453,8 @@ async function trigger_review_completion(
 
   const discord = ctx.discord as unknown as { send_to_entity: ReturnType<typeof vi.fn> };
   const sm = ctx.session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
-  return { ctx, discord, session_manager: sm };
+  const alert_router = ctx.alert_router as unknown as { post_alert: ReturnType<typeof vi.fn> };
+  return { ctx, discord, session_manager: sm, alert_router };
 }
 
 describe("webhook handler — CI fix loop", () => {
@@ -460,7 +469,7 @@ describe("webhook handler — CI fix loop", () => {
   });
 
   it("spawns a builder when CI checks fail on an approved PR", async () => {
-    const { session_manager, discord } = await trigger_review_completion(() => ({
+    const { session_manager, alert_router } = await trigger_review_completion(() => ({
       stdout: JSON.stringify([
         { name: "Lint", state: "COMPLETED", conclusion: "SUCCESS" },
         { name: "Build", state: "COMPLETED", conclusion: "FAILURE" },
@@ -477,18 +486,13 @@ describe("webhook handler — CI fix loop", () => {
     expect((ci_fix_spawn![0] as { archetype: string }).archetype).toBe("builder");
     expect((ci_fix_spawn![0] as { dna: string[] }).dna).toEqual(["coding-dna"]);
 
-    // Should alert about spawning CI fix
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("spawning builder to fix"),
-      "reviewer",
-    );
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("attempt 1/3"),
-      "reviewer",
+    // Should alert about spawning CI fix via alert router
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: "test-entity",
+        tier: "routine",
+        body: expect.stringContaining("spawning builder"),
+      }),
     );
   });
 
@@ -532,7 +536,7 @@ describe("webhook handler — CI fix loop", () => {
       },
     };
 
-    const { session_manager, discord } = await trigger_review_completion(() => ({
+    const { session_manager, alert_router } = await trigger_review_completion(() => ({
       stdout: JSON.stringify([{ name: "Build", state: "COMPLETED", conclusion: "FAILURE" }]),
     }));
 
@@ -547,12 +551,13 @@ describe("webhook handler — CI fix loop", () => {
     const entry = mock_pr_state["test-entity:42"] as { ci_fix_attempts?: number } | undefined;
     expect(entry?.ci_fix_attempts).toBe(3);
 
-    // Should alert about reaching the cap
-    expect(discord.send_to_entity).toHaveBeenCalledWith(
-      "test-entity",
-      "alerts",
-      expect.stringContaining("human intervention"),
-      "reviewer",
+    // Should alert about reaching the cap via alert router
+    expect(alert_router.post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        entity_id: "test-entity",
+        tier: "action_required",
+        body: expect.stringContaining("human intervention"),
+      }),
     );
   });
 

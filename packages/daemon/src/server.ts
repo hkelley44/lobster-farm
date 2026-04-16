@@ -4,6 +4,7 @@ import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { DAEMON_PORT } from "@lobster-farm/shared";
 import { type ArchetypeRole, expand_home } from "@lobster-farm/shared";
 import { persist_entity_config } from "./actions.js";
+import { ALERT_COLOR_RED, type AlertRouter } from "./alert-router.js";
 import type { CommanderProcess } from "./commander-process.js";
 import { is_discord_snowflake } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
@@ -38,6 +39,7 @@ interface ServerContext {
   pool: BotPool | null;
   github_app: GitHubAppAuth | null;
   pr_watches: PRWatchStore | null;
+  alert_router: AlertRouter | null;
 }
 
 type RouteHandler = (
@@ -146,6 +148,7 @@ const handle_webhook_github: RouteHandler = async (req, res, ctx) => {
     config: ctx.config,
     pool: ctx.pool,
     pr_watches: ctx.pr_watches,
+    alert_router: ctx.alert_router,
   };
 
   await handle_github_webhook(req, res, webhook_ctx);
@@ -286,6 +289,7 @@ async function process_sentry_webhook(
       registry: ctx.registry,
       discord: ctx.discord,
       config: ctx.config,
+      alert_router: ctx.alert_router,
     };
 
     // Fire-and-forget: triage runs async; failure is caught inside
@@ -326,11 +330,38 @@ async function process_sentry_webhook(
     issue_url,
   });
 
-  if (ctx.discord) {
+  // Route through the tiered alert system (#253).
+  // error/fatal + triage-worthy (created/regression) → incident_open (top-level embed + thread)
+  // warning/other or non-triage actions → routine (daily thread)
+  const sentry_level = (issue?.level as string) ?? "error";
+  const is_triage_worthy = triage_actions.includes(action ?? "");
+  const is_high_severity = sentry_level === "fatal" || sentry_level === "error";
+  const effective_entity_id = target_entity_id ?? ctx.registry.get_active()[0]?.entity.id ?? null;
+
+  if (ctx.alert_router && effective_entity_id) {
+    if (is_triage_worthy && is_high_severity) {
+      // Tier 3: incident thread for error/fatal triage events
+      await ctx.alert_router.post_alert({
+        entity_id: effective_entity_id,
+        tier: "incident_open",
+        title: `\u{1f534} Sentry [${sentry_level}]: ${error_title}`,
+        body: alert_message,
+        embed_color: ALERT_COLOR_RED,
+      });
+    } else {
+      // Tier 2: routine (resolved, unresolved, warnings, P2/P3)
+      await ctx.alert_router.post_alert({
+        entity_id: effective_entity_id,
+        tier: "routine",
+        title: `Sentry [${action ?? "event"}]`,
+        body: alert_message,
+      });
+    }
+  } else if (ctx.discord) {
+    // Fallback: no alert_router, use direct Discord send
     if (target_entity_id) {
       await ctx.discord.send_to_entity(target_entity_id, "alerts", alert_message, "system");
     } else {
-      // No entity mapping — post to first active entity's alerts as a catch-all
       const first_active = ctx.registry.get_active()[0];
       if (first_active) {
         await ctx.discord.send_to_entity(first_active.entity.id, "alerts", alert_message, "system");
@@ -776,6 +807,7 @@ export function start_server(
   pool: BotPool | null = null,
   github_app: GitHubAppAuth | null = null,
   pr_watches: PRWatchStore | null = null,
+  alert_router: AlertRouter | null = null,
   port: number = DAEMON_PORT,
 ): Server {
   const ctx: ServerContext = {
@@ -788,6 +820,7 @@ export function start_server(
     pool,
     github_app,
     pr_watches,
+    alert_router,
   };
 
   const server = createServer((req, res) => {

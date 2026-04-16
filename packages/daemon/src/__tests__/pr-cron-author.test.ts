@@ -51,7 +51,7 @@ describe("PR cron — author-based alert labeling", () => {
     on: ReturnType<typeof vi.fn>;
     removeListener: ReturnType<typeof vi.fn>;
   };
-  let mock_discord: { send_to_entity: ReturnType<typeof vi.fn> };
+  let mock_alert_router: { post_alert: ReturnType<typeof vi.fn> };
   beforeEach(() => {
     alerts = [];
 
@@ -67,13 +67,12 @@ describe("PR cron — author-based alert labeling", () => {
       removeListener: vi.fn(),
     };
 
-    mock_discord = {
-      send_to_entity: vi
-        .fn()
-        .mockImplementation((_entity: string, _channel: string, message: string) => {
-          alerts.push(message);
-          return Promise.resolve();
-        }),
+    mock_alert_router = {
+      post_alert: vi.fn().mockImplementation((payload: { title: string; body: string }) => {
+        // Combine title + body for backward-compatible string assertions
+        alerts.push(`${payload.title}: ${payload.body}`);
+        return Promise.resolve({ message_id: null });
+      }),
     };
   });
 
@@ -83,7 +82,10 @@ describe("PR cron — author-based alert labeling", () => {
       mock_registry as any,
       mock_session_manager as any,
       make_config(),
-      mock_discord as any,
+      null, // discord
+      null, // github_app
+      null, // pr_watches
+      mock_alert_router as any,
     );
   }
 
@@ -116,7 +118,7 @@ describe("PR cron — author-based alert labeling", () => {
     await trigger_review(cron, "test-org", "changes_requested");
 
     expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toMatch(/^PR #42:/);
+    expect(alerts[0]).toContain("PR #42");
     expect(alerts[0]).not.toContain("External");
     expect(alerts[0]).not.toContain("@test-org");
   });
@@ -128,7 +130,9 @@ describe("PR cron — author-based alert labeling", () => {
     await trigger_review(cron, "contributor123", "changes_requested");
 
     expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toMatch(/^External PR #42 from @contributor123:/);
+    expect(alerts[0]).toContain("External");
+    expect(alerts[0]).toContain("@contributor123");
+    expect(alerts[0]).toContain("PR #42");
   });
 
   it("treats all non-feature PRs as external when entity has no github.user", async () => {
@@ -138,15 +142,13 @@ describe("PR cron — author-based alert labeling", () => {
     await trigger_review(cron, "test-org", "changes_requested");
 
     expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toMatch(/^External PR #42 from @test-org:/);
+    expect(alerts[0]).toContain("External");
+    expect(alerts[0]).toContain("@test-org");
+    expect(alerts[0]).toContain("PR #42");
   });
 
   it("labels approved+merged internal PR without 'External'", async () => {
     mock_registry.get.mockReturnValue(make_entity("test-org"));
-
-    // Mock check_pr_merged — we need execFile to return MERGED state
-    const { execFile } = await import("node:child_process");
-    const { promisify } = await import("node:util");
 
     const cron = await create_cron();
 
@@ -156,7 +158,7 @@ describe("PR cron — author-based alert labeling", () => {
     await trigger_review(cron, "test-org", "approved");
 
     expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toMatch(/^PR #42:/);
+    expect(alerts[0]).toContain("PR #42");
     expect(alerts[0]).toContain("approved and merged to main");
     expect(alerts[0]).not.toContain("External");
   });
@@ -170,7 +172,8 @@ describe("PR cron — author-based alert labeling", () => {
     await trigger_review(cron, "outsider", "approved");
 
     expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toMatch(/^External PR #42 from @outsider:/);
+    expect(alerts[0]).toContain("External");
+    expect(alerts[0]).toContain("@outsider");
     expect(alerts[0]).toContain("approved and merged to main");
   });
 
@@ -184,7 +187,7 @@ describe("PR cron — author-based alert labeling", () => {
 
     expect(alerts).toHaveLength(1);
     expect(alerts[0]).toContain("awaiting human merge");
-    expect(alerts[0]).toMatch(/^External PR #42 from @outsider:/);
+    expect(alerts[0]).toContain("@outsider");
   });
 
   it("still spawns fixer for both internal and external PRs needing changes", async () => {
