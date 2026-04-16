@@ -223,6 +223,12 @@ describe("generate_plist", () => {
     expect(result).toContain("com.lobsterfarm.daemon");
   });
 
+  it("includes ExitTimeout of 300 for graceful drain", () => {
+    const result = generate_plist("/w.sh", "/l.log", "/d");
+    expect(result).toContain("<key>ExitTimeout</key>");
+    expect(result).toContain("<integer>300</integer>");
+  });
+
   it("is synchronous (returns string, not Promise)", () => {
     const result = generate_plist("/w.sh", "/l.log", "/d");
 
