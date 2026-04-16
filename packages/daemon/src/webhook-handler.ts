@@ -15,7 +15,7 @@ import { promisify } from "node:util";
 import type { ArchetypeRole } from "@lobster-farm/shared";
 import { expand_home } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
-import { detect_review_outcome } from "./actions.js";
+import { type ReviewOutcome, detect_review_outcome } from "./actions.js";
 import {
   type CheckSuiteWebhookPayload,
   handle_check_suite,
@@ -895,7 +895,7 @@ export async function handle_v2_review_completion(
   repo_path: string,
   repo_full_name: string,
   pr: WebhookPR,
-  outcome: "approved" | "changes_requested" | "pending",
+  outcome: ReviewOutcome,
   gh_token: string | undefined,
   ctx: WebhookContext,
   installation_id?: string,
@@ -1067,6 +1067,20 @@ export async function handle_v2_review_completion(
         );
         return;
     }
+    return;
+  }
+
+  if (outcome === "dismissed") {
+    // All reviews were dismissed (e.g., duplicate cleanup). Don't spawn a new
+    // review inline — let the next pr-cron or check_suite cycle pick it up.
+    console.log(
+      `[webhook:v2] All reviews dismissed on PR #${String(pr.number)} — will be re-reviewed next cycle`,
+    );
+    await notify_alerts(
+      entity_id,
+      `PR #${String(pr.number)}: "${pr.title}" — all reviews dismissed, will re-review next cycle`,
+      ctx,
+    );
     return;
   }
 
