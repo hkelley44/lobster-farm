@@ -1180,31 +1180,163 @@ export function build_reviewer_prompt(
   repo_full_name: string,
   issue_context: string,
 ): string {
-  const n = String(pr.number);
+  const pr_num = String(pr.number);
+  const has_issue = issue_context.length > 0;
 
-  const lines = [
-    `Review PR #${n}: "${pr.title}" on branch ${pr.head.ref}.`,
+  // Header + linked issue context FIRST, so the reviewer reads the spec before
+  // being told what to do with it.
+  const lines: string[] = [
+    `Review PR #${pr_num}: "${pr.title}" on branch ${pr.head.ref}.`,
     `Repository: ${repo_path}`,
     "",
-    "Run /review to do a comprehensive code review.",
-    "",
-    "Post your review on the PR using gh cli.",
     "You are authenticated as the LobsterFarm Reviewer GitHub App.",
+    "Post your review via `gh` CLI.",
     "",
     "Before posting your review, check for any existing reviews you've already posted:",
-    `  gh api repos/${repo_full_name}/pulls/${n}/reviews --jq '[.[] | select(.user.login | endswith("[bot]"))] | { count: length, reviews: map({state, submitted_at}) }'`,
+    `  gh api repos/${repo_full_name}/pulls/${pr_num}/reviews --jq '[.[] | select(.user.login | endswith("[bot]"))] | { count: length, reviews: map({state, submitted_at}) }'`,
     "If a review already exists with state APPROVED or CHANGES_REQUESTED, skip posting",
     "and go directly to the merge step (if approved) or stop (if changes requested).",
     "",
-    "Review standards:",
-    "- Every piece of actionable feedback should be included.",
-    "- If there is ANY actionable feedback, request changes:",
-    `  gh pr review ${n} --request-changes --body "<your review>" && echo "✓ Review posted"`,
+  ];
+
+  if (has_issue) {
+    lines.push("## Linked Issue Context", "", issue_context, "");
+  }
+
+  // Two-pass review instructions. Pass 1 is a hard gate on spec compliance;
+  // Pass 2 (code quality) only runs if Pass 1 passes. Single session, early
+  // return on Pass 1 failure — no second spawn.
+  lines.push(
+    "## Review Procedure — Two Passes",
+    "",
+    "You will run TWO passes, in order. Pass 1 is a hard gate: if it fails,",
+    "you do NOT run Pass 2. No exceptions.",
+    "",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "### Pass 1 — Spec Compliance (ALWAYS runs first)",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "",
+    "Purpose: verify the PR implements exactly what the linked issue asked for.",
+    "Not more, not less. Code quality is NOT evaluated in this pass.",
+    "",
+  );
+
+  if (has_issue) {
+    lines.push(
+      "Procedure:",
+      "",
+      "1. Read the `## Linked Issue Context` section above. Find the",
+      "   Acceptance Criteria / Spec / Requirements block.",
+      "",
+      "2. Walk each acceptance criterion line by line against the diff",
+      `   (\`gh pr diff ${pr_num}\`). For each criterion, classify as:`,
+      "     - **met**     — the diff clearly implements this criterion",
+      "     - **missing** — the diff does not address this criterion at all",
+      "     - **partial** — the diff addresses it but incompletely or incorrectly",
+      "",
+      "   Treat **partial as failing**. A partially-met criterion is a Pass 1",
+      "   failure, even if the gap is minor. Consistent gate behavior beats",
+      "   case-by-case judgment — note the gap in your review body, but do",
+      "   not waive it.",
+      "",
+      "3. Separately check for **over-building**: code or behavior the PR",
+      "   introduces that the spec did not request. Unrequested features,",
+      "   speculative abstractions, scope creep, drive-by refactors unrelated",
+      "   to the stated criteria. Flag these as 'out of scope' items.",
+      "",
+      "   Out-of-scope additions are blocking even if they are well-written.",
+      "",
+      "4. Decide the Pass 1 verdict:",
+      "",
+      "   **FAIL** — if ANY criterion is missing or partial, OR any over-build",
+      "   is flagged. Post a CHANGES REQUESTED review and STOP:",
+      "",
+      `     gh pr review ${pr_num} --request-changes --body "<pass 1 body>"`,
+      "",
+      "   The review body MUST start with this exact marker line (first line,",
+      "   no prefix, no whitespace):",
+      "",
+      "     ## Pass 1 — Spec Compliance: CHANGES REQUESTED",
+      "",
+      "   Under the marker, list each failing criterion (missing / partial)",
+      "   and each out-of-scope addition with a one-line explanation. Keep",
+      "   it focused on the gap — the builder needs to know what to fix.",
+      "",
+      "   After posting the review, STOP IMMEDIATELY. Do NOT run Pass 2. Do",
+      "   NOT do any code-quality analysis. Do NOT merge. A fresh review",
+      "   cycle will run against the corrected diff on the next push.",
+      "",
+      "   **PASS** — if every criterion is met and no over-build is flagged.",
+      "   Record the Pass 1 verdict (you will include it in the combined",
+      "   review body) and proceed to Pass 2.",
+      "",
+    );
+  } else {
+    lines.push(
+      "No linked issue was detected on this PR. Pass 1 is a documented no-op.",
+      "There is no spec to compare against, so spec compliance cannot be",
+      "evaluated. Record the Pass 1 verdict as SKIPPED and proceed to Pass 2.",
+      "",
+      "When you post the combined review in Pass 2, the body MUST start with",
+      "this exact marker line (first line, no prefix, no whitespace):",
+      "",
+      "     ## Pass 1 — Spec Compliance: SKIPPED (no linked issue)",
+      "",
+    );
+  }
+
+  lines.push(
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "### Pass 2 — Code Quality (runs ONLY if Pass 1 passed or was skipped)",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "",
+    "Do NOT run this pass if Pass 1 found missing criteria, partial",
+    "criteria, or over-building. If Pass 1 failed, you have already posted",
+    "a CHANGES REQUESTED review and you are done.",
+    "",
+    "Run a comprehensive code-quality review per `review-dna`. Priority order:",
+    "bugs → security → design → readability → nits. Every piece of actionable",
+    "feedback should be included.",
+    "",
+    "Combined review body structure. The body MUST start with the Pass 1",
+    "verdict line, then a blank line, then the `## Pass 2 — Code Quality`",
+    "heading, then the Pass 2 findings:",
+    "",
+  );
+
+  if (has_issue) {
+    lines.push(
+      "     ## Pass 1 — Spec Compliance: PASSED",
+      "",
+      "     <one-line summary confirming each acceptance criterion was met>",
+      "",
+      "     ## Pass 2 — Code Quality",
+      "",
+      "     <your code-quality findings, or 'No issues found.'>",
+      "",
+    );
+  } else {
+    lines.push(
+      "     ## Pass 1 — Spec Compliance: SKIPPED (no linked issue)",
+      "",
+      "     ## Pass 2 — Code Quality",
+      "",
+      "     <your code-quality findings, or 'No issues found.'>",
+      "",
+    );
+  }
+
+  lines.push(
+    "Post the combined review using the existing approve / request-changes",
+    "logic:",
+    "",
+    "- If there is ANY actionable code-quality feedback, request changes:",
+    `    gh pr review ${pr_num} --request-changes --body "<combined body>" && echo "✓ Review posted"`,
     "- If the code is genuinely clean with no improvements needed, approve:",
-    `  gh pr review ${n} --approve --body "Looks good." && echo "✓ Review posted"`,
+    `    gh pr review ${pr_num} --approve --body "<combined body>" && echo "✓ Review posted"`,
     "",
     "After posting your review, verify it landed:",
-    `  gh api repos/${repo_full_name}/pulls/${n}/reviews --jq '[.[] | select(.user.login | endswith("[bot]"))] | last | .state // "NOT_FOUND"'`,
+    `  gh api repos/${repo_full_name}/pulls/${pr_num}/reviews --jq '[.[] | select(.user.login | endswith("[bot]"))] | last | .state // "NOT_FOUND"'`,
     "If the state is CHANGES_REQUESTED or APPROVED, your review is confirmed. Move on.",
     "If the state is DISMISSED or NOT_FOUND, something went wrong — do NOT retry, just stop.",
     "",
@@ -1213,8 +1345,12 @@ export function build_reviewer_prompt(
     "- Never dismiss, delete, or modify reviews you have already posted.",
     "- If you accidentally post duplicate reviews, leave them — do not try to clean up.",
     "",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "### CI status & merge (only relevant if Pass 2 approved)",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "",
     "CI status — three distinct cases, treat them differently:",
-    `  gh pr checks ${n} --required`,
+    `  gh pr checks ${pr_num} --required`,
     "",
     "1. FAILING required checks (conclusion failure/cancelled/timed_out):",
     "   The PR is broken. Note the failing checks in your review and request",
@@ -1241,20 +1377,16 @@ export function build_reviewer_prompt(
     "After posting your review:",
     "- If you approved AND all required checks are passing (or none configured),",
     "  merge the PR:",
-    `  gh pr merge ${n} --squash --delete-branch`,
+    `  gh pr merge ${pr_num} --squash --delete-branch`,
     "- If you approved but CI is still pending, do NOT run the merge command",
     "  yourself. The daemon will merge once checks clear. Your review is the signal.",
     "- If the merge command fails (branch behind main):",
     `  1. Try: git fetch origin && git checkout ${pr.head.ref} && git rebase origin/main`,
     `  2. If rebase is clean (no conflicts): git push --force-with-lease origin ${pr.head.ref}`,
-    `  3. Then retry: gh pr merge ${n} --squash --delete-branch`,
+    `  3. Then retry: gh pr merge ${pr_num} --squash --delete-branch`,
     "  4. If rebase has conflicts: git rebase --abort — do NOT force push conflict markers",
     "- If you requested changes, do NOT merge.",
-  ];
-
-  if (issue_context) {
-    lines.push("", "## Linked Issue Context", "", issue_context);
-  }
+  );
 
   return lines.join("\n");
 }
