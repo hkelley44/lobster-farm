@@ -2,7 +2,7 @@ import type { ModelName, ModelTier, ThinkLevel } from "@lobster-farm/shared";
 
 /** Map abstract model names to Claude CLI model identifiers. */
 const MODEL_IDS: Record<ModelName, string> = {
-  opus: "claude-opus-4-6",
+  opus: "claude-opus-4-7",
   sonnet: "claude-sonnet-4-6",
   haiku: "claude-haiku-4-5-20251001",
 };
@@ -17,6 +17,8 @@ const EFFORT_MAP: Record<ThinkLevel, string | null> = {
   none: "low",
   standard: "medium",
   high: "high",
+  xhigh: "xhigh",
+  max: "max",
 };
 
 /** Resolve a ModelTier to a Claude CLI model ID string. */

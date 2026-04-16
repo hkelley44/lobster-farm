@@ -22,7 +22,7 @@ export type AgentMode = z.infer<typeof AgentModeSchema>;
 export const ModelNameSchema = z.enum(["opus", "sonnet", "haiku"]);
 export type ModelName = z.infer<typeof ModelNameSchema>;
 
-export const ThinkLevelSchema = z.enum(["none", "standard", "high"]);
+export const ThinkLevelSchema = z.enum(["none", "standard", "high", "xhigh", "max"]);
 export type ThinkLevel = z.infer<typeof ThinkLevelSchema>;
 
 export const RepoStructureSchema = z.enum(["monorepo", "single"]);

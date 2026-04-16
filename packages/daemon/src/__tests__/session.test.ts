@@ -31,7 +31,7 @@ describe("build_model_flags", () => {
   it("maps opus/high to correct flags", () => {
     const flags = build_model_flags({ model: "opus", think: "high" });
     expect(flags).toContain("--model");
-    expect(flags).toContain("claude-opus-4-6");
+    expect(flags).toContain("claude-opus-4-7");
     expect(flags).toContain("--effort");
     expect(flags).toContain("high");
   });
@@ -47,6 +47,22 @@ describe("build_model_flags", () => {
     expect(flags).toContain("claude-haiku-4-5-20251001");
     expect(flags).toContain("--effort");
     expect(flags).toContain("low");
+  });
+
+  it("maps opus/xhigh to correct flags", () => {
+    const flags = build_model_flags({ model: "opus", think: "xhigh" });
+    expect(flags).toContain("--model");
+    expect(flags).toContain("claude-opus-4-7");
+    expect(flags).toContain("--effort");
+    expect(flags).toContain("xhigh");
+  });
+
+  it("maps opus/max to correct flags", () => {
+    const flags = build_model_flags({ model: "opus", think: "max" });
+    expect(flags).toContain("--model");
+    expect(flags).toContain("claude-opus-4-7");
+    expect(flags).toContain("--effort");
+    expect(flags).toContain("max");
   });
 });
 
@@ -84,7 +100,7 @@ describe("ClaudeSessionManager", () => {
       expect(args).toContain("--agent");
       expect(args).toContain("bob"); // default builder name
       expect(args).toContain("--model");
-      expect(args).toContain("claude-opus-4-6");
+      expect(args).toContain("claude-opus-4-7");
       expect(args).toContain("--permission-mode");
       expect(args).toContain("bypassPermissions");
       expect(args).toContain("--session-id");
