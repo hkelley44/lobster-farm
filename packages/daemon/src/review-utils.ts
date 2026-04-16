@@ -465,6 +465,92 @@ export async function fetch_merge_state(
   }
 }
 
+// ── Mergeable state queries (#257 merge-gate) ──
+
+/**
+ * GitHub's `mergeStateStatus` field, returned by GraphQL via `gh pr view`.
+ * Documented at https://docs.github.com/en/graphql/reference/enums#mergestatestatus.
+ *
+ * - `CLEAN` — mergeable, all checks green, ready
+ * - `HAS_HOOKS` — mergeable, but a status hook will run on merge (also OK)
+ * - `BLOCKED` — branch protection is blocking (missing review, failing checks…)
+ * - `BEHIND` — base ref has new commits; needs update / rebase
+ * - `DIRTY` — merge conflicts
+ * - `UNSTABLE` — non-required check failed; may still merge
+ * - `UNKNOWN` — GitHub still computing
+ */
+export type MergeStateStatus =
+  | "CLEAN"
+  | "HAS_HOOKS"
+  | "BLOCKED"
+  | "BEHIND"
+  | "DIRTY"
+  | "UNSTABLE"
+  | "UNKNOWN";
+
+export interface PRMergeability {
+  /** GitHub's `mergeable` field — MERGEABLE | CONFLICTING | UNKNOWN. */
+  mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  /** GitHub's `mergeStateStatus` field. */
+  merge_state_status: MergeStateStatus;
+  /** Latest commit SHA on the head branch. */
+  head_sha: string;
+}
+
+/**
+ * Fetch a PR's mergeability state and head SHA via `gh pr view`.
+ * Used by the v2 merge-gate (#257) to verify a PR is ready to merge.
+ *
+ * Throws on auth/network errors so the caller can decide between abort and retry.
+ */
+export async function fetch_pr_mergeability(
+  pr_number: number,
+  repo_path: string,
+  gh_token?: string,
+  gh_bin = "gh",
+): Promise<PRMergeability> {
+  const env = gh_token ? { ...process.env, GH_TOKEN: gh_token } : process.env;
+
+  const { stdout } = await exec_async(
+    gh_bin,
+    ["pr", "view", String(pr_number), "--json", "mergeable,mergeStateStatus,headRefOid"],
+    { cwd: repo_path, env, timeout: 15_000 },
+  );
+
+  const data = JSON.parse(stdout) as {
+    mergeable: string;
+    mergeStateStatus: string;
+    headRefOid: string;
+  };
+
+  const VALID_MERGEABLE = new Set(["MERGEABLE", "CONFLICTING", "UNKNOWN"]);
+  const VALID_MERGE_STATE = new Set([
+    "CLEAN",
+    "HAS_HOOKS",
+    "BLOCKED",
+    "BEHIND",
+    "DIRTY",
+    "UNSTABLE",
+    "UNKNOWN",
+  ]);
+
+  const mergeable = data.mergeable.toUpperCase();
+  const merge_state_status = data.mergeStateStatus.toUpperCase();
+
+  if (!VALID_MERGEABLE.has(mergeable)) {
+    throw new Error(`Unexpected mergeable value from GitHub: "${data.mergeable}"`);
+  }
+  if (!VALID_MERGE_STATE.has(merge_state_status)) {
+    throw new Error(`Unexpected mergeStateStatus value from GitHub: "${data.mergeStateStatus}"`);
+  }
+
+  return {
+    mergeable: mergeable as PRMergeability["mergeable"],
+    merge_state_status: merge_state_status as MergeStateStatus,
+    head_sha: data.headRefOid,
+  };
+}
+
 /**
  * Get the repo owner/name (e.g. "org/repo") from the git remote.
  * Tries `gh repo view --json nameWithOwner` first.
@@ -550,14 +636,40 @@ async function poll_mergeable(
 }
 
 /**
+ * Result of attempting a local git rebase.
+ *
+ * `kind` differentiates between transient failures (could_not_clone,
+ * fetch_failed, push_failed) and a real merge conflict that requires manual
+ * resolution. The merge-gate (#257) uses `kind` to decide whether to alert
+ * a human or wait for the next CI cycle.
+ */
+export type LocalRebaseResult =
+  | { success: true }
+  | {
+      success: false;
+      kind:
+        | "conflict"
+        | "no_remote"
+        | "no_tmp_dir"
+        | "clone_failed"
+        | "fetch_failed"
+        | "push_failed"
+        | "other";
+      error: string;
+    };
+
+/**
  * Attempt a local git rebase of the branch onto origin/main.
  * Uses a temp directory with a minimal clone, then force-pushes with lease.
+ *
+ * Exported so the v2 merge-gate (#257) can drive the rebase fallback path
+ * without going through the legacy `attempt_auto_merge` wrapper.
  */
-async function try_local_rebase(
+export async function try_local_rebase(
   branch: string,
   repo_path: string,
   env: NodeJS.ProcessEnv,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<LocalRebaseResult> {
   // Get the remote URL from the repo
   let remote_url: string;
   try {
@@ -568,7 +680,7 @@ async function try_local_rebase(
     });
     remote_url = stdout.trim();
   } catch {
-    return { success: false, error: "Could not determine remote URL" };
+    return { success: false, kind: "no_remote", error: "Could not determine remote URL" };
   }
 
   // Create temp dir for the rebase
@@ -577,18 +689,38 @@ async function try_local_rebase(
     const { stdout } = await exec_async("mktemp", ["-d"], { timeout: 5_000 });
     tmp_dir = stdout.trim();
   } catch {
-    return { success: false, error: "Could not create temp directory" };
+    return { success: false, kind: "no_tmp_dir", error: "Could not create temp directory" };
   }
 
   try {
     // Clone the branch (shallow to save time)
-    await exec_async("git", ["clone", "--single-branch", "--branch", branch, remote_url, tmp_dir], {
-      env,
-      timeout: 60_000,
-    });
+    try {
+      await exec_async(
+        "git",
+        ["clone", "--single-branch", "--branch", branch, remote_url, tmp_dir],
+        {
+          env,
+          timeout: 60_000,
+        },
+      );
+    } catch (err) {
+      return {
+        success: false,
+        kind: "clone_failed",
+        error: `Clone failed: ${String(err instanceof Error ? err.message : err)}`,
+      };
+    }
 
     // Fetch main
-    await exec_async("git", ["fetch", "origin", "main"], { cwd: tmp_dir, env, timeout: 30_000 });
+    try {
+      await exec_async("git", ["fetch", "origin", "main"], { cwd: tmp_dir, env, timeout: 30_000 });
+    } catch (err) {
+      return {
+        success: false,
+        kind: "fetch_failed",
+        error: `Fetch failed: ${String(err instanceof Error ? err.message : err)}`,
+      };
+    }
 
     // Attempt rebase
     try {
@@ -608,6 +740,7 @@ async function try_local_rebase(
       const is_conflict = /CONFLICT|could not apply|Merge conflict/i.test(msg);
       return {
         success: false,
+        kind: is_conflict ? "conflict" : "other",
         error: is_conflict
           ? "Rebase conflicts require manual resolution"
           : `Rebase failed: ${msg.slice(0, 200)}`,
@@ -615,19 +748,22 @@ async function try_local_rebase(
     }
 
     // Rebase succeeded — force-push with lease
-    await exec_async("git", ["push", "--force-with-lease", "origin", branch], {
-      cwd: tmp_dir,
-      env,
-      timeout: 30_000,
-    });
+    try {
+      await exec_async("git", ["push", "--force-with-lease", "origin", branch], {
+        cwd: tmp_dir,
+        env,
+        timeout: 30_000,
+      });
+    } catch (err) {
+      return {
+        success: false,
+        kind: "push_failed",
+        error: `Force-push failed: ${String(err instanceof Error ? err.message : err)}`,
+      };
+    }
 
     console.log(`[auto-merge] Local rebase succeeded for branch ${branch}`);
     return { success: true };
-  } catch (err) {
-    return {
-      success: false,
-      error: `Local rebase failed: ${String(err instanceof Error ? err.message : err)}`,
-    };
   } finally {
     // Clean up temp dir — best-effort
     try {

@@ -61,6 +61,18 @@ vi.mock("../review-utils.js", () => ({
   check_merge_conflicts: vi.fn(async () => false),
   attempt_auto_merge: vi.fn(async () => ({ merged: true, method: "direct" })),
   check_ci_status: vi.fn(async () => ({ passed: true, pending: false, failures: [] })),
+  // merge-gate.ts and the v2 path import these transitively (#257)
+  fetch_pr_mergeability: vi.fn(async () => ({
+    mergeable: "MERGEABLE",
+    merge_state_status: "CLEAN",
+    head_sha: "deadbeef",
+  })),
+  try_local_rebase: vi.fn(async () => ({ success: true })),
+  fetch_ci_failure_logs: vi.fn(async () => []),
+  build_ci_fix_prompt: vi.fn(() => "ci fix prompt"),
+  build_deploy_triage_prompt: vi.fn(() => "deploy triage prompt"),
+  MAX_CI_FIX_ATTEMPTS: 3,
+  MAX_DEPLOY_FIX_ATTEMPTS: 2,
 }));
 
 // Mock issue-utils — default: no linked issues
