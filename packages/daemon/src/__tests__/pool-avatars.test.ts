@@ -4,8 +4,9 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AVATAR_COOLDOWN_MS, BotPool } from "../pool.js";
+import { AVATAR_COOLDOWN_MS } from "../pool.js";
 import type { AvatarHandler, PoolBot } from "../pool.js";
+import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 let temp_dir: string;
 
@@ -17,7 +18,7 @@ function make_config(): LobsterFarmConfig {
 }
 
 /** Test-friendly subclass that overrides tmux operations. */
-class TestBotPool extends BotPool {
+class TestBotPool extends BotPoolTestBase {
   private idle_overrides = new Map<number, boolean>();
 
   inject_bots(bots: PoolBot[]): void {
@@ -37,6 +38,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     archetype: null,
     channel_type: null,
     session_id: null,
+    session_confirmed: true,
     tmux_session: `pool-${String(overrides.id)}`,
     last_active: null,
     assigned_at: null,

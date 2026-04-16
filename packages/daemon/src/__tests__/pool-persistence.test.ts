@@ -11,9 +11,9 @@ import {
   save_pr_reviews,
 } from "../persistence.js";
 import type { PersistedPoolBot } from "../persistence.js";
-import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 import type { EntityRegistry } from "../registry.js";
+import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 // ── Test helpers ──
 
@@ -47,7 +47,7 @@ function make_persisted_bot(
  * Test-friendly subclass that stubs tmux/filesystem/persistence side effects.
  * Mirrors TestBotPool from pool.test.ts but adds persistence visibility.
  */
-class TestBotPool extends BotPool {
+class TestBotPool extends BotPoolTestBase {
   private idle_overrides = new Map<number, boolean>();
 
   /** Track persist() calls for assertions. */
@@ -82,6 +82,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     archetype: null,
     channel_type: null,
     session_id: null,
+    session_confirmed: true,
     tmux_session: `pool-${String(overrides.id)}`,
     last_active: null,
     assigned_at: null,

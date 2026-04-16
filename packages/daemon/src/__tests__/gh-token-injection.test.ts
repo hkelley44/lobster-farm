@@ -120,6 +120,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     archetype: null,
     channel_type: null,
     session_id: null,
+    session_confirmed: true,
     tmux_session: `pool-${String(overrides.id)}`,
     last_active: null,
     assigned_at: null,

@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { access, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
@@ -26,6 +26,11 @@ export interface PoolBot {
   archetype: ArchetypeRole | null;
   channel_type: ChannelType | null;
   session_id: string | null;
+  /** True once the Claude Code JSONL transcript for `session_id` has been observed
+   * on disk — only confirmed sessions are persisted to pool-state.json, so a
+   * daemon restart during the pre-confirmation window will never try to
+   * `--resume` a phantom session that Claude never materialized. See issue #256. */
+  session_confirmed: boolean;
   tmux_session: string;
   last_active: Date | null;
   /** When this bot was assigned to its current channel. Used for uptime calculation. */
@@ -107,6 +112,77 @@ export function is_tmux_session_idle(tmux_session: string): boolean {
   } catch {
     return true; // Can't check — assume idle (fail-open)
   }
+}
+
+// ── Claude Code JSONL session tracking ──
+
+/**
+ * Encode an absolute filesystem path into Claude Code's project-slug format.
+ *
+ * Claude Code stores each session's JSONL transcript at
+ * `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. The encoding replaces
+ * every `/` and `.` in the absolute path with `-`.
+ *
+ * Example:
+ *   /Users/farm/.lobsterfarm/entities/lobster-farm/repos/lobster-farm
+ *   → -Users-farm--lobsterfarm-entities-lobster-farm-repos-lobster-farm
+ */
+export function encode_project_slug(abs_path: string): string {
+  return abs_path.replace(/[/.]/g, "-");
+}
+
+/** Absolute path to the JSONL transcript Claude Code will write for this session. */
+export function claude_session_jsonl_path(working_dir: string, session_id: string): string {
+  return join(
+    homedir(),
+    ".claude",
+    "projects",
+    encode_project_slug(working_dir),
+    `${session_id}.jsonl`,
+  );
+}
+
+/** Returns true iff the session's JSONL transcript exists on disk under the
+ * project slug that corresponds to `working_dir`. Claude Code only creates
+ * the JSONL on the session's first write, so this is how we distinguish a
+ * "real" session from one that never committed anything.
+ *
+ * This is the targeted check used during confirmation — we know the cwd of
+ * the tmux session we spawned, so we look in exactly that project slug. */
+export async function session_jsonl_exists(
+  working_dir: string,
+  session_id: string,
+): Promise<boolean> {
+  try {
+    await access(claude_session_jsonl_path(working_dir, session_id));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Returns true iff a JSONL transcript for `session_id` exists under *any*
+ * project slug in `~/.claude/projects/`. Used when restoring state from
+ * pool-state.json on daemon restart, where the original cwd (e.g. a feature
+ * worktree) may differ from the entity_dir the restart will actually use. */
+export async function session_jsonl_exists_anywhere(session_id: string): Promise<boolean> {
+  const projects_dir = join(homedir(), ".claude", "projects");
+  const filename = `${session_id}.jsonl`;
+  try {
+    const entries = await readdir(projects_dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      try {
+        await access(join(projects_dir, entry.name, filename));
+        return true;
+      } catch {
+        // not in this project dir
+      }
+    }
+  } catch {
+    // ~/.claude/projects missing or unreadable — treat as "not found"
+  }
+  return false;
 }
 
 // ── Agent name resolution ──
@@ -203,6 +279,11 @@ export class BotPool extends EventEmitter {
   /** Queued messages for bots that weren't at the prompt when inject was attempted.
    * tmux_session → messages[]. Drained by the health check cycle (every 30s). */
   private pending_injections = new Map<string, string[]>();
+  /** Active session-confirmation watchers (issue #256). bot_id → timer handle.
+   * Each watcher polls for the JSONL transcript and promotes bot.session_confirmed
+   * from false → true once Claude commits its first turn to disk. Cleared on
+   * reassignment, release, or shutdown to prevent leaks. */
+  private session_watchers = new Map<number, ReturnType<typeof setTimeout>>();
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -221,6 +302,16 @@ export class BotPool extends EventEmitter {
    * .env file and makes a raw REST call. The pool never sees the token. */
   set_avatar_handler(handler: AvatarHandler): void {
     this.avatar_handler = handler;
+  }
+
+  /** Protected wrappers around JSONL existence checks so tests can override
+   * without touching the real filesystem. Defaults to the module-level helpers
+   * which read from `~/.claude/projects/`. */
+  protected check_session_jsonl_exists(working_dir: string, session_id: string): Promise<boolean> {
+    return session_jsonl_exists(working_dir, session_id);
+  }
+  protected check_session_jsonl_exists_anywhere(session_id: string): Promise<boolean> {
+    return session_jsonl_exists_anywhere(session_id);
   }
 
   /** Enter drain mode — no new assignments accepted. */
@@ -298,6 +389,7 @@ export class BotPool extends EventEmitter {
         archetype: null,
         channel_type: null,
         session_id: null,
+        session_confirmed: false,
         tmux_session,
         last_active: is_running ? new Date() : null,
         assigned_at: is_running ? new Date() : null,
@@ -328,14 +420,31 @@ export class BotPool extends EventEmitter {
     let restored = 0;
     this.resume_candidates = [];
 
-    // Restore session history from persisted state
+    // Restore session history from persisted state. Pre-flight the JSONL for
+    // each entry — a history entry whose transcript has gone missing is a
+    // phantom session that would crash-loop the next bot assigned to this
+    // channel (issue #256). Drop phantoms on the floor.
+    // We search *all* project slugs because the original session may have
+    // been spawned in a worktree cwd that no longer matches entity_dir.
     const now = Date.now();
+    let history_dropped = 0;
     for (const [key, session_id] of Object.entries(saved_state.session_history)) {
+      const exists = await this.check_session_jsonl_exists_anywhere(session_id);
+      if (!exists) {
+        console.warn(
+          `[pool] Dropping phantom session_history entry ${key} → ${session_id.slice(0, 8)} (no JSONL on disk)`,
+        );
+        history_dropped++;
+        continue;
+      }
       this.session_history.set(key, session_id);
       this.session_history_ts.set(key, now);
     }
     if (this.session_history.size > 0) {
       console.log(`[pool] Restored ${String(this.session_history.size)} session history entries`);
+    }
+    if (history_dropped > 0) {
+      console.warn(`[pool] Dropped ${String(history_dropped)} phantom session_history entries`);
     }
 
     // Restore avatar state for all bots (including those that will stay free).
@@ -374,6 +483,25 @@ export class BotPool extends EventEmitter {
         entry.effort ??
         (entry.archetype ? resolve_effort(DEFAULT_ARCHETYPES[entry.archetype].think) : null);
 
+      // Defensive pre-flight (issue #256): a persisted session_id must have a
+      // JSONL transcript on disk, otherwise --resume will fail and trigger a
+      // crash loop. If the file is missing — either because the state file
+      // predates the confirmation-gate fix, or because Claude Code deleted
+      // the JSONL externally — drop the session_id and fall through to a
+      // fresh spawn on next assignment. Logged loudly so we can see it.
+      // Search all project slugs in case the session was originally spawned
+      // in a feature worktree that differs from entity_dir.
+      let restored_session_id = entry.session_id;
+      if (restored_session_id) {
+        const exists = await this.check_session_jsonl_exists_anywhere(restored_session_id);
+        if (!exists) {
+          console.warn(
+            `[pool] pool-${String(entry.id)}: persisted session ${restored_session_id.slice(0, 8)} has no JSONL on disk — dropping to prevent --resume crash loop`,
+          );
+          restored_session_id = null;
+        }
+      }
+
       if (bot.state === "assigned") {
         // tmux is still running (survived restart, e.g. launchd) — restore metadata.
         // BUT the Claude process inside has a stale MCP connection to the old daemon.
@@ -383,7 +511,8 @@ export class BotPool extends EventEmitter {
         bot.entity_id = entry.entity_id;
         bot.archetype = entry.archetype;
         bot.channel_type = entry.channel_type;
-        bot.session_id = entry.session_id;
+        bot.session_id = restored_session_id;
+        bot.session_confirmed = !!restored_session_id;
         bot.model = restored_model;
         bot.effort = restored_effort;
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
@@ -392,11 +521,12 @@ export class BotPool extends EventEmitter {
 
         // Add to resume candidates — the live tmux session has a dead MCP socket.
         // resume_parked_bots() will kill it and spawn fresh with --resume.
-        if (entry.state === "assigned" && entry.session_id) {
-          this.resume_candidates.push(entry);
+        // Only resume if the JSONL actually exists on disk.
+        if (entry.state === "assigned" && restored_session_id) {
+          this.resume_candidates.push({ ...entry, session_id: restored_session_id });
           console.log(
             `[pool] pool-${String(bot.id)} has live tmux but stale MCP — ` +
-              `queued for fresh resume (session: ${entry.session_id.slice(0, 8)})`,
+              `queued for fresh resume (session: ${restored_session_id.slice(0, 8)})`,
           );
         }
       } else {
@@ -408,7 +538,8 @@ export class BotPool extends EventEmitter {
         bot.entity_id = entry.entity_id;
         bot.archetype = entry.archetype;
         bot.channel_type = entry.channel_type;
-        bot.session_id = entry.session_id;
+        bot.session_id = restored_session_id;
+        bot.session_confirmed = !!restored_session_id;
         bot.model = restored_model;
         bot.effort = restored_effort;
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
@@ -418,8 +549,8 @@ export class BotPool extends EventEmitter {
         // If this bot was actively assigned (not already parked) before shutdown
         // and has a session_id, it's a candidate for proactive resume.
         // Bots saved as "parked" were already idle — don't resume those.
-        if (entry.state === "assigned" && entry.session_id) {
-          this.resume_candidates.push(entry);
+        if (entry.state === "assigned" && restored_session_id) {
+          this.resume_candidates.push({ ...entry, session_id: restored_session_id });
         }
       }
 
@@ -577,8 +708,12 @@ export class BotPool extends EventEmitter {
           extra_env,
         );
 
-        // Update bot state to assigned
+        // Update bot state to assigned. The resumed session is known to have
+        // a JSONL on disk (pre-flight checked in initialize()), so mark it
+        // confirmed — persist() will now write the session_id.
         bot.state = "assigned";
+        bot.session_id = candidate.session_id;
+        bot.session_confirmed = true;
         bot.last_active = new Date();
         bot.assigned_at = new Date(); // Reset uptime — new process
 
@@ -765,7 +900,16 @@ export class BotPool extends EventEmitter {
       // Stash session history for the evicted bot's channel before overwriting.
       // Only stash if the bot is being reassigned away from a different channel
       // (i.e., not a returning parked bot reclaiming its own channel, and not a free bot).
-      if (bot.channel_id && bot.entity_id && bot.session_id && bot.channel_id !== channel_id) {
+      // Only stash *confirmed* sessions — stashing an unconfirmed UUID would
+      // plant a phantom that the next assignment on this channel would try
+      // (and fail) to --resume (issue #256).
+      if (
+        bot.channel_id &&
+        bot.entity_id &&
+        bot.session_id &&
+        bot.session_confirmed &&
+        bot.channel_id !== channel_id
+      ) {
         const evict_key = `${bot.entity_id}:${bot.channel_id}`;
         this.session_history.set(evict_key, bot.session_id);
         this.session_history_ts.set(evict_key, Date.now());
@@ -773,6 +917,11 @@ export class BotPool extends EventEmitter {
           `[pool] Stashed session history for ${evict_key}: ${bot.session_id.slice(0, 8)}`,
         );
       }
+
+      // Cancel any in-flight session-confirmation watcher for this bot —
+      // the old session is about to be killed, so confirming it would be
+      // a no-op at best and a race at worst.
+      this.cancel_session_watcher(bot.id);
 
       // Kill any existing tmux session
       this.kill_tmux(bot.tmux_session);
@@ -820,6 +969,11 @@ export class BotPool extends EventEmitter {
       bot.archetype = archetype;
       bot.channel_type = channel_type ?? null;
       bot.session_id = session_id;
+      // Resumed sessions already have a JSONL on disk (we pre-flight checked
+      // at the initialize() / history-restore layer). Fresh sessions start
+      // unconfirmed — persist() won't write the session_id until the
+      // confirmation watcher sees the JSONL materialize. See issue #256.
+      bot.session_confirmed = !!resolved_session_id;
       bot.model = resolve_model_id(assigned_defaults);
       bot.effort = resolve_effort(assigned_defaults.think);
       bot.last_active = new Date();
@@ -834,6 +988,15 @@ export class BotPool extends EventEmitter {
       }
 
       await this.persist();
+
+      // Kick off a background watcher for fresh sessions: once Claude writes
+      // its first JSONL turn we promote session_confirmed = true and persist
+      // the session_id. If the daemon restarts before confirmation, the next
+      // startup will not see session_id in pool-state.json and will cleanly
+      // spawn a new session instead of crash-looping on --resume.
+      if (!resolved_session_id) {
+        this.watch_session_confirmation(bot, resolved_dir, session_id);
+      }
 
       console.log(
         `[pool] Assigned pool-${String(bot.id)} to channel ${channel_id} ` +
@@ -875,6 +1038,7 @@ export class BotPool extends EventEmitter {
     try {
       const bot_id = bot.id;
       this.kill_tmux(bot.tmux_session);
+      this.cancel_session_watcher(bot_id);
 
       bot.state = "free";
       bot.channel_id = null;
@@ -882,6 +1046,7 @@ export class BotPool extends EventEmitter {
       bot.archetype = null;
       bot.channel_type = null;
       bot.session_id = null;
+      bot.session_confirmed = false;
       bot.model = null;
       bot.effort = null;
       bot.last_active = null;
@@ -1170,12 +1335,14 @@ export class BotPool extends EventEmitter {
           console.log(
             `[pool] Freeing orphan pool-${String(bot.id)} (no metadata — cannot restart)`,
           );
+          this.cancel_session_watcher(bot.id);
           bot.state = "free";
           bot.channel_id = null;
           bot.entity_id = null;
           bot.archetype = null;
           bot.channel_type = null;
           bot.session_id = null;
+          bot.session_confirmed = false;
           bot.model = null;
           bot.effort = null;
           bot.last_active = null;
@@ -1210,10 +1377,13 @@ export class BotPool extends EventEmitter {
 
     if (!entity_id || !archetype) {
       console.error(`[pool] Cannot restart pool-${String(bot.id)}: missing fields — force-freeing`);
+      this.cancel_session_watcher(bot.id);
 
       // Stash session history when possible — allows a future assignment on
       // this channel to resume the session even though we can't restart now.
-      if (session_id && channel_id && entity_id) {
+      // Only stash *confirmed* sessions (JSONL on disk) to avoid planting
+      // phantom session_history entries (issue #256).
+      if (session_id && bot.session_confirmed && channel_id && entity_id) {
         const key = `${entity_id}:${channel_id}`;
         this.session_history.set(key, session_id);
         this.session_history_ts.set(key, Date.now());
@@ -1238,8 +1408,30 @@ export class BotPool extends EventEmitter {
     // Look up entity config for alerting and GH_TOKEN resolution
     const entity_config = this.registry?.get(entity_id);
 
-    const resume_id = session_id ?? randomUUID();
-    const is_resume = !!session_id;
+    // Any in-flight session-confirmation watcher for this bot is stale now —
+    // the tmux/Claude process it was observing is dead.
+    this.cancel_session_watcher(bot.id);
+
+    // Defensive pre-flight (issue #256): if we have a session_id but its
+    // JSONL transcript doesn't exist anywhere on disk, --resume will fail
+    // every time. Fall through to a fresh session instead of burning
+    // crash-loop retries. We search all project slugs because the session
+    // may have been spawned in a worktree cwd that differs from entity_dir.
+    const working_dir = entity_dir(this.config.paths, entity_id);
+    let resume_id: string;
+    let is_resume: boolean;
+    if (session_id && (await this.check_session_jsonl_exists_anywhere(session_id))) {
+      resume_id = session_id;
+      is_resume = true;
+    } else {
+      if (session_id) {
+        console.warn(
+          `[pool] pool-${String(bot.id)}: session ${session_id.slice(0, 8)} has no JSONL on disk — spawning fresh session instead of --resume (prevents crash loop)`,
+        );
+      }
+      resume_id = randomUUID();
+      is_resume = false;
+    }
     let restarted = false;
     try {
       // Resolve per-entity GitHub token (if configured)
@@ -1258,8 +1450,7 @@ export class BotPool extends EventEmitter {
         await this.write_access_json(bot.state_dir, channel_id);
       }
 
-      // Restart tmux — use --resume if we have a session_id
-      const working_dir = entity_dir(this.config.paths, entity_id);
+      // Restart tmux — use --resume if we have a verified session_id
       await this.start_tmux(
         bot,
         archetype,
@@ -1270,12 +1461,21 @@ export class BotPool extends EventEmitter {
         extra_env,
       );
 
-      // Update state — bot stays assigned with refreshed timestamps
+      // Update state — bot stays assigned with refreshed timestamps.
+      // `is_resume` is only true when we pre-flighted the JSONL on disk, so
+      // a resumed session is already confirmed. A fresh session needs the
+      // confirmation watcher before persist() will write its session_id.
       bot.session_id = resume_id;
+      bot.session_confirmed = is_resume;
       bot.last_active = new Date();
       bot.assigned_at = new Date();
 
       await this.persist();
+
+      if (!is_resume) {
+        this.watch_session_confirmation(bot, working_dir, resume_id);
+      }
+
       restarted = true;
     } catch (err) {
       console.error(`[pool] Failed to restart pool-${String(bot.id)} after crash: ${String(err)}`);
@@ -1284,8 +1484,10 @@ export class BotPool extends EventEmitter {
         contexts: { crash: { entity_id, session_id, channel_id } },
       });
 
-      // Restart failed — fall back to the old behavior: stash session history and free the bot
-      if (session_id && channel_id && entity_id) {
+      // Restart failed — fall back to the old behavior: stash session history and free the bot.
+      // Only stash confirmed sessions (JSONL on disk) so the next channel
+      // assignment can't crash-loop on a phantom UUID (issue #256).
+      if (session_id && bot.session_confirmed && channel_id && entity_id) {
         const key = `${entity_id}:${channel_id}`;
         this.session_history.set(key, session_id);
         this.session_history_ts.set(key, Date.now());
@@ -1353,15 +1555,31 @@ export class BotPool extends EventEmitter {
     const archetype = bot.archetype;
 
     console.error(`[pool] Crash loop detected for pool-${String(bot.id)} — releasing`);
+    this.cancel_session_watcher(bot.id);
 
     // Look up entity config for alerting
     const entity_config = entity_id ? this.registry?.get(entity_id) : undefined;
 
-    // Stash session history before release so the channel can resume later
-    if (bot.session_id && channel_id && entity_id) {
-      const key = `${entity_id}:${channel_id}`;
-      this.session_history.set(key, bot.session_id);
-      this.session_history_ts.set(key, Date.now());
+    // Stash session history before release so the channel can resume later.
+    // A crash-looping session is almost certainly broken — only stash if the
+    // JSONL still exists on disk. Planting a phantom UUID here is how the
+    // original bug self-perpetuated: the next assignment would pull the dead
+    // UUID out of history and re-enter the crash loop (issue #256).
+    if (bot.session_id && bot.session_confirmed && channel_id && entity_id) {
+      const exists = await this.check_session_jsonl_exists_anywhere(bot.session_id);
+      if (exists) {
+        const key = `${entity_id}:${channel_id}`;
+        this.session_history.set(key, bot.session_id);
+        this.session_history_ts.set(key, Date.now());
+      } else {
+        console.warn(
+          `[pool] Not stashing crash-loop session ${bot.session_id.slice(0, 8)} — JSONL missing`,
+        );
+      }
+    } else if (bot.session_id && !bot.session_confirmed) {
+      console.warn(
+        `[pool] Not stashing unconfirmed crash-loop session ${bot.session_id.slice(0, 8)}`,
+      );
     }
 
     // Release the bot — this kills tmux, frees the bot, clears access.json
@@ -1454,9 +1672,109 @@ export class BotPool extends EventEmitter {
     }
   }
 
+  // ── Session confirmation (issue #256) ──
+
+  /**
+   * Watch for Claude Code to write the JSONL transcript for a freshly-spawned
+   * session. Once the file appears, promote `bot.session_confirmed` to true
+   * and persist — this is the gate that lets `persist()` write the session_id.
+   *
+   * Until the watcher fires, a daemon restart will see `session_id: null` in
+   * pool-state.json and spawn a fresh session on the next assignment instead
+   * of trying to --resume a phantom UUID (issue #256).
+   *
+   * Uses a simple poll loop with a 60-second cap. If the session never
+   * commits (e.g. the bot was parked without ever being talked to), we give
+   * up — the UUID just stays unpersisted, which is the correct behavior.
+   *
+   * Protected so tests can override timing.
+   */
+  protected watch_session_confirmation(
+    bot: PoolBot,
+    working_dir: string,
+    session_id: string,
+  ): void {
+    // Replace any prior watcher for this bot — only one live at a time
+    this.cancel_session_watcher(bot.id);
+
+    const poll_interval_ms = 500;
+    const max_attempts = 120; // 60 seconds total
+    const bot_id = bot.id;
+    let attempts = 0;
+
+    const tick = async (): Promise<void> => {
+      // Bot may have been reassigned / released while we were waiting —
+      // verify the session_id still matches before promoting.
+      const current = this.bots.find((b) => b.id === bot_id);
+      if (!current || current.session_id !== session_id) {
+        this.session_watchers.delete(bot_id);
+        return;
+      }
+
+      const exists = await this.check_session_jsonl_exists(working_dir, session_id);
+
+      // Re-check after await: bot may have been reassigned during the async
+      // suspension — cancel_session_watcher only stops future ticks, not an
+      // in-flight continuation. (#256)
+      const still_current = this.bots.find((b) => b.id === bot_id);
+      if (!still_current || still_current.session_id !== session_id) {
+        this.session_watchers.delete(bot_id);
+        return;
+      }
+
+      if (exists) {
+        still_current.session_confirmed = true;
+        this.session_watchers.delete(bot_id);
+        console.log(
+          `[pool] pool-${String(bot_id)} session ${session_id.slice(0, 8)} confirmed — JSONL on disk, persisting`,
+        );
+        await this.persist();
+        return;
+      }
+
+      attempts++;
+      if (attempts >= max_attempts) {
+        this.session_watchers.delete(bot_id);
+        console.warn(
+          `[pool] pool-${String(bot_id)} session ${session_id.slice(0, 8)} unconfirmed ` +
+            `after ${String(max_attempts * poll_interval_ms)}ms — leaving unpersisted`,
+        );
+        return;
+      }
+
+      const next = setTimeout(() => {
+        void tick();
+      }, poll_interval_ms);
+      this.session_watchers.set(bot_id, next);
+    };
+
+    // First tick runs immediately — in tests the file may already exist.
+    const initial = setTimeout(() => {
+      void tick();
+    }, 0);
+    this.session_watchers.set(bot_id, initial);
+  }
+
+  /** Cancel any pending session-confirmation watcher for a bot. Safe to call
+   * when no watcher exists. */
+  private cancel_session_watcher(bot_id: number): void {
+    const timer = this.session_watchers.get(bot_id);
+    if (timer) {
+      clearTimeout(timer);
+      this.session_watchers.delete(bot_id);
+    }
+  }
+
   /** Stop all pool bot sessions. Used during daemon shutdown. */
   async shutdown(): Promise<void> {
     this.stop_health_monitor();
+
+    // Cancel all in-flight session confirmation watchers — we're about to
+    // kill tmux anyway, and the timers would otherwise keep the event loop
+    // alive past shutdown.
+    for (const bot_id of Array.from(this.session_watchers.keys())) {
+      this.cancel_session_watcher(bot_id);
+    }
 
     // Snapshot current state before killing tmux — this is what the next
     // daemon startup will load for proactive resume.
@@ -1487,7 +1805,11 @@ export class BotPool extends EventEmitter {
         entity_id: b.entity_id!,
         archetype: b.archetype!,
         channel_type: b.channel_type,
-        session_id: b.session_id,
+        // Only persist session_id once Claude has committed the JSONL to disk
+        // (issue #256). Writing an unconfirmed UUID would let a restart during
+        // the pre-confirmation window crash-loop on --resume of a session that
+        // was never materialized.
+        session_id: b.session_confirmed ? b.session_id : null,
         model: b.model,
         effort: b.effort,
         last_active: b.last_active?.toISOString() ?? null,
@@ -1602,6 +1924,23 @@ export class BotPool extends EventEmitter {
     const model_id = resolve_model_id(archetype_defaults);
     const effort = resolve_effort(archetype_defaults.think);
 
+    // Trusted directory set for `--permission-mode bypassPermissions`. Beyond
+    // the entity/working dir we also include:
+    //   - ~/.claude  — global skill + agent library. Bots load skills from
+    //     here via auto-load, so operator meta-tasks that need to read or
+    //     write the skill files themselves (e.g. diffing, porting) don't
+    //     trigger an interactive approval modal. See issue #260.
+    //   - /tmp       — standard scratch dir. Lets bots stage intermediate
+    //     artifacts without polluting the entity worktree's git status.
+    //     Security note: /tmp is world-writable. We accept this because pool
+    //     bots already run under bypassPermissions for the entity worktree —
+    //     the threat model assumes a trusted single-user environment. If
+    //     multi-tenant isolation is ever required, replace with a per-entity
+    //     temp dir.
+    // Both paths are already world-accessible to this user — adding them to
+    // the trusted set doesn't widen the blast radius, it just stops the
+    // modal stalls. We resolve ~ via homedir() because tmux command-string
+    // parsing doesn't expand tildes.
     const claude_args = [
       sq(claude_bin),
       "--channels",
@@ -1616,6 +1955,10 @@ export class BotPool extends EventEmitter {
       sq(working_dir),
       "--add-dir",
       sq(entity_dir(this.config.paths, entity_id)),
+      "--add-dir",
+      sq(join(homedir(), ".claude")),
+      "--add-dir",
+      sq("/tmp"),
     ];
 
     if (effort) {

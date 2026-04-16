@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
+import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 let temp_dir: string;
 
@@ -20,7 +20,7 @@ function make_config(): LobsterFarmConfig {
  * Test-friendly subclass that exposes internals and stubs side effects.
  * Tracks persist() and kill_tmux() calls for assertion.
  */
-class TestBotPool extends BotPool {
+class TestBotPool extends BotPoolTestBase {
   persist_calls = 0;
   kill_tmux_calls: string[] = [];
   private persist_order: string[] = [];
@@ -64,6 +64,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     archetype: null,
     channel_type: null,
     session_id: null,
+    session_confirmed: true,
     tmux_session: `pool-${String(overrides.id)}`,
     last_active: null,
     assigned_at: null,

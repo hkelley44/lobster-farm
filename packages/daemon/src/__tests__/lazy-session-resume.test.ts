@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
+import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 // ── Test helpers ──
 
@@ -26,6 +26,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     archetype: null,
     channel_type: null,
     session_id: null,
+    session_confirmed: true,
     tmux_session: `pool-${String(overrides.id)}`,
     last_active: null,
     assigned_at: null,
@@ -42,7 +43,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
  * Test-friendly BotPool subclass that stubs tmux/filesystem side effects and
  * exposes internals for assertion. Follows the same pattern as existing test files.
  */
-class TestBotPool extends BotPool {
+class TestBotPool extends BotPoolTestBase {
   private tmux_alive_overrides = new Map<string, boolean>();
 
   inject_bots(bots: PoolBot[]): void {

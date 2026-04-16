@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BotPool } from "../pool.js";
 import type { PoolBot } from "../pool.js";
+import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
 let temp_dir: string;
 
@@ -20,7 +20,7 @@ function make_config(): LobsterFarmConfig {
  * Test-friendly subclass of BotPool that exposes internals for unit testing.
  * Overrides tmux/filesystem operations to avoid real side effects.
  */
-class TestBotPool extends BotPool {
+class TestBotPool extends BotPoolTestBase {
   // Override the tmux-dependent methods to make tests deterministic.
   // The real pool checks tmux pane output; we control what is_bot_idle returns
   // by mapping bot IDs to idle status.
@@ -56,6 +56,7 @@ function make_bot(overrides: Partial<PoolBot> & { id: number }): PoolBot {
     archetype: null,
     channel_type: null,
     session_id: null,
+    session_confirmed: true,
     tmux_session: `pool-${String(overrides.id)}`,
     last_active: null,
     assigned_at: null,
