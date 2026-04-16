@@ -47,7 +47,7 @@ export interface SentryTriageContext {
   registry: EntityRegistry;
   discord: DiscordBot | null;
   config: LobsterFarmConfig;
-  alert_router?: AlertRouter | null;
+  alert_router: AlertRouter | null;
 }
 
 // ── Sentry webhook payload shapes ──
