@@ -115,6 +115,91 @@ export function is_tmux_session_idle(tmux_session: string): boolean {
   }
 }
 
+// ── Pending file path ──
+
+/** Canonical path for the pending-message file used by bridge and drain. */
+export function pending_file_path(tmux_session: string): string {
+  return `/tmp/lf-pending-${tmux_session}.txt`;
+}
+
+// ── Bot readiness polling ──
+
+/**
+ * Poll a tmux pane until the Claude Code bot is ready (prompt + plugin indicators).
+ *
+ * Ready when the pane output contains "❯" OR "bypass permissions" — these indicate
+ * the Claude process is at the prompt and the MCP plugin is connected.
+ *
+ * Returns true if the bot became ready within the timeout, false otherwise.
+ */
+export async function wait_for_bot_ready(
+  tmux_session: string,
+  opts?: { timeout_ms?: number; poll_ms?: number },
+): Promise<boolean> {
+  const timeout = opts?.timeout_ms ?? 30_000;
+  const poll = opts?.poll_ms ?? 500;
+  const start = Date.now();
+
+  while (Date.now() - start < timeout) {
+    await new Promise((resolve) => setTimeout(resolve, poll));
+    try {
+      const output = execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
+        encoding: "utf-8",
+        timeout: 2000,
+      });
+      if (
+        output.includes("Listening for channel messages") &&
+        (output.includes("❯") || output.includes("bypass permissions"))
+      ) {
+        return true;
+      }
+    } catch {
+      /* tmux pane not ready yet */
+    }
+  }
+  return false;
+}
+
+/**
+ * Wait for a bot to be ready with retries and tmux liveness checks.
+ *
+ * Calls wait_for_bot_ready up to `max_attempts` times. Between attempts,
+ * checks if the tmux session is still alive — bails early if it died.
+ *
+ * Returns true if the bot became ready, false if all attempts were exhausted
+ * or the tmux session died.
+ */
+export async function wait_for_bot_ready_with_retries(
+  tmux_session: string,
+  opts?: { timeout_ms?: number; poll_ms?: number; max_attempts?: number },
+): Promise<boolean> {
+  const max_attempts = opts?.max_attempts ?? 3;
+
+  for (let attempt = 1; attempt <= max_attempts; attempt++) {
+    const ready = await wait_for_bot_ready(tmux_session, {
+      timeout_ms: opts?.timeout_ms,
+      poll_ms: opts?.poll_ms,
+    });
+    if (ready) return true;
+
+    // Between retries, check if the tmux session is still alive
+    if (attempt < max_attempts) {
+      try {
+        execFileSync("tmux", ["has-session", "-t", tmux_session], { stdio: "ignore" });
+      } catch {
+        // Session died — no point retrying
+        console.log(`[pool] Tmux session ${tmux_session} died during readiness wait — bailing`);
+        return false;
+      }
+      console.log(
+        `[pool] Bot ${tmux_session} not ready after attempt ${String(attempt)}/${String(max_attempts)} — retrying`,
+      );
+    }
+  }
+
+  return false;
+}
+
 // ── Claude Code JSONL session tracking ──
 
 /**
@@ -260,6 +345,9 @@ export class BotPool extends EventEmitter {
   private assigning_channels = new Set<string>();
   /** In-flight lock: channels currently being released. Prevents double-release races. */
   private releasing_channels = new Set<string>();
+  /** In-flight lock: tmux sessions with a pending file delivery in progress.
+   * Prevents drain_pending_files from re-delivering during the 5s cleanup window. */
+  private draining_sessions = new Set<string>();
   private bot_user_ids = new Map<number, string>();
   private nickname_handler: NicknameHandler | null = null;
   private avatar_handler: AvatarHandler | null = null;
@@ -1043,6 +1131,10 @@ export class BotPool extends EventEmitter {
       this.kill_tmux(bot.tmux_session);
       this.cancel_session_watcher(bot_id);
 
+      // Clear any orphaned pending file when releasing a bot — prevents stale
+      // message content from a previous assignment leaking into a future one.
+      void unlink(pending_file_path(bot.tmux_session)).catch(() => {});
+
       bot.state = "free";
       bot.channel_id = null;
       bot.entity_id = null;
@@ -1102,6 +1194,17 @@ export class BotPool extends EventEmitter {
       this.session_history_ts.delete(key);
       console.log(`[pool] Cleared session history for ${key}`);
     }
+  }
+
+  /** Mark a tmux session as having an in-flight pending file delivery.
+   * Prevents drain_pending_files from re-delivering during the cleanup window.
+   * Returns a cleanup function that unmarks the session and deletes the file. */
+  mark_draining(tmux_session: string, pending_path: string): () => void {
+    this.draining_sessions.add(tmux_session);
+    return () => {
+      void unlink(pending_path).catch(() => {});
+      this.draining_sessions.delete(tmux_session);
+    };
   }
 
   /** Check if an assigned bot's tmux session is still alive.
@@ -1365,6 +1468,11 @@ export class BotPool extends EventEmitter {
 
       // Deliver any queued messages to bots that are now at the prompt
       this.drain_pending_injections();
+
+      // Safety net: recover undelivered pending files left by failed bridge attempts.
+      // If bridge_first_message or bridge_resume_nudge timed out but the bot later
+      // became ready, deliver the pending file content via tmux send-keys.
+      await this.drain_pending_files();
 
       for (const bot of this.bots) {
         if (bot.state !== "assigned") continue;
@@ -1652,6 +1760,7 @@ export class BotPool extends EventEmitter {
         `[pool] Crash loop for pool-${String(bot.id)} with no channel_id — force-freeing`,
       );
       this.kill_tmux(bot.tmux_session);
+      void unlink(pending_file_path(bot.tmux_session)).catch(() => {});
       bot.state = "free";
       bot.channel_id = null;
       bot.entity_id = null;
@@ -2251,7 +2360,13 @@ export class BotPool extends EventEmitter {
     return false;
   }
 
-  /** Check if a bot's tmux pane shows the Claude prompt indicator (❯). */
+  /** Check if a bot's tmux pane shows the Claude prompt indicator (❯).
+   *
+   * Note: This uses a simpler check than wait_for_bot_ready (which also
+   * requires "Listening for channel messages"). The ❯ prompt is sufficient
+   * for drain — if the bot is at the prompt, it can read a file regardless
+   * of MCP plugin state. wait_for_bot_ready's stricter check is for the
+   * initial bridge path where we need the plugin connected for Discord I/O. */
   private is_at_prompt(session_name: string): boolean {
     try {
       const output = execFileSync("tmux", ["capture-pane", "-t", session_name, "-p"], {
@@ -2302,53 +2417,90 @@ export class BotPool extends EventEmitter {
   }
 
   /**
+   * Safety net for failed bridge attempts.
+   *
+   * Scans assigned bots for orphaned /tmp/lf-pending-{session}.txt files.
+   * If the bot is alive and at the prompt, delivers the message via tmux
+   * send-keys and removes the file. This catches the case where
+   * bridge_first_message or bridge_resume_nudge timed out but the bot
+   * became ready later.
+   */
+  private async drain_pending_files(): Promise<void> {
+    for (const bot of this.bots) {
+      if (bot.state !== "assigned") continue;
+
+      const pending_path = pending_file_path(bot.tmux_session);
+      try {
+        await access(pending_path);
+      } catch {
+        continue; // No pending file — normal case
+      }
+
+      // Skip if a bridge or previous drain is already handling this session's
+      // pending file — prevents double-delivery during the 5s cleanup window.
+      if (this.draining_sessions.has(bot.tmux_session)) continue;
+
+      // File exists — check if the bot is alive and ready
+      if (!this.is_tmux_alive(bot.tmux_session)) continue;
+      if (!this.is_at_prompt(bot.tmux_session)) continue;
+
+      // Bot is ready with an undelivered pending file — deliver it
+      try {
+        const prompt = `A user messaged you earlier but the message wasn't delivered. Read ${pending_path} for their message and respond to them.`;
+        this.send_via_tmux(bot.tmux_session, prompt);
+        console.log(`[pool] Drained pending file for ${bot.tmux_session} via health check`);
+        // Clean up shortly after — Claude has the prompt and will read it within seconds.
+        // Keep this well under the 30s health-check interval to prevent self-re-delivery
+        // on the next tick.
+        const cleanup = this.mark_draining(bot.tmux_session, pending_path);
+        setTimeout(cleanup, 5_000);
+      } catch (err) {
+        console.warn(`[pool] Failed to drain pending file for ${bot.tmux_session}: ${String(err)}`);
+      }
+    }
+  }
+
+  /**
    * Bridge a continuation nudge to a resumed bot's Claude Code process.
    * Writes a pending message file that the MCP Discord plugin picks up,
    * using the same mechanism as bridge_first_message in discord.ts.
    *
-   * Waits for the Claude process to be ready (prompt indicator visible in
-   * the tmux pane) before writing the file, so the plugin is listening.
+   * Uses wait_for_bot_ready_with_retries for robust readiness detection
+   * with up to 3 attempts (~90s total coverage).
    */
   private async bridge_resume_nudge(bot: PoolBot): Promise<void> {
-    const pending_path = `/tmp/lf-pending-${bot.tmux_session}.txt`;
+    const pending_path = pending_file_path(bot.tmux_session);
     const nudge =
       "The daemon restarted and your session was resumed. " +
       "Check where you left off and continue any in-progress work.";
 
-    // Poll the tmux pane for the ready indicator — same pattern as
-    // bridge_first_message in discord.ts. The Claude process needs time
-    // to load history via --resume before it starts the MCP plugin.
-    const start = Date.now();
-    const timeout = 20_000;
-    let ready = false;
+    // Write file first so drain_pending_files can recover it if readiness times out
+    await writeFile(pending_path, nudge, "utf-8");
 
-    while (Date.now() - start < timeout) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      try {
-        const output = execFileSync("tmux", ["capture-pane", "-t", bot.tmux_session, "-p"], {
-          encoding: "utf-8",
-          timeout: 2000,
-        });
-        if (output.includes("Listening for channel messages") && output.includes("❯")) {
-          ready = true;
-          break;
-        }
-      } catch {
-        /* tmux pane not ready yet */
-      }
-    }
+    const ready = await wait_for_bot_ready_with_retries(bot.tmux_session);
 
     if (!ready) {
       console.log(
-        `[pool] Bot ${bot.tmux_session} not ready after ${String(timeout)}ms — resume nudge not sent`,
+        `[pool] Bot ${bot.tmux_session} not ready after all retries — resume nudge not sent`,
+      );
+      // pending_path stays in place for drain_pending_files to recover
+      return;
+    }
+
+    // Guard against drain having already delivered while we were polling.
+    // drain_pending_files runs on the 30s health-check timer and may have
+    // claimed and sent the file during the ~90s readiness wait.
+    try {
+      await access(pending_path);
+    } catch {
+      console.log(
+        `[pool] Pending file already claimed by drain for ${bot.tmux_session} — skipping nudge send`,
       );
       return;
     }
 
     // Small extra delay for the MCP plugin to fully connect
     await new Promise((resolve) => setTimeout(resolve, 2000));
-
-    await writeFile(pending_path, nudge, "utf-8");
 
     // Deliver the nudge via tmux send-keys — the file alone is not enough.
     // The send-keys call injects a prompt into Claude's stdin telling it
@@ -2367,10 +2519,11 @@ export class BotPool extends EventEmitter {
 
     console.log(`[pool] Bridged resume nudge to ${bot.tmux_session}`);
 
-    // Clean up the pending file after a delay
-    setTimeout(() => {
-      void unlink(pending_path).catch(() => {});
-    }, 30_000);
+    // Clean up shortly after — Claude has the prompt and will read it within seconds.
+    // Keep this well under the 30s health-check interval to prevent drain_pending_files
+    // from re-delivering the same message after Claude finishes processing.
+    const cleanup = this.mark_draining(bot.tmux_session, pending_path);
+    setTimeout(cleanup, 5_000);
   }
 
   /**
