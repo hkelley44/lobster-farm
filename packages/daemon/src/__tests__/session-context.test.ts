@@ -416,8 +416,9 @@ describe("session-context", () => {
 
       const result = await read_session_context(session_id);
       expect(result).not.toBeNull();
-      // 1 from compact_boundary + 1 from token-drop after turn 2 + 1 from token-drop after turn 4 = 3
-      expect(result!.compactions).toBe(3);
+      // 1 from compact_boundary + 1 from token-drop at turn 4 = 2
+      // (turn 2's token drop is NOT counted — prev_total resets on boundary detection)
+      expect(result!.compactions).toBe(2);
     });
 
     it("does not count minor token decreases as compactions", async () => {

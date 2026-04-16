@@ -115,6 +115,7 @@ async function parse_session_usage(
       // without waiting for the next assistant turn's token drop.
       if (entry.type === "system" && entry.subtype === "compact_boundary") {
         compactions++;
+        prev_total = 0; // reset so the subsequent token drop doesn't double-count
         continue;
       }
 
