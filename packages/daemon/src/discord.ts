@@ -664,7 +664,14 @@ export class DiscordBot extends EventEmitter {
     // The MCP plugin needs time to deliver the message — checking idle
     // on the very first tick may fire before the bot starts processing.
     let consecutive_idle = 0;
-    const IDLE_THRESHOLD = 2; // require 2 consecutive idle checks (~8s) before finalizing
+    const IDLE_THRESHOLD = 3; // require 3 consecutive idle checks (~12s) before finalizing
+
+    // Grace period: skip idle checks entirely for the first 15 seconds.
+    // MCP message delivery (channel push or bridge) takes several seconds —
+    // the bot sits at its previous prompt during delivery, looking "idle"
+    // when it's actually about to start processing. (#280)
+    const started_at = Date.now();
+    const GRACE_PERIOD_MS = 15_000;
 
     const interval = setInterval(() => {
       if (!this._pool) {
@@ -700,7 +707,34 @@ export class DiscordBot extends EventEmitter {
         return;
       }
 
+      // During the grace period, skip idle checks — the message is still
+      // being delivered via MCP and the bot will appear idle at its old prompt.
+      if (Date.now() - started_at < GRACE_PERIOD_MS) {
+        // Still update the status embed so the user sees activity
+        void this.update_status_embed_from_tmux(channel_id, bot.tmux_session);
+        return;
+      }
+
       if (this._pool.is_bot_idle(bot)) {
+        // Before declaring idle, check if there's a pending MCP delivery.
+        // The tmux pane shows "← discord" when the channel plugin is pushing
+        // a message — if that indicator is present near the end of the pane
+        // alongside a prompt, the bot is about to receive work.
+        try {
+          const pane = execFileSync(
+            "tmux",
+            ["capture-pane", "-t", bot.tmux_session, "-p", "-S", "-5"],
+            { encoding: "utf-8", timeout: 2000 },
+          );
+          if (pane.includes("← discord")) {
+            consecutive_idle = 0;
+            void this.update_status_embed_from_tmux(channel_id, bot.tmux_session);
+            return;
+          }
+        } catch {
+          // tmux read failure — fall through to normal idle logic
+        }
+
         consecutive_idle++;
         if (consecutive_idle >= IDLE_THRESHOLD) {
           this.stop_typing_loop(channel_id);
