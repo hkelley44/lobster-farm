@@ -489,7 +489,10 @@ async function resolve_gh_token(
       ? await github_app.get_token_for_installation(override_id)
       : await github_app.get_token();
   } catch (err) {
-    console.warn(`[sentry-triage] Failed to resolve GH token for ${entity_id}: ${String(err)}`);
+    console.error(`[sentry-triage] Failed to resolve GH token for ${entity_id}: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "sentry-triage", entity: entity_id },
+    });
     return undefined;
   }
 }
