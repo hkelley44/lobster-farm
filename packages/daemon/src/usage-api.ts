@@ -136,8 +136,9 @@ function format_usage_summary(data: SubscriptionUsageResponse): string {
   }
 
   if (data.extra_usage?.is_enabled) {
-    const spent = data.extra_usage.used_credits.toFixed(2);
-    const limit = data.extra_usage.monthly_limit.toFixed(0);
+    // API returns used_credits and monthly_limit in cents — convert to dollars
+    const spent = (data.extra_usage.used_credits / 100).toFixed(2);
+    const limit = (data.extra_usage.monthly_limit / 100).toFixed(0);
     parts.push(`Extra: $${spent}/$${limit}`);
   }
 
