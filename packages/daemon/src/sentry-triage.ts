@@ -632,7 +632,7 @@ async function spawn_triage_session(
         void ctx.alert_router
           .post_alert({
             entity_id,
-            tier: "routine",
+            tier: "action_required",
             title: "\u26a0\ufe0f Sentry triage completed \u2014 no verdict parsed",
             body: `Ray's session completed but didn't output a structured verdict.\n${issue_details.title}\n${issue_details.web_url}`,
           })
