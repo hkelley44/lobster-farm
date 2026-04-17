@@ -1,8 +1,10 @@
 # LobsterFarm — Specification Index
 
 ## Architecture & Reference
-- `lobsterfarm-architecture-v0.3.md` — Full system architecture (components, data model, SOPs, governance, roadmap)
+- `architecture/README.md` — Current architecture (canonical)
+- `architecture/docs/ARCHITECTURE.md`, `AGENT-FILES.md`, `TERMINOLOGY.md`, `FILE-STRUCTURE.md`, `STATUS.md`, `RESEARCH.md`
 - `lobsterfarm-file-boundary-map-v2.md` — What content goes in which file (definitive guide)
+- `archive/` — Historical / aspirational specs that were never fully implemented. Do not treat as current.
 
 ## Default Configuration Templates (../config/)
 
