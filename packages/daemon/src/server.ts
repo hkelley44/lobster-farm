@@ -755,11 +755,23 @@ const handle_channel_delete: RouteHandler = async (req, res, ctx) => {
 
 // ── Lockdown route ──
 
+// In-flight guard for the fire-and-forget lockdown. Prevents a second
+// POST /lockdown during an active run from racing the first on Discord's
+// role-create API (two creates for the same role name landing simultaneously).
+let lockdown_in_progress = false;
+
 const handle_lockdown: RouteHandler = async (_req, res, ctx) => {
   if (!ctx.discord) {
     json_response(res, 503, { error: "Discord bot not connected" });
     return;
   }
+
+  if (lockdown_in_progress) {
+    json_response(res, 409, { error: "Lockdown already in progress" });
+    return;
+  }
+
+  lockdown_in_progress = true;
 
   // Respond immediately — lockdown makes many sequential Discord API calls
   // and may be rate-limited. Fire-and-forget; check logs for results.
@@ -768,18 +780,23 @@ const handle_lockdown: RouteHandler = async (_req, res, ctx) => {
     message: "Lockdown started — check daemon logs for results",
   });
 
-  void ctx.discord.lockdown().then(
-    (result) => {
-      console.log("[lockdown] Completed successfully:", JSON.stringify(result));
-    },
-    (err) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[lockdown] Failed: ${msg}`);
-      sentry.captureException(err, {
-        tags: { module: "server", action: "lockdown" },
-      });
-    },
-  );
+  void ctx.discord
+    .lockdown()
+    .then(
+      (result) => {
+        console.log("[lockdown] Completed successfully:", JSON.stringify(result));
+      },
+      (err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[lockdown] Failed: ${msg}`);
+        sentry.captureException(err, {
+          tags: { module: "server", action: "lockdown" },
+        });
+      },
+    )
+    .finally(() => {
+      lockdown_in_progress = false;
+    });
 };
 
 // ── Router ──

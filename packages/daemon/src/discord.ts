@@ -1733,10 +1733,18 @@ export class DiscordBot extends EventEmitter {
    * Find or create the entity-specific Discord role.
    * The role itself has no special permissions — it's used as a tag
    * for category permission overrides.
+   *
+   * `skip_fetch` is for callers that have already populated the role cache
+   * in this same operation (e.g. lockdown() after find_or_create_bot_role),
+   * to avoid redundant `guild.roles.fetch()` round-trips per entity.
    */
-  async find_or_create_entity_role(guild: Guild, entity_id: string): Promise<Role> {
+  async find_or_create_entity_role(
+    guild: Guild,
+    entity_id: string,
+    opts: { skip_fetch?: boolean } = {},
+  ): Promise<Role> {
     // Fetch fresh from API to avoid creating duplicates if role was created externally
-    await guild.roles.fetch();
+    if (!opts.skip_fetch) await guild.roles.fetch();
     const existing = guild.roles.cache.find((r) => r.name === entity_id);
     if (existing) return existing;
 
@@ -1933,13 +1941,19 @@ export class DiscordBot extends EventEmitter {
       }
 
       try {
-        // Find or create entity role
-        const entity_role = await this.find_or_create_entity_role(guild, entity_id);
+        // Find or create entity role. The role cache was populated by the
+        // find_or_create_bot_role call above, so skip the per-entity refetch.
+        const entity_role = await this.find_or_create_entity_role(guild, entity_id, {
+          skip_fetch: true,
+        });
 
         // Fetch category channel and set overrides
         const category = (await guild.channels.fetch(category_id)) as CategoryChannel | null;
         if (!category || category.type !== DiscordChannelType.GuildCategory) {
+          // A valid snowflake in config resolving to null means the category
+          // was deleted or the bot lost access — a failure, not a skip.
           console.warn(`[lockdown] Category ${category_id} not found for entity "${entity_id}"`);
+          entities_failed++;
           continue;
         }
 

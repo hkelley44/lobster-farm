@@ -274,7 +274,7 @@ describe("find_or_create_entity_role (#295)", () => {
 });
 
 describe("lockdown — category fetch returns null (#295)", () => {
-  it("skips the entity (not failed, not processed) and continues the run", async () => {
+  it("counts the entity as failed and continues the run", async () => {
     const config = make_config();
     const registry = new TestRegistry(config);
     const bot = new TestDiscordBot(config, registry);
@@ -293,9 +293,10 @@ describe("lockdown — category fetch returns null (#295)", () => {
     });
     registry.set_entities([entity]);
 
-    // Category fetch resolves null for this snowflake — the entity should be
-    // skipped with a warning, not counted as a failure, and lockdown should
-    // still complete successfully.
+    // Category fetch resolves null for this snowflake — a valid snowflake
+    // resolving to null means the category was deleted or the bot lost
+    // access. That's a failure (not a silent skip). Lockdown should still
+    // complete and continue on to GLOBAL/failsafe.
     const channel_fetch = vi.fn().mockResolvedValue(null);
     const { guild } = make_mock_guild({ channel_fetch });
     bot.set_guild(guild);
@@ -304,7 +305,7 @@ describe("lockdown — category fetch returns null (#295)", () => {
 
     expect(channel_fetch).toHaveBeenCalledWith("1234567890123456789");
     expect(result.entities_processed).toBe(0);
-    expect(result.entities_failed).toBe(0);
+    expect(result.entities_failed).toBe(1);
     // No disk write happened since the entity never reached the persist step.
     expect(bot.persisted).toHaveLength(0);
     // Bot role was still created even though no entity completed.
