@@ -407,6 +407,10 @@ entity:
     vault: "1password"
     vault_name: "entity-alpha"
 
+  # Optional: per-entity Claude Max subscription (see docs/per-entity-subscriptions.md)
+  subscription:
+    claude_config_dir: ~/.lobsterfarm/entities/alpha/.claude-config
+
   budget:
     monthly_warning_pct: 80
     monthly_limit: null  # null = no hard limit

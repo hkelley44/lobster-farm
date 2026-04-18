@@ -4,6 +4,9 @@
 - `lobsterfarm-architecture-v0.3.md` — Full system architecture (components, data model, SOPs, governance, roadmap)
 - `lobsterfarm-file-boundary-map-v2.md` — What content goes in which file (definitive guide)
 
+## Guides
+- `per-entity-subscriptions.md` — Per-entity Claude Max subscription setup (CLAUDE_CONFIG_DIR isolation)
+
 ## Default Configuration Templates (../config/)
 
 ### ~/.claude/ (Global Claude Code Configuration)

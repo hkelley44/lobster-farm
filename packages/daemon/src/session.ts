@@ -4,7 +4,12 @@ import { EventEmitter } from "node:events";
 import { readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ArchetypeRole, LobsterFarmConfig, ModelTier } from "@lobster-farm/shared";
+import type {
+  ArchetypeRole,
+  EntityConfig,
+  LobsterFarmConfig,
+  ModelTier,
+} from "@lobster-farm/shared";
 import {
   entity_context_dir,
   entity_daily_dir,
@@ -178,15 +183,36 @@ function claude_binary(): string {
 
 // ── Implementation ──
 
+/** Minimal interface for entity config lookup — avoids importing the full
+ * EntityRegistry class (which lives in the daemon package). */
+interface EntityConfigLookup {
+  get(entity_id: string): EntityConfig | undefined;
+}
+
 export class ClaudeSessionManager extends EventEmitter implements SessionManager {
   private sessions = new Map<string, ActiveSession>();
   private processes = new Map<string, ChildProcess>();
   private output_buffers = new Map<string, string[]>();
   private config: LobsterFarmConfig;
+  private registry: EntityConfigLookup | null = null;
 
   constructor(config: LobsterFarmConfig) {
     super();
     this.config = config;
+  }
+
+  /** Set the entity registry for per-entity config lookups (e.g. subscription). */
+  set_registry(registry: EntityConfigLookup): void {
+    this.registry = registry;
+  }
+
+  /** Look up the per-entity Claude subscription config dir from the registry.
+   * Returns the absolute path if configured, or null (use default ~/.claude). */
+  private resolve_claude_config_dir(entity_id: string): string | null {
+    if (!this.registry) return null;
+    const entity_config = this.registry.get(entity_id);
+    if (!entity_config) return null;
+    return entity_config.entity.subscription?.claude_config_dir ?? null;
   }
 
   /** Build the full CLI arguments for spawning a claude session. */
@@ -271,11 +297,27 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
       tmux_pane: null,
     };
 
+    // Resolve per-entity Claude subscription config dir if configured.
+    // Merged into spawn env so the session uses the entity's own subscription.
+    const spawn_env: Record<string, string> = { ...options.env };
+    const claude_config_dir = this.resolve_claude_config_dir(options.entity_id);
+    if (claude_config_dir) {
+      spawn_env.CLAUDE_CONFIG_DIR = claude_config_dir;
+      console.log(
+        `[session] Spawning session for ${options.entity_id} ` +
+          `with CLAUDE_CONFIG_DIR=${claude_config_dir}`,
+      );
+    } else {
+      console.log(
+        `[session] Spawning session for ${options.entity_id} with CLAUDE_CONFIG_DIR=default (~/.claude)`,
+      );
+    }
+
     // Spawn the process — prompt is piped via stdin
     const proc = spawn(command, args, {
       cwd: expand_home(options.worktree_path),
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...options.env },
+      env: { ...process.env, ...spawn_env },
     });
 
     // Write prompt to stdin and close it.

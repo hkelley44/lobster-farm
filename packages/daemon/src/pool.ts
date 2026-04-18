@@ -822,6 +822,16 @@ export class BotPool extends EventEmitter {
           }
         }
 
+        // Inject per-entity Claude subscription config dir if configured.
+        const resume_config_dir = this.resolve_claude_config_dir(candidate.entity_id);
+        if (resume_config_dir) {
+          extra_env.CLAUDE_CONFIG_DIR = resume_config_dir;
+          console.log(
+            `[pool] Resuming bot pool-${String(bot.id)} for ${candidate.entity_id} ` +
+              `with CLAUDE_CONFIG_DIR=${resume_config_dir}`,
+          );
+        }
+
         // Write a resume-nudge pending message and point LF_PENDING_FILE at
         // it. The SessionStart hook (session-start-inject.sh) delivers it
         // during Claude init as additionalContext — replacing the legacy
@@ -1093,6 +1103,21 @@ export class BotPool extends EventEmitter {
           console.warn(`[pool] Failed to resolve GH_TOKEN for ${entity_id}: ${String(err)}`);
           // Non-fatal: session starts without GH_TOKEN
         }
+      }
+
+      // Inject per-entity Claude subscription config dir if configured.
+      const assign_config_dir = this.resolve_claude_config_dir(entity_id);
+      if (assign_config_dir) {
+        extra_env.CLAUDE_CONFIG_DIR = assign_config_dir;
+        console.log(
+          `[pool] Assigning bot pool-${String(bot.id)} to ${channel_id} ` +
+            `(entity: ${entity_id}, claude_config: ${assign_config_dir})`,
+        );
+      } else {
+        console.log(
+          `[pool] Assigning bot pool-${String(bot.id)} to ${channel_id} ` +
+            `(entity: ${entity_id}, claude_config: default)`,
+        );
       }
 
       // If a pending message was provided, write it to the JSON file and
@@ -1701,6 +1726,16 @@ export class BotPool extends EventEmitter {
         } catch (err) {
           console.warn(`[pool] Failed to resolve GH_TOKEN for ${entity_id}: ${String(err)}`);
         }
+      }
+
+      // Inject per-entity Claude subscription config dir if configured.
+      const restart_config_dir = this.resolve_claude_config_dir(entity_id);
+      if (restart_config_dir) {
+        extra_env.CLAUDE_CONFIG_DIR = restart_config_dir;
+        console.log(
+          `[pool] Restarting bot pool-${String(bot.id)} for ${entity_id} ` +
+            `with CLAUDE_CONFIG_DIR=${restart_config_dir}`,
+        );
       }
 
       // Write access.json so the Discord plugin listens on this channel
@@ -2327,6 +2362,15 @@ export class BotPool extends EventEmitter {
     const entity_config = this.registry.get(entity_id);
     if (!entity_config) return null;
     return entity_config.entity.secrets.github_token_ref ?? null;
+  }
+
+  /** Look up the per-entity Claude subscription config dir from the registry.
+   * Returns the absolute path if configured, or null (use default ~/.claude). */
+  private resolve_claude_config_dir(entity_id: string): string | null {
+    if (!this.registry) return null;
+    const entity_config = this.registry.get(entity_id);
+    if (!entity_config) return null;
+    return entity_config.entity.subscription?.claude_config_dir ?? null;
   }
 
   /** Resolve a 1Password secret reference to its plaintext value.

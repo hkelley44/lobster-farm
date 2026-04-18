@@ -234,6 +234,39 @@ describe("EntityConfigSchema", () => {
       }),
     ).toThrow();
   });
+
+  // Per-entity subscription support (#296)
+  it("accepts optional subscription with claude_config_dir", () => {
+    const config = EntityConfigSchema.parse({
+      ...MINIMAL_ENTITY,
+      entity: {
+        ...MINIMAL_ENTITY.entity,
+        subscription: {
+          claude_config_dir: "/Users/farm/.lobsterfarm/entities/alpha/.claude-config",
+        },
+      },
+    });
+    expect(config.entity.subscription?.claude_config_dir).toBe(
+      "/Users/farm/.lobsterfarm/entities/alpha/.claude-config",
+    );
+  });
+
+  it("accepts subscription without claude_config_dir", () => {
+    const config = EntityConfigSchema.parse({
+      ...MINIMAL_ENTITY,
+      entity: {
+        ...MINIMAL_ENTITY.entity,
+        subscription: {},
+      },
+    });
+    expect(config.entity.subscription).toBeDefined();
+    expect(config.entity.subscription?.claude_config_dir).toBeUndefined();
+  });
+
+  it("omits subscription by default (backward compatible)", () => {
+    const config = EntityConfigSchema.parse(MINIMAL_ENTITY);
+    expect(config.entity.subscription).toBeUndefined();
+  });
 });
 
 describe("TemplateVariablesSchema", () => {
