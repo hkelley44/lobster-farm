@@ -17,6 +17,6 @@ Zod schemas that define the shape of all configuration and runtime data.
 - `index.ts` -- Re-exports all schema modules.
 - `enums.ts` -- Enumeration types: `ArchetypeRole`, `ChannelType`, `EntityStatus`, `AgentMode`, `ModelName`, `ThinkLevel`, `RepoStructure`, `Priority`.
 - `config.ts` -- `LobsterFarmConfigSchema`. Global config shape: version, paths, concurrency limits, default model tiers per task type, Discord settings, user info, machine info, and agent names.
-- `entity.ts` -- `EntityConfigSchema`. Per-entity config shape: identity, status, blueprint, repos, accounts (GitHub/Vercel/Sentry), Discord channels, memory settings, SOP/guideline overrides, and secrets vault.
+- `entity.ts` -- `EntityConfigSchema`. Per-entity config shape: identity, status, blueprint, repos, accounts (GitHub/Vercel/Sentry), Discord channels, memory settings, SOP/guideline overrides, secrets vault, and optional subscription config (`subscription.claude_config_dir` for per-entity Claude Max subscriptions -- see `docs/per-entity-subscriptions.md`).
 - `queue.ts` -- `QueuedTaskSchema`. Task queue entry: entity, feature, archetype, DNA, model, prompt, priority, status, and completion metadata.
 - `template.ts` -- `TemplateVariablesSchema`. All `{{PLACEHOLDER}}` keys used in config templates: user info, GitHub credentials, machine details, agent names (title case and lowercase), and block content.

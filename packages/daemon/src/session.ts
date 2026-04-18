@@ -13,6 +13,7 @@ import {
   expand_home,
 } from "@lobster-farm/shared";
 import { build_model_flags } from "./models.js";
+import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
 
 // ── Interfaces ──
@@ -183,10 +184,18 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
   private processes = new Map<string, ChildProcess>();
   private output_buffers = new Map<string, string[]>();
   private config: LobsterFarmConfig;
+  /** Entity registry reference — set via set_registry(), used to look up
+   * per-entity config (e.g., subscription.claude_config_dir). */
+  private registry: EntityRegistry | null = null;
 
   constructor(config: LobsterFarmConfig) {
     super();
     this.config = config;
+  }
+
+  /** Attach the entity registry so spawn() can resolve per-entity config. */
+  set_registry(registry: EntityRegistry): void {
+    this.registry = registry;
   }
 
   /** Build the full CLI arguments for spawning a claude session. */
@@ -271,11 +280,24 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
       tmux_pane: null,
     };
 
+    // Resolve per-entity CLAUDE_CONFIG_DIR (if configured) so this session
+    // uses the entity's own Claude Max subscription for billing and rate limits.
+    const spawn_env: Record<string, string> = { ...options.env };
+    const claude_config_dir = this.resolve_claude_config_dir(options.entity_id);
+    if (claude_config_dir) {
+      spawn_env.CLAUDE_CONFIG_DIR = claude_config_dir;
+      console.log(
+        `[session] Using CLAUDE_CONFIG_DIR=${claude_config_dir} for ${options.entity_id}`,
+      );
+    } else {
+      console.log(`[session] Using default ~/.claude config for ${options.entity_id}`);
+    }
+
     // Spawn the process — prompt is piped via stdin
     const proc = spawn(command, args, {
       cwd: expand_home(options.worktree_path),
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...options.env },
+      env: { ...process.env, ...spawn_env },
     });
 
     // Write prompt to stdin and close it.
@@ -429,5 +451,14 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
   async kill_all(): Promise<void> {
     const sessions = this.get_active();
     await Promise.all(sessions.map((s) => this.kill(s.session_id)));
+  }
+
+  /** Look up the subscription.claude_config_dir for an entity from the registry.
+   * Returns the absolute path if configured, or null. */
+  private resolve_claude_config_dir(entity_id: string): string | null {
+    if (!this.registry) return null;
+    const entity_config = this.registry.get(entity_id);
+    if (!entity_config) return null;
+    return entity_config.entity.subscription?.claude_config_dir ?? null;
   }
 }

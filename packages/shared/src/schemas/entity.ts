@@ -116,6 +116,15 @@ export const EntityConfigSchema = z.object({
       // e.g., "op://entity-my-app/github/credential"
       github_token_ref: z.string().optional(),
     }),
+
+    // Per-entity Claude Max subscription. When set, CLAUDE_CONFIG_DIR is
+    // injected into session environments so this entity uses a separate
+    // Claude account (billing, rate limits). See docs/per-entity-subscriptions.md.
+    subscription: z
+      .object({
+        claude_config_dir: z.string().optional(),
+      })
+      .optional(),
   }),
 });
 

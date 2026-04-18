@@ -43,6 +43,7 @@ async function main(): Promise<void> {
 
   // Initialize session manager + task queue
   const session_manager = new ClaudeSessionManager(config);
+  session_manager.set_registry(registry);
   const queue = new TaskQueue(session_manager, config);
 
   // Wire up session events for session history logging.

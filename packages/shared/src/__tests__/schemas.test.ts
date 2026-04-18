@@ -234,6 +234,39 @@ describe("EntityConfigSchema", () => {
       }),
     ).toThrow();
   });
+
+  // subscription.claude_config_dir (#296)
+  it("accepts optional subscription.claude_config_dir", () => {
+    const config = EntityConfigSchema.parse({
+      ...MINIMAL_ENTITY,
+      entity: {
+        ...MINIMAL_ENTITY.entity,
+        subscription: {
+          claude_config_dir: "/home/farm/.lobsterfarm/entities/alpha/.claude-config",
+        },
+      },
+    });
+    expect(config.entity.subscription?.claude_config_dir).toBe(
+      "/home/farm/.lobsterfarm/entities/alpha/.claude-config",
+    );
+  });
+
+  it("defaults subscription to undefined when omitted", () => {
+    const config = EntityConfigSchema.parse(MINIMAL_ENTITY);
+    expect(config.entity.subscription).toBeUndefined();
+  });
+
+  it("accepts subscription object without claude_config_dir", () => {
+    const config = EntityConfigSchema.parse({
+      ...MINIMAL_ENTITY,
+      entity: {
+        ...MINIMAL_ENTITY.entity,
+        subscription: {},
+      },
+    });
+    expect(config.entity.subscription).toBeDefined();
+    expect(config.entity.subscription?.claude_config_dir).toBeUndefined();
+  });
 });
 
 describe("TemplateVariablesSchema", () => {
