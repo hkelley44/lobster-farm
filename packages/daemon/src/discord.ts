@@ -1956,10 +1956,20 @@ export class DiscordBot extends EventEmitter {
           }
         }
 
-        // Store role_id in entity config if not already set
+        // Store role_id in entity config if not already set.
+        // Persist first with an updated copy — only mutate the in-memory registry
+        // object after the disk write succeeds, so a persist failure doesn't leave
+        // the registry out of sync with disk.
         if (entity_config.entity.channels.role_id !== entity_role.id) {
+          const updated = {
+            ...entity_config,
+            entity: {
+              ...entity_config.entity,
+              channels: { ...entity_config.entity.channels, role_id: entity_role.id },
+            },
+          };
+          await this.persist_entity_config(updated);
           entity_config.entity.channels.role_id = entity_role.id;
-          await this.persist_entity_config(entity_config);
           console.log(`[lockdown] Stored role_id for entity "${entity_id}"`);
         }
 
@@ -2012,7 +2022,13 @@ export class DiscordBot extends EventEmitter {
         global_locked = true;
         console.log("[lockdown] GLOBAL category locked down");
       } else {
-        console.log("[lockdown] GLOBAL category not found — skipping");
+        // Lookup is by name. If the category was renamed, this step silently
+        // skips and global_locked stays false — surface it as a warning so
+        // operators notice rather than discovering it via a return value.
+        console.warn(
+          '[lockdown] GLOBAL category not found by name "GLOBAL" — skipping. ' +
+            "If the category was renamed, restore the original name or update this lookup.",
+        );
       }
     } catch (err) {
       console.error(`[lockdown] Failed to lock GLOBAL category: ${String(err)}`);
@@ -2050,7 +2066,12 @@ export class DiscordBot extends EventEmitter {
         failsafe_locked = true;
         console.log("[lockdown] Failsafe channel locked down");
       } else {
-        console.log("[lockdown] Failsafe channel not found — skipping");
+        // Lookup is by name. If the channel was renamed, this step silently
+        // skips and failsafe_locked stays false — warn rather than fail quietly.
+        console.warn(
+          '[lockdown] Failsafe channel not found by name "failsafe" — skipping. ' +
+            "If the channel was renamed, restore the original name or update this lookup.",
+        );
       }
     } catch (err) {
       console.error(`[lockdown] Failed to lock failsafe channel: ${String(err)}`);
