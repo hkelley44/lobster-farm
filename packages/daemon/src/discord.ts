@@ -627,7 +627,7 @@ export class DiscordBot extends EventEmitter {
   }
 
   /**
-   * Start a typing indicator loop for a channel. Sends typing every 8 seconds
+   * Start a typing indicator loop for a channel. Sends typing every 4 seconds
    * while the assigned pool bot is actively processing (not idle at prompt).
    * Auto-stops when the bot returns to idle or the bot is released.
    */
