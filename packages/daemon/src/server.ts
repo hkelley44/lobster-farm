@@ -753,6 +753,56 @@ const handle_channel_delete: RouteHandler = async (req, res, ctx) => {
   json_response(res, 200, { ok: true, deleted: params.channel_id });
 };
 
+// ── Lockdown route ──
+
+let lockdown_in_progress = false;
+
+// Safety timeout for lockdown — if it hangs (e.g., Discord API rate-limit loop),
+// the flag resets so the endpoint isn't permanently stuck until process restart.
+const LOCKDOWN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+const handle_lockdown: RouteHandler = async (_req, res, ctx) => {
+  if (!ctx.discord) {
+    json_response(res, 503, { error: "Discord bot not connected" });
+    return;
+  }
+
+  if (lockdown_in_progress) {
+    json_response(res, 409, { error: "Lockdown already in progress" });
+    return;
+  }
+
+  lockdown_in_progress = true;
+
+  // Respond immediately — lockdown makes many sequential Discord API calls
+  // and may be rate-limited. Fire-and-forget; check logs for results.
+  json_response(res, 202, {
+    ok: true,
+    message: "Lockdown started — check daemon logs for results",
+  });
+
+  const timeout_promise = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error("Lockdown timed out after 5 minutes")), LOCKDOWN_TIMEOUT_MS);
+  });
+
+  void Promise.race([ctx.discord.lockdown(), timeout_promise])
+    .then(
+      (result) => {
+        console.log("[lockdown] Completed successfully:", JSON.stringify(result));
+      },
+      (err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[lockdown] Failed: ${msg}`);
+        sentry.captureException(err, {
+          tags: { module: "server", action: "lockdown" },
+        });
+      },
+    )
+    .finally(() => {
+      lockdown_in_progress = false;
+    });
+};
+
 // ── Router ──
 
 const routes: Route[] = [
@@ -768,6 +818,7 @@ const routes: Route[] = [
   { method: "POST", pattern: /^\/pr\/watch$/, handler: handle_pr_watch },
   { method: "POST", pattern: /^\/channels\/delete$/, handler: handle_channel_delete },
   { method: "POST", pattern: /^\/scaffold\/entity$/, handler: handle_scaffold_entity },
+  { method: "POST", pattern: /^\/lockdown$/, handler: handle_lockdown },
   { method: "POST", pattern: /^\/reload$/, handler: handle_reload },
   { method: "POST", pattern: /^\/webhooks\/github$/, handler: handle_webhook_github },
   { method: "POST", pattern: /^\/webhooks\/sentry$/, handler: handle_webhook_sentry },
