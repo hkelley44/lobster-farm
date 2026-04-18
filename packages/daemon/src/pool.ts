@@ -2353,7 +2353,8 @@ export class BotPool extends EventEmitter {
     if (!this.registry) return null;
     const entity_config = this.registry.get(entity_id);
     if (!entity_config) return null;
-    return entity_config.entity.subscription?.claude_config_dir ?? null;
+    const raw = entity_config.entity.subscription?.claude_config_dir;
+    return raw ? expand_home(raw) : null;
   }
 
   /** Resolve a 1Password secret reference to its plaintext value.

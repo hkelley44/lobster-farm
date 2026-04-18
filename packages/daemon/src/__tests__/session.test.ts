@@ -1,5 +1,5 @@
 import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
@@ -367,6 +367,49 @@ describe("ClaudeSessionManager", () => {
       const output = await completed;
       // The mock script echoes $CLAUDE_CONFIG_DIR — verify it was set
       expect(output.some((l) => l.includes("/tmp/test-claude-config"))).toBe(true);
+
+      delete process.env.CLAUDE_BIN;
+    });
+
+    it("expands tilde in claude_config_dir to absolute path", async () => {
+      const mock_claude = join(tmp, "mock-claude-tilde");
+      // Script that prints its CLAUDE_CONFIG_DIR to stdout
+      await writeFile(
+        mock_claude,
+        '#!/bin/bash\necho "{\\"type\\":\\"result\\",\\"content\\":\\"$CLAUDE_CONFIG_DIR\\"}"\nexit 0\n',
+        "utf-8",
+      );
+      await chmod(mock_claude, 0o755);
+
+      const config = make_config();
+      const mgr = new ClaudeSessionManager(config);
+
+      const registry = new MockRegistry();
+      registry.add(make_entity("tilde-entity", "~/.lobsterfarm/entities/tilde/.claude-config"));
+      mgr.set_registry(registry as unknown as import("../registry.js").EntityRegistry);
+
+      process.env.CLAUDE_BIN = mock_claude;
+
+      const completed = new Promise<string[]>((resolve) => {
+        mgr.on("session:completed", (result) => resolve(result.output_lines));
+      });
+
+      await mgr.spawn({
+        entity_id: "tilde-entity",
+        feature_id: "test-tilde",
+        archetype: "builder",
+        dna: [],
+        model: { model: "opus", think: "high" },
+        worktree_path: tmp,
+        prompt: "test",
+        interactive: false,
+      });
+
+      const output = await completed;
+      const expected = join(homedir(), ".lobsterfarm/entities/tilde/.claude-config");
+      // Tilde must be expanded — the injected path should start with / not ~
+      expect(output.some((l) => l.includes(expected))).toBe(true);
+      expect(output.some((l) => l.includes("~/.lobsterfarm"))).toBe(false);
 
       delete process.env.CLAUDE_BIN;
     });

@@ -289,8 +289,6 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
       console.log(
         `[session] Using CLAUDE_CONFIG_DIR=${claude_config_dir} for ${options.entity_id}`,
       );
-    } else {
-      console.log(`[session] Using default ~/.claude config for ${options.entity_id}`);
     }
 
     // Spawn the process — prompt is piped via stdin
@@ -459,6 +457,7 @@ export class ClaudeSessionManager extends EventEmitter implements SessionManager
     if (!this.registry) return null;
     const entity_config = this.registry.get(entity_id);
     if (!entity_config) return null;
-    return entity_config.entity.subscription?.claude_config_dir ?? null;
+    const raw = entity_config.entity.subscription?.claude_config_dir;
+    return raw ? expand_home(raw) : null;
   }
 }
