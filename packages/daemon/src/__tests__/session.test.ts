@@ -1,8 +1,8 @@
 import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { LobsterFarmConfig } from "@lobster-farm/shared";
-import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
+import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
+import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { build_model_flags } from "../models.js";
 import { ClaudeSessionManager } from "../session.js";
@@ -297,6 +297,240 @@ describe("ClaudeSessionManager", () => {
       await mgr.kill(session.session_id);
       await wait_for(() => mgr.get_active().length === 0);
       expect(mgr.get_active()).toHaveLength(0);
+
+      delete process.env.CLAUDE_BIN;
+    });
+  });
+
+  describe("CLAUDE_CONFIG_DIR injection", () => {
+    /** Minimal mock registry that returns entity configs by ID. */
+    class MockRegistry {
+      private entities = new Map<string, EntityConfig>();
+
+      add(config: EntityConfig): void {
+        this.entities.set(config.entity.id, config);
+      }
+
+      get(id: string): EntityConfig | undefined {
+        return this.entities.get(id);
+      }
+    }
+
+    function make_entity(id: string, claude_config_dir?: string): EntityConfig {
+      return EntityConfigSchema.parse({
+        entity: {
+          id,
+          name: id,
+          repos: [],
+          channels: { category_id: "", list: [] },
+          memory: { path: `/tmp/test-memory/${id}` },
+          secrets: { vault_name: `entity-${id}` },
+          ...(claude_config_dir ? { subscription: { claude_config_dir } } : {}),
+        },
+      });
+    }
+
+    it("injects CLAUDE_CONFIG_DIR when entity has subscription.claude_config_dir", async () => {
+      const mock_claude = join(tmp, "mock-claude-env");
+      // Script that prints its CLAUDE_CONFIG_DIR to stdout
+      await writeFile(
+        mock_claude,
+        '#!/bin/bash\necho "{\\"type\\":\\"result\\",\\"content\\":\\"$CLAUDE_CONFIG_DIR\\"}"\nexit 0\n',
+        "utf-8",
+      );
+      await chmod(mock_claude, 0o755);
+
+      const config = make_config();
+      const mgr = new ClaudeSessionManager(config);
+
+      const registry = new MockRegistry();
+      registry.add(make_entity("test-entity", "/tmp/test-claude-config"));
+      mgr.set_registry(registry as unknown as import("../registry.js").EntityRegistry);
+
+      process.env.CLAUDE_BIN = mock_claude;
+
+      const completed = new Promise<string[]>((resolve) => {
+        mgr.on("session:completed", (result) => resolve(result.output_lines));
+      });
+
+      await mgr.spawn({
+        entity_id: "test-entity",
+        feature_id: "test-42",
+        archetype: "builder",
+        dna: [],
+        model: { model: "opus", think: "high" },
+        worktree_path: tmp,
+        prompt: "test",
+        interactive: false,
+      });
+
+      const output = await completed;
+      // The mock script echoes $CLAUDE_CONFIG_DIR — verify it was set
+      expect(output.some((l) => l.includes("/tmp/test-claude-config"))).toBe(true);
+
+      delete process.env.CLAUDE_BIN;
+    });
+
+    it("expands tilde in claude_config_dir to absolute path", async () => {
+      const mock_claude = join(tmp, "mock-claude-tilde");
+      // Script that prints its CLAUDE_CONFIG_DIR to stdout
+      await writeFile(
+        mock_claude,
+        '#!/bin/bash\necho "{\\"type\\":\\"result\\",\\"content\\":\\"$CLAUDE_CONFIG_DIR\\"}"\nexit 0\n',
+        "utf-8",
+      );
+      await chmod(mock_claude, 0o755);
+
+      const config = make_config();
+      const mgr = new ClaudeSessionManager(config);
+
+      const registry = new MockRegistry();
+      registry.add(make_entity("tilde-entity", "~/.lobsterfarm/entities/tilde/.claude-config"));
+      mgr.set_registry(registry as unknown as import("../registry.js").EntityRegistry);
+
+      process.env.CLAUDE_BIN = mock_claude;
+
+      const completed = new Promise<string[]>((resolve) => {
+        mgr.on("session:completed", (result) => resolve(result.output_lines));
+      });
+
+      await mgr.spawn({
+        entity_id: "tilde-entity",
+        feature_id: "test-tilde",
+        archetype: "builder",
+        dna: [],
+        model: { model: "opus", think: "high" },
+        worktree_path: tmp,
+        prompt: "test",
+        interactive: false,
+      });
+
+      const output = await completed;
+      const expected = join(homedir(), ".lobsterfarm/entities/tilde/.claude-config");
+      // Tilde must be expanded — the injected path should start with / not ~
+      expect(output.some((l) => l.includes(expected))).toBe(true);
+      expect(output.some((l) => l.includes("~/.lobsterfarm"))).toBe(false);
+
+      delete process.env.CLAUDE_BIN;
+    });
+
+    it("does NOT inject CLAUDE_CONFIG_DIR when entity has no subscription", async () => {
+      const mock_claude = join(tmp, "mock-claude-noenv");
+      // Script that prints CLAUDE_CONFIG_DIR (should be empty)
+      await writeFile(
+        mock_claude,
+        '#!/bin/bash\necho "{\\"type\\":\\"result\\",\\"content\\":\\"CONFIG_DIR=$CLAUDE_CONFIG_DIR\\"}"\nexit 0\n',
+        "utf-8",
+      );
+      await chmod(mock_claude, 0o755);
+
+      const config = make_config();
+      const mgr = new ClaudeSessionManager(config);
+
+      const registry = new MockRegistry();
+      registry.add(make_entity("plain-entity"));
+      mgr.set_registry(registry as unknown as import("../registry.js").EntityRegistry);
+
+      process.env.CLAUDE_BIN = mock_claude;
+
+      const completed = new Promise<string[]>((resolve) => {
+        mgr.on("session:completed", (result) => resolve(result.output_lines));
+      });
+
+      await mgr.spawn({
+        entity_id: "plain-entity",
+        feature_id: "test-43",
+        archetype: "builder",
+        dna: [],
+        model: { model: "opus", think: "high" },
+        worktree_path: tmp,
+        prompt: "test",
+        interactive: false,
+      });
+
+      const output = await completed;
+      // CONFIG_DIR= should be empty (no value after =)
+      expect(output.some((l) => l.includes("CONFIG_DIR="))).toBe(true);
+      expect(output.some((l) => l.includes("CONFIG_DIR=/"))).toBe(false);
+
+      delete process.env.CLAUDE_BIN;
+    });
+
+    it("works without a registry (backward compatible)", async () => {
+      const mock_claude = join(tmp, "mock-claude-noreg");
+      await writeFile(
+        mock_claude,
+        '#!/bin/bash\necho "{\\"type\\":\\"result\\",\\"content\\":\\"ok\\"}"\nexit 0\n',
+        "utf-8",
+      );
+      await chmod(mock_claude, 0o755);
+
+      const config = make_config();
+      const mgr = new ClaudeSessionManager(config);
+      // No registry set — should not throw
+
+      process.env.CLAUDE_BIN = mock_claude;
+
+      const completed = new Promise<void>((resolve) => {
+        mgr.on("session:completed", () => resolve());
+      });
+
+      await mgr.spawn({
+        entity_id: "no-registry-entity",
+        feature_id: "test-44",
+        archetype: "builder",
+        dna: [],
+        model: { model: "opus", think: "high" },
+        worktree_path: tmp,
+        prompt: "test",
+        interactive: false,
+      });
+
+      await completed;
+      // Session completed successfully without a registry
+      expect(mgr.get_active()).toHaveLength(0);
+
+      delete process.env.CLAUDE_BIN;
+    });
+
+    it("merges CLAUDE_CONFIG_DIR with caller-provided env", async () => {
+      const mock_claude = join(tmp, "mock-claude-merge");
+      await writeFile(
+        mock_claude,
+        '#!/bin/bash\necho "{\\"type\\":\\"result\\",\\"content\\":\\"GH=$GH_TOKEN CCD=$CLAUDE_CONFIG_DIR\\"}"\nexit 0\n',
+        "utf-8",
+      );
+      await chmod(mock_claude, 0o755);
+
+      const config = make_config();
+      const mgr = new ClaudeSessionManager(config);
+
+      const registry = new MockRegistry();
+      registry.add(make_entity("merge-entity", "/tmp/merge-config"));
+      mgr.set_registry(registry as unknown as import("../registry.js").EntityRegistry);
+
+      process.env.CLAUDE_BIN = mock_claude;
+
+      const completed = new Promise<string[]>((resolve) => {
+        mgr.on("session:completed", (result) => resolve(result.output_lines));
+      });
+
+      await mgr.spawn({
+        entity_id: "merge-entity",
+        feature_id: "test-45",
+        archetype: "builder",
+        dna: [],
+        model: { model: "opus", think: "high" },
+        worktree_path: tmp,
+        prompt: "test",
+        interactive: false,
+        env: { GH_TOKEN: "ghp_test123" },
+      });
+
+      const output = await completed;
+      // Both GH_TOKEN and CLAUDE_CONFIG_DIR should be present
+      expect(output.some((l) => l.includes("GH=ghp_test123"))).toBe(true);
+      expect(output.some((l) => l.includes("CCD=/tmp/merge-config"))).toBe(true);
 
       delete process.env.CLAUDE_BIN;
     });

@@ -69,6 +69,7 @@ class MockRegistry {
 function make_entity_config(overrides: {
   id: string;
   github_token_ref?: string;
+  claude_config_dir?: string;
 }): EntityConfig {
   return EntityConfigSchema.parse({
     entity: {
@@ -81,6 +82,9 @@ function make_entity_config(overrides: {
         vault_name: `entity-${overrides.id}`,
         ...(overrides.github_token_ref ? { github_token_ref: overrides.github_token_ref } : {}),
       },
+      ...(overrides.claude_config_dir
+        ? { subscription: { claude_config_dir: overrides.claude_config_dir } }
+        : {}),
     },
   });
 }
@@ -346,6 +350,94 @@ describe("per-entity GitHub token injection", () => {
 
       expect(cmd_string).not.toContain("GH_TOKEN=");
       expect(cmd_string).toContain("claude");
+    });
+  });
+
+  describe("per-entity CLAUDE_CONFIG_DIR injection", () => {
+    it("injects CLAUDE_CONFIG_DIR into tmux command and spawn env", async () => {
+      const config_dir = "/home/farm/.lobsterfarm/entities/client-x/.claude-config";
+      registry.add(make_entity_config({ id: "custom-claude", claude_config_dir: config_dir }));
+      pool.inject_registry(registry);
+      pool.inject_bots([make_bot({ id: 7, state: "free" })]);
+
+      await pool.assign("ch-test", "custom-claude", "builder", undefined, "work_room");
+
+      const tmux_call = spawn_calls.find((c) => c.command === "tmux");
+      expect(tmux_call).toBeDefined();
+      const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
+
+      // CLAUDE_CONFIG_DIR should appear as env var prefix in the tmux command
+      expect(cmd_string).toContain("CLAUDE_CONFIG_DIR=");
+      expect(cmd_string).toContain(config_dir);
+
+      // Spawn env should also have CLAUDE_CONFIG_DIR
+      const spawn_env = tmux_call!.options.env as Record<string, string>;
+      expect(spawn_env.CLAUDE_CONFIG_DIR).toBe(config_dir);
+    });
+
+    it("does NOT inject CLAUDE_CONFIG_DIR when entity has no subscription", async () => {
+      registry.add(make_entity_config({ id: "no-sub-entity" }));
+      pool.inject_registry(registry);
+      pool.inject_bots([make_bot({ id: 8, state: "free" })]);
+
+      await pool.assign("ch-test", "no-sub-entity", "builder", undefined, "work_room");
+
+      const tmux_call = spawn_calls.find((c) => c.command === "tmux");
+      expect(tmux_call).toBeDefined();
+      const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
+
+      expect(cmd_string).not.toContain("CLAUDE_CONFIG_DIR=");
+
+      const spawn_env = tmux_call!.options.env as Record<string, string>;
+      expect(spawn_env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    });
+
+    it("injects both GH_TOKEN and CLAUDE_CONFIG_DIR when both are configured", async () => {
+      const config_dir = "/tmp/dual-config";
+      const ref = "op://entity-dual/github/credential";
+      registry.add(
+        make_entity_config({
+          id: "dual-entity",
+          github_token_ref: ref,
+          claude_config_dir: config_dir,
+        }),
+      );
+      pool.inject_registry(registry);
+      pool.inject_bots([make_bot({ id: 2, state: "free" })]);
+
+      pool.override_resolve_op_secret(async () => "ghp_dual_token");
+
+      await pool.assign("ch-test", "dual-entity", "builder", undefined, "work_room");
+
+      const tmux_call = spawn_calls.find((c) => c.command === "tmux");
+      expect(tmux_call).toBeDefined();
+      const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
+
+      // Both env vars should appear in the tmux command string
+      expect(cmd_string).toContain("GH_TOKEN=");
+      expect(cmd_string).toContain("CLAUDE_CONFIG_DIR=");
+      expect(cmd_string).toContain(config_dir);
+
+      // Both should also be in the spawn env
+      const spawn_env = tmux_call!.options.env as Record<string, string>;
+      expect(spawn_env.GH_TOKEN).toBe("ghp_dual_token");
+      expect(spawn_env.CLAUDE_CONFIG_DIR).toBe(config_dir);
+    });
+
+    it("no CLAUDE_CONFIG_DIR when registry is not set", async () => {
+      // Pool without registry — backward compatible
+      pool.inject_bots([make_bot({ id: 0, state: "free" })]);
+
+      await pool.assign("ch-test", "orphan-entity", "builder", undefined, "work_room");
+
+      const tmux_call = spawn_calls.find((c) => c.command === "tmux");
+      expect(tmux_call).toBeDefined();
+      const cmd_string = tmux_call!.args[tmux_call!.args.length - 1];
+
+      expect(cmd_string).not.toContain("CLAUDE_CONFIG_DIR=");
+
+      const spawn_env = tmux_call!.options.env as Record<string, string>;
+      expect(spawn_env.CLAUDE_CONFIG_DIR).toBeUndefined();
     });
   });
 });
