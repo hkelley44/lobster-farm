@@ -79,27 +79,55 @@ export type ActivityState = "idle" | "working" | "waiting_for_human" | "active_c
 // ── Per-entity OP_SERVICE_ACCOUNT_TOKEN resolution ──
 
 /**
- * Normalize an entity id into the suffix used for the per-entity token env
- * var: `OP_SERVICE_ACCOUNT_TOKEN_<SUFFIX>`.
+ * Normalize an entity id into the ordered list of candidate suffixes used for
+ * per-entity token env vars: `OP_SERVICE_ACCOUNT_TOKEN_<SUFFIX>`.
+ *
+ * Two conventions exist in the wild and must both be tried:
+ *   1. kebab → underscore (explicit):  "lobster-farm" → "LOBSTER_FARM"
+ *   2. kebab → stripped    (compact):  "lobster-farm" → "LOBSTERFARM"
+ *
+ * The underscore form is listed first so it wins when both are populated —
+ * it's the explicit, unambiguous form. The stripped form is included because
+ * the live secrets file (`~/.lobsterfarm/secrets/op-tokens.env`) was seeded
+ * with that convention and we don't want to force a rename (see issue #13).
+ *
+ * For entity ids without hyphens (e.g. "healthydogs"), both candidates
+ * collapse to the same value — we dedupe so callers do one env lookup.
  *
  * Env var names are restricted to `[A-Z0-9_]` in practice, so we upper-case
- * and convert any non-alphanumeric character to an underscore. The result is
- * further validated to start with a letter or underscore (POSIX rule). An
- * empty / invalid entity id returns null — callers treat that as "no token".
+ * and convert any non-alphanumeric character to an underscore. Each candidate
+ * is validated to start with a letter or underscore (POSIX rule). An empty /
+ * invalid entity id returns an empty array — callers treat that as "no token".
  *
  * Examples:
- *   "lobster-farm"  → "LOBSTER_FARM"
- *   "healthydogs"   → "HEALTHYDOGS"
- *   "my_entity"     → "MY_ENTITY"
- *   "client.99"     → "CLIENT_99"
- *   "99badstart"    → null   (env var can't begin with a digit)
- *   ""              → null
+ *   "lobster-farm"  → ["LOBSTER_FARM", "LOBSTERFARM"]
+ *   "healthydogs"   → ["HEALTHYDOGS"]
+ *   "my_entity"     → ["MY_ENTITY"]
+ *   "client.99"     → ["CLIENT_99"]        (dot → underscore, strip leaves same)
+ *   "99badstart"    → []                   (env var can't begin with a digit)
+ *   ""              → []
+ *
+ * Collision note: `lobster-farm` and `lobsterfarm` both contain `LOBSTERFARM`
+ * in their candidate list. If only `OP_SERVICE_ACCOUNT_TOKEN_LOBSTERFARM` is
+ * set on the machine, both entity ids will resolve to the same token. This
+ * is accepted — see the issue #13 collision test for the assertion.
  */
-export function entity_id_to_env_suffix(entity_id: string): string | null {
-  if (typeof entity_id !== "string" || entity_id.length === 0) return null;
-  const suffix = entity_id.toUpperCase().replace(/[^A-Z0-9_]/g, "_");
-  if (!/^[A-Z_][A-Z0-9_]*$/.test(suffix)) return null;
-  return suffix;
+export function entity_id_to_env_suffix(entity_id: string): string[] {
+  if (typeof entity_id !== "string" || entity_id.length === 0) return [];
+  const upper = entity_id.toUpperCase();
+  // Explicit form: non-alphanumerics become underscores.
+  const underscore = upper.replace(/[^A-Z0-9_]/g, "_");
+  // Compact form: hyphens are dropped entirely; other non-alphanumerics still
+  // become underscores (a dot is still invalid as-is, underscore is the safe
+  // fallback for anything that isn't specifically kebab).
+  const stripped = upper.replace(/-/g, "").replace(/[^A-Z0-9_]/g, "_");
+
+  const valid = /^[A-Z_][A-Z0-9_]*$/;
+  const candidates: string[] = [];
+  for (const s of [underscore, stripped]) {
+    if (valid.test(s) && !candidates.includes(s)) candidates.push(s);
+  }
+  return candidates;
 }
 
 /**
@@ -107,21 +135,22 @@ export function entity_id_to_env_suffix(entity_id: string): string | null {
  * spawned for `entity_id`.
  *
  * Lookup order:
- *   1. `OP_SERVICE_ACCOUNT_TOKEN_<ENTITY_SUFFIX>` — the entity-scoped token
- *   2. `OP_SERVICE_ACCOUNT_TOKEN`                 — platform fallback (with warning)
+ *   1. `OP_SERVICE_ACCOUNT_TOKEN_<ENTITY_SUFFIX>` for each candidate suffix,
+ *      underscore form first (see `entity_id_to_env_suffix`)
+ *   2. `OP_SERVICE_ACCOUNT_TOKEN` — platform fallback (with warning)
  *
- * Returns `null` if neither is set; the session spawns without `op` access.
+ * Returns `null` if nothing is set; the session spawns without `op` access.
  *
  * The fallback path logs a warning and adds a Sentry breadcrumb. Neither
- * surface contains the token value — only the entity id and the suffix
- * that was looked up.
+ * surface contains the token value — only the entity id and the suffixes
+ * that were tried.
  */
 export function resolve_entity_op_token(
   entity_id: string,
   env: Record<string, string | undefined> = process.env,
 ): string | null {
-  const suffix = entity_id_to_env_suffix(entity_id);
-  if (suffix) {
+  const suffixes = entity_id_to_env_suffix(entity_id);
+  for (const suffix of suffixes) {
     const scoped = env[`OP_SERVICE_ACCOUNT_TOKEN_${suffix}`];
     if (scoped) return scoped;
   }
@@ -137,7 +166,7 @@ export function resolve_entity_op_token(
         category: "pool.op-token",
         message: "entity-scoped OP token missing, fell back to platform token",
         level: "warning",
-        data: { entity_id, suffix: suffix ?? null },
+        data: { entity_id, suffixes_tried: suffixes },
       });
     } catch {
       // Never let a Sentry misconfig break session startup. The warning above
