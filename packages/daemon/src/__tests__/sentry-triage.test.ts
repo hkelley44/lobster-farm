@@ -166,6 +166,19 @@ function make_context(overrides: Partial<SentryTriageContext> = {}): SentryTriag
 
 // ── Setup ──
 
+const ORIGINAL_ENV = { ...process.env };
+
+afterEach(() => {
+  // Remove any keys added during the test
+  for (const key of Object.keys(process.env)) {
+    if (!(key in ORIGINAL_ENV)) delete process.env[key];
+  }
+  // Restore any keys mutated or deleted during the test
+  for (const [key, value] of Object.entries(ORIGINAL_ENV)) {
+    process.env[key] = value;
+  }
+});
+
 beforeEach(async () => {
   vi.clearAllMocks();
   vi.spyOn(console, "log").mockImplementation(() => {});
@@ -187,9 +200,6 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(temp_dir, { recursive: true, force: true });
-  delete process.env.SENTRY_AUTH_TOKEN;
-  delete process.env.SENTRY_ORG;
-
   vi.restoreAllMocks();
 });
 
