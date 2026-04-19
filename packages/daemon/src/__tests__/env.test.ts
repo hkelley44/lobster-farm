@@ -6,6 +6,19 @@ import {
   resolve_binary,
 } from "../env.js";
 
+const ORIGINAL_ENV = { ...process.env };
+
+afterEach(() => {
+  // Remove any keys added during the test
+  for (const key of Object.keys(process.env)) {
+    if (!(key in ORIGINAL_ENV)) delete process.env[key];
+  }
+  // Restore any keys mutated or deleted during the test
+  for (const [key, value] of Object.entries(ORIGINAL_ENV)) {
+    process.env[key] = value;
+  }
+});
+
 describe("check_required_binaries", () => {
   let original_exit: typeof process.exit;
   let exit_code: number | undefined;
@@ -57,7 +70,6 @@ describe("check_required_binaries", () => {
 
   it("logs the current PATH on failure for debugging", () => {
     const error_spy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const original_path = process.env.PATH;
     process.env.PATH = "/test/path:/usr/bin";
 
     // Fail "claude"
@@ -72,7 +84,6 @@ describe("check_required_binaries", () => {
     expect(error_spy).toHaveBeenCalledWith(expect.stringContaining("/test/path:/usr/bin"));
 
     error_spy.mockRestore();
-    process.env.PATH = original_path;
   });
 
   it("lists all missing required binaries in the error message", () => {

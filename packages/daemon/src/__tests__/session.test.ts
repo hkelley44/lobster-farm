@@ -7,6 +7,19 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { build_model_flags } from "../models.js";
 import { ClaudeSessionManager } from "../session.js";
 
+const ORIGINAL_ENV = { ...process.env };
+
+afterEach(() => {
+  // Remove any keys added during the test
+  for (const key of Object.keys(process.env)) {
+    if (!(key in ORIGINAL_ENV)) delete process.env[key];
+  }
+  // Restore any keys mutated or deleted during the test
+  for (const [key, value] of Object.entries(ORIGINAL_ENV)) {
+    process.env[key] = value;
+  }
+});
+
 function make_config(overrides?: Partial<LobsterFarmConfig>): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
     user: { name: "Test" },
@@ -211,8 +224,6 @@ describe("ClaudeSessionManager", () => {
 
       // After completion, session should be cleaned up
       expect(mgr.get_active()).toHaveLength(0);
-
-      delete process.env.CLAUDE_BIN;
     });
 
     it("rejects interactive mode", async () => {
@@ -260,8 +271,6 @@ describe("ClaudeSessionManager", () => {
       const error = await failed;
       expect(error).toContain("exited with code 1");
       expect(mgr.get_active()).toHaveLength(0);
-
-      delete process.env.CLAUDE_BIN;
     });
   });
 
@@ -297,8 +306,6 @@ describe("ClaudeSessionManager", () => {
       await mgr.kill(session.session_id);
       await wait_for(() => mgr.get_active().length === 0);
       expect(mgr.get_active()).toHaveLength(0);
-
-      delete process.env.CLAUDE_BIN;
     });
   });
 });

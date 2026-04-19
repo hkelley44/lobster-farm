@@ -7,6 +7,19 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { TaskQueue } from "../queue.js";
 import { ClaudeSessionManager } from "../session.js";
 
+const ORIGINAL_ENV = { ...process.env };
+
+afterEach(() => {
+  // Remove any keys added during the test
+  for (const key of Object.keys(process.env)) {
+    if (!(key in ORIGINAL_ENV)) delete process.env[key];
+  }
+  // Restore any keys mutated or deleted during the test
+  for (const [key, value] of Object.entries(ORIGINAL_ENV)) {
+    process.env[key] = value;
+  }
+});
+
 function make_config(overrides?: Record<string, unknown>): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
     user: { name: "Test" },
@@ -37,7 +50,6 @@ describe("TaskQueue", () => {
 
   afterEach(async () => {
     await rm(tmp, { recursive: true, force: true });
-    delete process.env.CLAUDE_BIN;
   });
 
   it("submits a task and returns an ID", () => {
