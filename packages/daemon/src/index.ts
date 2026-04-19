@@ -217,6 +217,20 @@ async function main(): Promise<void> {
     await pool.resume_parked_bots();
   }
 
+  // Re-run tmux env propagation AFTER the initial pool resumes have spawned
+  // their tmux sessions. On a fresh daemon boot the first `propagate_tmux_env`
+  // call above runs before any tmux server exists, so the depropagate loop
+  // no-ops (the remover silently fails against a missing server). The first
+  // `tmux new-session` inside resume_parked_bots creates the server, which
+  // inherits the daemon's env — planting OP_SERVICE_ACCOUNT_TOKEN into the
+  // tmux global. Running propagate_tmux_env a second time here targets the
+  // now-live server and actually scrubs the legacy vars. See issue #18.
+  //
+  // Idempotent: the propagate half is a straight `tmux set-environment`
+  // (same keys, same values), and the depropagate half swallows unknown-var
+  // errors. Safe regardless of whether the first call succeeded.
+  propagate_tmux_env();
+
   // Initialize Commander (persistent Claude Code session with Discord channel)
   const commander = new CommanderProcess(config);
   if (await commander.has_token()) {

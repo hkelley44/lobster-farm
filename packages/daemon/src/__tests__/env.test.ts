@@ -329,6 +329,61 @@ describe("propagate_tmux_env", () => {
 
     log_spy.mockRestore();
   });
+
+  it("scrubs legacy vars on the second call once tmux becomes live (issue #18)", () => {
+    // Models the fresh-boot timing bug fixed by issue #18. At daemon startup
+    // the tmux server does not yet exist, so the FIRST propagate_tmux_env
+    // call's remover silently no-ops. Later, `tmux new-session` spawned by
+    // pool bot resume creates the server, which inherits the daemon's env
+    // (including the bare OP_SERVICE_ACCOUNT_TOKEN aliased from env.sh). A
+    // SECOND propagate_tmux_env call, issued after the server is live, must
+    // successfully reach it and remove the legacy var.
+    //
+    // The second call is wired in packages/daemon/src/index.ts right after
+    // `await pool.resume_parked_bots()`. This test exercises the invariant
+    // that propagate_tmux_env is safe to call twice and that the second
+    // call is the one that actually scrubs.
+    let tmux_alive = false;
+    const removed: string[] = [];
+    const set_calls: Array<[string, string]> = [];
+
+    const setter = (key: string, value: string) => {
+      if (!tmux_alive) return false;
+      set_calls.push([key, value]);
+      return true;
+    };
+    const remover = (key: string) => {
+      if (!tmux_alive) return false; // server not running → no-op
+      removed.push(key);
+      return true;
+    };
+
+    // Token value is an opaque placeholder — the test only inspects keys,
+    // never values. Never compare against a raw token here.
+    const env = {
+      PATH: "/usr/bin",
+      HOME: "/Users/test",
+      OP_SERVICE_ACCOUNT_TOKEN: "platform-token-placeholder",
+    };
+
+    // First call: tmux server not running. Everything fails silently.
+    propagate_tmux_env(env, setter, remover);
+    expect(removed).toEqual([]);
+    expect(set_calls).toEqual([]);
+
+    // Simulate the first tmux new-session creating the server (e.g. pool
+    // bot resume in resume_parked_bots).
+    tmux_alive = true;
+
+    // Second call: the fix path. Must now actually scrub the legacy var
+    // AND propagate the whitelisted vars.
+    propagate_tmux_env(env, setter, remover);
+    expect(removed).toContain("OP_SERVICE_ACCOUNT_TOKEN");
+    expect(removed).toEqual([...TMUX_DEPROPAGATE_VARS]);
+    expect(set_calls.map(([k]) => k)).toEqual(["PATH", "HOME"]);
+    // Belt-and-suspenders: the token is NOT in the propagate set.
+    expect(set_calls.map(([k]) => k)).not.toContain("OP_SERVICE_ACCOUNT_TOKEN");
+  });
 });
 
 describe("resolve_binary", () => {
