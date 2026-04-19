@@ -1,5 +1,49 @@
-import { describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { generate_env_sh, generate_plist, generate_wrapper_sh } from "../lib/launchd.js";
+
+/**
+ * Build an env with every OP_SERVICE_ACCOUNT_TOKEN* and related host-leak
+ * variable stripped. Prevents the developer's real tokens from contaminating
+ * the subshell under test.
+ */
+function scrubbed_env(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("OP_SERVICE_ACCOUNT_TOKEN")) delete env[key];
+  }
+  return env;
+}
+
+/**
+ * Source a snippet of the generated env.sh under a synthetic $HOME that we
+ * fully control, then dump the resulting environment as NUL-delimited
+ * KEY=VALUE pairs. Returns a map of env vars visible after sourcing.
+ *
+ * We run under /bin/sh (not zsh) to exercise the most conservative shell —
+ * if it works in sh, it works in zsh.
+ */
+function source_and_dump_env(generated: string, fake_home: string): Record<string, string> {
+  // Replace the shebang (zsh-specific) — /bin/sh evaluation only needs POSIX.
+  const script = generated.replace(/^#!\/bin\/zsh\n/, "");
+  const runner = `HOME='${fake_home}'\n${script}\nenv -0`;
+  const out = execFileSync("/bin/sh", ["-c", runner], {
+    encoding: "utf-8",
+    env: scrubbed_env(),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const map: Record<string, string> = {};
+  for (const entry of out.split("\0")) {
+    if (!entry) continue;
+    const eq = entry.indexOf("=");
+    if (eq < 0) continue;
+    map[entry.slice(0, eq)] = entry.slice(eq + 1);
+  }
+  return map;
+}
 
 // --- generate_env_sh ---
 
@@ -73,34 +117,34 @@ describe("generate_env_sh", () => {
     expect(result).toContain('export BUN_INSTALL="/Users/test/.bun"');
   });
 
-  it("captures OP_SERVICE_ACCOUNT_TOKEN from env when present", () => {
+  it("does NOT capture OP_SERVICE_ACCOUNT_TOKEN from host env", () => {
+    // Host-captured value would shadow the op-tokens.env alias and break
+    // idempotent regeneration. Must be resolved via op-tokens.env at source-time.
     const resolver = mock_resolver({});
-    const env = { OP_SERVICE_ACCOUNT_TOKEN: "ops_abc123" };
+    const env = { OP_SERVICE_ACCOUNT_TOKEN: "ops_should_not_leak_into_template" };
 
     const result = generate_env_sh(env, resolver);
 
-    expect(result).toContain('export OP_SERVICE_ACCOUNT_TOKEN="ops_abc123"');
+    expect(result).not.toContain("ops_should_not_leak_into_template");
+    expect(result).not.toContain('export OP_SERVICE_ACCOUNT_TOKEN="ops_');
   });
 
   it("escapes shell-special characters in env var values", () => {
     const resolver = mock_resolver({});
-    const env = { OP_SERVICE_ACCOUNT_TOKEN: 'token"with$pecial`chars\\here' };
+    const env = { BUN_INSTALL: 'path"with$pecial`chars\\here' };
 
     const result = generate_env_sh(env, resolver);
 
     // The value should be escaped so it's safe inside double quotes
-    expect(result).toContain(
-      'export OP_SERVICE_ACCOUNT_TOKEN="token\\"with\\$pecial\\`chars\\\\here"',
-    );
+    expect(result).toContain('export BUN_INSTALL="path\\"with\\$pecial\\`chars\\\\here"');
   });
 
-  it("omits env vars not present in process.env", () => {
+  it("omits captured env vars when not present in process.env", () => {
     const resolver = mock_resolver({});
 
     const result = generate_env_sh({}, resolver);
 
     expect(result).not.toContain("BUN_INSTALL");
-    expect(result).not.toContain("OP_SERVICE_ACCOUNT_TOKEN");
     // Should not have the env section header either
     expect(result).not.toContain("Environment variables (captured at generation time)");
   });
@@ -121,6 +165,163 @@ describe("generate_env_sh", () => {
     const resolver = mock_resolver({});
     const result = generate_env_sh({}, resolver);
     expect(result).toMatch(/^#!\/bin\/zsh\n/);
+  });
+});
+
+// --- generate_env_sh: op-tokens.env block ---
+
+describe("generate_env_sh op-tokens block", () => {
+  const mock_resolver = () => (_name: string) => null;
+  let fake_home: string;
+
+  beforeEach(() => {
+    fake_home = mkdtempSync(join(tmpdir(), "lf-env-sh-"));
+  });
+
+  afterEach(() => {
+    rmSync(fake_home, { recursive: true, force: true });
+  });
+
+  it("emits a guarded source block for op-tokens.env", () => {
+    const result = generate_env_sh({}, mock_resolver());
+
+    expect(result).toContain('if [ -f "$HOME/.lobsterfarm/secrets/op-tokens.env" ]; then');
+    expect(result).toContain("set -a");
+    expect(result).toContain('. "$HOME/.lobsterfarm/secrets/op-tokens.env"');
+    expect(result).toContain("set +a");
+    expect(result).toContain("fi");
+  });
+
+  it("aliases OP_SERVICE_ACCOUNT_TOKEN with a default-empty fallback", () => {
+    const result = generate_env_sh({}, mock_resolver());
+
+    // The `:-` default guards against `set -u` crashing when the platform
+    // token is absent (e.g. fresh install).
+    expect(result).toContain(
+      'export OP_SERVICE_ACCOUNT_TOKEN="${OP_SERVICE_ACCOUNT_TOKEN_LOBSTERFARM:-}"',
+    );
+  });
+
+  it("does NOT unset per-entity OP_SERVICE_ACCOUNT_TOKEN_* vars", () => {
+    // The daemon's pool.ts needs these at runtime to inject the right token
+    // per entity tmux session.
+    const result = generate_env_sh({}, mock_resolver());
+
+    expect(result).not.toMatch(/unset\s+OP_SERVICE_ACCOUNT_TOKEN/);
+  });
+
+  it("exports every token in op-tokens.env when the file is present", () => {
+    // Write a fake tokens file with multiple per-entity tokens.
+    const secrets_dir = join(fake_home, ".lobsterfarm", "secrets");
+    mkdirSync(secrets_dir, { recursive: true });
+    const tokens = [
+      "OP_SERVICE_ACCOUNT_TOKEN_LOBSTERFARM=fake_platform_token",
+      "OP_SERVICE_ACCOUNT_TOKEN_ACME=fake_acme_token",
+      "OP_SERVICE_ACCOUNT_TOKEN_WIDGETS=fake_widgets_token",
+      "",
+    ].join("\n");
+    writeFileSync(join(secrets_dir, "op-tokens.env"), tokens, { mode: 0o600 });
+
+    const result = generate_env_sh({}, mock_resolver());
+    const env = source_and_dump_env(result, fake_home);
+
+    expect(env.OP_SERVICE_ACCOUNT_TOKEN_LOBSTERFARM).toBe("fake_platform_token");
+    expect(env.OP_SERVICE_ACCOUNT_TOKEN_ACME).toBe("fake_acme_token");
+    expect(env.OP_SERVICE_ACCOUNT_TOKEN_WIDGETS).toBe("fake_widgets_token");
+    // Alias resolves to the platform token.
+    expect(env.OP_SERVICE_ACCOUNT_TOKEN).toBe("fake_platform_token");
+  });
+
+  it("sources silently when op-tokens.env is absent (fresh install)", () => {
+    // No secrets dir at all — fresh install path.
+    const result = generate_env_sh({}, mock_resolver());
+
+    // Sourcing must succeed with no error output.
+    const script = result.replace(/^#!\/bin\/zsh\n/, "");
+    const runner = `HOME='${fake_home}'\n${script}\necho "__OK__"`;
+    const stdout = execFileSync("/bin/sh", ["-ceu", runner], {
+      encoding: "utf-8",
+      env: scrubbed_env(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    expect(stdout).toContain("__OK__");
+
+    // And the alias is not exported (the whole block is guarded).
+    const env = source_and_dump_env(result, fake_home);
+    expect(env.OP_SERVICE_ACCOUNT_TOKEN).toBeUndefined();
+  });
+
+  it("does not crash under `set -u` when OP_SERVICE_ACCOUNT_TOKEN_LOBSTERFARM is unset", () => {
+    // Tokens file exists but does NOT set the platform token — alias must
+    // fall back to empty string instead of nounset-crashing.
+    const secrets_dir = join(fake_home, ".lobsterfarm", "secrets");
+    mkdirSync(secrets_dir, { recursive: true });
+    writeFileSync(
+      join(secrets_dir, "op-tokens.env"),
+      "OP_SERVICE_ACCOUNT_TOKEN_ACME=fake_acme_token\n",
+      { mode: 0o600 },
+    );
+
+    const result = generate_env_sh({}, mock_resolver());
+    const script = result.replace(/^#!\/bin\/zsh\n/, "");
+    const runner = `HOME='${fake_home}'\nset -u\n${script}\necho "__OK__"`;
+    const stdout = execFileSync("/bin/sh", ["-c", runner], {
+      encoding: "utf-8",
+      env: scrubbed_env(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    expect(stdout).toContain("__OK__");
+  });
+
+  it("is byte-identical across regenerations (idempotent)", () => {
+    const resolver = (paths: Record<string, string>) => (name: string) => paths[name] ?? null;
+    const inputs = {
+      bun: "/Users/test/.bun/bin/bun",
+      node: "/opt/homebrew/bin/node",
+      git: "/usr/bin/git",
+    };
+    const env = { BUN_INSTALL: "/Users/test/.bun" };
+
+    const first = generate_env_sh(env, resolver(inputs));
+    const second = generate_env_sh(env, resolver(inputs));
+    const third = generate_env_sh(env, resolver(inputs));
+
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+  });
+
+  it("matches the expected template shape (snapshot)", () => {
+    const resolver = (name: string) =>
+      name === "node" ? "/opt/homebrew/bin/node" : name === "op" ? "/opt/homebrew/bin/op" : null;
+
+    const result = generate_env_sh({}, resolver);
+
+    // Assert structural landmarks in the exact expected order. Any drift in
+    // the emitted template trips this test.
+    const expected_markers = [
+      "#!/bin/zsh",
+      "# LobsterFarm daemon environment",
+      "# Detected binaries:",
+      "# node: /opt/homebrew/bin/node",
+      "# op: /opt/homebrew/bin/op",
+      'export PATH="',
+      "# 1Password service account tokens.",
+      'if [ -f "$HOME/.lobsterfarm/secrets/op-tokens.env" ]; then',
+      "  set -a",
+      '  . "$HOME/.lobsterfarm/secrets/op-tokens.env"',
+      "  set +a",
+      '  export OP_SERVICE_ACCOUNT_TOKEN="${OP_SERVICE_ACCOUNT_TOKEN_LOBSTERFARM:-}"',
+      "fi",
+    ];
+    let cursor = 0;
+    for (const marker of expected_markers) {
+      const idx = result.indexOf(marker, cursor);
+      expect({ marker, idx }).toEqual({ marker, idx: expect.any(Number) });
+      expect(idx).toBeGreaterThanOrEqual(cursor);
+      cursor = idx + marker.length;
+    }
   });
 });
 
