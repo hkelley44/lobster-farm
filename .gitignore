@@ -33,3 +33,6 @@ coverage/
 # Turborepo
 .turbo/
 .claude/
+
+# Agent worktrees
+worktrees/
