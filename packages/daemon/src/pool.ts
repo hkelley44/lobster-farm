@@ -76,6 +76,79 @@ export interface PoolStatus {
 /** Activity state computed on demand from observable signals (tmux pane, timestamps). */
 export type ActivityState = "idle" | "working" | "waiting_for_human" | "active_conversation";
 
+// ── Per-entity OP_SERVICE_ACCOUNT_TOKEN resolution ──
+
+/**
+ * Normalize an entity id into the suffix used for the per-entity token env
+ * var: `OP_SERVICE_ACCOUNT_TOKEN_<SUFFIX>`.
+ *
+ * Env var names are restricted to `[A-Z0-9_]` in practice, so we upper-case
+ * and convert any non-alphanumeric character to an underscore. The result is
+ * further validated to start with a letter or underscore (POSIX rule). An
+ * empty / invalid entity id returns null — callers treat that as "no token".
+ *
+ * Examples:
+ *   "lobster-farm"  → "LOBSTER_FARM"
+ *   "healthydogs"   → "HEALTHYDOGS"
+ *   "my_entity"     → "MY_ENTITY"
+ *   "client.99"     → "CLIENT_99"
+ *   "99badstart"    → null   (env var can't begin with a digit)
+ *   ""              → null
+ */
+export function entity_id_to_env_suffix(entity_id: string): string | null {
+  if (typeof entity_id !== "string" || entity_id.length === 0) return null;
+  const suffix = entity_id.toUpperCase().replace(/[^A-Z0-9_]/g, "_");
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(suffix)) return null;
+  return suffix;
+}
+
+/**
+ * Resolve the OP_SERVICE_ACCOUNT_TOKEN value to inject into a tmux session
+ * spawned for `entity_id`.
+ *
+ * Lookup order:
+ *   1. `OP_SERVICE_ACCOUNT_TOKEN_<ENTITY_SUFFIX>` — the entity-scoped token
+ *   2. `OP_SERVICE_ACCOUNT_TOKEN`                 — platform fallback (with warning)
+ *
+ * Returns `null` if neither is set; the session spawns without `op` access.
+ *
+ * The fallback path logs a warning and adds a Sentry breadcrumb. Neither
+ * surface contains the token value — only the entity id and the suffix
+ * that was looked up.
+ */
+export function resolve_entity_op_token(
+  entity_id: string,
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const suffix = entity_id_to_env_suffix(entity_id);
+  if (suffix) {
+    const scoped = env[`OP_SERVICE_ACCOUNT_TOKEN_${suffix}`];
+    if (scoped) return scoped;
+  }
+
+  const platform = env.OP_SERVICE_ACCOUNT_TOKEN;
+  if (platform) {
+    console.warn(
+      `[pool] WARN: no entity-scoped OP token for ${entity_id}, falling back to platform token`,
+    );
+    // Sentry is a no-op if not initialized (see sentry.ts) — safe to always call.
+    try {
+      sentry.addBreadcrumb({
+        category: "pool.op-token",
+        message: "entity-scoped OP token missing, fell back to platform token",
+        level: "warning",
+        data: { entity_id, suffix: suffix ?? null },
+      });
+    } catch {
+      // Never let a Sentry misconfig break session startup. The warning above
+      // is the operator's source of truth.
+    }
+    return platform;
+  }
+
+  return null;
+}
+
 // ── Tmux idle detection ──
 
 /**
@@ -822,6 +895,15 @@ export class BotPool extends EventEmitter {
           }
         }
 
+        // Per-entity 1Password token. Falls back to the platform token with
+        // a warning if no entity-scoped token is configured (see
+        // resolve_entity_op_token). Null means neither is set — the agent
+        // session will simply lack `op` access until tokens are wired.
+        const op_token = resolve_entity_op_token(candidate.entity_id);
+        if (op_token) {
+          extra_env.OP_SERVICE_ACCOUNT_TOKEN = op_token;
+        }
+
         // Write a resume-nudge pending message and point LF_PENDING_FILE at
         // it. The SessionStart hook (session-start-inject.sh) delivers it
         // during Claude init as additionalContext — replacing the legacy
@@ -1093,6 +1175,11 @@ export class BotPool extends EventEmitter {
           console.warn(`[pool] Failed to resolve GH_TOKEN for ${entity_id}: ${String(err)}`);
           // Non-fatal: session starts without GH_TOKEN
         }
+      }
+
+      const assign_op_token = resolve_entity_op_token(entity_id);
+      if (assign_op_token) {
+        extra_env.OP_SERVICE_ACCOUNT_TOKEN = assign_op_token;
       }
 
       // If a pending message was provided, write it to the JSON file and
@@ -1689,6 +1776,11 @@ export class BotPool extends EventEmitter {
         } catch (err) {
           console.warn(`[pool] Failed to resolve GH_TOKEN for ${entity_id}: ${String(err)}`);
         }
+      }
+
+      const crash_op_token = resolve_entity_op_token(entity_id);
+      if (crash_op_token) {
+        extra_env.OP_SERVICE_ACCOUNT_TOKEN = crash_op_token;
       }
 
       // Write access.json so the Discord plugin listens on this channel
