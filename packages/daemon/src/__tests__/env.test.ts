@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { check_required_binaries, propagate_tmux_env, resolve_binary } from "../env.js";
+import {
+  TMUX_PROPAGATED_VARS,
+  check_required_binaries,
+  propagate_tmux_env,
+  resolve_binary,
+} from "../env.js";
 
 describe("check_required_binaries", () => {
   let original_exit: typeof process.exit;
@@ -88,6 +93,27 @@ describe("check_required_binaries", () => {
   });
 });
 
+describe("TMUX_PROPAGATED_VARS", () => {
+  it("does NOT include OP_SERVICE_ACCOUNT_TOKEN (injected per-session by pool.ts)", () => {
+    // Platform token is scoped to the daemon process. Per-entity tokens are
+    // injected by pool.ts::resolve_entity_op_token when a session is spawned.
+    // Propagating here would leak the platform token into every entity session.
+    expect(TMUX_PROPAGATED_VARS).not.toContain("OP_SERVICE_ACCOUNT_TOKEN");
+  });
+
+  it("does NOT include any OP_SERVICE_ACCOUNT_TOKEN_* variant", () => {
+    for (const key of TMUX_PROPAGATED_VARS) {
+      expect(key.startsWith("OP_SERVICE_ACCOUNT_TOKEN")).toBe(false);
+    }
+  });
+
+  it("includes the core process-wide vars (PATH, HOME, BUN_INSTALL)", () => {
+    expect(TMUX_PROPAGATED_VARS).toContain("PATH");
+    expect(TMUX_PROPAGATED_VARS).toContain("HOME");
+    expect(TMUX_PROPAGATED_VARS).toContain("BUN_INSTALL");
+  });
+});
+
 describe("propagate_tmux_env", () => {
   it("calls tmux setter for each present env var", () => {
     const calls: Array<[string, string]> = [];
@@ -100,16 +126,35 @@ describe("propagate_tmux_env", () => {
       PATH: "/usr/bin:/bin",
       HOME: "/Users/test",
       BUN_INSTALL: "/Users/test/.bun",
-      OP_SERVICE_ACCOUNT_TOKEN: "ops_test123",
     };
 
     propagate_tmux_env(env, setter);
 
-    expect(calls).toHaveLength(4);
+    expect(calls).toHaveLength(3);
     expect(calls).toContainEqual(["PATH", "/usr/bin:/bin"]);
     expect(calls).toContainEqual(["HOME", "/Users/test"]);
     expect(calls).toContainEqual(["BUN_INSTALL", "/Users/test/.bun"]);
-    expect(calls).toContainEqual(["OP_SERVICE_ACCOUNT_TOKEN", "ops_test123"]);
+  });
+
+  it("does NOT propagate OP_SERVICE_ACCOUNT_TOKEN even when present in env", () => {
+    const calls: Array<[string, string]> = [];
+    const setter = (key: string, value: string) => {
+      calls.push([key, value]);
+      return true;
+    };
+
+    // Token value is an opaque placeholder — we only assert its KEY doesn't
+    // appear in the propagated calls. Never compare against the raw value.
+    const env = {
+      PATH: "/usr/bin",
+      HOME: "/Users/test",
+      OP_SERVICE_ACCOUNT_TOKEN: "placeholder-should-not-propagate",
+    };
+
+    propagate_tmux_env(env, setter);
+
+    const propagated_keys = calls.map((c) => c[0]);
+    expect(propagated_keys).not.toContain("OP_SERVICE_ACCOUNT_TOKEN");
   });
 
   it("skips env vars that are not set", () => {
