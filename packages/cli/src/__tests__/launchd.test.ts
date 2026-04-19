@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,10 +29,10 @@ function scrubbed_env(): NodeJS.ProcessEnv {
 function source_and_dump_env(generated: string, fake_home: string): Record<string, string> {
   // Replace the shebang (zsh-specific) — /bin/sh evaluation only needs POSIX.
   const script = generated.replace(/^#!\/bin\/zsh\n/, "");
-  const runner = `HOME='${fake_home}'\n${script}\nenv -0`;
+  const runner = `${script}\nenv -0`;
   const out = execFileSync("/bin/sh", ["-c", runner], {
     encoding: "utf-8",
-    env: scrubbed_env(),
+    env: { ...scrubbed_env(), HOME: fake_home },
     stdio: ["ignore", "pipe", "pipe"],
   });
   const map: Record<string, string> = {};
@@ -236,16 +236,20 @@ describe("generate_env_sh op-tokens block", () => {
     // No secrets dir at all — fresh install path.
     const result = generate_env_sh({}, mock_resolver());
 
-    // Sourcing must succeed with no error output.
+    // Sourcing must succeed with no error output. We capture stdout and
+    // stderr separately so a silent stderr regression (e.g. an unbound
+    // variable warning that doesn't fail the exit) is caught.
     const script = result.replace(/^#!\/bin\/zsh\n/, "");
-    const runner = `HOME='${fake_home}'\n${script}\necho "__OK__"`;
-    const stdout = execFileSync("/bin/sh", ["-ceu", runner], {
+    const runner = `${script}\necho "__OK__"`;
+    const proc = spawnSync("/bin/sh", ["-ceu", runner], {
       encoding: "utf-8",
-      env: scrubbed_env(),
+      env: { ...scrubbed_env(), HOME: fake_home },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    expect(stdout).toContain("__OK__");
+    expect(proc.status).toBe(0);
+    expect(proc.stdout).toContain("__OK__");
+    expect(proc.stderr).toBe("");
 
     // And the alias is not exported (the whole block is guarded).
     const env = source_and_dump_env(result, fake_home);
@@ -265,10 +269,10 @@ describe("generate_env_sh op-tokens block", () => {
 
     const result = generate_env_sh({}, mock_resolver());
     const script = result.replace(/^#!\/bin\/zsh\n/, "");
-    const runner = `HOME='${fake_home}'\nset -u\n${script}\necho "__OK__"`;
+    const runner = `set -u\n${script}\necho "__OK__"`;
     const stdout = execFileSync("/bin/sh", ["-c", runner], {
       encoding: "utf-8",
-      env: scrubbed_env(),
+      env: { ...scrubbed_env(), HOME: fake_home },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -318,7 +322,9 @@ describe("generate_env_sh op-tokens block", () => {
     let cursor = 0;
     for (const marker of expected_markers) {
       const idx = result.indexOf(marker, cursor);
-      expect({ marker, idx }).toEqual({ marker, idx: expect.any(Number) });
+      // `indexOf` returns -1 on miss; `cursor` starts at 0 and only advances,
+      // so this single assertion catches both "marker missing" and
+      // "marker appeared out of order".
       expect(idx).toBeGreaterThanOrEqual(cursor);
       cursor = idx + marker.length;
     }
