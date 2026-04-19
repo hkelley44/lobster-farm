@@ -40,10 +40,20 @@ try {
 
 // ── Helpers ──
 
-/** Invoke the hook script with the given env. Returns stdout + exit code. */
+/**
+ * Invoke the hook script with an explicit, minimal env. Returns stdout + exit
+ * code.
+ *
+ * We deliberately do NOT spread `process.env` here. The hook's only contract
+ * input is `LF_PENDING_FILE`, and if the test runner shell has that variable
+ * exported (as happens inside a live LobsterFarm daemon session), it leaks
+ * into every case that doesn't explicitly override it — silently breaking
+ * the "no-op when unset" assertions. The only ambient var we need is PATH so
+ * bash can resolve `jq`.
+ */
 function run_hook(env: Record<string, string>): { stdout: string; stderr: string; code: number } {
   const result = spawnSync("bash", [HOOK_SCRIPT], {
-    env: { ...process.env, ...env },
+    env: { PATH: process.env.PATH ?? "", ...env },
     encoding: "utf-8",
     timeout: 5000,
   });
