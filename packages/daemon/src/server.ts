@@ -806,8 +806,10 @@ function send_member_error(res: ServerResponse, err: unknown): void {
     json_response(res, 404, { error: "User not found in guild" });
     return;
   }
+  // Fallthrough: unrecognized error during a Discord API call. Per spec, this
+  // is a 502 (upstream Discord failure) rather than a 500 (our bug).
   const msg = err instanceof Error ? err.message : String(err);
-  json_response(res, 500, { error: msg });
+  json_response(res, 502, { error: msg });
 }
 
 const handle_entity_member_add: RouteHandler = async (req, res, ctx) => {
@@ -865,9 +867,11 @@ const handle_entity_member_add: RouteHandler = async (req, res, ctx) => {
     }
 
     await ctx.discord.assign_entity_role(entity_id, user_id);
+    const role_id = entity.entity.channels.role_id;
+    const assigned_at = new Date().toISOString();
     const via = params.username ? ` (via username "${params.username.trim()}")` : "";
     console.log(`[members] Assigned entity role for "${entity_id}" to ${user_id}${via}`);
-    json_response(res, 201, { ok: true, entity_id, user_id });
+    json_response(res, 201, { ok: true, entity_id, user_id, role_id, assigned_at });
   } catch (err) {
     send_member_error(res, err);
   }

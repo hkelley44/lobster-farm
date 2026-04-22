@@ -301,9 +301,17 @@ describe("POST /entities/:id/members (#308)", () => {
     });
 
     expect(res.status).toBe(201);
-    const body = (await res.json()) as { ok: boolean; user_id: string };
+    const body = (await res.json()) as {
+      ok: boolean;
+      user_id: string;
+      role_id: string;
+      assigned_at: string;
+    };
     expect(body.ok).toBe(true);
     expect(body.user_id).toBe(VALID_USER_ID);
+    expect(body.role_id).toBe(ENTITY_ROLE_ID);
+    // ISO-8601 timestamp generated at assignment time
+    expect(body.assigned_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
     expect(assign).toHaveBeenCalledWith("alpha", VALID_USER_ID);
   });
 
@@ -320,6 +328,12 @@ describe("POST /entities/:id/members (#308)", () => {
     });
 
     expect(res.status).toBe(201);
+    const body = (await res.json()) as {
+      role_id: string;
+      assigned_at: string;
+    };
+    expect(body.role_id).toBe(ENTITY_ROLE_ID);
+    expect(body.assigned_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
     expect(resolve).toHaveBeenCalledWith("alice");
     expect(assign).toHaveBeenCalledWith("alpha", VALID_USER_ID);
   });
@@ -442,6 +456,26 @@ describe("POST /entities/:id/members (#308)", () => {
 
     expect(res.status).toBe(503);
   });
+
+  it("502 — Discord API failure (assign_entity_role rejects)", async () => {
+    // Simulate a generic Discord API error (e.g. 403 Missing Permissions, 500,
+    // or network failure). These all surface as unrecognized Error instances
+    // in the fallthrough and should map to 502 per spec.
+    const err = Object.assign(new Error("Missing Permissions"), { status: 403 });
+    const assign = vi.fn().mockRejectedValue(err);
+    const discord = { assign_entity_role: assign, resolve_user_id: vi.fn() };
+    await start([make_entity("alpha")], discord);
+
+    const res = await fetch(`http://localhost:${String(port)}/entities/alpha/members`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: VALID_USER_ID }),
+    });
+
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/Missing Permissions/);
+  });
 });
 
 describe("DELETE /entities/:id/members/:user_id (#308)", () => {
@@ -536,5 +570,21 @@ describe("DELETE /entities/:id/members/:user_id (#308)", () => {
 
     // Route pattern requires a snowflake — non-matching URL falls through to 404 "Not found"
     expect(res.status).toBe(404);
+  });
+
+  it("502 — Discord API failure (remove_entity_role rejects)", async () => {
+    const err = Object.assign(new Error("Missing Permissions"), { status: 403 });
+    const remove = vi.fn().mockRejectedValue(err);
+    const discord = { remove_entity_role: remove };
+    await start([make_entity("alpha")], discord);
+
+    const res = await fetch(
+      `http://localhost:${String(port)}/entities/alpha/members/${VALID_USER_ID}`,
+      { method: "DELETE" },
+    );
+
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/Missing Permissions/);
   });
 });
