@@ -53,6 +53,56 @@ export function is_discord_snowflake(id: string): boolean {
   return /^\d{17,20}$/.test(id);
 }
 
+// ── Member-management errors (#308) ──
+//
+// Routes layer maps these to HTTP responses; carrying them as typed errors
+// keeps the bot logic independent of HTTP concerns.
+
+/** Thrown when a username search returns no matches in the guild. */
+export class UserNotFoundError extends Error {
+  constructor(public readonly username: string) {
+    super(`No guild member found with username "${username}"`);
+    this.name = "UserNotFoundError";
+  }
+}
+
+/** A shortlist entry used when a username resolution is ambiguous. */
+export interface UserCandidate {
+  id: string;
+  username: string;
+  global_name: string | null;
+}
+
+/** Thrown when a username search returns more than one exact match. */
+export class AmbiguousUserError extends Error {
+  constructor(
+    public readonly username: string,
+    public readonly candidates: UserCandidate[],
+  ) {
+    super(
+      `Multiple guild members matched "${username}" — disambiguate by user_id. ` +
+        `Candidates: ${candidates.map((c) => `${c.username} (${c.id})`).join(", ")}`,
+    );
+    this.name = "AmbiguousUserError";
+  }
+}
+
+/** Thrown when a requested entity does not exist in the registry. */
+export class NotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NotFoundError";
+  }
+}
+
+/** Thrown when an entity has not yet been assigned a Discord role via lockdown. */
+export class EntityRoleNotConfiguredError extends Error {
+  constructor(public readonly entity_id: string) {
+    super(`Entity "${entity_id}" has no role configured — run lockdown first.`);
+    this.name = "EntityRoleNotConfiguredError";
+  }
+}
+
 /**
  * Check whether a Discord bot username belongs to LobsterFarm.
  * Only LF bots should receive the Administrator-privileged "LobsterFarm Bot" role.
@@ -1800,6 +1850,96 @@ export class DiscordBot extends EventEmitter {
       `[discord] Set permission overrides on category "${category.name}" ` +
         `(entity: ${entity_role.name}, bot: ${bot_role.name})`,
     );
+  }
+
+  // ── Entity membership management (#308) ──
+
+  /**
+   * Resolve a Discord username to a user ID by searching the guild.
+   *
+   * Uses Discord's prefix-match member search, then filters down to an exact
+   * case-insensitive match on `username` first, falling back to `global_name`.
+   * A username match wins over a global_name match if both exist — usernames
+   * are globally unique, global_names are not.
+   *
+   * @throws UserNotFoundError when no member matches
+   * @throws AmbiguousUserError when more than one member matches
+   */
+  async resolve_user_id(username: string): Promise<string> {
+    const guild = await this.get_guild();
+    if (!guild) {
+      throw new Error("Cannot resolve user — Discord not connected or server_id missing");
+    }
+
+    const query = username.trim();
+    if (!query) {
+      throw new UserNotFoundError(username);
+    }
+
+    // Discord's search is prefix-match — fetch a handful and filter exactly.
+    const results = await guild.members.search({ query, limit: 10 });
+    const target = query.toLowerCase();
+
+    const by_username: UserCandidate[] = [];
+    const by_global_name: UserCandidate[] = [];
+
+    for (const [, member] of results) {
+      const uname = member.user.username.toLowerCase();
+      const gname = member.user.globalName?.toLowerCase() ?? null;
+      const candidate: UserCandidate = {
+        id: member.user.id,
+        username: member.user.username,
+        global_name: member.user.globalName ?? null,
+      };
+      if (uname === target) by_username.push(candidate);
+      else if (gname === target) by_global_name.push(candidate);
+    }
+
+    // Prefer username matches — they're globally unique on Discord.
+    const matches = by_username.length > 0 ? by_username : by_global_name;
+
+    if (matches.length === 0) throw new UserNotFoundError(username);
+    if (matches.length > 1) throw new AmbiguousUserError(username, matches);
+    return matches[0]!.id;
+  }
+
+  /**
+   * Assign the entity role to a guild member.
+   * The role must already exist in the entity config (populated by lockdown).
+   */
+  async assign_entity_role(entity_id: string, user_id: string): Promise<void> {
+    const { guild, role_id } = await this.get_entity_role_context(entity_id);
+    const member = await guild.members.fetch(user_id);
+    await member.roles.add(role_id, `LobsterFarm entity membership — ${entity_id}`);
+  }
+
+  /** Remove the entity role from a guild member. Idempotent. */
+  async remove_entity_role(entity_id: string, user_id: string): Promise<void> {
+    const { guild, role_id } = await this.get_entity_role_context(entity_id);
+    const member = await guild.members.fetch(user_id);
+    await member.roles.remove(role_id, `LobsterFarm entity membership removed — ${entity_id}`);
+  }
+
+  /**
+   * Shared preamble for assign/remove — verifies the guild is reachable and
+   * the entity has a role_id configured. Throws if either check fails.
+   */
+  private async get_entity_role_context(
+    entity_id: string,
+  ): Promise<{ guild: Guild; role_id: string }> {
+    const guild = await this.get_guild();
+    if (!guild) {
+      throw new Error("Cannot manage entity membership — Discord not connected");
+    }
+    const entity = this.registry.get(entity_id);
+    if (!entity) {
+      throw new NotFoundError(`Entity "${entity_id}" not found`);
+    }
+    const role_id = entity.entity.channels.role_id;
+    if (!role_id) {
+      throw new EntityRoleNotConfiguredError(entity_id);
+    }
+    return { guild, role_id };
   }
 
   /**
