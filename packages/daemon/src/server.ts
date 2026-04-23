@@ -6,7 +6,13 @@ import { type ArchetypeRole, expand_home } from "@lobster-farm/shared";
 import { persist_entity_config } from "./actions.js";
 import { ALERT_COLOR_RED, type AlertRouter } from "./alert-router.js";
 import type { CommanderProcess } from "./commander-process.js";
-import { is_discord_snowflake } from "./discord.js";
+import {
+  AmbiguousUserError,
+  NotFoundError as DiscordNotFoundError,
+  EntityRoleNotConfiguredError,
+  UserNotFoundError,
+  is_discord_snowflake,
+} from "./discord.js";
 import type { DiscordBot } from "./discord.js";
 import type { GitHubAppAuth } from "./github-app.js";
 import type { BotPool } from "./pool.js";
@@ -753,6 +759,157 @@ const handle_channel_delete: RouteHandler = async (req, res, ctx) => {
   json_response(res, 200, { ok: true, deleted: params.channel_id });
 };
 
+// ── Entity member routes (#308) ──
+//
+// POST   /entities/:id/members           { username? | user_id? }
+// DELETE /entities/:id/members/:user_id
+//
+// Adds or removes the entity-scoped Discord role so collaborators see the
+// entity's channels. Role lookup comes from entity.channels.role_id (populated
+// by lockdown). Exactly one of username/user_id must be supplied for POST;
+// usernames are resolved server-side via guild search.
+
+/** Discord.js wraps HTTP errors — extract the status code if present. */
+function discord_http_status(err: unknown): number | undefined {
+  if (err && typeof err === "object" && "status" in err) {
+    const status = (err as { status: unknown }).status;
+    if (typeof status === "number") return status;
+  }
+  return undefined;
+}
+
+/** Translate a thrown error during member operations to an HTTP response. */
+function send_member_error(res: ServerResponse, err: unknown): void {
+  if (err instanceof DiscordNotFoundError) {
+    json_response(res, 404, { error: err.message });
+    return;
+  }
+  if (err instanceof EntityRoleNotConfiguredError) {
+    json_response(res, 409, { error: "Entity role not configured — run lockdown first." });
+    return;
+  }
+  if (err instanceof UserNotFoundError) {
+    json_response(res, 404, { error: err.message });
+    return;
+  }
+  if (err instanceof AmbiguousUserError) {
+    json_response(res, 400, {
+      error: err.message,
+      candidates: err.candidates,
+    });
+    return;
+  }
+  // Discord.js raises DiscordAPIError with status 404 when the user isn't in
+  // the guild. Surface as 404 so the caller can distinguish "bad request" from
+  // "valid request, user missing".
+  if (discord_http_status(err) === 404) {
+    json_response(res, 404, { error: "User not found in guild" });
+    return;
+  }
+  // Any other error from a member operation is a Discord API failure (network,
+  // rate limit, 5xx upstream, unexpected member.fetch rejection). Per spec,
+  // surface these as 502 Bad Gateway — our code is fine, the upstream isn't.
+  const msg = err instanceof Error ? err.message : String(err);
+  json_response(res, 502, { error: `Discord API failure: ${msg}` });
+}
+
+const handle_entity_member_add: RouteHandler = async (req, res, ctx) => {
+  if (!ctx.discord) {
+    json_response(res, 503, { error: "Discord bot not connected" });
+    return;
+  }
+
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const match = url.pathname.match(/^\/entities\/([a-z0-9-]+)\/members$/);
+  const entity_id = match?.[1];
+  if (!entity_id) {
+    json_response(res, 400, { error: "Invalid entity ID" });
+    return;
+  }
+
+  const entity = ctx.registry.get(entity_id);
+  if (!entity) {
+    json_response(res, 404, { error: `Entity "${entity_id}" not found` });
+    return;
+  }
+
+  const body = await read_body(req);
+  let params: { username?: string; user_id?: string };
+  try {
+    params = JSON.parse(body) as typeof params;
+  } catch {
+    json_response(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+
+  const has_username = typeof params.username === "string" && params.username.trim().length > 0;
+  const has_user_id = typeof params.user_id === "string" && params.user_id.trim().length > 0;
+
+  if (has_username === has_user_id) {
+    json_response(res, 400, {
+      error: "Provide exactly one of: username, user_id",
+    });
+    return;
+  }
+
+  try {
+    let user_id: string;
+    if (has_user_id) {
+      const raw = params.user_id!.trim();
+      if (!is_discord_snowflake(raw)) {
+        json_response(res, 400, {
+          error: `Invalid user_id "${raw}" — not a Discord snowflake`,
+        });
+        return;
+      }
+      user_id = raw;
+    } else {
+      user_id = await ctx.discord.resolve_user_id(params.username!.trim());
+    }
+
+    const role_id = await ctx.discord.assign_entity_role(entity_id, user_id);
+    const assigned_at = new Date().toISOString();
+    const via = params.username ? ` (via username "${params.username.trim()}")` : "";
+    console.log(
+      `[members] ${assigned_at} — Assigned entity role for "${entity_id}" to ${user_id}${via}`,
+    );
+    json_response(res, 200, { ok: true, entity_id, user_id, role_id, assigned_at });
+  } catch (err) {
+    send_member_error(res, err);
+  }
+};
+
+const handle_entity_member_remove: RouteHandler = async (req, res, ctx) => {
+  if (!ctx.discord) {
+    json_response(res, 503, { error: "Discord bot not connected" });
+    return;
+  }
+
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const match = url.pathname.match(/^\/entities\/([a-z0-9-]+)\/members\/(\d{17,20})$/);
+  const entity_id = match?.[1];
+  const user_id = match?.[2];
+  if (!entity_id || !user_id) {
+    json_response(res, 400, { error: "Invalid entity_id or user_id" });
+    return;
+  }
+
+  const entity = ctx.registry.get(entity_id);
+  if (!entity) {
+    json_response(res, 404, { error: `Entity "${entity_id}" not found` });
+    return;
+  }
+
+  try {
+    await ctx.discord.remove_entity_role(entity_id, user_id);
+    const removed_at = new Date().toISOString();
+    console.log(`[members] ${removed_at} — Removed entity role for "${entity_id}" from ${user_id}`);
+    json_response(res, 200, { ok: true, entity_id, user_id, removed_at });
+  } catch (err) {
+    send_member_error(res, err);
+  }
+};
+
 // ── Lockdown route ──
 
 let lockdown_in_progress = false;
@@ -817,6 +974,16 @@ const routes: Route[] = [
   { method: "POST", pattern: /^\/pool\/release$/, handler: handle_pool_release },
   { method: "POST", pattern: /^\/pr\/watch$/, handler: handle_pr_watch },
   { method: "POST", pattern: /^\/channels\/delete$/, handler: handle_channel_delete },
+  {
+    method: "POST",
+    pattern: /^\/entities\/[a-z0-9-]+\/members$/,
+    handler: handle_entity_member_add,
+  },
+  {
+    method: "DELETE",
+    pattern: /^\/entities\/[a-z0-9-]+\/members\/\d{17,20}$/,
+    handler: handle_entity_member_remove,
+  },
   { method: "POST", pattern: /^\/scaffold\/entity$/, handler: handle_scaffold_entity },
   { method: "POST", pattern: /^\/lockdown$/, handler: handle_lockdown },
   { method: "POST", pattern: /^\/reload$/, handler: handle_reload },
