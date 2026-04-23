@@ -51,6 +51,7 @@ import {
   type SentryTriageContext,
   type SentryTriageState,
   _reset_for_test,
+  handle_sentry_fix_pr_merged,
   handle_sentry_resolved,
   handle_sentry_triage_event,
   load_triage_state,
@@ -148,7 +149,13 @@ function make_discord(): DiscordBot {
 
 function make_alert_router() {
   return {
-    post_alert: vi.fn().mockResolvedValue({ message_id: null }),
+    // Default: simulate incident_open returning a thread_id; other tiers return null.
+    post_alert: vi.fn().mockImplementation(async (payload: { tier: string }) => {
+      if (payload.tier === "incident_open") {
+        return { message_id: "msg-100", thread_id: "thread-200" };
+      }
+      return { message_id: null };
+    }),
     resolve_incident: vi.fn().mockResolvedValue(undefined),
   };
 }
@@ -1213,5 +1220,496 @@ describe("build_sentry_fix_prompt", () => {
     expect(prompt).toContain("**Culprit:** src/handler.ts in process");
     expect(prompt).toContain("at handler.ts:99");
     expect(prompt).toContain("Do NOT merge the PR");
+  });
+});
+
+// ── Thread-based alert lifecycle tests (#310) ──
+
+const USER_TAG = "<@732686813856006245>";
+
+describe("thread-based alerts — ingress", () => {
+  it("opens incident thread with correct title and body on ingress", async () => {
+    const ctx = make_context();
+    const alert_router = ctx.alert_router as unknown as {
+      post_alert: ReturnType<typeof vi.fn>;
+    };
+
+    await handle_sentry_triage_event("ISSUE-INGRESS-1", "test-backend", "created", ctx);
+
+    // Incident_open should have been posted first, with the Sentry issue title + URL
+    const incident_open_call = alert_router.post_alert.mock.calls.find(
+      (c) => (c[0] as { tier: string }).tier === "incident_open",
+    );
+    expect(incident_open_call).toBeDefined();
+    const payload = incident_open_call![0] as {
+      title: string;
+      body: string;
+      entity_id: string;
+    };
+    expect(payload.entity_id).toBe("test-entity");
+    expect(payload.title).toContain("Sentry");
+    expect(payload.title).toContain("TypeError");
+    expect(payload.body).toContain("https://sentry.io/issues/12345/");
+    expect(payload.body).toContain("received");
+  });
+
+  it("persists thread_id on triage state after ingress", async () => {
+    const config = make_config();
+    const ctx = make_context({ config });
+
+    await handle_sentry_triage_event("ISSUE-PERSIST", "test-backend", "created", ctx);
+
+    const state = await load_triage_state(config);
+    expect(state.triages["ISSUE-PERSIST"]).toBeDefined();
+    expect(state.triages["ISSUE-PERSIST"]!.thread_id).toBe("thread-200");
+    expect(state.triages["ISSUE-PERSIST"]!.alert_message_id).toBe("msg-100");
+  });
+
+  it("does NOT open incident when dedup gate fires", async () => {
+    const ctx = make_context();
+    const alert_router = ctx.alert_router as unknown as {
+      post_alert: ReturnType<typeof vi.fn>;
+    };
+
+    // First call opens incident
+    await handle_sentry_triage_event("ISSUE-DEDUP", "test-backend", "created", ctx);
+    const opens_first = alert_router.post_alert.mock.calls.filter(
+      (c) => (c[0] as { tier: string }).tier === "incident_open",
+    );
+    expect(opens_first.length).toBe(1);
+
+    // Second call should be deduped — no new incident_open
+    await handle_sentry_triage_event("ISSUE-DEDUP", "test-backend", "created", ctx);
+    const opens_second = alert_router.post_alert.mock.calls.filter(
+      (c) => (c[0] as { tier: string }).tier === "incident_open",
+    );
+    expect(opens_second.length).toBe(1);
+  });
+
+  it("does NOT open incident when cooldown gate fires (non-regression)", async () => {
+    const config = make_config();
+    const ctx = make_context({ config });
+    const alert_router = ctx.alert_router as unknown as {
+      post_alert: ReturnType<typeof vi.fn>;
+    };
+
+    // Pre-seed a recent triage
+    const state_dir = join(temp_dir, "state");
+    await mkdir(state_dir, { recursive: true });
+    await save_triage_state(
+      {
+        triages: {
+          "ISSUE-COOL-310": {
+            entity_id: "test-entity",
+            project_slug: "test-backend",
+            error_title: "Old error",
+            triaged_at: new Date().toISOString(),
+            status: "tracked",
+            sentry_url: "https://sentry.io/issues/ISSUE-COOL-310/",
+          },
+        },
+        stats: {
+          total_triaged: 1,
+          issues_created: 0,
+          dismissed: 0,
+          last_triage_at: new Date().toISOString(),
+        },
+      },
+      config,
+    );
+
+    await handle_sentry_triage_event("ISSUE-COOL-310", "test-backend", "created", ctx);
+
+    const opens = alert_router.post_alert.mock.calls.filter(
+      (c) => (c[0] as { tier: string }).tier === "incident_open",
+    );
+    expect(opens.length).toBe(0);
+  });
+});
+
+describe("thread-based alerts — state transitions", () => {
+  /**
+   * Helper: trigger ingress + complete the triage session with a given verdict.
+   * Returns the spy so the caller can assert on thread messages.
+   */
+  async function triage_and_complete(
+    sentry_issue_id: string,
+    verdict_json: string | null,
+    overrides: Partial<SentryTriageContext> = {},
+  ) {
+    const session_manager = make_session_manager();
+    const ctx = make_context({ session_manager, ...overrides });
+    const sm = session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    let spawn_count = 0;
+    sm.spawn.mockImplementation(async () => {
+      spawn_count++;
+      return {
+        session_id: `session-${String(spawn_count)}`,
+        entity_id: "test-entity",
+        feature_id: `sentry-triage-${sentry_issue_id}`,
+        archetype: spawn_count === 1 ? "operator" : "builder",
+        started_at: new Date(),
+        pid: 10000 + spawn_count,
+      };
+    });
+
+    await handle_sentry_triage_event(sentry_issue_id, "test-backend", "created", ctx);
+
+    const output_lines = verdict_json
+      ? ["Diagnostic output...", `SENTRY_TRIAGE_VERDICT:${verdict_json}`]
+      : ["Diagnostic prose line 1", "Diagnostic prose line 2", "ran out of tokens, no verdict"];
+
+    (session_manager as unknown as EventEmitter).emit("session:completed", {
+      session_id: "session-1",
+      exit_code: 0,
+      output_lines,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    return { ctx, sm, session_manager };
+  }
+
+  it("verdict (P1 auto-fixable) posts thread update, no user tag", async () => {
+    const { ctx } = await triage_and_complete(
+      "ISSUE-P1",
+      '{"severity":"P1","auto_fixable":true,"github_issue":42,"fix_approach":"Fix null check"}',
+    );
+    const alert_router = ctx.alert_router as unknown as {
+      post_alert: ReturnType<typeof vi.fn>;
+    };
+
+    // Find the incident_update call for the verdict
+    const updates = alert_router.post_alert.mock.calls.filter(
+      (c) => (c[0] as { tier: string }).tier === "incident_update",
+    );
+    expect(updates.length).toBeGreaterThanOrEqual(1);
+
+    const verdict_update = updates.find((c) => {
+      const body = (c[0] as { body: string }).body;
+      return body.includes("P1") && body.includes("Fix null check");
+    });
+    expect(verdict_update).toBeDefined();
+    const payload = verdict_update![0] as {
+      tier: string;
+      incident_id: string;
+      body: string;
+    };
+    expect(payload.incident_id).toBe("thread-200");
+    expect(payload.body).not.toContain(USER_TAG);
+    expect(payload.body).toContain("#42");
+
+    // No action_required top-level alert for the verdict anymore
+    const action_required_verdict = alert_router.post_alert.mock.calls.find((c) => {
+      const p = c[0] as { tier: string; title: string };
+      return p.tier === "action_required" && p.title.includes("triage");
+    });
+    expect(action_required_verdict).toBeUndefined();
+  });
+
+  it("verdict (P0) posts thread update WITH user tag", async () => {
+    const { ctx } = await triage_and_complete(
+      "ISSUE-P0",
+      '{"severity":"P0","auto_fixable":false,"github_issue":5,"fix_approach":null}',
+    );
+    const alert_router = ctx.alert_router as unknown as {
+      post_alert: ReturnType<typeof vi.fn>;
+    };
+
+    const updates = alert_router.post_alert.mock.calls.filter(
+      (c) => (c[0] as { tier: string }).tier === "incident_update",
+    );
+    const verdict_update = updates.find((c) => {
+      const body = (c[0] as { body: string }).body;
+      return body.includes("P0");
+    });
+    expect(verdict_update).toBeDefined();
+    expect((verdict_update![0] as { body: string }).body).toContain(USER_TAG);
+  });
+
+  it("no-verdict posts thread update WITH user tag AND Ray's last 20 output lines", async () => {
+    // Build a session output with >20 lines to verify tail truncation
+    const long_output = Array.from({ length: 30 }, (_, i) => `line ${String(i + 1)}`);
+
+    const session_manager = make_session_manager();
+    const ctx = make_context({ session_manager });
+    const sm = session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    sm.spawn.mockResolvedValue({
+      session_id: "session-1",
+      entity_id: "test-entity",
+      feature_id: "sentry-triage-ISSUE-NOVERDICT",
+      archetype: "operator",
+      started_at: new Date(),
+      pid: 12345,
+    });
+
+    await handle_sentry_triage_event("ISSUE-NOVERDICT", "test-backend", "created", ctx);
+
+    (session_manager as unknown as EventEmitter).emit("session:completed", {
+      session_id: "session-1",
+      exit_code: 0,
+      output_lines: long_output,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const alert_router = ctx.alert_router as unknown as {
+      post_alert: ReturnType<typeof vi.fn>;
+    };
+    const updates = alert_router.post_alert.mock.calls.filter(
+      (c) => (c[0] as { tier: string }).tier === "incident_update",
+    );
+    const no_verdict_update = updates.find((c) => {
+      const body = (c[0] as { body: string }).body;
+      return body.includes("didn't emit") || body.includes("didn't output");
+    });
+    expect(no_verdict_update).toBeDefined();
+    const body = (no_verdict_update![0] as { body: string }).body;
+    expect(body).toContain(USER_TAG);
+    // Last 20 lines means lines 11..30; line 10 must NOT appear, line 11 must
+    expect(body).toContain("line 30");
+    expect(body).toContain("line 11");
+    expect(body).not.toContain("line 10\n");
+    // Should be code-blocked
+    expect(body).toContain("```");
+  });
+
+  it("session failure posts thread update WITH user tag and error message", async () => {
+    const session_manager = make_session_manager();
+    const ctx = make_context({ session_manager });
+    const sm = session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    sm.spawn.mockResolvedValue({
+      session_id: "session-1",
+      entity_id: "test-entity",
+      feature_id: "sentry-triage-ISSUE-CRASH",
+      archetype: "operator",
+      started_at: new Date(),
+      pid: 12345,
+    });
+
+    await handle_sentry_triage_event("ISSUE-CRASH", "test-backend", "created", ctx);
+
+    (session_manager as unknown as EventEmitter).emit(
+      "session:failed",
+      "session-1",
+      "tmux session died unexpectedly",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const alert_router = ctx.alert_router as unknown as {
+      post_alert: ReturnType<typeof vi.fn>;
+    };
+    const updates = alert_router.post_alert.mock.calls.filter(
+      (c) => (c[0] as { tier: string }).tier === "incident_update",
+    );
+    const crash_update = updates.find((c) => {
+      const body = (c[0] as { body: string }).body;
+      return body.includes("crashed") || body.includes("tmux");
+    });
+    expect(crash_update).toBeDefined();
+    const body = (crash_update![0] as { body: string }).body;
+    expect(body).toContain(USER_TAG);
+    expect(body).toContain("tmux session died unexpectedly");
+  });
+
+  it("fix-attempt exhaustion posts thread update WITH user tag", async () => {
+    const config = make_config();
+    const session_manager = make_session_manager();
+    const ctx = make_context({ session_manager, config });
+    const sm = session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    // Pre-seed: 2 attempts already used, thread_id already set (as if from prior ingress)
+    await save_triage_state(
+      {
+        triages: {
+          "ISSUE-EXHAUST": {
+            entity_id: "test-entity",
+            project_slug: "test-backend",
+            error_title: "Already tried to fix",
+            triaged_at: new Date().toISOString(),
+            status: "tracked",
+            sentry_url: "https://sentry.io/issues/ISSUE-EXHAUST/",
+            severity: "P1",
+            auto_fixable: true,
+            fix_attempts: 2,
+            fix_status: "failed",
+            thread_id: "thread-200",
+            alert_message_id: "msg-100",
+          },
+        },
+        stats: {
+          total_triaged: 1,
+          issues_created: 1,
+          dismissed: 0,
+          last_triage_at: new Date().toISOString(),
+        },
+      },
+      config,
+    );
+
+    sm.spawn.mockResolvedValue({
+      session_id: "session-1",
+      entity_id: "test-entity",
+      feature_id: "sentry-triage-ISSUE-EXHAUST",
+      archetype: "operator",
+      started_at: new Date(),
+      pid: 12345,
+    });
+
+    // Regression bypasses cooldown
+    await handle_sentry_triage_event("ISSUE-EXHAUST", "test-backend", "regression", ctx);
+
+    // Complete with auto_fixable verdict — but cap will kick in
+    (session_manager as unknown as EventEmitter).emit("session:completed", {
+      session_id: "session-1",
+      exit_code: 0,
+      output_lines: [
+        'SENTRY_TRIAGE_VERDICT:{"severity":"P1","auto_fixable":true,"github_issue":42,"fix_approach":"Try again"}',
+      ],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const alert_router = ctx.alert_router as unknown as {
+      post_alert: ReturnType<typeof vi.fn>;
+    };
+    const updates = alert_router.post_alert.mock.calls.filter(
+      (c) => (c[0] as { tier: string }).tier === "incident_update",
+    );
+    const exhaust_update = updates.find((c) => {
+      const body = (c[0] as { body: string }).body;
+      return body.includes("after") && body.includes("attempts");
+    });
+    expect(exhaust_update).toBeDefined();
+    expect((exhaust_update![0] as { body: string }).body).toContain(USER_TAG);
+  });
+});
+
+describe("thread-based alerts — resolve on fix merge", () => {
+  it("fix PR merge calls resolve_incident with PR number in body", async () => {
+    const config = make_config();
+
+    // Pre-seed state: triage has a thread_id and a linked github issue
+    await save_triage_state(
+      {
+        triages: {
+          "ISSUE-RESOLVE": {
+            entity_id: "test-entity",
+            project_slug: "test-backend",
+            error_title: "Fixable error",
+            triaged_at: new Date().toISOString(),
+            status: "tracked",
+            sentry_url: "https://sentry.io/issues/ISSUE-RESOLVE/",
+            severity: "P1",
+            auto_fixable: true,
+            github_issue: 42,
+            fix_attempts: 1,
+            fix_status: "fixing",
+            thread_id: "thread-200",
+            alert_message_id: "msg-100",
+          },
+        },
+        stats: {
+          total_triaged: 1,
+          issues_created: 1,
+          dismissed: 0,
+          last_triage_at: new Date().toISOString(),
+        },
+      },
+      config,
+    );
+
+    const alert_router = make_alert_router();
+    const ctx = make_context({
+      config,
+      alert_router: alert_router as unknown as SentryTriageContext["alert_router"],
+    });
+
+    // Simulate the fix PR merging — linked to issue #42, PR number 99
+    await handle_sentry_fix_pr_merged(99, [42], ctx);
+
+    expect(alert_router.resolve_incident).toHaveBeenCalledWith(
+      "thread-200",
+      expect.stringContaining("99"),
+    );
+
+    // Triage state fix_status should now be "fixed"
+    const state = await load_triage_state(config);
+    expect(state.triages["ISSUE-RESOLVE"]!.fix_status).toBe("fixed");
+  });
+});
+
+describe("thread-based alerts — back-compat", () => {
+  it("legacy triage state without thread_id falls back to action_required top-level alert", async () => {
+    const config = make_config();
+
+    // Pre-seed state WITHOUT thread_id (simulates a state from before #310)
+    await save_triage_state(
+      {
+        triages: {
+          "ISSUE-LEGACY": {
+            entity_id: "test-entity",
+            project_slug: "test-backend",
+            error_title: "Legacy error",
+            triaged_at: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+            status: "tracked",
+            sentry_url: "https://sentry.io/issues/ISSUE-LEGACY/",
+          },
+        },
+        stats: {
+          total_triaged: 1,
+          issues_created: 0,
+          dismissed: 0,
+          last_triage_at: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+        },
+      },
+      config,
+    );
+
+    const session_manager = make_session_manager();
+    const alert_router = make_alert_router();
+    // Simulate incident_open failing (so no thread_id is persisted) by returning nulls
+    alert_router.post_alert.mockImplementation(async (payload: { tier: string }) => {
+      if (payload.tier === "incident_open") {
+        return { message_id: null };
+      }
+      return { message_id: null };
+    });
+
+    const ctx = make_context({
+      config,
+      session_manager,
+      alert_router: alert_router as unknown as SentryTriageContext["alert_router"],
+    });
+    const sm = session_manager as unknown as { spawn: ReturnType<typeof vi.fn> };
+
+    sm.spawn.mockResolvedValue({
+      session_id: "session-1",
+      entity_id: "test-entity",
+      feature_id: "sentry-triage-ISSUE-LEGACY",
+      archetype: "operator",
+      started_at: new Date(),
+      pid: 12345,
+    });
+
+    // cooldown expired (25h ago), so we proceed. But incident_open returned null → no thread_id persisted.
+    await handle_sentry_triage_event("ISSUE-LEGACY", "test-backend", "created", ctx);
+
+    (session_manager as unknown as EventEmitter).emit("session:completed", {
+      session_id: "session-1",
+      exit_code: 0,
+      output_lines: [
+        'SENTRY_TRIAGE_VERDICT:{"severity":"P1","auto_fixable":false,"github_issue":42,"fix_approach":"Manual review"}',
+      ],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // With no thread_id, the verdict must fall back to action_required top-level alert
+    const action_required = alert_router.post_alert.mock.calls.find((c) => {
+      const p = c[0] as { tier: string; title: string };
+      return p.tier === "action_required" && p.title.includes("triage");
+    });
+    expect(action_required).toBeDefined();
   });
 });
