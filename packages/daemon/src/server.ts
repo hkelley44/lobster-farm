@@ -362,6 +362,14 @@ async function process_sentry_webhook(
         await ctx.discord.send_to_entity(first_active.entity.id, "alerts", alert_message, "system");
       }
     }
+  } else if (ctx.alert_router && !effective_entity_id && !is_triage_worthy) {
+    // alert_router is configured but no active entities are registered, so we
+    // have nothing to route a non-triage event to. Triage events are opened
+    // by the triage orchestrator and don't come through here. Surface the
+    // drop instead of silently eating the alert.
+    console.warn(
+      `[sentry-webhook] Dropping non-triage ${action ?? "event"} — alert_router configured but no effective entity resolved (project=${project_slug}, title=${error_title})`,
+    );
   }
 
   console.log(`[sentry-webhook] Processed: ${resource}.${action ?? "unknown"} — ${error_title}`);

@@ -35,6 +35,7 @@ import {
   format_incident_open_body,
   format_no_verdict_body,
   format_session_failed_body,
+  format_triaging_body,
   format_verdict_body,
   get_cached_issue_details,
   truncate_title,
@@ -560,6 +561,27 @@ async function spawn_triage_session(
     `[sentry-triage] Spawned Ray session ${session.session_id.slice(0, 8)} ` +
       `for Sentry issue ${sentry_issue_id}`,
   );
+
+  // Post "triaging" update into the incident thread (#310). Pattern mirrors
+  // format_fix_spawned_body() in spawn_sentry_fix. Best-effort — a failed
+  // thread post must not block the triage session.
+  if (ctx.alert_router) {
+    const { triages } = await load_triage_state(ctx.config);
+    const thread_id = triages[sentry_issue_id]?.thread_id;
+    if (thread_id) {
+      void ctx.alert_router
+        .post_alert({
+          entity_id,
+          tier: "incident_update",
+          incident_id: thread_id,
+          title: "",
+          body: format_triaging_body(),
+        })
+        .catch((err) => {
+          console.error(`[sentry-triage] Failed to post triaging update: ${String(err)}`);
+        });
+    }
+  }
 
   // Track in-memory
   active_triages.set(sentry_issue_id, {
