@@ -56,6 +56,7 @@ import {
   fetch_pr_mergeability,
   fetch_review_comments,
 } from "./review-utils.js";
+import { handle_sentry_fix_pr_merged } from "./sentry-triage.js";
 import * as sentry from "./sentry.js";
 import type { ClaudeSessionManager, SessionResult } from "./session.js";
 import { cleanup_after_merge } from "./worktree-cleanup.js";
@@ -1727,6 +1728,27 @@ async function handle_pr_merged(
 ): Promise<void> {
   // Close linked issues
   const issue_numbers = extract_linked_issues(pr.body, pr.title);
+
+  // Resolve any Sentry incidents tied to the linked issues (#310). Best-effort:
+  // failures are logged but never break the merge path.
+  if (issue_numbers.length > 0) {
+    try {
+      await handle_sentry_fix_pr_merged(pr.number, issue_numbers, {
+        session_manager: ctx.session_manager,
+        registry: ctx.registry,
+        discord: ctx.discord,
+        config: ctx.config,
+        alert_router: ctx.alert_router,
+      });
+    } catch (err) {
+      console.error(`[webhook] Sentry incident resolve failed: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "webhook", action: "sentry_incident_resolve" },
+        contexts: { pr: { number: pr.number, title: pr.title } },
+      });
+    }
+  }
+
   if (issue_numbers.length === 0) {
     console.log(`[webhook] Merged PR #${String(pr.number)} has no linked issues to close`);
   } else {
@@ -1795,6 +1817,26 @@ async function post_auto_merge_cleanup(
 ): Promise<void> {
   // Close linked issues
   const issue_numbers = extract_linked_issues(pr.body, pr.title);
+
+  // Resolve any Sentry incidents tied to the linked issues (#310).
+  if (issue_numbers.length > 0) {
+    try {
+      await handle_sentry_fix_pr_merged(pr.number, issue_numbers, {
+        session_manager: ctx.session_manager,
+        registry: ctx.registry,
+        discord: ctx.discord,
+        config: ctx.config,
+        alert_router: ctx.alert_router,
+      });
+    } catch (err) {
+      console.error(`[webhook] Sentry incident resolve failed (auto-merge): ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "webhook", action: "auto_merge_sentry_resolve" },
+        contexts: { pr: { number: pr.number, title: pr.title } },
+      });
+    }
+  }
+
   if (issue_numbers.length > 0) {
     // Derive repo full name from entity registry
     const entity_config = ctx.registry

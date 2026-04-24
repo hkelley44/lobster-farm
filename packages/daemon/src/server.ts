@@ -4,7 +4,7 @@ import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { DAEMON_PORT } from "@lobster-farm/shared";
 import { type ArchetypeRole, expand_home } from "@lobster-farm/shared";
 import { persist_entity_config } from "./actions.js";
-import { ALERT_COLOR_RED, type AlertRouter } from "./alert-router.js";
+import type { AlertRouter } from "./alert-router.js";
 import type { CommanderProcess } from "./commander-process.js";
 import {
   AmbiguousUserError,
@@ -337,33 +337,22 @@ async function process_sentry_webhook(
   });
 
   // Route through the tiered alert system (#253).
-  // error/fatal + triage-worthy (created/regression) → incident_open (top-level embed + thread)
-  // warning/other or non-triage actions → routine (daily thread)
-  const sentry_level = (issue?.level as string) ?? "error";
+  // Triage-worthy (created/regression) events get their incident opened by
+  // the triage orchestrator (#310) — opening it here would create a duplicate
+  // top-level embed and a thread with no content. For non-triage events
+  // (resolved, unresolved, warnings) we still post a routine daily-thread entry.
   const is_triage_worthy = triage_actions.includes(action ?? "");
-  const is_high_severity = sentry_level === "fatal" || sentry_level === "error";
   const effective_entity_id = target_entity_id ?? ctx.registry.get_active()[0]?.entity.id ?? null;
 
-  if (ctx.alert_router && effective_entity_id) {
-    if (is_triage_worthy && is_high_severity) {
-      // Tier 3: incident thread for error/fatal triage events
-      await ctx.alert_router.post_alert({
-        entity_id: effective_entity_id,
-        tier: "incident_open",
-        title: `\u{1f534} Sentry [${sentry_level}]: ${error_title}`,
-        body: alert_message,
-        embed_color: ALERT_COLOR_RED,
-      });
-    } else {
-      // Tier 2: routine (resolved, unresolved, warnings, P2/P3)
-      await ctx.alert_router.post_alert({
-        entity_id: effective_entity_id,
-        tier: "routine",
-        title: `Sentry [${action ?? "event"}]`,
-        body: alert_message,
-      });
-    }
-  } else if (ctx.discord) {
+  if (ctx.alert_router && effective_entity_id && !is_triage_worthy) {
+    // Tier 2: routine (resolved, unresolved, warnings)
+    await ctx.alert_router.post_alert({
+      entity_id: effective_entity_id,
+      tier: "routine",
+      title: `Sentry [${action ?? "event"}]`,
+      body: alert_message,
+    });
+  } else if (!ctx.alert_router && ctx.discord) {
     // Fallback: no alert_router, use direct Discord send
     if (target_entity_id) {
       await ctx.discord.send_to_entity(target_entity_id, "alerts", alert_message, "system");
@@ -373,6 +362,15 @@ async function process_sentry_webhook(
         await ctx.discord.send_to_entity(first_active.entity.id, "alerts", alert_message, "system");
       }
     }
+  } else if (ctx.alert_router && !effective_entity_id && !is_triage_worthy) {
+    // Alert router is configured but there's no entity to route to (no active
+    // entities in the registry and no target_entity_id on the event). The
+    // previous implementation broadcast to all entities via send_to_all here,
+    // which was noisy; the intentional silence replaces it. Logging makes the
+    // drop observable so operators can diagnose "why didn't I see that alert?".
+    console.warn(
+      `[sentry-webhook] Dropping non-triage event — no effective entity_id (resource=${resource}, action=${action ?? "unknown"}, title=${error_title})`,
+    );
   }
 
   console.log(`[sentry-webhook] Processed: ${resource}.${action ?? "unknown"} — ${error_title}`);

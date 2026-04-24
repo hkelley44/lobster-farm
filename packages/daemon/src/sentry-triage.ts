@@ -28,7 +28,18 @@ import type { AlertRouter } from "./alert-router.js";
 import type { DiscordBot } from "./discord.js";
 import type { EntityRegistry } from "./registry.js";
 import { MAX_SENTRY_FIX_ATTEMPTS, build_sentry_fix_prompt } from "./review-utils.js";
-import { get_cached_issue_details } from "./sentry-alert-format.js";
+import {
+  format_fix_exhausted_body,
+  format_fix_merged_body,
+  format_fix_spawned_body,
+  format_incident_open_body,
+  format_no_verdict_body,
+  format_session_failed_body,
+  format_triaging_body,
+  format_verdict_body,
+  get_cached_issue_details,
+  truncate_title,
+} from "./sentry-alert-format.js";
 import { type SentryIssueDetails, fetch_sentry_issue_details } from "./sentry-api.js";
 import * as sentry from "./sentry.js";
 import type { ActiveSession, ClaudeSessionManager, SessionResult } from "./session.js";
@@ -142,6 +153,10 @@ export interface SentryTriageRecord {
   fix_attempts?: number;
   fix_session_id?: string;
   fix_status?: "pending" | "fixing" | "fixed" | "failed";
+  // Incident thread tracking (#310)
+  thread_id?: string;
+  alert_message_id?: string;
+  last_fix_pr_url?: string;
 }
 
 export interface SentryTriageState {
@@ -557,6 +572,27 @@ async function spawn_triage_session(
     error_title: issue_details.title,
   });
 
+  // Post "triaging" update into the incident thread (#310).
+  // Mirrors the format_fix_spawned_body pattern in spawn_sentry_fix — read the
+  // thread_id set by open_incident_for_triage and post an incident_update.
+  if (ctx.alert_router) {
+    const { triages } = await load_triage_state(ctx.config);
+    const thread_id = triages[sentry_issue_id]?.thread_id;
+    if (thread_id) {
+      void ctx.alert_router
+        .post_alert({
+          entity_id,
+          tier: "incident_update",
+          incident_id: thread_id,
+          title: "",
+          body: format_triaging_body(),
+        })
+        .catch((err) => {
+          console.error(`[sentry-triage] Failed to post triaging update: ${String(err)}`);
+        });
+    }
+  }
+
   // ── Post-session listeners ──
 
   const on_complete = (result: SessionResult): void => {
@@ -572,24 +608,37 @@ async function spawn_triage_session(
     const verdict = parse_triage_verdict(result.output_lines);
 
     if (verdict) {
-      // Post triage verdict to #alerts
+      // Route verdict into the incident thread if we have one (#310);
+      // fall back to the legacy top-level action_required alert if not.
       if (ctx.alert_router) {
-        const fix_note = verdict.auto_fixable
-          ? `Auto-fix: yes → ${verdict.fix_approach ?? "approach TBD"}`
-          : "Auto-fix: no";
-        const issue_note = verdict.github_issue
-          ? `GitHub: #${String(verdict.github_issue)}`
-          : "No GitHub issue created";
-
-        void ctx.alert_router
-          .post_alert({
-            entity_id,
-            tier:
-              verdict.severity === "P0" || verdict.severity === "P1"
-                ? "action_required"
-                : "routine",
-            title: `\u{1f50d} Sentry triage: ${verdict.severity} — ${issue_details.title}`,
-            body: [issue_details.web_url, issue_note, fix_note].join("\n"),
+        void load_triage_state(ctx.config)
+          .then((state) => {
+            const thread_id = state.triages[sentry_issue_id]?.thread_id;
+            if (thread_id) {
+              return ctx.alert_router!.post_alert({
+                entity_id,
+                tier: "incident_update",
+                incident_id: thread_id,
+                title: "",
+                body: format_verdict_body(verdict),
+              });
+            }
+            // Back-compat: no thread_id (pre-#310 state) → top-level alert.
+            const fix_note = verdict.auto_fixable
+              ? `Auto-fix: yes → ${verdict.fix_approach ?? "approach TBD"}`
+              : "Auto-fix: no";
+            const issue_note = verdict.github_issue
+              ? `GitHub: #${String(verdict.github_issue)}`
+              : "No GitHub issue created";
+            return ctx.alert_router!.post_alert({
+              entity_id,
+              tier:
+                verdict.severity === "P0" || verdict.severity === "P1"
+                  ? "action_required"
+                  : "routine",
+              title: `\u{1f50d} Sentry triage: ${verdict.severity} — ${issue_details.title}`,
+              body: [issue_details.web_url, issue_note, fix_note].join("\n"),
+            });
           })
           .catch((err) => {
             console.error(`[sentry-triage] Failed to post verdict alert: ${String(err)}`);
@@ -627,14 +676,28 @@ async function spawn_triage_session(
           );
         });
     } else {
-      // Post no-verdict alert to #alerts
+      // No verdict parsed \u2014 route to the incident thread if we have one
+      // (#310), with Ray's output tail so the user can diagnose the parse
+      // failure. Fall back to top-level alert for back-compat.
       if (ctx.alert_router) {
-        void ctx.alert_router
-          .post_alert({
-            entity_id,
-            tier: "action_required",
-            title: "\u26a0\ufe0f Sentry triage completed \u2014 no verdict parsed",
-            body: `Ray's session completed but didn't output a structured verdict.\n${issue_details.title}\n${issue_details.web_url}`,
+        void load_triage_state(ctx.config)
+          .then((state) => {
+            const thread_id = state.triages[sentry_issue_id]?.thread_id;
+            if (thread_id) {
+              return ctx.alert_router!.post_alert({
+                entity_id,
+                tier: "incident_update",
+                incident_id: thread_id,
+                title: "",
+                body: format_no_verdict_body(result.output_lines),
+              });
+            }
+            return ctx.alert_router!.post_alert({
+              entity_id,
+              tier: "action_required",
+              title: "\u26a0\ufe0f Sentry triage completed \u2014 no verdict parsed",
+              body: `Ray's session completed but didn't output a structured verdict.\n${issue_details.title}\n${issue_details.web_url}`,
+            });
           })
           .catch((err) => {
             console.error(`[sentry-triage] Failed to post no-verdict alert: ${String(err)}`);
@@ -668,12 +731,26 @@ async function spawn_triage_session(
 
     // Alert on session failure — more urgent than no-verdict since Ray didn't run at all
     if (ctx.alert_router) {
-      void ctx.alert_router
-        .post_alert({
-          entity_id,
-          tier: "action_required",
-          title: "\u274c Sentry triage session failed",
-          body: `Ray's triage session crashed.\n${issue_details.title}\n${issue_details.web_url}\nError: ${error}`,
+      // Route into incident thread if we have one (#310); fall back to
+      // top-level action_required for back-compat.
+      void load_triage_state(ctx.config)
+        .then((state) => {
+          const thread_id = state.triages[sentry_issue_id]?.thread_id;
+          if (thread_id) {
+            return ctx.alert_router!.post_alert({
+              entity_id,
+              tier: "incident_update",
+              incident_id: thread_id,
+              title: "",
+              body: format_session_failed_body(error),
+            });
+          }
+          return ctx.alert_router!.post_alert({
+            entity_id,
+            tier: "action_required",
+            title: "\u274c Sentry triage session failed",
+            body: `Ray's triage session crashed.\n${issue_details.title}\n${issue_details.web_url}\nError: ${error}`,
+          });
         })
         .catch((err) => {
           console.error(`[sentry-triage] Failed to post failure alert: ${String(err)}`);
@@ -722,6 +799,20 @@ async function spawn_sentry_fix(
       `[sentry-triage] Fix attempt cap reached for ${sentry_issue_id} ` +
         `(${String(current_attempts)}/${String(MAX_SENTRY_FIX_ATTEMPTS)}) — skipping auto-fix`,
     );
+    // Post exhaustion update into the incident thread (#310).
+    if (ctx.alert_router && record?.thread_id) {
+      await ctx.alert_router
+        .post_alert({
+          entity_id,
+          tier: "incident_update",
+          incident_id: record.thread_id,
+          title: "",
+          body: format_fix_exhausted_body(current_attempts, record.last_fix_pr_url ?? null),
+        })
+        .catch((err) => {
+          console.error(`[sentry-triage] Failed to post fix-exhaustion update: ${String(err)}`);
+        });
+    }
     return;
   }
 
@@ -776,6 +867,21 @@ async function spawn_sentry_fix(
     { fix_session_id: fix_session.session_id },
     ctx.config,
   );
+
+  // Post "fix spawned" update into the incident thread (#310).
+  if (ctx.alert_router && record?.thread_id) {
+    void ctx.alert_router
+      .post_alert({
+        entity_id,
+        tier: "incident_update",
+        incident_id: record.thread_id,
+        title: "",
+        body: format_fix_spawned_body(),
+      })
+      .catch((err) => {
+        console.error(`[sentry-triage] Failed to post fix-spawned update: ${String(err)}`);
+      });
+  }
 
   // ── Fix session lifecycle listeners ──
 
@@ -905,6 +1011,7 @@ export async function handle_sentry_triage_event(
       `[sentry-triage] At capacity (${String(MAX_CONCURRENT_TRIAGES)} concurrent) — ` +
         `queuing issue ${sentry_issue_id}`,
     );
+    await open_incident_for_triage(sentry_issue_id, entity_id, issue_details, ctx);
     triage_queue.push({
       sentry_issue_id,
       entity_id,
@@ -916,6 +1023,7 @@ export async function handle_sentry_triage_event(
     return;
   }
 
+  await open_incident_for_triage(sentry_issue_id, entity_id, issue_details, ctx);
   await spawn_triage_session(
     sentry_issue_id,
     entity_id,
@@ -927,6 +1035,45 @@ export async function handle_sentry_triage_event(
   );
 }
 
+/**
+ * Open a Discord incident thread for a Sentry issue we're about to triage
+ * (#310). The thread carries the full lifecycle (triage start, verdict,
+ * fix spawn, fix merge). Persists `thread_id` + `alert_message_id` on the
+ * triage state so every subsequent update posts into this thread.
+ *
+ * Called only after gates pass (not dedup, not cooldown, not queue-full).
+ * If Discord is unavailable or no alerts channel is configured, returns
+ * without persisting — subsequent alerts fall back to top-level action_required.
+ */
+async function open_incident_for_triage(
+  sentry_issue_id: string,
+  entity_id: string,
+  issue_details: SentryIssueDetails,
+  ctx: SentryTriageContext,
+): Promise<void> {
+  if (!ctx.alert_router) return;
+  try {
+    const result = await ctx.alert_router.post_alert({
+      entity_id,
+      tier: "incident_open",
+      title: `\u{1f6a8} Sentry — ${truncate_title(issue_details.title, 80)}`,
+      body: format_incident_open_body(issue_details.web_url),
+    });
+    if (result.thread_id) {
+      await update_triage_state(
+        sentry_issue_id,
+        {
+          thread_id: result.thread_id,
+          alert_message_id: result.message_id ?? undefined,
+        },
+        ctx.config,
+      );
+    }
+  } catch (err) {
+    console.error(`[sentry-triage] Failed to open incident thread: ${String(err)}`);
+  }
+}
+
 // ── Test helpers ──
 
 /**
@@ -936,6 +1083,53 @@ export function _reset_for_test(): void {
   active_triages.clear();
   triage_queue.length = 0;
   state_write_lock = Promise.resolve();
+}
+
+/**
+ * Handle a fix PR being merged (#310).
+ *
+ * Called by the GitHub webhook handler when a merged PR's linked issues
+ * include one tracked by a Sentry triage. Finds every triage record whose
+ * `github_issue` matches, marks it `fix_status: fixed`, and calls
+ * `resolve_incident` to turn the top-level embed green and post a
+ * resolution message into the thread.
+ *
+ * Safe to call when no matching triage exists — it's a best-effort hook.
+ */
+export async function handle_sentry_fix_pr_merged(
+  pr_number: number,
+  linked_issue_numbers: number[],
+  ctx: SentryTriageContext,
+): Promise<void> {
+  if (linked_issue_numbers.length === 0) return;
+
+  const state = await load_triage_state(ctx.config);
+  const linked_set = new Set(linked_issue_numbers);
+
+  for (const [sentry_issue_id, record] of Object.entries(state.triages)) {
+    if (record.github_issue == null) continue;
+    if (!linked_set.has(record.github_issue)) continue;
+    if (record.fix_status === "fixed") continue;
+
+    await update_triage_state(
+      sentry_issue_id,
+      { fix_status: "fixed", last_fix_pr_url: `PR #${String(pr_number)}` },
+      ctx.config,
+    );
+
+    if (ctx.alert_router && record.thread_id) {
+      try {
+        await ctx.alert_router.resolve_incident(
+          record.thread_id,
+          format_fix_merged_body(pr_number),
+        );
+      } catch (err) {
+        console.error(
+          `[sentry-triage] Failed to resolve incident for ${sentry_issue_id}: ${String(err)}`,
+        );
+      }
+    }
+  }
 }
 
 /**

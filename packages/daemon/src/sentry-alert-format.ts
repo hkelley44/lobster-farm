@@ -241,6 +241,104 @@ export function get_cached_issue_details(
   return promise;
 }
 
+// ── Incident thread formatting (#310) ──
+
+/**
+ * Discord user ID for the entity owner (e.g. Jax). Hardcoded for now.
+ *
+ * When multi-user support lands, read this from entity config instead. For
+ * this issue the only consumer is lobster-farm's own alerts.
+ */
+const USER_MENTION = "<@732686813856006245>";
+
+/**
+ * Mention the user who should act on a Sentry incident. Used in thread
+ * updates that require human attention (P0, parse failures, crashes,
+ * fix-attempt exhaustion).
+ */
+export function mention_user(): string {
+  return USER_MENTION;
+}
+
+/**
+ * Truncate an issue title to the 80-char embed title budget, with ellipsis.
+ */
+export function truncate_title(title: string, max = 80): string {
+  if (title.length <= max) return title;
+  return `${title.slice(0, max - 1)}…`;
+}
+
+/**
+ * Body for the ingress incident_open alert. Deliberately minimal — the
+ * thread will carry the actual lifecycle.
+ */
+export function format_incident_open_body(web_url: string): string {
+  return `${web_url}\n\nStatus: received — spawning triage`;
+}
+
+/** Body for "triage session started" thread update. */
+export function format_triaging_body(): string {
+  return "\u{1f50d} Triage session started";
+}
+
+/**
+ * Body for the verdict thread update. Tags the user when severity is P0.
+ */
+export function format_verdict_body(verdict: {
+  severity: "P0" | "P1" | "P2";
+  auto_fixable: boolean;
+  github_issue: number | null;
+  fix_approach: string | null;
+}): string {
+  const needs_tag = verdict.severity === "P0";
+  const tag = needs_tag ? `${USER_MENTION} ` : "";
+  const summary = verdict.fix_approach ?? "(no fix summary)";
+  const lines = [`✅ ${tag}Verdict: ${verdict.severity} — ${summary}`];
+  if (verdict.github_issue != null) {
+    lines.push(`GitHub: #${String(verdict.github_issue)}`);
+  } else {
+    lines.push("No GitHub issue created");
+  }
+  const fix_note = verdict.auto_fixable
+    ? `Auto-fix: yes — ${verdict.fix_approach ?? "approach TBD"}`
+    : "Auto-fix: no";
+  lines.push(fix_note);
+  return lines.join("\n");
+}
+
+/**
+ * Body for the "no verdict parsed" thread update. Always tags the user
+ * and appends the last 20 lines of Ray's output (code-blocked) so the
+ * user can see what went wrong.
+ */
+export function format_no_verdict_body(output_lines: string[] | undefined): string {
+  const tail = (output_lines ?? []).slice(-20).join("\n");
+  const tail_block =
+    tail.length > 0 ? `\n\n**Last 20 lines of output:**\n\`\`\`\n${tail}\n\`\`\`` : "";
+  return `⚠️ ${USER_MENTION} Ray completed but didn't emit a verdict block.${tail_block}`;
+}
+
+/** Body for "session crashed" thread update. */
+export function format_session_failed_body(error: string): string {
+  return `❌ ${USER_MENTION} Triage session crashed: ${error}`;
+}
+
+/** Body for "auto-fix session spawned" thread update. */
+export function format_fix_spawned_body(): string {
+  return "\u{1f6e0}️ Auto-fix session spawned (Bob, Opus)";
+}
+
+/** Body for "auto-fix exhausted attempts" thread update. */
+export function format_fix_exhausted_body(attempts: number, last_pr_url?: string | null): string {
+  const suffix = last_pr_url ? ` Last PR: ${last_pr_url}` : "";
+  return `❌ ${USER_MENTION} Auto-fix failed after ${String(attempts)} attempts.${suffix}`;
+}
+
+/** Body for "fix PR merged — incident resolved" thread update. */
+export function format_fix_merged_body(pr_number: number): string {
+  return `Fix PR #${String(pr_number)} merged`;
+}
+
 // ── Test helpers ──
 
 /**
