@@ -383,13 +383,18 @@ async function main(): Promise<void> {
         `[shutdown] Draining — ${String(work_check.working_bots.length)} agent(s) still working: ${names}`,
       );
 
-      // Notify command center
+      // Notify #system-status (mirrors the startup notification path).
+      // Previously this passed an empty channel id from a placeholder ternary
+      // and produced a noisy 404 in the logs on every shutdown drain (#319).
       if (discord_connected) {
         try {
-          await discord.send(
-            config.discord?.server_id ? "" : "",
-            `Daemon shutting down — waiting for ${String(work_check.working_bots.length)} active agent(s) to finish: ${names}. Send another signal to force.`,
-          );
+          const status_channel = await discord.find_system_status_channel();
+          if (status_channel) {
+            await discord.send(
+              status_channel,
+              `Daemon shutting down — waiting for ${String(work_check.working_bots.length)} active agent(s) to finish: ${names}. Send another signal to force.`,
+            );
+          }
         } catch {
           /* best effort */
         }

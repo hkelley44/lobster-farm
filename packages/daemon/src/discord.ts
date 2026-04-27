@@ -704,8 +704,32 @@ export class DiscordBot extends EventEmitter {
     return this.command_center_channel_id;
   }
 
+  /**
+   * Defensive guard: returns true and logs if `channel_id` is empty/whitespace.
+   * Caller should early-return on `true`. Captures a Sentry breadcrumb (not an
+   * exception event) so we get caller attribution without paging — a real bug
+   * upstream of the call should be fixed at the source, this is only the net.
+   */
+  private assert_empty_channel_id(
+    method_name: string,
+    channel_id: string | undefined | null,
+    content?: string,
+  ): boolean {
+    if (channel_id?.trim()) return false;
+    const err = new Error(`${method_name}() called with empty channel_id`);
+    console.warn(`[discord] ${err.message}`, err.stack);
+    sentry.addBreadcrumb({
+      category: "discord",
+      level: "warning",
+      message: err.message,
+      data: { content_preview: content?.slice(0, 80) },
+    });
+    return true;
+  }
+
   /** Send a plain message to a channel (from the bot itself). */
   async send(channel_id: string, content: string): Promise<void> {
+    if (this.assert_empty_channel_id("send", channel_id, content)) return;
     if (!this.connected) {
       console.log(`[discord:offline] Would send to ${channel_id}: ${content}`);
       return;
@@ -1060,6 +1084,7 @@ export class DiscordBot extends EventEmitter {
    * Stores the message ID so we can edit it when the agent finishes.
    */
   async send_status_embed(channel_id: string, archetype: ArchetypeRole | "system"): Promise<void> {
+    if (this.assert_empty_channel_id("send_status_embed", channel_id)) return;
     if (!this.connected) return;
 
     // Don't stack embeds — finalize any existing one first
@@ -1188,6 +1213,7 @@ export class DiscordBot extends EventEmitter {
     content: string,
     archetype: ArchetypeRole | "system",
   ): Promise<void> {
+    if (this.assert_empty_channel_id("send_as_agent", channel_id, content)) return;
     if (!this.connected) {
       console.log(`[discord:offline] [${archetype}] ${content}`);
       return;
@@ -1252,6 +1278,7 @@ export class DiscordBot extends EventEmitter {
 
   /** Send a Discord embed to a channel. Returns the message ID, or null on failure. */
   async send_embed(channel_id: string, embed: EmbedBuilder): Promise<string | null> {
+    if (this.assert_empty_channel_id("send_embed", channel_id)) return null;
     if (!this.connected) {
       console.log(`[discord:offline] Would send embed to ${channel_id}`);
       return null;
@@ -1306,6 +1333,7 @@ export class DiscordBot extends EventEmitter {
 
   /** Post a text message to a thread. */
   async send_to_thread(thread_id: string, content: string): Promise<void> {
+    if (this.assert_empty_channel_id("send_to_thread", thread_id, content)) return;
     if (!this.connected) {
       console.log(`[discord:offline] Would send to thread ${thread_id}: ${content}`);
       return;
