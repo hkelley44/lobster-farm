@@ -220,6 +220,15 @@ async function main(): Promise<void> {
 
   // Initialize Commander (persistent Claude Code session with Discord channel)
   const commander = new CommanderProcess(config);
+
+  // Wire commander into discord so handle_message can keep Pat's access.json
+  // in sync when the owner posts in non-pool channels (issue #318). Safe even
+  // when commander has no token — ensure_channel_allowlisted only runs on
+  // owner-authored messages that miss every other branch.
+  if (discord_connected) {
+    discord.set_commander(commander);
+  }
+
   if (await commander.has_token()) {
     try {
       await commander.start();
