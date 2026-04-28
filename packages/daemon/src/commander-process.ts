@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
@@ -24,6 +24,66 @@ const BACKOFF_SCHEDULE = [0, 5_000, 15_000, 60_000, 300_000];
 const BACKOFF_RESET_MS = 10 * 60 * 1000; // 10 min stable → reset counter
 const MAX_RESTARTS = 5;
 const HEALTH_INTERVAL_MS = 10_000; // check every 10s
+
+/** Shape of Pat's access.json. Mirrors the Discord plugin's Access type
+ *  (server.ts:105-121). Fields beyond the defaults are optional — we
+ *  preserve any that exist on disk and never invent values for them. */
+interface PatGroupPolicy {
+  requireMention: boolean;
+  allowFrom: string[];
+}
+interface PatAccess {
+  dmPolicy: "pairing" | "allowlist" | "disabled";
+  allowFrom: string[];
+  groups: Record<string, PatGroupPolicy>;
+  pending: Record<string, unknown>;
+  mentionPatterns?: string[];
+  ackReaction?: string;
+  replyToMode?: "off" | "first" | "all";
+  textChunkLimit?: number;
+  chunkMode?: "length" | "newline";
+}
+
+/**
+ * Default access.json shape used when seeding a missing or corrupt file.
+ *
+ * `dmPolicy: 'allowlist'` matches the existing pat/access.json on disk
+ * and the daemon's single-user trust model. The plugin's own default is
+ * `'pairing'` (server.ts:123-130), but the commander runs in a context
+ * where the owner is already known via config.discord.user_id, so seeding
+ * `'allowlist'` here avoids a no-op pairing-code dance on first DM.
+ */
+function default_access(): PatAccess {
+  return {
+    dmPolicy: "allowlist",
+    allowFrom: [],
+    groups: {},
+    pending: {},
+  };
+}
+
+/**
+ * Normalize a parsed access.json so downstream code can mutate it safely.
+ *
+ * Defaults are applied for the required fields only — optional fields
+ * (mentionPatterns, ackReaction, replyToMode, textChunkLimit, chunkMode)
+ * are preserved when present and left undefined when absent. The plugin
+ * fills in its own runtime defaults for those, so we don't bake any in
+ * that could drift.
+ */
+function normalize_access(parsed: Partial<PatAccess>): PatAccess {
+  return {
+    dmPolicy: parsed.dmPolicy ?? "allowlist",
+    allowFrom: parsed.allowFrom ?? [],
+    groups: parsed.groups ?? {},
+    pending: parsed.pending ?? {},
+    mentionPatterns: parsed.mentionPatterns,
+    ackReaction: parsed.ackReaction,
+    replyToMode: parsed.replyToMode,
+    textChunkLimit: parsed.textChunkLimit,
+    chunkMode: parsed.chunkMode,
+  };
+}
 
 /**
  * Manages a persistent Claude Code session connected to Discord via the
@@ -75,6 +135,96 @@ export class CommanderProcess extends EventEmitter {
     } catch {
       /* ignore — file may not exist */
     }
+  }
+
+  /** Path to Pat's Discord plugin allowlist. */
+  private access_json_path(): string {
+    return join(this.state_dir(), "access.json");
+  }
+
+  /**
+   * Idempotently add a channel to Pat's `access.json.groups`.
+   *
+   * Pat's plugin gates inbound messages by `groups[channelId]`. When the
+   * daemon's bot sees the owner post in a channel Pat hasn't been keyed to,
+   * we add the channel here so a follow-up @-mention of Pat is delivered
+   * instead of dropped. `requireMention: true` keeps Pat silent unless pinged
+   * — the allowlist entry only authorizes delivery, it doesn't make Pat chatty.
+   *
+   * Additive only: existing `groups` entries are preserved across writes.
+   * The pool's `write_access_json` overwrite pattern would clobber Pat's
+   * canonical channel and is intentionally not reused here.
+   *
+   * No-op when the channel is already present (no file write, no log noise).
+   * Tolerates ENOENT (seeds full default access.json) and corrupt JSON
+   * (moves the bad file aside, mirroring the plugin's `readAccessFile`).
+   */
+  async ensure_channel_allowlisted(channel_id: string): Promise<void> {
+    const owner_id = this.config.discord?.user_id;
+    if (!owner_id) {
+      // No owner configured — silently skip. Adding an entry with an empty
+      // allowFrom would leave the group open to any sender, which is the
+      // wrong default in single-user trust mode.
+      return;
+    }
+
+    const target = this.access_json_path();
+    let access: PatAccess;
+    try {
+      const raw = await readFile(target, "utf-8");
+      try {
+        const parsed = JSON.parse(raw) as Partial<PatAccess>;
+        access = normalize_access(parsed);
+      } catch {
+        // Corrupt file. Move aside and seed defaults. Mirrors the plugin's
+        // readAccessFile recovery (server.ts:166-171) so the daemon and the
+        // plugin agree on what to do with a broken file.
+        try {
+          await rename(target, `${target}.corrupt-${String(Date.now())}`);
+        } catch {
+          /* ignore — best effort */
+        }
+        console.warn("[commander] access.json was corrupt, moved aside. Starting fresh.");
+        access = default_access();
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      access = default_access();
+    }
+
+    if (access.groups[channel_id]) {
+      // Already allowlisted — no-op. Skipping the write here is what makes
+      // the trigger in handle_message safe to call on every owner message.
+      return;
+    }
+
+    access.groups[channel_id] = {
+      requireMention: true,
+      allowFrom: [owner_id],
+    };
+
+    // Atomic write: tmp + rename, mode 0600. Matches the plugin's saveAccess
+    // (server.ts:195-201) so a torn write never leaves the plugin staring at
+    // a half-written file. The tmp suffix is per-call random so concurrent
+    // ensure_channel_allowlisted() calls don't race on a shared tmp path —
+    // each writer's rename is independent. Last writer wins on the final
+    // file (acceptable: the additive design accepts read-modify-write
+    // last-write-wins; the next call retries any lost update).
+    const tmp = `${target}.tmp.${randomUUID()}`;
+    try {
+      await writeFile(tmp, `${JSON.stringify(access, null, 2)}\n`, { mode: 0o600 });
+      await rename(tmp, target);
+    } catch (err) {
+      // Best-effort cleanup so a failed rename doesn't leave litter behind.
+      try {
+        await unlink(tmp);
+      } catch {
+        /* ignore */
+      }
+      throw err;
+    }
+
+    console.log(`[commander] Allowlisted channel ${channel_id} for Pat`);
   }
 
   /** Check if Pat's bot token is configured. */

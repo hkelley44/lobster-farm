@@ -38,6 +38,7 @@ import {
   type TextChannel,
   type Webhook,
 } from "discord.js";
+import type { CommanderProcess } from "./commander-process.js";
 import { PAT_TMUX_SESSION } from "./commander-process.js";
 import { is_tmux_session_idle } from "./pool.js";
 import type { BotPool, PoolBot } from "./pool.js";
@@ -2430,10 +2431,21 @@ export class DiscordBot extends EventEmitter {
   }
 
   private _pool: BotPool | null = null;
+  private _commander: CommanderProcess | null = null;
 
   set_managers(_queue: TaskQueue): void {
     // Queue wiring deferred — will be used for slash-command task submission
     console.debug("[discord] set_managers called — queue wiring not yet implemented");
+  }
+
+  /**
+   * Wire the CommanderProcess so handle_message can keep Pat's access.json
+   * in sync when the owner posts in a daemon-watched channel that isn't a
+   * pool work room. See `ensure_channel_allowlisted` for the additive
+   * allowlist semantics. Issue #318.
+   */
+  set_commander(commander: CommanderProcess): void {
+    this._commander = commander;
   }
 
   set_pool(pool: BotPool): void {
@@ -2489,6 +2501,32 @@ export class DiscordBot extends EventEmitter {
       this.start_commander_typing_loop(message.channelId);
       void this.send_status_embed(message.channelId, "commander");
       return;
+    }
+
+    // Owner-authored message in a non-pool, non-command-center channel that
+    // the daemon's bot can see. Ensure Pat's allowlist contains this channel
+    // so a follow-up @-mention of Pat is delivered by the plugin's gate
+    // instead of dropped. Idempotent: skips on channels already allowlisted.
+    // Issue #318.
+    if (!entry && this._commander) {
+      const owner_id = this.config.discord?.user_id;
+      if (owner_id && message.author.id === owner_id) {
+        try {
+          await this._commander.ensure_channel_allowlisted(message.channelId);
+        } catch (err) {
+          // Don't let an allowlist write failure derail message handling for
+          // the rest of the daemon. Log + Sentry; the next owner message in
+          // the same channel will retry.
+          console.error(
+            `[discord] Failed to allowlist channel for Pat: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          sentry.captureException(err, {
+            tags: { module: "discord", action: "ensure_channel_allowlisted" },
+          });
+        }
+      }
     }
 
     // Unmapped channels: ignore everything.
