@@ -176,6 +176,22 @@ describe("send_status_embed() — empty channel_id guard (#319)", () => {
     expect(bot.channels_fetch_mock).not.toHaveBeenCalled();
     expect(sentry.addBreadcrumb).toHaveBeenCalled();
   });
+
+  it("early-returns on undefined channel_id", async () => {
+    const config = make_config();
+    const registry = new EntityRegistry(config);
+    const bot = new TestDiscordBot(config, registry);
+
+    await bot.send_status_embed(undefined as unknown as string, "planner");
+
+    expect(bot.channels_fetch_mock).not.toHaveBeenCalled();
+    expect(sentry.addBreadcrumb).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "send_status_embed() called with empty channel_id",
+      }),
+    );
+    expect(sentry.captureException).not.toHaveBeenCalled();
+  });
 });
 
 describe("send_embed() — empty channel_id guard (#319)", () => {
@@ -186,6 +202,24 @@ describe("send_embed() — empty channel_id guard (#319)", () => {
 
     const embed = new EmbedBuilder().setDescription("test");
     const result = await bot.send_embed("", embed);
+
+    expect(result).toBeNull();
+    expect(bot.channels_fetch_mock).not.toHaveBeenCalled();
+    expect(sentry.addBreadcrumb).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "send_embed() called with empty channel_id",
+      }),
+    );
+    expect(sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  it("returns null and breadcrumbs on undefined channel_id", async () => {
+    const config = make_config();
+    const registry = new EntityRegistry(config);
+    const bot = new TestDiscordBot(config, registry);
+
+    const embed = new EmbedBuilder().setDescription("test");
+    const result = await bot.send_embed(undefined as unknown as string, embed);
 
     expect(result).toBeNull();
     expect(bot.channels_fetch_mock).not.toHaveBeenCalled();
@@ -215,6 +249,23 @@ describe("send_to_thread() — empty thread_id guard (#319)", () => {
     );
     expect(sentry.captureException).not.toHaveBeenCalled();
   });
+
+  it("early-returns on undefined thread_id", async () => {
+    const config = make_config();
+    const registry = new EntityRegistry(config);
+    const bot = new TestDiscordBot(config, registry);
+
+    await bot.send_to_thread(undefined as unknown as string, "hello");
+
+    expect(bot.channels_fetch_mock).not.toHaveBeenCalled();
+    expect(sentry.addBreadcrumb).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "send_to_thread() called with empty channel_id",
+        data: expect.objectContaining({ content_preview: "hello" }),
+      }),
+    );
+    expect(sentry.captureException).not.toHaveBeenCalled();
+  });
 });
 
 describe("send_as_agent() — empty channel_id guard (#319)", () => {
@@ -226,6 +277,23 @@ describe("send_as_agent() — empty channel_id guard (#319)", () => {
     // If the guard didn't fire, send_as_agent would either hit the webhook
     // path or fall through to send() — both routes ultimately call fetch.
     await bot.send_as_agent("", "hello", "planner");
+
+    expect(bot.channels_fetch_mock).not.toHaveBeenCalled();
+    expect(sentry.addBreadcrumb).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "send_as_agent() called with empty channel_id",
+        data: expect.objectContaining({ content_preview: "hello" }),
+      }),
+    );
+    expect(sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  it("early-returns on undefined channel_id", async () => {
+    const config = make_config();
+    const registry = new EntityRegistry(config);
+    const bot = new TestDiscordBot(config, registry);
+
+    await bot.send_as_agent(undefined as unknown as string, "hello", "planner");
 
     expect(bot.channels_fetch_mock).not.toHaveBeenCalled();
     expect(sentry.addBreadcrumb).toHaveBeenCalledWith(
