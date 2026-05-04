@@ -1082,21 +1082,28 @@ _Temporary workarounds for the LobsterFarm monorepo. Sunset clause at the bottom
 
 When you're an agent working inside a worktree under `~/.lobsterfarm/entities/<entity>/repos/<repo>/worktrees/`, follow these three rules until further notice:
 
-1. **Prefer `pnpm --filter <package> test` over `pnpm -r test`.**
-   The recursive form runs the full daemon test suite (~1100+ tests) plus `cli` and `shared` in parallel, and has been killed with SIGKILL (exit 137) 3-for-3 times. Filtered runs of a single package complete in under 300ms and have never been killed. If you genuinely need cross-package coverage, run each filter sequentially in separate commands — never gang them up under `-r`.
+1. **Prefer `pnpm --filter <package> test` for single-package work; use `setsid pnpm -r test` when you genuinely need cross-package coverage.**
+   The recursive form runs the full daemon test suite (~1100+ tests) plus `cli` and `shared` in parallel. Run unwrapped (`pnpm -r test`) inside an agent session, it gets SIGKILL'd (exit 137) — not because of memory, but because every descendant of the daemon shares a macOS resource coalition with a 2 GiB / 24h dirty-write budget, and the parallel vitest workers blow through what's left of it. Root cause analysis in #28; fix in #33.
+
+   **The wrapper:** `setsid` creates a new process group, session, and (on macOS) a new anonymous resource coalition. Workers spawned underneath it bill against the new coalition, not the daemon's. So:
+   - `pnpm --filter <package> test` — lightest weight, no wrapper needed for a single package. Use this when you can.
+   - `setsid pnpm -r test` — canonical full-suite invocation from an agent session. Always wrap `-r` with `setsid`.
+   - `pnpm -r test` (unwrapped) — only safe outside agent sessions (your own terminal, CI). Inside an agent session it will eventually SIGKILL.
+
+   You can sanity-check the coalition break with `ps -o pid,pgid,sid,command` — vitest workers under `setsid` have a different SID than the agent shell.
 
 2. **Push commits eagerly.**
    After every meaningful milestone (a package's tests pass, a refactor is complete, or before any heavy command), `git push -u origin <branch>`. Treat unpushed commits as work that doesn't exist yet — because in this environment, it doesn't.
 
-3. **Worktrees are not yet durable storage.**
-   The cleanup-sweep data-loss path is now guarded (PR #30 closed #27 — the sweep refuses to remove worktrees with uncommitted, untracked, or unpushed work). But the SIGKILL that triggers the cleanup window is still un-investigated (#28 open). Pushing eagerly turns a kill from "lose progress" into "resume from origin" — keep doing it.
+3. **Worktrees are durable, but kills still cost scrollback.**
+   The cleanup-sweep data-loss path is guarded (PR #30 closed #27 — the sweep refuses to remove worktrees with uncommitted, untracked, or unpushed work) and the SIGKILL root cause is identified and mitigated (PR for #33 — `setsid` wrapper + `maxForks: 4` cap). But a worker kill still loses your tmux scrollback and any uncommitted edits in flight. Pushing eagerly turns a kill from "lose progress" into "resume from origin" — keep doing it.
 
 **When to remove this section:** Delete it once **all three** of the following are true:
 - ✅ #27 — guardrail merged in PR #30 (done).
-- ⏳ #28 — SIGKILL root-cause investigation closed.
-- ⏳ One full week observed where `pnpm -r test` does not get SIGKILL'd in any agent session.
+- ✅ #28 — SIGKILL root cause identified (macOS resource coalition dirty-write accounting), mitigation shipped in #33.
+- ⏳ One full week observed where `setsid pnpm -r test` runs cleanly in agent sessions and no other coalition-related kills surface.
 
-**Cleanup ownership:** Whoever closes #28 (likely Karim) is responsible for starting the one-week observation window and, once it elapses cleanly, deleting this section in a follow-up PR. Tidus may also drive the cleanup as the planner who filed it.
+**Cleanup ownership:** Karim drives the one-week observation window. Once it elapses cleanly, this whole section gets deleted in a follow-up PR. Tidus may also drive the cleanup as the planner who filed #27/#28/#33.
 
 ---
 
