@@ -246,6 +246,11 @@ ${ENV_XML}    </dict>
 </plist>
 PLIST_EOF
 
+# Lock down /tmp artefacts to 0600 — they live in a world-readable directory
+# and the plist exposes the full command line, working directory, and any
+# allowlisted env var values. Even on a single-user box this is basic hygiene.
+chmod 0600 "${PLIST}"
+
 # Sanity-check the plist; if it's malformed launchctl will fail with a
 # cryptic message, so we surface the parser error early.
 if ! plutil -lint "${PLIST}" >/dev/null; then
@@ -255,9 +260,16 @@ if ! plutil -lint "${PLIST}" >/dev/null; then
 fi
 
 # Pre-create the out/err files so `tail -f` has something to attach to
-# without racing the service's first write.
+# without racing the service's first write. chmod immediately so launchd's
+# subsequent appends inherit the restrictive mode.
 : >"${STDOUT_FILE}"
+chmod 0600 "${STDOUT_FILE}"
 : >"${STDERR_FILE}"
+chmod 0600 "${STDERR_FILE}"
+# Pre-create the exit-code file too; the inner bash will overwrite it via
+# `echo $? > …` but starting with 0600 means there's no brief 0644 window.
+: >"${EXITCODE_FILE}"
+chmod 0600 "${EXITCODE_FILE}"
 
 # ---------------------------------------------------------------------------
 # Bootstrap into the user's launchd domain. This is the load-bearing step:
