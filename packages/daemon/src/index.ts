@@ -298,7 +298,7 @@ async function main(): Promise<void> {
   // merged PRs that the webhook handler missed or from manual merges.
   const WORKTREE_SWEEP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
   const worktree_sweep_timer = setInterval(() => {
-    void sweep_stale_worktrees(registry).catch((err) => {
+    void sweep_stale_worktrees(registry, { alert_router }).catch((err) => {
       console.error(`[worktree-cleanup] Sweep failed: ${String(err)}`);
       sentry.captureException(err, {
         tags: { module: "worktree-cleanup", action: "sweep" },

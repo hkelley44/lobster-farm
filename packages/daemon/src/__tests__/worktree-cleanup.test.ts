@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup_after_merge,
   find_worktree_for_branch,
+  is_worktree_safe_to_remove,
   parse_worktree_list,
   relocate_sessions_from_path,
   remove_worktree,
@@ -83,6 +84,10 @@ function setup_git_mocks(
     merged_branches?: string;
     fetch_error?: Error;
     rev_parse_missing?: string[]; // branches whose remote ref is gone
+    /** Output for `git status --porcelain=v1 --untracked-files=all`. Defaults to "" (clean). */
+    status_porcelain?: string;
+    /** Output for `git rev-list <branch> --not --remotes`. Defaults to "" (no unpushed commits). */
+    rev_list_unpushed?: string;
   } = {},
 ): void {
   mock_exec_file.mockImplementation((cmd: string, args: string[], _opts: unknown) => {
@@ -126,6 +131,15 @@ function setup_git_mocks(
         throw new Error("fatal: Needed a single revision");
       }
       return "abc123";
+    }
+
+    // Issue #27 guardrail probes
+    if (subcmd === "status") {
+      return opts.status_porcelain ?? "";
+    }
+
+    if (subcmd === "rev-list") {
+      return opts.rev_list_unpushed ?? "";
     }
 
     return "";
@@ -418,6 +432,71 @@ describe("cleanup_after_merge", () => {
     );
   });
 
+  it("does not delete a no-worktree branch with unpushed commits and posts an alert", async () => {
+    // Regression: the no-worktree path of cleanup_after_merge used to call
+    // `git branch -d` directly, bypassing the guardrail. `git branch -d` is
+    // soft (refuses unmerged branches), so this isn't a new data-loss path —
+    // but the PR spec was that *every* removal route through the guardrail
+    // and produce a consistent alert when blocked.
+    setup_git_mocks({
+      // No worktree exists for this branch
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      status_porcelain: "",
+      // Branch has an unpushed commit
+      rev_list_unpushed: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    });
+
+    const alert_router = { post_alert: vi.fn() };
+
+    await cleanup_after_merge("/repo", "feature/orphan-with-work", {
+      alert_router: alert_router as any,
+      entity_id: "test-entity",
+    });
+
+    // (a) `git branch -d` must NOT be called for this branch
+    const delete_calls = mock_exec_file.mock.calls.filter(
+      (c: unknown[]) =>
+        (c[0] as string) === "git" &&
+        (c[1] as string[])[0] === "branch" &&
+        (c[1] as string[])[1] === "-d" &&
+        (c[1] as string[])[2] === "feature/orphan-with-work",
+    );
+    expect(delete_calls).toHaveLength(0);
+
+    // (b) An alert must have fired
+    expect(alert_router.post_alert).toHaveBeenCalledTimes(1);
+    const payload = alert_router.post_alert.mock.calls[0][0];
+    expect(payload.entity_id).toBe("test-entity");
+    expect(payload.tier).toBe("action_required");
+    expect(payload.title).toContain("Unpushed");
+    expect(payload.body).toContain("feature/orphan-with-work");
+  });
+
+  it("deletes a no-worktree branch when it has no unpushed commits", async () => {
+    // The happy path for the no-worktree branch: nothing to protect, delete proceeds.
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      status_porcelain: "",
+      rev_list_unpushed: "",
+    });
+
+    const alert_router = { post_alert: vi.fn() };
+
+    await cleanup_after_merge("/repo", "feature/orphan", {
+      alert_router: alert_router as any,
+      entity_id: "test-entity",
+    });
+
+    // Branch delete must have run
+    expect(mock_exec_file).toHaveBeenCalledWith(
+      "git",
+      ["branch", "-d", "feature/orphan"],
+      expect.objectContaining({ cwd: "/repo" }),
+    );
+    // No alert
+    expect(alert_router.post_alert).not.toHaveBeenCalled();
+  });
+
   it("scans .claude/worktrees/ for matching agent directories", async () => {
     setup_git_mocks({
       worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
@@ -641,5 +720,307 @@ describe("sweep_stale_worktrees", () => {
     };
 
     await expect(sweep_stale_worktrees(registry as any)).resolves.toBeUndefined();
+  });
+});
+
+// ── Issue #27: Worktree cleanup safety guardrail ──
+
+describe("is_worktree_safe_to_remove", () => {
+  it("returns safe=true on a clean, fully-pushed worktree", async () => {
+    setup_git_mocks({ status_porcelain: "", rev_list_unpushed: "" });
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+
+    const result = await is_worktree_safe_to_remove("/repo", "/repo/wt/foo", "feature/foo");
+    expect(result.safe).toBe(true);
+  });
+
+  it("returns safe=true when the worktree directory is already gone (no-op path)", async () => {
+    mock_stat.mockRejectedValue(new Error("ENOENT"));
+    // Even if status would say dirty, we should never reach it for a missing dir.
+    setup_git_mocks({ status_porcelain: " M src/foo.ts" });
+
+    const result = await is_worktree_safe_to_remove(
+      "/repo",
+      "/repo/wt/already-gone",
+      "feature/gone",
+    );
+    expect(result.safe).toBe(true);
+  });
+
+  it("flags uncommitted changes to tracked files", async () => {
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    setup_git_mocks({
+      status_porcelain: " M src/index.ts\n M packages/daemon/src/foo.ts",
+      rev_list_unpushed: "",
+    });
+
+    const result = await is_worktree_safe_to_remove("/repo", "/repo/wt/dirty", "feature/dirty");
+    expect(result.safe).toBe(false);
+    if (!result.safe) {
+      expect(result.reason).toBe("uncommitted");
+      expect(result.detail).toContain("src/index.ts");
+    }
+  });
+
+  it("flags untracked files separately from uncommitted modifications", async () => {
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    setup_git_mocks({
+      status_porcelain: "?? scratch.md\n?? notes/",
+      rev_list_unpushed: "",
+    });
+
+    const result = await is_worktree_safe_to_remove(
+      "/repo",
+      "/repo/wt/untracked",
+      "feature/untracked",
+    );
+    expect(result.safe).toBe(false);
+    if (!result.safe) {
+      expect(result.reason).toBe("untracked");
+      expect(result.detail).toContain("scratch.md");
+    }
+  });
+
+  it("prefers the uncommitted reason over untracked when both are present", async () => {
+    // A real-world dirty worktree often has both — we want the more urgent
+    // signal (lost-on-disk modifications) to win the alert title.
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    setup_git_mocks({
+      status_porcelain: " M src/index.ts\n?? scratch.md",
+      rev_list_unpushed: "",
+    });
+
+    const result = await is_worktree_safe_to_remove("/repo", "/repo/wt/mixed", "feature/mixed");
+    expect(result.safe).toBe(false);
+    if (!result.safe) {
+      expect(result.reason).toBe("uncommitted");
+    }
+  });
+
+  it("flags unpushed commits when working tree is otherwise clean", async () => {
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    setup_git_mocks({
+      status_porcelain: "",
+      rev_list_unpushed:
+        "abc123def456abc123def456abc123def456abcd\n11112222333344445555666677778888aaaabbbb",
+    });
+
+    const result = await is_worktree_safe_to_remove("/repo", "/repo/wt/unpushed", "feature/wip");
+    expect(result.safe).toBe(false);
+    if (!result.safe) {
+      expect(result.reason).toBe("unpushed");
+      expect(result.detail).toContain("2 unpushed commit");
+      expect(result.detail).toContain("abc123de");
+    }
+  });
+
+  it("reports the true unpushed count even when there are more than 5 commits", async () => {
+    // Regression: previously rev-list ran with --max-count=5, so a branch with
+    // 50 unpushed commits would be reported as "5 unpushed commit(s)" — a
+    // misleading number for Hunter to act on. The fix removes the cap entirely
+    // (the list is bounded by branch length and only runs when the branch is
+    // already known to be local-only, so the overhead is negligible).
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    const shas = Array.from(
+      { length: 12 },
+      (_, i) => `${String(i).padStart(8, "0")}deadbeefdeadbeefdeadbeefdeadbeefdead`,
+    );
+    setup_git_mocks({
+      status_porcelain: "",
+      rev_list_unpushed: shas.join("\n"),
+    });
+
+    const result = await is_worktree_safe_to_remove("/repo", "/repo/wt/many", "feature/many");
+    expect(result.safe).toBe(false);
+    if (!result.safe) {
+      expect(result.reason).toBe("unpushed");
+      // Real count is 12, not capped to 5
+      expect(result.detail).toContain("12 unpushed commit");
+      // First few SHAs shown
+      expect(result.detail).toContain("00000000");
+      expect(result.detail).toContain("00000004");
+      // "more" indicator should signal there's overflow
+      expect(result.detail).toContain("more");
+    }
+
+    // The rev-list call must NOT include --max-count
+    const rev_list_calls = mock_exec_file.mock.calls.filter(
+      (c: unknown[]) => (c[0] as string) === "git" && (c[1] as string[])[0] === "rev-list",
+    );
+    expect(rev_list_calls.length).toBeGreaterThan(0);
+    for (const call of rev_list_calls) {
+      const args = call[1] as string[];
+      const has_max_count = args.some((a) => a.startsWith("--max-count"));
+      expect(has_max_count).toBe(false);
+    }
+  });
+});
+
+describe("remove_worktree — issue #27 guardrail", () => {
+  it("proceeds with removal when the worktree is clean and pushed", async () => {
+    setup_git_mocks({ status_porcelain: "", rev_list_unpushed: "" });
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+
+    const alert_router = { post_alert: vi.fn() };
+
+    const result = await remove_worktree("/repo", "/repo/wt/clean", "feature/clean", {
+      alert_router: alert_router as any,
+      entity_id: "test-entity",
+    });
+
+    expect(result).toBe(true);
+    expect(alert_router.post_alert).not.toHaveBeenCalled();
+    expect(mock_exec_file).toHaveBeenCalledWith(
+      "git",
+      ["worktree", "remove", "/repo/wt/clean", "--force"],
+      expect.objectContaining({ cwd: "/repo" }),
+    );
+  });
+
+  it("skips removal and posts an alert for uncommitted changes", async () => {
+    setup_git_mocks({ status_porcelain: " M src/work.ts", rev_list_unpushed: "" });
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+
+    const alert_router = { post_alert: vi.fn() };
+
+    const result = await remove_worktree("/repo", "/repo/wt/dirty", "feature/dirty", {
+      alert_router: alert_router as any,
+      entity_id: "test-entity",
+    });
+
+    expect(result).toBe(false);
+
+    // Worktree must NOT have been removed
+    const remove_calls = mock_exec_file.mock.calls.filter(
+      (c: unknown[]) =>
+        (c[0] as string) === "git" &&
+        (c[1] as string[])[0] === "worktree" &&
+        (c[1] as string[])[1] === "remove",
+    );
+    expect(remove_calls).toHaveLength(0);
+
+    // Branch must NOT have been deleted
+    const branch_delete_calls = mock_exec_file.mock.calls.filter(
+      (c: unknown[]) =>
+        (c[0] as string) === "git" &&
+        (c[1] as string[])[0] === "branch" &&
+        (c[1] as string[])[1] === "-d",
+    );
+    expect(branch_delete_calls).toHaveLength(0);
+
+    // Alert must have fired with action_required tier and recovery hint
+    expect(alert_router.post_alert).toHaveBeenCalledTimes(1);
+    const payload = alert_router.post_alert.mock.calls[0][0];
+    expect(payload.entity_id).toBe("test-entity");
+    expect(payload.tier).toBe("action_required");
+    expect(payload.title).toContain("Uncommitted");
+    expect(payload.body).toContain("/repo/wt/dirty");
+    expect(payload.body).toContain("feature/dirty");
+    expect(payload.body).toContain("git push -u origin feature/dirty");
+  });
+
+  it("skips removal and posts an alert for untracked files", async () => {
+    setup_git_mocks({ status_porcelain: "?? scratch.md", rev_list_unpushed: "" });
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+
+    const alert_router = { post_alert: vi.fn() };
+
+    const result = await remove_worktree("/repo", "/repo/wt/untracked", "feature/notes", {
+      alert_router: alert_router as any,
+      entity_id: "test-entity",
+    });
+
+    expect(result).toBe(false);
+    expect(alert_router.post_alert).toHaveBeenCalledTimes(1);
+    const payload = alert_router.post_alert.mock.calls[0][0];
+    expect(payload.title).toContain("Untracked");
+    expect(payload.body).toContain("scratch.md");
+  });
+
+  it("skips removal and posts an alert for unpushed commits", async () => {
+    setup_git_mocks({
+      status_porcelain: "",
+      rev_list_unpushed: "abc123def456abc123def456abc123def456abcd",
+    });
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+
+    const alert_router = { post_alert: vi.fn() };
+
+    const result = await remove_worktree("/repo", "/repo/wt/unpushed", "feature/wip", {
+      alert_router: alert_router as any,
+      entity_id: "test-entity",
+    });
+
+    expect(result).toBe(false);
+    expect(alert_router.post_alert).toHaveBeenCalledTimes(1);
+    const payload = alert_router.post_alert.mock.calls[0][0];
+    expect(payload.title).toContain("Unpushed");
+    expect(payload.body).toContain("abc123de");
+  });
+
+  it("treats already-removed worktrees as a silent no-op (no alert)", async () => {
+    // The worktree directory is gone — stat throws ENOENT
+    mock_stat.mockRejectedValue(new Error("ENOENT"));
+    // The git worktree remove call should also report "not a working tree"
+    setup_git_mocks({
+      worktree_remove_error: new Error("fatal: '/repo/wt/gone' is not a working tree"),
+    });
+
+    const alert_router = { post_alert: vi.fn() };
+
+    const result = await remove_worktree("/repo", "/repo/wt/gone", "feature/gone", {
+      alert_router: alert_router as any,
+      entity_id: "test-entity",
+    });
+
+    // Treated as success (already gone), no alert fired
+    expect(result).toBe(true);
+    expect(alert_router.post_alert).not.toHaveBeenCalled();
+  });
+
+  it("blocks the sweep_repo remote-gone path from nuking unpushed work", async () => {
+    // This is the exact bug from issue #27: agent has unpushed commits, sweep
+    // sees no origin/<branch> ref, used to call --force remove. Now blocked.
+    const porcelain = make_porcelain(
+      { path: "/repo", branch: "refs/heads/main" },
+      { path: "/repo/wt/wip", branch: "refs/heads/feature/wip" },
+    );
+    setup_git_mocks({
+      worktree_list: porcelain,
+      merged_branches: "", // not merged
+      rev_parse_missing: ["feature/wip"], // remote ref gone
+      status_porcelain: "", // working tree clean
+      rev_list_unpushed: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", // but commit is unpushed
+    });
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+
+    const alert_router = { post_alert: vi.fn() };
+    const registry = {
+      get_active: vi.fn().mockReturnValue([
+        {
+          entity: {
+            id: "test-entity",
+            repos: [{ path: "/repo", url: "https://github.com/test/repo.git" }],
+          },
+        },
+      ]),
+    };
+
+    await sweep_stale_worktrees(registry as any, { alert_router: alert_router as any });
+
+    // Worktree must NOT be removed
+    const remove_calls = mock_exec_file.mock.calls.filter(
+      (c: unknown[]) =>
+        (c[0] as string) === "git" &&
+        (c[1] as string[])[0] === "worktree" &&
+        (c[1] as string[])[1] === "remove",
+    );
+    expect(remove_calls).toHaveLength(0);
+
+    // Alert must have fired against the right entity
+    expect(alert_router.post_alert).toHaveBeenCalledTimes(1);
+    const payload = alert_router.post_alert.mock.calls[0][0];
+    expect(payload.entity_id).toBe("test-entity");
+    expect(payload.title).toContain("Unpushed");
   });
 });

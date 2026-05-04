@@ -503,7 +503,11 @@ describe("handle_github_webhook", () => {
 
         await vi.waitFor(
           () => {
-            expect(cleanup_after_merge).toHaveBeenCalledWith("/tmp/test-repo", "feature/55-cool");
+            expect(cleanup_after_merge).toHaveBeenCalledWith(
+              "/tmp/test-repo",
+              "feature/55-cool",
+              expect.objectContaining({ entity_id: expect.any(String) }),
+            );
           },
           { timeout: 2000 },
         );
@@ -611,7 +615,11 @@ describe("handle_github_webhook", () => {
             // Issue closing should NOT have been called (token failed)
             expect(close_linked_issues).not.toHaveBeenCalled();
             // But worktree cleanup should still have been called
-            expect(cleanup_after_merge).toHaveBeenCalledWith("/tmp/test-repo", "feature/88-thing");
+            expect(cleanup_after_merge).toHaveBeenCalledWith(
+              "/tmp/test-repo",
+              "feature/88-thing",
+              expect.objectContaining({ entity_id: expect.any(String) }),
+            );
           },
           { timeout: 2000 },
         );
