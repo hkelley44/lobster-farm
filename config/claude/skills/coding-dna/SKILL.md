@@ -1078,33 +1078,53 @@ Loggers are configurable per-environment. In prod you want structured logs. In d
 
 ## Running tests in agent worktrees
 
-_Temporary workarounds for the LobsterFarm monorepo. Sunset clause at the bottom of this section._
+_Workarounds for the macOS coalition-inheritance kill path (#28). Sunset clause at the bottom of this section._
 
-When you're an agent working inside a worktree under `~/.lobsterfarm/entities/<entity>/repos/<repo>/worktrees/`, follow these three rules until further notice:
+When you're an agent working inside a worktree under `~/.lobsterfarm/entities/<entity>/repos/<repo>/worktrees/`, the issue is this: every process spawned from your agent session inherits the daemon's macOS resource coalition (`com.lobsterfarm.daemon`, id 1153) and bills its disk writes against a shared 2 GiB / 24 h budget. Parallel vitest workers exhaust the budget quickly, and the kernel SIGKILLs the heaviest writer (exit 137). Coalition membership is set at `posix_spawn` time and is **not** changed by `setsid`, `nohup`, `sudo`, `launchctl asuser`, or `sandbox-exec` (all empirically ruled out in PRs #34 and #35).
 
-1. **Use `pnpm --filter <package> test` — it is the only reliable workaround.**
-   `pnpm -r test` runs the full daemon test suite (~1100+ tests) plus `cli` and `shared` in parallel. Inside an agent session it gets SIGKILL'd (exit 137) — not because of memory, but because every descendant of the daemon inherits a macOS resource coalition with a 2 GiB / 24h dirty-write budget, and the parallel vitest workers blow through what's left of it. Root cause analysis in #28.
+There is exactly one userspace mechanism that breaks the inheritance: dynamically bootstrapping a one-shot LaunchAgent. `launchctl` itself holds the private entitlement that lets it create a fresh coalition; processes started via `launchctl bootstrap gui/$UID <plist>` get their own coalition with a fresh 2 GiB / 24 h budget.
 
-   **There is currently no userspace wrapper that breaks this inheritance on Darwin.** Empirical testing (in PR #34) confirmed that `setsid`, `setsid -f`, `nohup`, `sudo bash`, `launchctl asuser`, and `sandbox-exec` all leave spawned processes in the daemon's coalition — coalition membership is set at `posix_spawn` time and is not affected by POSIX session/group manipulation. Earlier versions of this doc recommended `setsid pnpm -r test`; that guidance was wrong and has been removed.
+### Primary method — wrap test runs in `scripts/run-tests-isolated.sh`
 
-   **What to do:**
-   - `pnpm --filter <package> test` — the default and only safe form for in-session work. Use this.
-   - **If you genuinely need cross-package coverage**, run multiple `--filter` invocations sequentially in **separate** commands. Do not gang them up under `-r`. Example: `pnpm --filter @lobster-farm/shared test`, then `pnpm --filter @lobster-farm/cli test`, then `pnpm --filter @lobster-farm/daemon test`. Sequential `--filter` runs keep peak concurrent I/O bounded; `-r` does not.
-   - `pnpm -r test` (with or without any wrapper) — only safe outside agent sessions (your own terminal, CI). Inside an agent session it will eventually SIGKILL.
+```bash
+scripts/run-tests-isolated.sh pnpm -r test
+scripts/run-tests-isolated.sh pnpm --filter @lobster-farm/daemon test
+scripts/run-tests-isolated.sh <any command>
+```
 
-   The `maxForks: 4` cap landed in #34 reduces peak vitest I/O within a single package run, but it does not change the coalition-inheritance mechanism — the workaround above is still required.
+The wrapper:
 
-2. **Push commits eagerly.**
-   After every meaningful milestone (a package's tests pass, a refactor is complete, or before any heavy command), `git push -u origin <branch>`. Treat unpushed commits as work that doesn't exist yet — because in this environment, it doesn't.
+- generates a unique label `com.lobsterfarm.test.<unix-ns>`, writes a one-shot plist to `/tmp/<label>.plist`, and `launchctl bootstrap`s it into your user domain
+- streams stdout and stderr to your terminal in real time (via `tail -F` on the plist's `StandardOutPath`/`StandardErrorPath`)
+- writes the wrapped command's exit code to `/tmp/<label>.exitcode` and propagates it as the wrapper's own exit status
+- cleans up the launchd service and all temp files on normal exit, on Ctrl-C, and on SIGTERM (idempotent trap)
+- forwards an explicit allowlist of non-sensitive env vars only (PATH, HOME, PNPM_HOME, NODE_ENV, LANG, LC_*, TERM, TMPDIR, CI) — **not** OP_*, AWS_*, GH_TOKEN, or anything token-shaped, because the plist is world-readable on disk
 
-3. **Worktrees are durable, but kills still cost scrollback.**
-   The cleanup-sweep data-loss path is guarded (PR #30 closed #27 — the sweep refuses to remove worktrees with uncommitted, untracked, or unpushed work) and the SIGKILL root cause is identified (#28 — macOS resource coalition dirty-write accounting). The `maxForks: 4` cap from PR #34 reduces peak I/O but does not eliminate the kill risk on a heavily-loaded coalition. A worker kill still loses your tmux scrollback and any uncommitted edits in flight — pushing eagerly turns a kill from "lose progress" into "resume from origin." Keep doing it.
+To verify isolation while a run is in flight, in another shell:
 
-**When to remove this section:** Delete it once a real coalition-isolation fix lands and is observed stable for one full week. The `maxForks: 4` cap (PR #34) reduces I/O pressure but does not address the inheritance mechanism, so it does not on its own clear the workaround.
+```bash
+launchctl print pid/$(pgrep -f vitest | head -1) | grep -A1 'name = com'
+# Expected: name = com.lobsterfarm.test.<timestamp>   (not com.lobsterfarm.daemon)
+```
 
-Candidate real fixes (all out of scope for #33/#34, none implemented yet): a launchd plist that runs the daemon outside a shared coalition, a `posix_spawn`-based wrapper that explicitly creates a new coalition, detaching agent sessions into their own launchd-managed services, or periodic daemon restart to reset the 24h budget. See #28 for the open investigation.
+If your test command needs 1Password-injected secrets, run `op run --env-file <file> -- <cmd>` **inside** the wrapped command (e.g. `scripts/run-tests-isolated.sh bash -c 'op run --env-file .env.op -- pnpm test'`). Do not export secrets in the calling shell expecting the wrapper to forward them.
 
-**Cleanup ownership:** Whoever lands the real fix owns deleting this section in the same PR. Tidus may also drive the cleanup as the planner who filed #27/#28/#33.
+### Fallback — when the wrapper script isn't available
+
+If you're working in an older worktree, on a host where `scripts/run-tests-isolated.sh` doesn't exist yet, or in a context where launchd isn't available (CI, Linux), use:
+
+- **`pnpm --filter <package> test`** — runs one package's tests under the daemon's coalition. Inside an agent session this is the only safe in-session form.
+- **Sequential `--filter` invocations** when you need cross-package coverage. Run `pnpm --filter @lobster-farm/shared test`, then `pnpm --filter @lobster-farm/cli test`, then `pnpm --filter @lobster-farm/daemon test` as separate commands. Sequential `--filter` runs keep peak concurrent I/O bounded; `pnpm -r test` does not, and will SIGKILL on a heavily-loaded coalition.
+- **Bare `pnpm -r test`** — safe outside agent sessions (your own terminal, CI). Inside an agent session, only safe when wrapped by `scripts/run-tests-isolated.sh`.
+
+The `maxForks: 4` cap from PR #34 stays as belt-and-suspenders inside a single package run, regardless of which path above you use.
+
+### Other rules that still apply
+
+- **Push commits eagerly.** After every meaningful milestone, `git push -u origin <branch>`. Treat unpushed commits as work that doesn't exist yet — because in this environment, it doesn't. Even with the wrapper, network failures and human kills still happen.
+- **Worktrees are durable.** The cleanup-sweep refuses to remove worktrees with uncommitted, untracked, or unpushed work (PR #30 closed #27). A kill costs scrollback and any uncommitted edits in flight; pushing eagerly turns "lose progress" into "resume from origin."
+
+**When to remove this section:** When the daemon itself is restructured so agent sessions are no longer descendants of coalition 1153 (e.g. session-per-launchd-service for agent workers). Until then the wrapper is required for `-r` runs and recommended for everything heavier than a single small package.
 
 ---
 
