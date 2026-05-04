@@ -432,6 +432,71 @@ describe("cleanup_after_merge", () => {
     );
   });
 
+  it("does not delete a no-worktree branch with unpushed commits and posts an alert", async () => {
+    // Regression: the no-worktree path of cleanup_after_merge used to call
+    // `git branch -d` directly, bypassing the guardrail. `git branch -d` is
+    // soft (refuses unmerged branches), so this isn't a new data-loss path —
+    // but the PR spec was that *every* removal route through the guardrail
+    // and produce a consistent alert when blocked.
+    setup_git_mocks({
+      // No worktree exists for this branch
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      status_porcelain: "",
+      // Branch has an unpushed commit
+      rev_list_unpushed: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    });
+
+    const alert_router = { post_alert: vi.fn() };
+
+    await cleanup_after_merge("/repo", "feature/orphan-with-work", {
+      alert_router: alert_router as any,
+      entity_id: "test-entity",
+    });
+
+    // (a) `git branch -d` must NOT be called for this branch
+    const delete_calls = mock_exec_file.mock.calls.filter(
+      (c: unknown[]) =>
+        (c[0] as string) === "git" &&
+        (c[1] as string[])[0] === "branch" &&
+        (c[1] as string[])[1] === "-d" &&
+        (c[1] as string[])[2] === "feature/orphan-with-work",
+    );
+    expect(delete_calls).toHaveLength(0);
+
+    // (b) An alert must have fired
+    expect(alert_router.post_alert).toHaveBeenCalledTimes(1);
+    const payload = alert_router.post_alert.mock.calls[0][0];
+    expect(payload.entity_id).toBe("test-entity");
+    expect(payload.tier).toBe("action_required");
+    expect(payload.title).toContain("Unpushed");
+    expect(payload.body).toContain("feature/orphan-with-work");
+  });
+
+  it("deletes a no-worktree branch when it has no unpushed commits", async () => {
+    // The happy path for the no-worktree branch: nothing to protect, delete proceeds.
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      status_porcelain: "",
+      rev_list_unpushed: "",
+    });
+
+    const alert_router = { post_alert: vi.fn() };
+
+    await cleanup_after_merge("/repo", "feature/orphan", {
+      alert_router: alert_router as any,
+      entity_id: "test-entity",
+    });
+
+    // Branch delete must have run
+    expect(mock_exec_file).toHaveBeenCalledWith(
+      "git",
+      ["branch", "-d", "feature/orphan"],
+      expect.objectContaining({ cwd: "/repo" }),
+    );
+    // No alert
+    expect(alert_router.post_alert).not.toHaveBeenCalled();
+  });
+
   it("scans .claude/worktrees/ for matching agent directories", async () => {
     setup_git_mocks({
       worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
@@ -746,6 +811,47 @@ describe("is_worktree_safe_to_remove", () => {
       expect(result.reason).toBe("unpushed");
       expect(result.detail).toContain("2 unpushed commit");
       expect(result.detail).toContain("abc123de");
+    }
+  });
+
+  it("reports the true unpushed count even when there are more than 5 commits", async () => {
+    // Regression: previously rev-list ran with --max-count=5, so a branch with
+    // 50 unpushed commits would be reported as "5 unpushed commit(s)" — a
+    // misleading number for Hunter to act on. The fix removes the cap entirely
+    // (the list is bounded by branch length and only runs when the branch is
+    // already known to be local-only, so the overhead is negligible).
+    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    const shas = Array.from(
+      { length: 12 },
+      (_, i) => `${String(i).padStart(8, "0")}deadbeefdeadbeefdeadbeefdeadbeefdead`,
+    );
+    setup_git_mocks({
+      status_porcelain: "",
+      rev_list_unpushed: shas.join("\n"),
+    });
+
+    const result = await is_worktree_safe_to_remove("/repo", "/repo/wt/many", "feature/many");
+    expect(result.safe).toBe(false);
+    if (!result.safe) {
+      expect(result.reason).toBe("unpushed");
+      // Real count is 12, not capped to 5
+      expect(result.detail).toContain("12 unpushed commit");
+      // First few SHAs shown
+      expect(result.detail).toContain("00000000");
+      expect(result.detail).toContain("00000004");
+      // "more" indicator should signal there's overflow
+      expect(result.detail).toContain("more");
+    }
+
+    // The rev-list call must NOT include --max-count
+    const rev_list_calls = mock_exec_file.mock.calls.filter(
+      (c: unknown[]) => (c[0] as string) === "git" && (c[1] as string[])[0] === "rev-list",
+    );
+    expect(rev_list_calls.length).toBeGreaterThan(0);
+    for (const call of rev_list_calls) {
+      const args = call[1] as string[];
+      const has_max_count = args.some((a) => a.startsWith("--max-count"));
+      expect(has_max_count).toBe(false);
     }
   });
 });

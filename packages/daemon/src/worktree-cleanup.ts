@@ -126,21 +126,45 @@ export async function is_worktree_safe_to_remove(
     };
   }
 
-  // Check 3: unpushed commits. `git rev-list <branch> --not --remotes` lists
-  // commits reachable from <branch> that aren't reachable from any remote ref.
-  // Empty output → fully pushed. Non-empty → at least one commit only lives locally.
+  // Check 3: unpushed commits. Delegate to the branch-only helper so the
+  // worktree-present and worktree-absent paths share a single source of truth.
+  return is_branch_safe_to_remove(repo_path, branch);
+}
+
+/**
+ * Branch-only safety check: refuse removal if the branch has commits that
+ * aren't reachable from any remote tracking ref.
+ *
+ * Used directly on the no-worktree path of `cleanup_after_merge` (where the
+ * working-tree checks don't apply) and as the third check inside
+ * `is_worktree_safe_to_remove`. Keeping a single helper means every removal
+ * path — worktree-present or not — runs the same unpushed-commit gate.
+ *
+ * Note: `git branch -d` (soft) already refuses to delete unmerged branches,
+ * so this is defense-in-depth. The point is consistent alert behavior across
+ * paths, not a new data-loss patch.
+ */
+export async function is_branch_safe_to_remove(
+  repo_path: string,
+  branch: string,
+): Promise<SafetyCheck> {
+  // `git rev-list <branch> --not --remotes` lists commits reachable from
+  // <branch> that aren't reachable from any remote ref. Empty → fully pushed.
+  //
+  // We don't cap with --max-count: the list is bounded by branch length
+  // (a single branch's history past its merge base with origin/*), and we
+  // need an accurate count for the alert detail. With --max-count=5, the
+  // alert would falsely report "5 unpushed commit(s)" even when there were
+  // 50, giving Hunter a misleading number to act on.
   let unpushed: string;
   try {
-    const { stdout } = await exec(
-      "git",
-      ["rev-list", branch, "--not", "--remotes", "--max-count=5"],
-      { cwd: repo_path, timeout: GIT_TIMEOUT_MS },
-    );
+    const { stdout } = await exec("git", ["rev-list", branch, "--not", "--remotes"], {
+      cwd: repo_path,
+      timeout: GIT_TIMEOUT_MS,
+    });
     unpushed = stdout;
   } catch {
     // Branch ref missing or rev-list failed. Be conservative: treat as unsafe.
-    // (A missing branch ref shouldn't reach here in practice — sweep_repo
-    // discovered this branch from `git worktree list`.)
     return {
       safe: false,
       reason: "unpushed",
@@ -150,10 +174,18 @@ export async function is_worktree_safe_to_remove(
 
   const unpushed_shas = unpushed.split("\n").filter((line) => line.length > 0);
   if (unpushed_shas.length > 0) {
+    // Truncate the SHA list shown in the detail to keep alerts readable, but
+    // always report the *true* count first so Hunter sees the real magnitude.
+    const MAX_SHAS = 5;
+    const shown = unpushed_shas.slice(0, MAX_SHAS).map((s) => s.slice(0, 8));
+    const sha_summary =
+      unpushed_shas.length > MAX_SHAS
+        ? `${shown.join(", ")} (+${String(unpushed_shas.length - MAX_SHAS)} more)`
+        : shown.join(", ");
     return {
       safe: false,
       reason: "unpushed",
-      detail: `${String(unpushed_shas.length)} unpushed commit(s): ${unpushed_shas.map((s) => s.slice(0, 8)).join(", ")}`,
+      detail: `${String(unpushed_shas.length)} unpushed commit(s): ${sha_summary}`,
     };
   }
 
@@ -512,15 +544,37 @@ export async function cleanup_after_merge(
     await remove_worktree(repo_path, worktree_path, branch, deps);
   } else {
     console.log(`[worktree-cleanup] No git worktree found for branch: ${branch}`);
-    // Still try to delete the branch even if no worktree was found
-    try {
-      await exec("git", ["branch", "-d", branch], {
-        cwd: repo_path,
-        timeout: GIT_TIMEOUT_MS,
-      });
-      console.log(`[worktree-cleanup] Deleted branch: ${branch}`);
-    } catch {
-      // Branch may already be gone — fine
+    // If the branch ref itself doesn't exist locally, there's literally nothing
+    // to delete or protect — silent no-op (mirrors the missing-worktree-dir path
+    // in is_worktree_safe_to_remove, where we deliberately avoid alert spam for
+    // entities that have already been cleaned up).
+    const branch_exists = await branch_ref_exists(repo_path, branch);
+    if (!branch_exists) {
+      // Nothing more to do for the git-tracked branch path.
+    } else {
+      // Branch exists locally but no worktree references it. Route through the
+      // same guardrail so unpushed work is never silently destroyed. The
+      // working-tree checks don't apply here (no worktree), but the
+      // unpushed-commits check absolutely does.
+      const check = await is_branch_safe_to_remove(repo_path, branch);
+      if (!check.safe) {
+        console.warn(
+          `[worktree-cleanup] Skipping branch delete for ${branch}: ${check.reason} — ${check.detail}`,
+        );
+        // No worktree path to show in the alert — pass the repo path so the
+        // recovery hint at least points at the right repo.
+        await post_unsafe_alert(deps, repo_path, repo_path, branch, check);
+      } else {
+        try {
+          await exec("git", ["branch", "-d", branch], {
+            cwd: repo_path,
+            timeout: GIT_TIMEOUT_MS,
+          });
+          console.log(`[worktree-cleanup] Deleted branch: ${branch}`);
+        } catch {
+          // Branch may already be gone — fine
+        }
+      }
     }
   }
 
@@ -712,6 +766,28 @@ async function sweep_repo(repo_path: string, deps: CleanupDeps = {}): Promise<nu
   }
 
   return cleaned;
+}
+
+/**
+ * Check if a local branch ref exists in this repo.
+ * Returns true if `refs/heads/<branch>` resolves, false otherwise.
+ *
+ * Used by `cleanup_after_merge` to short-circuit the no-worktree branch
+ * cleanup path: if the branch was already deleted out-of-band (by a previous
+ * cleanup, by the merge --delete-branch flag, or because we're operating
+ * against a path that isn't a git repo at all), there's nothing to delete
+ * and nothing to protect.
+ */
+async function branch_ref_exists(repo_path: string, branch: string): Promise<boolean> {
+  try {
+    await exec("git", ["rev-parse", "--verify", `refs/heads/${branch}`], {
+      cwd: repo_path,
+      timeout: GIT_TIMEOUT_MS,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
