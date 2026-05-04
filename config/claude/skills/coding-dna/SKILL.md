@@ -1076,6 +1076,25 @@ Loggers are configurable per-environment. In prod you want structured logs. In d
 
 ---
 
+## Running tests in agent worktrees
+
+_Temporary workarounds for the LobsterFarm monorepo. Sunset clause at the bottom of this section._
+
+When you're an agent working inside a worktree under `~/.lobsterfarm/entities/<entity>/repos/<repo>/worktrees/`, follow these three rules until further notice:
+
+1. **Prefer `pnpm --filter <package> test` over `pnpm -r test`.**
+   The recursive form runs the full daemon test suite (~1100+ tests) plus `cli` and `shared` in parallel, and has been killed with SIGKILL (exit 137) 3-for-3 times. Filtered runs of a single package complete in under 300ms and have never been killed. If you genuinely need cross-package coverage, run each filter sequentially in separate commands — never gang them up under `-r`.
+
+2. **Push commits eagerly.**
+   After every meaningful milestone (a package's tests pass, a refactor is complete, or before any heavy command), `git push -u origin <branch>`. Treat unpushed commits as work that doesn't exist yet — because in this environment, it doesn't.
+
+3. **Worktrees are not durable storage.**
+   Until issue #27 lands, the periodic cleanup sweep can remove a worktree whose branch isn't on `origin`. If your worktree disappears, your work is gone. Pushing is the only way to make it real. See also issue #28 (the SIGKILL root-cause investigation) — these workarounds exist because both are still open.
+
+**When to remove this section:** Delete it once **both** #27 and #28 are merged **and** `pnpm -r test` has been observed to no longer SIGKILL for at least one week.
+
+---
+
 ## Anti-Patterns — Things We Don't Do
 
 | Don't | Do Instead |
