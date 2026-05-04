@@ -150,7 +150,12 @@ trap 'cleanup; exit 143' TERM
 # ---------------------------------------------------------------------------
 shell_escape() {
   local arg="$1"
-  printf "'%s'" "${arg//\'/\'\\\'\'}"
+  # Use a local variable for the single quote so bash's parameter-expansion
+  # parser doesn't get tangled trying to balance literal `'` characters in
+  # the replacement pattern. The substitution rule is: every `'` becomes
+  # `'\''` (close-quote, escaped-quote, open-quote).
+  local -r SQ="'"
+  printf "'%s'" "${arg//$SQ/$SQ\\$SQ$SQ}"
 }
 
 USER_CMD=""
