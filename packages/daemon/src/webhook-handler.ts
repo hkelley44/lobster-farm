@@ -434,7 +434,14 @@ async function route_event(
       `[webhook] pull_request.closed (merged) for #${String(pr.number)} ` +
         `in ${match.entity_id} (${repo_full_name})`,
     );
-    await handle_pr_merged(pr, repo_full_name, match.repo_path, ctx, installation_id);
+    await handle_pr_merged(
+      pr,
+      repo_full_name,
+      match.repo_path,
+      ctx,
+      installation_id,
+      match.entity_id,
+    );
     await notify_pr_watcher(
       repo_full_name,
       pr.number,
@@ -1725,6 +1732,7 @@ async function handle_pr_merged(
   repo_path: string,
   ctx: WebhookContext,
   installation_id?: string,
+  entity_id?: string,
 ): Promise<void> {
   // Close linked issues
   const issue_numbers = extract_linked_issues(pr.body, pr.title);
@@ -1789,7 +1797,10 @@ async function handle_pr_merged(
 
   // Clean up worktrees for the merged branch
   try {
-    await cleanup_after_merge(repo_path, pr.head.ref);
+    await cleanup_after_merge(repo_path, pr.head.ref, {
+      alert_router: ctx.alert_router,
+      entity_id,
+    });
   } catch (err) {
     // Best-effort — never let cleanup break the merge handler
     console.error(`[webhook] Worktree cleanup failed for branch ${pr.head.ref}: ${String(err)}`);
@@ -1880,7 +1891,10 @@ async function post_auto_merge_cleanup(
 
   // Clean up worktrees
   try {
-    await cleanup_after_merge(repo_path, pr.head.ref);
+    await cleanup_after_merge(repo_path, pr.head.ref, {
+      alert_router: ctx.alert_router,
+      entity_id,
+    });
   } catch (err) {
     console.error(
       `[webhook] Worktree cleanup failed after auto-merge for branch ${pr.head.ref}: ${String(err)}`,

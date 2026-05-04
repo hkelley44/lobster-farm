@@ -39,9 +39,13 @@ async function try_cleanup_worktree(
   repo_path: string,
   branch: string,
   pr_number: number,
+  deps: { alert_router: AlertRouter | null; entity_id: string },
 ): Promise<void> {
   try {
-    await cleanup_after_merge(repo_path, branch);
+    await cleanup_after_merge(repo_path, branch, {
+      alert_router: deps.alert_router,
+      entity_id: deps.entity_id,
+    });
   } catch (err) {
     console.error(
       `[pr-cron] Worktree cleanup failed after merge for branch ${branch}: ${String(err)}`,
@@ -620,7 +624,10 @@ export class PRReviewCron {
         });
 
         // Clean up local worktrees for the merged branch
-        await try_cleanup_worktree(repo_path, pr.headRefName, pr.number);
+        await try_cleanup_worktree(repo_path, pr.headRefName, pr.number, {
+          alert_router: this.alert_router,
+          entity_id,
+        });
       } else if (is_internal) {
         // Check CI status before attempting merge (#189)
         const ci = await check_ci_status(pr.number, repo_path, gh_token, this.gh_bin);
@@ -653,7 +660,10 @@ export class PRReviewCron {
             });
 
             // Clean up local worktrees for the merged branch
-            await try_cleanup_worktree(repo_path, pr.headRefName, pr.number);
+            await try_cleanup_worktree(repo_path, pr.headRefName, pr.number, {
+              alert_router: this.alert_router,
+              entity_id,
+            });
           } else {
             await this.alert_router?.post_alert({
               entity_id,
@@ -837,7 +847,10 @@ export class PRReviewCron {
         });
 
         // Clean up local worktrees for the merged branch
-        await try_cleanup_worktree(repo_path, pr.headRefName, pr.number);
+        await try_cleanup_worktree(repo_path, pr.headRefName, pr.number, {
+          alert_router: this.alert_router,
+          entity_id,
+        });
       } else {
         await this.alert_router?.post_alert({
           entity_id,

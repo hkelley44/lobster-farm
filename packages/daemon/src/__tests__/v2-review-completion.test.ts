@@ -274,7 +274,11 @@ describe("handle_v2_review_completion — approved", () => {
 
     // post_auto_merge_cleanup should have been called (cleanup_after_merge is
     // the observable side effect from the mock layer)
-    expect(cleanup_after_merge).toHaveBeenCalledWith(REPO_PATH, "feature/42-x");
+    expect(cleanup_after_merge).toHaveBeenCalledWith(
+      REPO_PATH,
+      "feature/42-x",
+      expect.objectContaining({ entity_id: expect.any(String) }),
+    );
 
     // Alert should mention merge
     expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(

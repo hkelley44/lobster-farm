@@ -13,6 +13,7 @@ import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { expand_home } from "@lobster-farm/shared";
+import type { AlertRouter } from "./alert-router.js";
 import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
 import { sq } from "./shell.js";
@@ -21,6 +22,225 @@ const exec = promisify(execFile);
 
 /** Timeout for git commands — generous but bounded. */
 const GIT_TIMEOUT_MS = 30_000;
+
+// ── Safety guardrail (issue #27) ──
+
+/**
+ * Reason a worktree was deemed unsafe to remove. Drives the alert message and
+ * the recovery hint shown to Hunter.
+ */
+export type UnsafeReason = "uncommitted" | "untracked" | "unpushed";
+
+export type SafetyCheck = { safe: true } | { safe: false; reason: UnsafeReason; detail: string };
+
+/**
+ * Optional dependencies for cleanup operations. Kept optional so tests and
+ * older call sites remain ergonomic; production wiring passes both.
+ */
+export interface CleanupDeps {
+  /** When provided, unsafe-skip events post to the entity #alerts channel. */
+  alert_router?: AlertRouter | null;
+  /** Required alongside alert_router to route alerts to the right entity. */
+  entity_id?: string;
+}
+
+/**
+ * Decide whether a worktree is safe to nuke.
+ *
+ * The historical bug (issue #27) was treating "no remote tracking ref" as
+ * sufficient grounds for removal. That heuristic is true for both merged
+ * branches AND never-pushed branches — and the latter case has destroyed
+ * agent work at least three times. This helper is the new precondition.
+ *
+ * Three checks, any failure → unsafe:
+ *   1. No uncommitted changes to tracked files.
+ *   2. No untracked files (with `--exclude-standard` so .gitignored noise is ignored).
+ *   3. No commits on the branch that aren't reachable from any `refs/remotes/origin/*` ref.
+ *
+ * If the worktree directory has already been removed out-of-band, `git status`
+ * will fail. We treat that as safe — the actual removal call is a no-op and
+ * we don't want to fire an alert for a worktree that's already gone.
+ */
+export async function is_worktree_safe_to_remove(
+  repo_path: string,
+  worktree_path: string,
+  branch: string,
+): Promise<SafetyCheck> {
+  // If the worktree directory itself is gone, there's nothing to protect.
+  // Let the caller proceed; `git worktree remove` will no-op and `git
+  // worktree prune` will tidy the metadata.
+  try {
+    await stat(worktree_path);
+  } catch {
+    return { safe: true };
+  }
+
+  // Check 1 + 2: working tree state. Run inside the worktree itself so the
+  // status reflects that worktree, not the main checkout.
+  // `--porcelain` gives stable, machine-readable output.
+  // `--untracked-files=all` includes untracked files individually (we want them).
+  // Default `--exclude-standard` is implicit — gitignored paths don't count.
+  let porcelain: string;
+  try {
+    const { stdout } = await exec("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
+      cwd: worktree_path,
+      timeout: GIT_TIMEOUT_MS,
+    });
+    porcelain = stdout;
+  } catch {
+    // Worktree is in a broken state (mid-rebase corruption, .git missing, etc).
+    // Be conservative: refuse to remove. Hunter can investigate.
+    return {
+      safe: false,
+      reason: "uncommitted",
+      detail: "git status failed — worktree may be corrupt",
+    };
+  }
+
+  const status_lines = porcelain.split("\n").filter((line) => line.length > 0);
+  const untracked: string[] = [];
+  const modified: string[] = [];
+  for (const line of status_lines) {
+    // Porcelain v1 lines: XY <space> path. "??" = untracked, anything else
+    // is a tracked-file change (modified, added, deleted, renamed, etc).
+    if (line.startsWith("??")) {
+      untracked.push(line.slice(3));
+    } else {
+      modified.push(line.slice(3));
+    }
+  }
+
+  if (modified.length > 0) {
+    return {
+      safe: false,
+      reason: "uncommitted",
+      detail: format_path_list(modified),
+    };
+  }
+
+  if (untracked.length > 0) {
+    return {
+      safe: false,
+      reason: "untracked",
+      detail: format_path_list(untracked),
+    };
+  }
+
+  // Check 3: unpushed commits. `git rev-list <branch> --not --remotes` lists
+  // commits reachable from <branch> that aren't reachable from any remote ref.
+  // Empty output → fully pushed. Non-empty → at least one commit only lives locally.
+  let unpushed: string;
+  try {
+    const { stdout } = await exec(
+      "git",
+      ["rev-list", branch, "--not", "--remotes", "--max-count=5"],
+      { cwd: repo_path, timeout: GIT_TIMEOUT_MS },
+    );
+    unpushed = stdout;
+  } catch {
+    // Branch ref missing or rev-list failed. Be conservative: treat as unsafe.
+    // (A missing branch ref shouldn't reach here in practice — sweep_repo
+    // discovered this branch from `git worktree list`.)
+    return {
+      safe: false,
+      reason: "unpushed",
+      detail: "rev-list failed — could not verify push state",
+    };
+  }
+
+  const unpushed_shas = unpushed.split("\n").filter((line) => line.length > 0);
+  if (unpushed_shas.length > 0) {
+    return {
+      safe: false,
+      reason: "unpushed",
+      detail: `${String(unpushed_shas.length)} unpushed commit(s): ${unpushed_shas.map((s) => s.slice(0, 8)).join(", ")}`,
+    };
+  }
+
+  return { safe: true };
+}
+
+/** Truncate a list of paths for inclusion in an alert body. */
+function format_path_list(paths: string[]): string {
+  const MAX = 5;
+  if (paths.length <= MAX) return paths.join(", ");
+  return `${paths.slice(0, MAX).join(", ")} (+${String(paths.length - MAX)} more)`;
+}
+
+/**
+ * Build the alert body shown when cleanup is skipped. Includes the recovery
+ * hint so Hunter can act without spelunking through logs.
+ */
+function build_unsafe_alert_body(
+  repo_path: string,
+  worktree_path: string,
+  branch: string,
+  reason: UnsafeReason,
+  detail: string,
+): { title: string; body: string } {
+  const reason_label: Record<UnsafeReason, string> = {
+    uncommitted: "Uncommitted changes",
+    untracked: "Untracked files",
+    unpushed: "Unpushed commits",
+  };
+
+  const title = `Worktree cleanup skipped — ${reason_label[reason]}`;
+  const body = [
+    `**Repo:** \`${repo_path}\``,
+    `**Worktree:** \`${worktree_path}\``,
+    `**Branch:** \`${branch}\``,
+    `**Reason:** ${reason_label[reason]} — ${detail}`,
+    "",
+    "**Recover:**",
+    "```",
+    `cd ${worktree_path}`,
+    "git status",
+    `git push -u origin ${branch}`,
+    "```",
+  ].join("\n");
+
+  return { title, body };
+}
+
+/**
+ * Post the "skipped because unsafe" alert via the existing alert router.
+ * No-ops cleanly when no router is wired (e.g. unit tests, or a daemon
+ * running without Discord).
+ */
+async function post_unsafe_alert(
+  deps: CleanupDeps,
+  repo_path: string,
+  worktree_path: string,
+  branch: string,
+  check: Extract<SafetyCheck, { safe: false }>,
+): Promise<void> {
+  const { alert_router, entity_id } = deps;
+  if (!alert_router || !entity_id) return;
+
+  const { title, body } = build_unsafe_alert_body(
+    repo_path,
+    worktree_path,
+    branch,
+    check.reason,
+    check.detail,
+  );
+
+  try {
+    await alert_router.post_alert({
+      entity_id,
+      tier: "action_required",
+      title,
+      body,
+    });
+  } catch (err) {
+    // Alert routing must never break cleanup logic.
+    console.error(`[worktree-cleanup] Failed to post unsafe alert: ${String(err)}`);
+    sentry.captureException(err, {
+      tags: { module: "worktree-cleanup", action: "post_unsafe_alert" },
+      contexts: { worktree: { repo_path, worktree_path, branch, reason: check.reason } },
+    });
+  }
+}
 
 // ── Session relocation ──
 
@@ -153,15 +373,32 @@ function short_branch(ref: string): string {
  * Remove a single worktree and its branch. Best-effort — logs errors but
  * never throws. Safe to call even if the worktree or branch no longer exists.
  *
+ * Issue #27 guardrail: before any removal, runs `is_worktree_safe_to_remove`.
+ * If the worktree has uncommitted changes, untracked files, or unpushed
+ * commits, the removal is skipped, an action-required alert is posted, and
+ * this function returns `false` without touching disk.
+ *
  * @param repo_path - Root repo path (not the worktree itself)
  * @param worktree_path - Absolute path to the worktree directory
  * @param branch - Branch name (short form, e.g. "feature/134-auto-cleanup")
+ * @param deps - Optional alert routing for unsafe-skip events.
  */
 export async function remove_worktree(
   repo_path: string,
   worktree_path: string,
   branch: string,
+  deps: CleanupDeps = {},
 ): Promise<boolean> {
+  // Step 0: safety guardrail. Refuse to remove worktrees with unsaved work.
+  const check = await is_worktree_safe_to_remove(repo_path, worktree_path, branch);
+  if (!check.safe) {
+    console.warn(
+      `[worktree-cleanup] Skipping removal of ${worktree_path} [${branch}]: ${check.reason} — ${check.detail}`,
+    );
+    await post_unsafe_alert(deps, repo_path, worktree_path, branch, check);
+    return false;
+  }
+
   let removed_worktree = false;
 
   // Step 1: Remove the worktree
@@ -255,7 +492,11 @@ export async function find_worktree_for_branch(
  *
  * Checks both git-tracked worktrees and .claude/worktrees/ directories.
  */
-export async function cleanup_after_merge(repo_path: string, branch: string): Promise<void> {
+export async function cleanup_after_merge(
+  repo_path: string,
+  branch: string,
+  deps: CleanupDeps = {},
+): Promise<void> {
   console.log(`[worktree-cleanup] Cleaning up after merge of branch: ${branch}`);
 
   // 1. Check git worktree list for a worktree on this branch
@@ -268,7 +509,7 @@ export async function cleanup_after_merge(repo_path: string, branch: string): Pr
         `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${worktree_path}`,
       );
     }
-    await remove_worktree(repo_path, worktree_path, branch);
+    await remove_worktree(repo_path, worktree_path, branch, deps);
   } else {
     console.log(`[worktree-cleanup] No git worktree found for branch: ${branch}`);
     // Still try to delete the branch even if no worktree was found
@@ -284,7 +525,7 @@ export async function cleanup_after_merge(repo_path: string, branch: string): Pr
   }
 
   // 2. Check .claude/worktrees/ for agent-created worktrees matching this branch
-  await cleanup_claude_worktrees(repo_path, branch);
+  await cleanup_claude_worktrees(repo_path, branch, deps);
 }
 
 /**
@@ -292,7 +533,11 @@ export async function cleanup_after_merge(repo_path: string, branch: string): Pr
  * given branch. Agent-created worktrees follow the pattern of branch slug
  * as directory name (e.g., .claude/worktrees/agent-feature-134-auto-cleanup).
  */
-async function cleanup_claude_worktrees(repo_path: string, branch: string): Promise<void> {
+async function cleanup_claude_worktrees(
+  repo_path: string,
+  branch: string,
+  deps: CleanupDeps = {},
+): Promise<void> {
   const claude_wt_dir = join(repo_path, ".claude", "worktrees");
 
   try {
@@ -322,7 +567,7 @@ async function cleanup_claude_worktrees(repo_path: string, branch: string): Prom
             `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${wt_path}`,
           );
         }
-        await remove_worktree(repo_path, wt_path, branch);
+        await remove_worktree(repo_path, wt_path, branch, deps);
       }
     }
   } catch (err) {
@@ -339,11 +584,15 @@ async function cleanup_claude_worktrees(repo_path: string, branch: string): Prom
  *
  * Designed to run periodically (e.g., hourly) as a safety net.
  */
-export async function sweep_stale_worktrees(registry: EntityRegistry): Promise<void> {
+export async function sweep_stale_worktrees(
+  registry: EntityRegistry,
+  deps: Pick<CleanupDeps, "alert_router"> = {},
+): Promise<void> {
   const entities = registry.get_active();
   let total_cleaned = 0;
 
   for (const entity_config of entities) {
+    const entity_id = entity_config.entity.id;
     for (const repo of entity_config.entity.repos) {
       const repo_path = expand_home(repo.path);
 
@@ -354,7 +603,10 @@ export async function sweep_stale_worktrees(registry: EntityRegistry): Promise<v
         continue;
       }
 
-      const cleaned = await sweep_repo(repo_path);
+      const cleaned = await sweep_repo(repo_path, {
+        alert_router: deps.alert_router ?? null,
+        entity_id,
+      });
       total_cleaned += cleaned;
     }
   }
@@ -370,7 +622,7 @@ export async function sweep_stale_worktrees(registry: EntityRegistry): Promise<v
  * Sweep a single repo for stale worktrees.
  * Returns the number of worktrees cleaned up.
  */
-async function sweep_repo(repo_path: string): Promise<number> {
+async function sweep_repo(repo_path: string, deps: CleanupDeps = {}): Promise<number> {
   // Fetch remote refs first so we have current state
   try {
     await exec("git", ["fetch", "--prune"], {
@@ -449,14 +701,14 @@ async function sweep_repo(repo_path: string): Promise<number> {
           `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${entry.path}`,
         );
       }
-      const removed = await remove_worktree(repo_path, entry.path, branch);
+      const removed = await remove_worktree(repo_path, entry.path, branch, deps);
       if (removed) cleaned++;
     }
   }
 
   // Also sweep .claude/worktrees/ for agent directories referencing merged branches
   for (const branch of merged_branches) {
-    await cleanup_claude_worktrees(repo_path, branch);
+    await cleanup_claude_worktrees(repo_path, branch, deps);
   }
 
   return cleaned;
