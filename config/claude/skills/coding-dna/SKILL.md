@@ -1088,10 +1088,15 @@ When you're an agent working inside a worktree under `~/.lobsterfarm/entities/<e
 2. **Push commits eagerly.**
    After every meaningful milestone (a package's tests pass, a refactor is complete, or before any heavy command), `git push -u origin <branch>`. Treat unpushed commits as work that doesn't exist yet — because in this environment, it doesn't.
 
-3. **Worktrees are not durable storage.**
-   Until issue #27 lands, the periodic cleanup sweep can remove a worktree whose branch isn't on `origin`. If your worktree disappears, your work is gone. Pushing is the only way to make it real. See also issue #28 (the SIGKILL root-cause investigation) — these workarounds exist because both are still open.
+3. **Worktrees are not yet durable storage.**
+   The cleanup-sweep data-loss path is now guarded (PR #30 closed #27 — the sweep refuses to remove worktrees with uncommitted, untracked, or unpushed work). But the SIGKILL that triggers the cleanup window is still un-investigated (#28 open). Pushing eagerly turns a kill from "lose progress" into "resume from origin" — keep doing it.
 
-**When to remove this section:** Delete it once **both** #27 and #28 are merged **and** `pnpm -r test` has been observed to no longer SIGKILL for at least one week.
+**When to remove this section:** Delete it once **all three** of the following are true:
+- ✅ #27 — guardrail merged in PR #30 (done).
+- ⏳ #28 — SIGKILL root-cause investigation closed.
+- ⏳ One full week observed where `pnpm -r test` does not get SIGKILL'd in any agent session.
+
+**Cleanup ownership:** Whoever closes #28 (likely Karim) is responsible for starting the one-week observation window and, once it elapses cleanly, deleting this section in a follow-up PR. Tidus may also drive the cleanup as the planner who filed it.
 
 ---
 
