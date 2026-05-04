@@ -1082,28 +1082,29 @@ _Temporary workarounds for the LobsterFarm monorepo. Sunset clause at the bottom
 
 When you're an agent working inside a worktree under `~/.lobsterfarm/entities/<entity>/repos/<repo>/worktrees/`, follow these three rules until further notice:
 
-1. **Prefer `pnpm --filter <package> test` for single-package work; use `setsid pnpm -r test` when you genuinely need cross-package coverage.**
-   The recursive form runs the full daemon test suite (~1100+ tests) plus `cli` and `shared` in parallel. Run unwrapped (`pnpm -r test`) inside an agent session, it gets SIGKILL'd (exit 137) — not because of memory, but because every descendant of the daemon shares a macOS resource coalition with a 2 GiB / 24h dirty-write budget, and the parallel vitest workers blow through what's left of it. Root cause analysis in #28; fix in #33.
+1. **Use `pnpm --filter <package> test` — it is the only reliable workaround.**
+   `pnpm -r test` runs the full daemon test suite (~1100+ tests) plus `cli` and `shared` in parallel. Inside an agent session it gets SIGKILL'd (exit 137) — not because of memory, but because every descendant of the daemon inherits a macOS resource coalition with a 2 GiB / 24h dirty-write budget, and the parallel vitest workers blow through what's left of it. Root cause analysis in #28.
 
-   **The wrapper:** `setsid` creates a new process group, session, and (on macOS) a new anonymous resource coalition. Workers spawned underneath it bill against the new coalition, not the daemon's. So:
-   - `pnpm --filter <package> test` — lightest weight, no wrapper needed for a single package. Use this when you can.
-   - `setsid pnpm -r test` — canonical full-suite invocation from an agent session. Always wrap `-r` with `setsid`.
-   - `pnpm -r test` (unwrapped) — only safe outside agent sessions (your own terminal, CI). Inside an agent session it will eventually SIGKILL.
+   **There is currently no userspace wrapper that breaks this inheritance on Darwin.** Empirical testing (in PR #34) confirmed that `setsid`, `setsid -f`, `nohup`, `sudo bash`, `launchctl asuser`, and `sandbox-exec` all leave spawned processes in the daemon's coalition — coalition membership is set at `posix_spawn` time and is not affected by POSIX session/group manipulation. Earlier versions of this doc recommended `setsid pnpm -r test`; that guidance was wrong and has been removed.
 
-   You can sanity-check the coalition break with `ps -o pid,pgid,sid,command` — vitest workers under `setsid` have a different SID than the agent shell.
+   **What to do:**
+   - `pnpm --filter <package> test` — the default and only safe form for in-session work. Use this.
+   - **If you genuinely need cross-package coverage**, run multiple `--filter` invocations sequentially in **separate** commands. Do not gang them up under `-r`. Example: `pnpm --filter @lobster-farm/shared test`, then `pnpm --filter @lobster-farm/cli test`, then `pnpm --filter @lobster-farm/daemon test`. Sequential `--filter` runs keep peak concurrent I/O bounded; `-r` does not.
+   - `pnpm -r test` (with or without any wrapper) — only safe outside agent sessions (your own terminal, CI). Inside an agent session it will eventually SIGKILL.
+
+   The `maxForks: 4` cap landed in #34 reduces peak vitest I/O within a single package run, but it does not change the coalition-inheritance mechanism — the workaround above is still required.
 
 2. **Push commits eagerly.**
    After every meaningful milestone (a package's tests pass, a refactor is complete, or before any heavy command), `git push -u origin <branch>`. Treat unpushed commits as work that doesn't exist yet — because in this environment, it doesn't.
 
 3. **Worktrees are durable, but kills still cost scrollback.**
-   The cleanup-sweep data-loss path is guarded (PR #30 closed #27 — the sweep refuses to remove worktrees with uncommitted, untracked, or unpushed work) and the SIGKILL root cause is identified and mitigated (PR for #33 — `setsid` wrapper + `maxForks: 4` cap). But a worker kill still loses your tmux scrollback and any uncommitted edits in flight. Pushing eagerly turns a kill from "lose progress" into "resume from origin" — keep doing it.
+   The cleanup-sweep data-loss path is guarded (PR #30 closed #27 — the sweep refuses to remove worktrees with uncommitted, untracked, or unpushed work) and the SIGKILL root cause is identified (#28 — macOS resource coalition dirty-write accounting). The `maxForks: 4` cap from PR #34 reduces peak I/O but does not eliminate the kill risk on a heavily-loaded coalition. A worker kill still loses your tmux scrollback and any uncommitted edits in flight — pushing eagerly turns a kill from "lose progress" into "resume from origin." Keep doing it.
 
-**When to remove this section:** Delete it once **all three** of the following are true:
-- ✅ #27 — guardrail merged in PR #30 (done).
-- ✅ #28 — SIGKILL root cause identified (macOS resource coalition dirty-write accounting), mitigation shipped in #33.
-- ⏳ One full week observed where `setsid pnpm -r test` runs cleanly in agent sessions and no other coalition-related kills surface.
+**When to remove this section:** Delete it once a real coalition-isolation fix lands and is observed stable for one full week. The `maxForks: 4` cap (PR #34) reduces I/O pressure but does not address the inheritance mechanism, so it does not on its own clear the workaround.
 
-**Cleanup ownership:** Karim drives the one-week observation window. Once it elapses cleanly, this whole section gets deleted in a follow-up PR. Tidus may also drive the cleanup as the planner who filed #27/#28/#33.
+Candidate real fixes (all out of scope for #33/#34, none implemented yet): a launchd plist that runs the daemon outside a shared coalition, a `posix_spawn`-based wrapper that explicitly creates a new coalition, detaching agent sessions into their own launchd-managed services, or periodic daemon restart to reset the 24h budget. See #28 for the open investigation.
+
+**Cleanup ownership:** Whoever lands the real fix owns deleting this section in the same PR. Tidus may also drive the cleanup as the planner who filed #27/#28/#33.
 
 ---
 
