@@ -293,8 +293,47 @@ TAIL_ERR_PID=$!
 # ---------------------------------------------------------------------------
 # Wait for the sentinel exit-code file. Poll at 200 ms; that's frequent
 # enough to feel instant on completion and cheap enough to be invisible.
+#
+# Two safety nets so we never loop forever:
+#   1. `launchctl print` state canary — if the inner bash crashed (SIGKILL,
+#      OOM, machine pressure) without writing the sentinel, the service
+#      stays registered but transitions to `state = not running` and the
+#      `pid = N` line disappears. We treat absence of a `pid =` line as
+#      "process is gone." (`launchctl print` itself still returns 0 for a
+#      registered-but-dead service, so the exit status is unreliable; we
+#      have to grep the body.)
+#   2. 30-minute hard cap — backstop in case the canary itself is unreliable
+#      (e.g. launchd output format changes in a future macOS). Generous:
+#      the full daemon test suite is ~10s and `pnpm -r test` was ~30s in
+#      validation, so 30 min covers any plausible legitimate run.
 # ---------------------------------------------------------------------------
+POLL_DEADLINE=$(( $(date +%s) + 1800 ))
 while [[ ! -s "${EXITCODE_FILE}" ]]; do
+  if (( $(date +%s) > POLL_DEADLINE )); then
+    echo "run-tests-isolated: timed out after 30m waiting for sentinel; service may have crashed" >&2
+    exit 1
+  fi
+  # Re-read print output each tick. If the service is unregistered (rc!=0)
+  # OR registered but has no pid line, the inner process is gone without
+  # having written the sentinel.
+  if ! PRINT_OUT="$(launchctl print "${DOMAIN_TARGET}" 2>/dev/null)"; then
+    echo "run-tests-isolated: service no longer registered without writing exit code sentinel (likely SIGKILL/OOM)" >&2
+    exit 1
+  fi
+  if ! grep -qE '^[[:space:]]*pid[[:space:]]*=[[:space:]]*[0-9]+' <<<"${PRINT_OUT}"; then
+    # Tiny grace window: launchd may report the service as registered before
+    # it has assigned a pid right after bootstrap. Re-check after a tick;
+    # if still no pid AND the sentinel is still empty, declare crash.
+    sleep 0.2
+    if [[ -s "${EXITCODE_FILE}" ]]; then
+      break
+    fi
+    PRINT_OUT="$(launchctl print "${DOMAIN_TARGET}" 2>/dev/null || true)"
+    if ! grep -qE '^[[:space:]]*pid[[:space:]]*=[[:space:]]*[0-9]+' <<<"${PRINT_OUT}"; then
+      echo "run-tests-isolated: service exited without writing exit code sentinel (likely SIGKILL/OOM)" >&2
+      exit 1
+    fi
+  fi
   sleep 0.2
 done
 
