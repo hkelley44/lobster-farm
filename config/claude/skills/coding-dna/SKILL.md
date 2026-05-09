@@ -781,6 +781,26 @@ All LobsterFarm repos use husky + lint-staged. Every commit automatically runs B
 
 As a belt-and-suspenders habit: run `pnpm lint` before committing to catch issues early. But the hook is the real safety net.
 
+### Self-smoke-test before every push (autonomous loop)
+
+When you're operating inside the autonomous build-review-merge loop (Ben on an assigned issue, on a feature branch, with the Reviewer waiting on the other side of the PR), **run the project's test suite locally before every push**. The Reviewer's full E2E pass is expensive — don't burn a review cycle on a known-broken state.
+
+```bash
+# Canonical for this repo (and any repo with the wrapper):
+scripts/run-tests-isolated.sh pnpm -r test
+
+# Per-package fallback when the wrapper isn't available:
+pnpm --filter <package> test
+```
+
+The smoke test is the gate, not the loop:
+
+- **Smoke passes** → push, let the Reviewer take it from there
+- **Smoke fails** → fix locally, re-run, only push when green
+- **Test infra fails** (wrapper crashes, environment issue, unrelated flake you've confirmed is pre-existing) → push with a note in the PR thread describing what failed and why you believe it's not your change. Don't silently push past a red suite.
+
+This is non-negotiable in the autonomous loop. Outside the loop (manual exploratory work, drafts you're not asking the Reviewer to look at yet) the rule relaxes to "test before you ask for review."
+
 ### Environment Separation
 
 | Environment | Branch | Database | Secrets | Deployment |

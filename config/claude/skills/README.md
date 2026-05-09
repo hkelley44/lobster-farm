@@ -20,4 +20,5 @@ Skills fall into three categories:
 - `discord-guideline/` -- Discord server management. Channel scaffolding, bot architecture, webhook patterns.
 - `tech-standards/` -- Architectural best practices and team technology standards. Shared decision guide for planners, builders, and reviewers.
 - `pr-review-merge/` -- SOP for the PR review, feedback, and merge workflow.
+- `feature-lifecycle/` -- SOP for how features move from idea to shipped, including the autonomous build-review-merge loop.
 - `entity-scaffold/` -- SOP for standing up a new entity from a blueprint.
