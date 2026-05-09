@@ -249,8 +249,21 @@ export async function generate_settings(path_overrides?: Partial<PathConfig>): P
           hooks: [
             {
               type: "command",
+              // Reply-enforcement (issue #39): the daemon may instruct us to
+              // block this turn (exit 2 with stderr reminder) when the agent
+              // produced assistant text but didn't route it through Discord.
+              // On any other condition (or if curl/jq fail / daemon
+              // unreachable), exit 0 — a wedged daemon must never wedge an
+              // agent.
               command:
-                'curl -s -X POST http://localhost:7749/hooks/stop -H \'Content-Type: application/json\' -d \'{"session_id": "\'"$CLAUDE_SESSION_ID"\'", "working_dir": "\'"$(pwd)"\'"}\' || true',
+                "RESP=$(curl -s -X POST http://localhost:7749/hooks/stop " +
+                "-H 'Content-Type: application/json' " +
+                '-d \'{"session_id": "\'"$CLAUDE_SESSION_ID"\'", "working_dir": "\'"$(pwd)"\'"}\' 2>/dev/null) || exit 0; ' +
+                "if echo \"$RESP\" | jq -e '.block == true' >/dev/null 2>&1; then " +
+                "echo \"$RESP\" | jq -r '.reminder' >&2; " +
+                "exit 2; " +
+                "fi; " +
+                "exit 0",
               timeout: 10,
             },
           ],
