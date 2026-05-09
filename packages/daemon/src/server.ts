@@ -20,6 +20,7 @@ import type { PRWatchStore } from "./pr-watches.js";
 import { QueueFullError } from "./queue.js";
 import type { TaskQueue, TaskSubmission } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
+import { evaluate_stop } from "./reply-enforcement.js";
 import {
   format_sentry_alert,
   format_sentry_alert_minimal,
@@ -430,10 +431,36 @@ async function build_sentry_alert_message(opts: {
 
 // ── Hook endpoints ──
 
-const handle_stop_hook: RouteHandler = async (req, res) => {
+const handle_stop_hook: RouteHandler = async (req, res, ctx) => {
   const body = await read_body(req);
   console.log("[hooks] Stop hook triggered:", body.slice(0, 200));
-  json_response(res, 200, { ok: true });
+
+  let parsed: { session_id?: string; working_dir?: string };
+  try {
+    parsed = JSON.parse(body) as { session_id?: string; working_dir?: string };
+  } catch {
+    json_response(res, 200, { ok: true });
+    return;
+  }
+
+  const session_id = typeof parsed.session_id === "string" ? parsed.session_id : "";
+  const working_dir = typeof parsed.working_dir === "string" ? parsed.working_dir : "";
+  if (!session_id || !working_dir) {
+    json_response(res, 200, { ok: true });
+    return;
+  }
+
+  try {
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      { pool: ctx.pool, discord: ctx.discord },
+    );
+    json_response(res, 200, result);
+  } catch (err) {
+    // Hook budget is tight; never bubble — fail open.
+    console.warn(`[hooks] stop-hook evaluator threw: ${String(err)}`);
+    json_response(res, 200, { ok: true });
+  }
 };
 
 // ── Task routes ──
