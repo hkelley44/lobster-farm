@@ -41,6 +41,8 @@ Four layers, hardest to softest:
 
 **One bot = one session = one channel.** Each pool bot runs as its own Claude Code session via the native Discord channel plugin. Separate context windows, no cross-contamination, no latency. Channel scoping uses the `groups` field in `access.json` which accepts **channel IDs** (not server IDs) to restrict which channel the bot listens to.
 
+**Outbound allowlist enrichment for #alerts (#40).** The Discord plugin gates *outbound* `reply` calls on the same `groups` map it uses for inbound. Pool bots therefore also need their entity's `#alerts` channel listed — otherwise escalations and notifications fail with "channel is not allowlisted." The daemon adds this entry automatically when reconciling `access.json`, with `requireMention: true` so the bot doesn't accidentally consume alert posts as commands. `#alerts` remains broadcast-only output to Hunter, never an agent input surface.
+
 **LRU pool management.** When all pool bots are assigned and a new channel needs one:
 1. Find the least recently active bot
 2. Park its session (kill tmux, preserve session ID for later `--resume`)

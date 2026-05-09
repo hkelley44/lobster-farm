@@ -719,12 +719,17 @@ export class BotPool extends EventEmitter {
     // assignments. access.json files may be stale from a previous run (e.g., a bot that
     // was reassigned or freed but whose tmux survived the restart). Rewriting them all
     // ensures the Discord plugin only listens to channels the daemon actually assigned.
+    //
+    // We also pass `bot.entity_id` so write_access_json can enrich the outbound
+    // allowlist with the entity's #alerts channel (#40). For free/parked bots
+    // this is null and no alerts entry is written.
     for (const bot of this.bots) {
       // Only assigned bots (with live tmux) should listen on their channel.
       // Parked and free bots get empty access.json — their channel claim is
       // preserved in memory/pool-state.json for resume, not in access.json.
       const expected_channel = bot.state === "assigned" ? bot.channel_id : null;
-      await this.write_access_json(bot.state_dir, expected_channel);
+      const expected_entity = bot.state === "assigned" ? bot.entity_id : null;
+      await this.write_access_json(bot.state_dir, expected_channel, expected_entity);
     }
     console.log(`[pool] Reconciled access.json for ${String(this.bots.length)} bots`);
 
@@ -801,8 +806,10 @@ export class BotPool extends EventEmitter {
         }
         this.kill_tmux(bot.tmux_session);
 
-        // Write access.json so the Discord plugin listens on this channel
-        await this.write_access_json(bot.state_dir, candidate.channel_id);
+        // Write access.json so the Discord plugin listens on this channel.
+        // Pass entity_id so the entity's #alerts channel is also added to the
+        // outbound allowlist (#40).
+        await this.write_access_json(bot.state_dir, candidate.channel_id, candidate.entity_id);
 
         // Set Discord nickname and profile avatar to match the archetype
         await this.set_bot_nickname(bot, candidate.archetype);
@@ -1085,8 +1092,9 @@ export class BotPool extends EventEmitter {
       // Kill any existing tmux session
       this.kill_tmux(bot.tmux_session);
 
-      // Update access.json with the channel ID
-      await this.write_access_json(bot.state_dir, channel_id);
+      // Update access.json with the channel ID. Pass entity_id so the
+      // entity's #alerts channel is also added to the outbound allowlist (#40).
+      await this.write_access_json(bot.state_dir, channel_id, entity_id);
 
       // Set Discord nickname and profile avatar to match the archetype
       await this.set_bot_nickname(bot, archetype);
@@ -1721,9 +1729,11 @@ export class BotPool extends EventEmitter {
         );
       }
 
-      // Write access.json so the Discord plugin listens on this channel
+      // Write access.json so the Discord plugin listens on this channel.
+      // Include entity_id so the entity's #alerts channel is added to the
+      // outbound allowlist (#40).
       if (channel_id) {
-        await this.write_access_json(bot.state_dir, channel_id);
+        await this.write_access_json(bot.state_dir, channel_id, entity_id);
       }
 
       // Restart tmux — use --resume if we have a verified session_id
@@ -2167,10 +2177,56 @@ export class BotPool extends EventEmitter {
 
   // ── Internal ──
 
-  private async write_access_json(state_dir: string, channel_id: string | null): Promise<void> {
+  /**
+   * Resolve the alerts channel ID for an entity, if any.
+   * Returns null when the registry isn't ready, the entity isn't registered,
+   * or the entity has no `type: "alerts"` channel configured.
+   *
+   * Pool bots are assigned to a single inbound channel (general or work_room),
+   * but agents are expected to *post* to their entity's #alerts channel for
+   * approvals, blockers, and incident notifications. The Discord plugin only
+   * permits outbound `reply` to channels present in `access.json.groups`, so
+   * we add the alerts channel as an outbound-only entry (see `write_access_json`).
+   */
+  private resolve_alerts_channel_id(entity_id: string | null): string | null {
+    if (!entity_id || !this.registry) return null;
+    const entity_config = this.registry.get(entity_id);
+    if (!entity_config) return null;
+    const alerts_channel = entity_config.entity.channels.list.find((ch) => ch.type === "alerts");
+    return alerts_channel?.id ?? null;
+  }
+
+  /**
+   * Write the Discord plugin's access.json for a pool bot.
+   *
+   * The plugin enforces a two-way allowlist:
+   *   - Inbound: messages are delivered only from channels in `groups`, gated
+   *     by `requireMention` (when true, only @mentions trigger the agent).
+   *   - Outbound: `reply` and other send tools only target channels in `groups`.
+   *
+   * Pool bots are assigned to ONE inbound channel (general or work_room). They
+   * also need OUTBOUND access to their entity's #alerts channel so agents can
+   * escalate. We add the alerts channel with `requireMention: true` so the bot
+   * doesn't accidentally consume alert posts as commands — alerts are meant to
+   * be broadcast-only output to Hunter, not an agent input surface. See #40.
+   */
+  private async write_access_json(
+    state_dir: string,
+    channel_id: string | null,
+    entity_id: string | null = null,
+  ): Promise<void> {
     const groups: Record<string, { requireMention: boolean; allowFrom: string[] }> = {};
     if (channel_id) {
       groups[channel_id] = { requireMention: false, allowFrom: [] };
+    }
+
+    // Always include the entity's #alerts channel for outbound posts when we
+    // can resolve it. Guarded with `requireMention: true` so the channel is
+    // strictly an output destination — incoming traffic without an explicit
+    // mention is ignored, preserving the broadcast-only semantics.
+    const alerts_channel_id = this.resolve_alerts_channel_id(entity_id);
+    if (alerts_channel_id && alerts_channel_id !== channel_id) {
+      groups[alerts_channel_id] = { requireMention: true, allowFrom: [] };
     }
 
     // The owner's Discord user ID controls who can DM pool bots.
