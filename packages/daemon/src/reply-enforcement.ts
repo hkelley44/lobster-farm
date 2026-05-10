@@ -65,9 +65,7 @@ export interface TurnSummary {
   found: boolean;
 }
 
-export type StopHookResponse =
-  | { ok: true; block?: false }
-  | { ok: true; block: true; reminder: string };
+export type StopHookResponse = { ok: true } | { ok: true; block: true; reminder: string };
 
 export interface EvaluateStopDeps {
   pool: BotPool | null;
@@ -143,7 +141,7 @@ export async function read_last_assistant_turn(
     try {
       next = await readFile(path, "utf-8");
     } catch {
-      // File not yet written.
+      // File not yet on disk; retry within budget.
       continue;
     }
     if (next.length === last_size) {
@@ -374,10 +372,17 @@ export async function evaluate_stop(
       return { ok: true };
     }
 
+    // Null-discord guard sits BEFORE the Haiku call so we don't burn an API
+    // round-trip in the (theoretical) case where a channel is bound but the
+    // discord client isn't wired (e.g., daemon during a partial-startup window).
+    if (!deps.discord) {
+      return { ok: true };
+    }
+
     try {
       const summary = await make_heartbeat(turn);
       const trimmed = summary.trim();
-      if (trimmed && deps.discord) {
+      if (trimmed) {
         await deps.discord.send(channel_id, `${HEARTBEAT_PREFIX}${trimmed}`);
         mark_cooldown(channel_id, now);
       }
