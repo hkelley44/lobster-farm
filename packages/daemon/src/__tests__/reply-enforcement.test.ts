@@ -229,6 +229,25 @@ describe("read_last_assistant_turn", () => {
     expect(turn.produced_text).toBe(true);
   });
 
+  it("returns found=false on a zero-byte JSONL (empty-file edge case)", async () => {
+    // Edge case: file exists but has zero bytes (a flush race window where
+    // open() has created the file but no events have landed). The retry loop
+    // settles when size stops growing, then the empty-content guard returns
+    // found=false so the caller treats this as pass-through.
+    const path = join(
+      temp_home,
+      ".claude",
+      "projects",
+      encode_project_slug(working_dir),
+      `${session_id}.jsonl`,
+    );
+    await writeFile(path, "", "utf-8");
+    const turn = await read_last_assistant_turn(working_dir, session_id);
+    expect(turn.found).toBe(false);
+    expect(turn.produced_text).toBe(false);
+    expect(turn.called_reply).toBe(false);
+  });
+
   it("tolerates a brief flush delay (race mitigation)", async () => {
     const path = join(
       temp_home,
@@ -290,6 +309,28 @@ describe("resolve_bound_channel / is_discord_bound", () => {
   it("returns null when pool is null", () => {
     expect(resolve_bound_channel("S1", null)).toBeNull();
     expect(is_discord_bound("S1", null)).toBe(false);
+  });
+
+  it("returns null for subagent session_ids (subagent sessions are never in the pool assignment map)", () => {
+    // Subagents inherit the parent's working dir but get their own session_id
+    // from Claude Code. They are never assigned a pool bot, so they never
+    // appear in the assignment map — pool binding is the primary defense
+    // against subagent Stop events triggering enforcement.
+    const parent_session_id = "parent-S";
+    const subagent_session_id = "subagent-S";
+    const pool = make_pool([
+      make_bot({
+        id: 1,
+        state: "assigned",
+        channel_id: "C123",
+        entity_id: "lobster-farm",
+        session_id: parent_session_id,
+      }),
+    ]);
+    expect(resolve_bound_channel(subagent_session_id, pool)).toBeNull();
+    expect(is_discord_bound(subagent_session_id, pool)).toBe(false);
+    // Sanity: the parent still resolves.
+    expect(is_discord_bound(parent_session_id, pool)).toBe(true);
   });
 });
 
@@ -543,6 +584,27 @@ describe("evaluate_stop — acceptance criteria", () => {
     );
     expect(result).toEqual({ ok: true });
     expect(sends.length).toBe(0);
+  });
+
+  it("silent turn with bound channel but null discord → pass-through, no Haiku call", async () => {
+    // Defends the null-discord short-circuit: if a channel is bound but the
+    // discord client somehow isn't wired (partial-startup edge case), we must
+    // not burn a Haiku round-trip just to discard it.
+    let heartbeat_called = false;
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord: null,
+        read_turn: make_turn_reader({ produced_text: false, called_reply: false }),
+        make_heartbeat: async () => {
+          heartbeat_called = true;
+          return "should not run";
+        },
+      },
+    );
+    expect(result).toEqual({ ok: true });
+    expect(heartbeat_called).toBe(false);
   });
 
   it("null pool (daemon without Discord) → pass-through", async () => {
