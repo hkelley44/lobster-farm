@@ -43,16 +43,35 @@ Spawn a reviewer agent scoped to the PR.
 
 The reviewer:
 - Loads `review-dna` for our review standards (priority order, comment format, frontend criteria, CI awareness, E2E classification, spec-gap heuristic)
-- **Counts prior review cycles** via `gh pr view <n> --json reviews` before starting. Each prior `Reviewer`-authored review (or findings comment with a `Verdict:` line) is a cycle.
+- **Counts prior review cycles** before starting (see the "Cycle cap" block below — multi-dev mode counts formal reviews, single-dev mode counts findings comments). Each prior `Reviewer`-authored review or findings comment with a `**Verdict:` line is a cycle.
 - Runs `/ultrareview` (Claude Code's parallel multi-agent PR review) for comprehensive analysis
 - Posts the review on the PR via `gh`
 - Verdict: **Approved** or **Changes Requested** — never ambiguous
 
 **Cycle cap (hard limit: 3):**
 
+The Reviewer counts prior cycles before starting. The query depends on whether this is a multi-dev or single-dev repo — detect by comparing the Reviewer's GitHub login to the PR author's login:
+
 ```bash
-gh pr view <n> --json reviews --jq '[.reviews[] | select(.author.login == "<reviewer-login>")] | length'
+REVIEWER_LOGIN=$(gh api user --jq '.login')
+PR_AUTHOR=$(gh pr view <n> --json author --jq '.author.login')
 ```
+
+**Mode 1 — Multi-dev repo (`$REVIEWER_LOGIN` ≠ `$PR_AUTHOR`):** count formal `PullRequestReview` entries authored by the Reviewer.
+
+```bash
+gh pr view <n> --json reviews --jq --arg login "$REVIEWER_LOGIN" \
+  '[.reviews[] | select(.author.login == $login)] | length'
+```
+
+**Mode 2 — Single-dev repo (`$REVIEWER_LOGIN` == `$PR_AUTHOR`, currently all of LobsterFarm):** GitHub blocks `gh pr review --approve` on self-authored PRs, so the Reviewer posts findings comments instead of formal reviews (see "Self-approval blocker" below). Count those findings comments instead.
+
+```bash
+gh pr view <n> --json comments --jq \
+  '[.comments[] | select(.body | startswith("**Verdict:"))] | length'
+```
+
+Whichever count applies, interpret it the same way:
 
 - `0` prior cycles → this is cycle 1, proceed normally
 - `1` prior → cycle 2, proceed normally
@@ -80,7 +99,7 @@ Ben:
 
 ### 3. Re-review
 
-After fixes are pushed, loop back to step 1. A fresh reviewer session — no memory of the previous review. Fresh eyes every time. The cycle counter (read from `gh pr view --json reviews`) tells the new Reviewer where it sits in the loop budget.
+After fixes are pushed, loop back to step 1. A fresh reviewer session — no memory of the previous review. Fresh eyes every time. The cycle counter (read per the mode-aware query in step 1) tells the new Reviewer where it sits in the loop budget.
 
 The loop continues until the Reviewer would post Approved — at which point step 3.5 fires before the merge.
 
@@ -118,11 +137,14 @@ Branch existence is the only signal — no per-repo config flag. If the repo gro
 
 1. **Check for conflicts** — `gh pr view {number} --json mergeable`
 2. **Resolve conflicts** if needed (per the rebase rules in 4b below)
-3. **Squash-merge the PR into `staging`:**
+3. **Squash-merge the PR into `staging`** — `gh pr merge` has no `--base` flag, so this is two explicit steps:
    ```bash
-   gh pr merge {number} --squash --delete-branch --base staging
+   # If PR was opened against main, reroute it first:
+   gh pr edit {number} --base staging
+   # Then merge:
+   gh pr merge {number} --squash --delete-branch
    ```
-   (If the PR was opened against `main`, change its base to `staging` first: `gh pr edit {number} --base staging`.)
+   If the PR is already based on `staging`, skip the `gh pr edit` and run the merge directly.
 4. **Post step-by-step test instructions** in two places — same content, two formats:
    - **Discord post in #work-log:**
      ```
@@ -193,14 +215,14 @@ This isn't about asking permission for every line of code. It's about being a co
 
 **Agents (intelligent):**
 - Review code against standards
-- Count cycles (via `gh pr view --json reviews`) and enforce the cap
+- Count cycles (via `gh pr view --json reviews` in multi-dev mode, `--json comments` in single-dev mode) and enforce the cap
 - Detect the staging-vs-main terminal path (via `git ls-remote --heads origin staging`)
 - Run the final-iteration E2E pass and classify findings
 - Fix review feedback and self-smoke-test before pushing
 - Decide what to escalate vs handle autonomously
 - Run `/ultrareview`, `/simplify`
 
-Cycle counting and branch detection are agent-side responsibilities for v1. A future v2 may move cycle counts into the daemon (more reliable than `gh` API at scale), but `gh`-based counting is fine at LobsterFarm volume today.
+Cycle counting and branch detection are agent-side responsibilities for v1. A future v2 may move cycle counts into the daemon (more reliable than `gh` API at scale, and removes the multi-dev/single-dev branching), but `gh`-based counting is fine at LobsterFarm volume today.
 
 ## What NOT to Do
 

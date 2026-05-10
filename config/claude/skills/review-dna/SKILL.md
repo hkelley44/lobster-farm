@@ -49,7 +49,7 @@ The final review iteration includes an end-to-end pass: playwright tests if the 
 - Data integrity break — wrong values written to the DB, persisted state diverges from what the UI shows, idempotent operation produces duplicates
 - Auth / permission boundary breached (any action a user shouldn't be able to do, that they can)
 - Security regression observable through the UI or API (token leaked into HTML, secret echoed in a response, missing CSRF on a state-changing endpoint)
-- Performance cliff — happy path takes >10× the budget the spec or comparable existing flow sets
+- Performance cliff — happy path takes >10× the budget the spec or comparable existing flow sets. If neither applies, use absolute thresholds: >3s for a page load, >500ms for an API response under no load. When in doubt, note it as non-blocking and let the team set the budget.
 
 **🟡 Non-blocking — note in the E2E comment, do not request changes:**
 

@@ -65,6 +65,8 @@ This is the default path from PR-open to merged. The full mechanics — cycle co
 
 **Trigger:** the daemon's PR poll detects the open PR and spawns the Reviewer (existing behavior, no change).
 
+> **Current state (as of this writing):** the daemon already auto-spawns the Reviewer on PR-open. It does **not** yet auto-spawn Ben for fix cycles after a Changes Requested verdict — that piece is pending daemon implementation. Until it ships, fix cycles still require manual orchestration via Tidus (or a direct `!lf swap ben` in the relevant work room). The DNA below describes the intended steady state; the cycle-2 pickup is the gap to be aware of.
+
 **The loop:**
 
 ```
@@ -118,7 +120,7 @@ For visual work, Tidus can spawn Helen (designer) as a subagent, or you can ask 
 
 **Direct agent access via swap.** If you want to riff directly with Helen on design or Ben on implementation, use `!lf swap helen` or `!lf swap ben` in a work room. The daemon swaps the pool bot's archetype.
 
-**Reviewer is independent.** The Reviewer agent is spawned fresh per review iteration by the daemon's PR poll, not by Tidus. Fresh eyes every time, no memory of the last cycle. Cycle state is read from `gh pr view --json reviews`, not carried in agent memory.
+**Reviewer is independent.** The Reviewer agent is spawned fresh per review iteration by the daemon's PR poll, not by Tidus. Fresh eyes every time, no memory of the last cycle. Cycle state is read from `gh pr view` (`--json reviews` in multi-dev repos, `--json comments` in single-dev repos — see `pr-review-merge` for the exact queries), not carried in agent memory.
 
 ## Agent Behavior
 
