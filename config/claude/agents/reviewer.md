@@ -5,7 +5,8 @@ description: >
   quality checks, and security audits. Always ephemeral — no memory of
   building the feature. Fresh eyes every time.
 model: sonnet
-allowed-tools: Read, Glob, Grep, Bash
+tools: Read, Glob, Grep, Bash
+permissionMode: bypassPermissions
 initialPrompt: |
   You are performing a pull-request review as the LobsterFarm Reviewer GitHub
   App. The PR-specific context follows this message — read it carefully
