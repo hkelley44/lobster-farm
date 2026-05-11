@@ -323,6 +323,11 @@ vi.mock("../sentry.js", () => ({
 // Mock actions to avoid real execFile calls
 vi.mock("../actions.js", () => ({
   detect_review_outcome: vi.fn().mockResolvedValue("approved"),
+  // Default to "approved" via formal review; tests that exercise the
+  // changes-requested branch override per-test with mockResolvedValueOnce.
+  detect_review_outcome_with_source: vi
+    .fn()
+    .mockResolvedValue({ outcome: "approved", source: "review" }),
 }));
 
 // Mock review-utils for retry_approved_unmerged and spawn_ci_fixer tests
@@ -334,6 +339,11 @@ vi.mock("../review-utils.js", () => ({
   fetch_ci_failure_logs: vi.fn().mockResolvedValue([]),
   build_ci_fix_prompt: vi.fn().mockReturnValue("ci fix prompt"),
   MAX_CI_FIX_ATTEMPTS: 3,
+  // Findings-comment cycle-cap helpers (#46). Real bodies are unit-tested in
+  // review-utils.test.ts; here we just keep imports defined.
+  get_authenticated_login: vi.fn().mockResolvedValue("reviewer-bot"),
+  count_verdict_comments: vi.fn().mockResolvedValue(0),
+  count_reviews_by_login: vi.fn().mockResolvedValue(0),
 }));
 
 function make_entity_with_repo(repo_path: string): EntityConfig {
@@ -749,7 +759,10 @@ describe("PRReviewCron.retry_approved_unmerged", () => {
 
     await call_retry(entity_id, repo_path, [pr], entity_config);
 
-    expect(mock_detect_outcome).toHaveBeenCalledWith(42, repo_path, "ghs_test_token");
+    expect(mock_detect_outcome).toHaveBeenCalledWith(42, repo_path, {
+      gh_token: "ghs_test_token",
+      is_self_authored: true,
+    });
     expect(mock_auto_merge).toHaveBeenCalled();
   });
 
@@ -1092,5 +1105,183 @@ describe("PRReviewCron.spawn_ci_fixer", () => {
 
     const result = await call_spawn_ci_fixer(entity_id, repo_path, pr, ["Build"], entity_config);
     expect(result).toBe(true);
+  });
+});
+
+// ── Cycle-cap enforcement (#46) ──
+
+import { MAX_REVIEW_CYCLES } from "../pr-cron.js";
+
+/**
+ * Build a cron instance with `count_review_cycles` overridden to a deterministic
+ * value, and `spawn_external_pr_fixer` stubbed so the test asserts on whether
+ * it was called without spawning a real session.
+ *
+ * The cycle-cap branch fires inside `handle_review_completion` for a
+ * `changes_requested` outcome, so the test drives that method directly.
+ */
+function make_cycle_cap_test_cron(opts: {
+  cycles: number;
+  processed?: Record<string, ProcessedPR>;
+}): {
+  cron: PRReviewCron;
+  alert_router: ReturnType<typeof make_mock_alert_router>;
+  spawn_fixer: ReturnType<typeof vi.fn>;
+  get_processed: () => Record<string, ProcessedPR>;
+  call_handle: (
+    entity_id: string,
+    repo_path: string,
+    pr: TestOpenPR,
+    outcome: "changes_requested" | "approved",
+    verdict_source?: "review" | "comment",
+  ) => Promise<void>;
+} {
+  const config = make_config();
+  const alert_router = make_mock_alert_router();
+  const entity_config = make_entity_with_github_user("test-user");
+  const registry = {
+    get_active: () => [],
+    get: vi.fn().mockReturnValue(entity_config),
+  };
+  const cron = new PRReviewCron(
+    registry as never,
+    { spawn: vi.fn(), on: vi.fn(), removeListener: vi.fn() } as never,
+    config,
+    null,
+    null,
+    null,
+    alert_router as never,
+  );
+
+  const cron_any = cron as unknown as Record<string, unknown>;
+
+  // Replace count_review_cycles with a deterministic counter so we can drive
+  // the cap branch without stubbing `gh`.
+  cron_any.count_review_cycles = vi.fn().mockResolvedValue(opts.cycles);
+
+  // Stub spawn_external_pr_fixer so changes_requested under the cap doesn't
+  // try to actually spawn a builder session.
+  const spawn_fixer = vi.fn().mockResolvedValue(undefined);
+  cron_any.spawn_external_pr_fixer = spawn_fixer;
+
+  // Seed processed state if provided.
+  if (opts.processed) {
+    cron_any.processed = { ...opts.processed };
+  }
+
+  return {
+    cron,
+    alert_router,
+    spawn_fixer,
+    get_processed: () => cron_any.processed as Record<string, ProcessedPR>,
+    call_handle: (entity_id, repo_path, pr, outcome, verdict_source) =>
+      (
+        cron_any.handle_review_completion as (
+          entity_id: string,
+          repo_path: string,
+          pr: TestOpenPR,
+          review_outcome: "changes_requested" | "approved",
+          gh_token: string | undefined,
+          verdict_source: "review" | "comment" | undefined,
+        ) => Promise<void>
+      ).call(cron, entity_id, repo_path, pr, outcome, undefined, verdict_source),
+  };
+}
+
+describe("PRReviewCron — cycle cap (#46)", () => {
+  let log_spy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    log_spy.mockRestore();
+  });
+
+  const entity_id = "test-entity";
+  const repo_path = "/tmp/test-repo";
+
+  it("exposes MAX_REVIEW_CYCLES = 3 (spec contract)", () => {
+    expect(MAX_REVIEW_CYCLES).toBe(3);
+  });
+
+  it("at 2 cycles, spawns builder and does not alert", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const { alert_router, spawn_fixer, call_handle, get_processed } = make_cycle_cap_test_cron({
+      cycles: 2,
+    });
+
+    await call_handle(entity_id, repo_path, pr, "changes_requested", "comment");
+
+    // Under the cap → builder is spawned.
+    expect(spawn_fixer).toHaveBeenCalledTimes(1);
+
+    // The alert that fires is the routine "spawning builder" notice, NOT
+    // the action_required cap-hit escalation.
+    expect(alert_router.post_alert).toHaveBeenCalledTimes(1);
+    const call = alert_router.post_alert.mock.calls[0]?.[0] as {
+      tier: string;
+      body: string;
+    };
+    expect(call?.tier).toBe("routine");
+    expect(call?.body).toContain("spawning builder");
+    expect(call?.body).toContain("cycle 2/3");
+
+    // No escalated_at_cycle persisted.
+    expect(get_processed()[`${entity_id}:42`]?.escalated_at_cycle).toBeUndefined();
+  });
+
+  it("at 3 cycles, fires action_required alert and does NOT spawn builder", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const { alert_router, spawn_fixer, call_handle, get_processed } = make_cycle_cap_test_cron({
+      cycles: 3,
+    });
+
+    await call_handle(entity_id, repo_path, pr, "changes_requested", "comment");
+
+    // At the cap → builder NOT spawned.
+    expect(spawn_fixer).not.toHaveBeenCalled();
+
+    // Exactly one action_required alert about the cap.
+    expect(alert_router.post_alert).toHaveBeenCalledTimes(1);
+    const call = alert_router.post_alert.mock.calls[0]?.[0] as {
+      tier: string;
+      title: string;
+      body: string;
+    };
+    expect(call?.tier).toBe("action_required");
+    expect(call?.title).toContain("max review cycles");
+    expect(call?.title).toContain("#42");
+    expect(call?.body).toContain("Hunter");
+
+    // escalated_at_cycle persisted so the next tick stays quiet.
+    expect(get_processed()[`${entity_id}:42`]?.escalated_at_cycle).toBe(3);
+    expect(get_processed()[`${entity_id}:42`]?.verdict_source).toBe("comment");
+  });
+
+  it("does not re-alert on subsequent cron ticks once escalated_at_cycle is set", async () => {
+    const pr = make_test_pr({ author: { login: "test-user" } });
+    const { alert_router, spawn_fixer, call_handle } = make_cycle_cap_test_cron({
+      cycles: 3,
+      processed: {
+        [`${entity_id}:42`]: {
+          entity_id,
+          pr_number: 42,
+          reviewed_at: "2026-05-09T10:00:00Z",
+          outcome: "changes_requested",
+          escalated_at_cycle: 3,
+          verdict_source: "comment",
+        },
+      },
+    });
+
+    await call_handle(entity_id, repo_path, pr, "changes_requested", "comment");
+
+    // Already escalated → no alert, no spawn.
+    expect(alert_router.post_alert).not.toHaveBeenCalled();
+    expect(spawn_fixer).not.toHaveBeenCalled();
   });
 });
