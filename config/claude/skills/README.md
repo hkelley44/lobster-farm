@@ -8,6 +8,25 @@ Skills fall into three categories:
 - **Guidelines** -- Operational requirements. Secret handling, code review standards, README maintenance, Discord management. Loaded across archetypes as needed.
 - **SOPs** -- Step-by-step procedures. PR review-merge workflow, entity scaffolding process. Loaded when executing a specific process.
 
+## Canonical source rule
+
+**This directory (`config/claude/skills/`) is the single source of truth for every skill.** The Claude Code harness only auto-discovers skills under `~/.claude/skills/`, so each shared skill is published to that load path as a **symlink** pointing at the repo file here. Never edit a user-global `~/.claude/skills/<name>/SKILL.md` directly — edit the repo file in this directory, commit it through a PR, and the symlinked user-global copy reflects the change immediately (the harness picks it up on the next session start).
+
+When adding a new shared skill:
+
+1. Create `config/claude/skills/<name>/SKILL.md` here and commit it through a PR.
+2. After merge, publish to the user-global load path on each machine:
+   ```bash
+   mkdir -p ~/.claude/skills/<name>
+   ln -s ~/.lobsterfarm/src/config/claude/skills/<name>/SKILL.md \
+         ~/.claude/skills/<name>/SKILL.md
+   ```
+3. Verify with `realpath ~/.claude/skills/<name>/SKILL.md` — it must resolve back into `~/.lobsterfarm/src/config/claude/skills/...`.
+
+Repo-only skills (no user-global presence needed) are loaded by agents that explicitly `Skill`-invoke them — they don't need to be published to `~/.claude/skills/`.
+
+If a SKILL.md is ever found as a regular file (not a symlink) under `~/.claude/skills/`, it is drift — replace it with a symlink to the repo file rather than editing in place.
+
 ## Directories
 
 - `coding-dna/` -- Engineering standards and architectural preferences. The foundational DNA for all code work.
