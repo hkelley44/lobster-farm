@@ -859,6 +859,65 @@ describe("detect_review_outcome — findings-comment fallback (#46)", () => {
       expect(env?.GH_TOKEN).toBe("ghs_legacy_token");
     }
   });
+
+  it("merges process.env into the env passed to `gh api user` and `gh pr view --json comments` when gh_token is set", async () => {
+    // Regression guard for cycle-2 review finding: `get_authenticated_login`
+    // and `detect_verdict_from_comments` are called via `exec_async` directly
+    // (not via the local `run()` helper), so they do NOT merge process.env on
+    // their own. If we forward a partial `{ GH_TOKEN }` env, PATH is dropped
+    // and the gh binary can't be located → login resolves to null → comment
+    // fallback silently stays pending. Pin both call sites here so the bug
+    // can't regress unnoticed.
+    const SENTINEL_KEY = "REVIEW_OUTCOME_ENV_SENTINEL";
+    const SENTINEL_VALUE = "preserved-from-process-env";
+    process.env[SENTINEL_KEY] = SENTINEL_VALUE;
+
+    try {
+      set_review_outcome_responses({
+        review_decision: "",
+        login: "reviewer-bot",
+        comments: [
+          {
+            body: "**Verdict: Approved**\n\nlgtm",
+            createdAt: "2026-05-09T10:00:00Z",
+            author: { login: "reviewer-bot" },
+          },
+        ],
+      });
+
+      await detect_review_outcome(42, "/repos/test-repo", {
+        gh_token: "ghs_cross_account_token",
+        is_self_authored: true,
+      });
+
+      // The `gh api user` call (used by get_authenticated_login) must see both
+      // GH_TOKEN AND the sentinel that lives in process.env.
+      const api_user_call = exec_calls.find(
+        (c) => c.command === "gh" && c.args[0] === "api" && c.args[1] === "user",
+      );
+      expect(api_user_call, "expected a `gh api user` call").toBeDefined();
+      const api_user_env = (api_user_call?.options as Record<string, unknown> | undefined)?.env as
+        | Record<string, string>
+        | undefined;
+      expect(api_user_env?.GH_TOKEN).toBe("ghs_cross_account_token");
+      expect(api_user_env?.[SENTINEL_KEY]).toBe(SENTINEL_VALUE);
+
+      // Same for the `gh pr view --json comments` call (used by
+      // detect_verdict_from_comments) — already correct before the fix but
+      // pinned here so the two paths stay consistent.
+      const comments_call = exec_calls.find(
+        (c) => c.command === "gh" && c.args.includes("--json") && c.args.includes("comments"),
+      );
+      expect(comments_call, "expected a `gh pr view --json comments` call").toBeDefined();
+      const comments_env = (comments_call?.options as Record<string, unknown> | undefined)?.env as
+        | Record<string, string>
+        | undefined;
+      expect(comments_env?.GH_TOKEN).toBe("ghs_cross_account_token");
+      expect(comments_env?.[SENTINEL_KEY]).toBe(SENTINEL_VALUE);
+    } finally {
+      delete process.env[SENTINEL_KEY];
+    }
+  });
 });
 
 describe("classify_merge_error", () => {

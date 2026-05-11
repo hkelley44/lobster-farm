@@ -717,7 +717,19 @@ async function handle_review_completion(
     // Fall through — detect_review_outcome will use daemon's default auth
   }
 
-  const outcome = await detect_review_outcome(pr.number, repo_path, gh_token);
+  // In single-dev repos GitHub blocks `gh pr review --approve` on self-authored
+  // PRs, so Reviewer falls back to a `**Verdict:` comment. Pass
+  // `is_self_authored` so detect_review_outcome can poll comments when
+  // reviewDecision is empty. Mirrors the same resolution pr-cron.ts uses
+  // (entity.accounts.github.user). See #46.
+  const entity_match = find_entity_for_repo_full(repo_full_name, ctx.registry);
+  const github_user = entity_match?.entity.entity.accounts?.github?.user;
+  const is_self_authored = github_user != null && pr.user.login === github_user;
+
+  const outcome = await detect_review_outcome(pr.number, repo_path, {
+    gh_token,
+    is_self_authored,
+  });
 
   console.log(`[webhook] Review completed for PR #${String(pr.number)} — outcome: ${outcome}`);
 

@@ -1298,7 +1298,7 @@ describe("handle_github_webhook", () => {
         expect(detect_review_outcome).toHaveBeenCalledWith(
           950,
           "/tmp/test-repo",
-          "ghs_install_88888",
+          expect.objectContaining({ gh_token: "ghs_install_88888" }),
         );
       } finally {
         log_spy.mockRestore();
@@ -1342,7 +1342,11 @@ describe("handle_github_webhook", () => {
         );
 
         // Default token from get_token() is "ghs_mock_token"
-        expect(detect_review_outcome).toHaveBeenCalledWith(951, "/tmp/test-repo", "ghs_mock_token");
+        expect(detect_review_outcome).toHaveBeenCalledWith(
+          951,
+          "/tmp/test-repo",
+          expect.objectContaining({ gh_token: "ghs_mock_token" }),
+        );
       } finally {
         log_spy.mockRestore();
       }
@@ -1396,10 +1400,151 @@ describe("handle_github_webhook", () => {
         );
 
         // Token should be undefined since resolution failed
-        expect(detect_review_outcome).toHaveBeenCalledWith(952, "/tmp/test-repo", undefined);
+        expect(detect_review_outcome).toHaveBeenCalledWith(
+          952,
+          "/tmp/test-repo",
+          expect.objectContaining({ gh_token: undefined }),
+        );
       } finally {
         log_spy.mockRestore();
         error_spy.mockRestore();
+      }
+    });
+
+    // Regression: webhook path must opt into the findings-comment fallback for
+    // self-authored PRs (#46 cycle 2). detect_review_outcome silently degrades
+    // to `pending` when `is_self_authored` is absent, so the comment fallback
+    // is dead for any PR routed through the webhook unless we wire it.
+    it("passes is_self_authored=true when PR author matches entity's GitHub user", async () => {
+      const { detect_review_outcome } = await import("../actions.js");
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      try {
+        // PR author "lobster-bot" matches the entity's github user.
+        const body = make_pr_payload("opened", 9460, "test-org/lobster-farm", {
+          user: { login: "lobster-bot" },
+        });
+        const req = make_request(body, {
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": sign_payload(body),
+        });
+        const res = make_response();
+
+        // Custom registry where the entity exposes its GitHub user.
+        const registry = {
+          get_active: vi.fn().mockReturnValue([
+            {
+              entity: {
+                id: "lobster-farm",
+                accounts: { github: { user: "lobster-bot" } },
+                repos: [
+                  {
+                    name: "lobster-farm",
+                    url: "https://github.com/test-org/lobster-farm.git",
+                    path: "/tmp/test-repo",
+                  },
+                ],
+              },
+            },
+          ]),
+        } as unknown as EntityRegistry;
+        const ctx = make_context({ registry });
+
+        await handle_github_webhook(req, res, ctx);
+
+        await vi.waitFor(
+          () => {
+            expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+          },
+          { timeout: 2000 },
+        );
+
+        const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
+        (ctx.session_manager as any).emit("session:completed", {
+          session_id: spawn_result.session_id,
+          exit_code: 0,
+        });
+
+        await vi.waitFor(
+          () => {
+            expect(detect_review_outcome).toHaveBeenCalled();
+          },
+          { timeout: 2000 },
+        );
+
+        expect(detect_review_outcome).toHaveBeenCalledWith(
+          9460,
+          "/tmp/test-repo",
+          expect.objectContaining({ is_self_authored: true }),
+        );
+      } finally {
+        log_spy.mockRestore();
+      }
+    });
+
+    it("passes is_self_authored=false when PR author does not match entity's GitHub user", async () => {
+      const { detect_review_outcome } = await import("../actions.js");
+      const log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      try {
+        // PR author "external-contributor" does NOT match the entity's user.
+        const body = make_pr_payload("opened", 9461, "test-org/lobster-farm", {
+          user: { login: "external-contributor" },
+        });
+        const req = make_request(body, {
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": sign_payload(body),
+        });
+        const res = make_response();
+
+        const registry = {
+          get_active: vi.fn().mockReturnValue([
+            {
+              entity: {
+                id: "lobster-farm",
+                accounts: { github: { user: "lobster-bot" } },
+                repos: [
+                  {
+                    name: "lobster-farm",
+                    url: "https://github.com/test-org/lobster-farm.git",
+                    path: "/tmp/test-repo",
+                  },
+                ],
+              },
+            },
+          ]),
+        } as unknown as EntityRegistry;
+        const ctx = make_context({ registry });
+
+        await handle_github_webhook(req, res, ctx);
+
+        await vi.waitFor(
+          () => {
+            expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+          },
+          { timeout: 2000 },
+        );
+
+        const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
+        (ctx.session_manager as any).emit("session:completed", {
+          session_id: spawn_result.session_id,
+          exit_code: 0,
+        });
+
+        await vi.waitFor(
+          () => {
+            expect(detect_review_outcome).toHaveBeenCalled();
+          },
+          { timeout: 2000 },
+        );
+
+        expect(detect_review_outcome).toHaveBeenCalledWith(
+          9461,
+          "/tmp/test-repo",
+          expect.objectContaining({ is_self_authored: false }),
+        );
+      } finally {
+        log_spy.mockRestore();
       }
     });
   });

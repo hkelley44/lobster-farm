@@ -423,7 +423,14 @@ export async function detect_review_outcome_with_source(
       ? { gh_token: gh_token_or_opts }
       : gh_token_or_opts;
 
+  // `env` is what we pass to `run()` (the local helper merges with process.env
+  // internally — see line 49). `merged_env` is what we pass to direct
+  // `exec_async` callers in review-utils.ts (get_authenticated_login,
+  // detect_verdict_from_comments) which do NOT merge themselves — without this
+  // PATH is dropped and the `gh` binary cannot be located. Build once and
+  // reuse so the two paths can't drift apart again.
   const env = opts.gh_token ? { GH_TOKEN: opts.gh_token } : undefined;
+  const merged_env = env ? { ...process.env, ...env } : undefined;
 
   try {
     // Check if PR is already merged
@@ -462,11 +469,8 @@ export async function detect_review_outcome_with_source(
       // Resolve the daemon's effective GitHub login. We MUST be able to
       // identify the author before trusting any comment-based verdict;
       // otherwise a stray human comment could be misread as a Reviewer call.
-      const login = await get_authenticated_login(repo_path, env);
+      const login = await get_authenticated_login(repo_path, merged_env);
       if (login) {
-        // Pass the merged env (process.env + GH_TOKEN) so the gh CLI invocation
-        // inside detect_verdict_from_comments sees the override token too.
-        const merged_env = env ? { ...process.env, ...env } : undefined;
         const detection = await detect_verdict_from_comments(
           pr_number,
           repo_path,
