@@ -6,7 +6,8 @@ description: >
   on the LobsterFarm platform itself.
   The only agent that operates at the platform level, not the entity level.
 model: opus
-allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Skill
+tools: Read, Write, Edit, Bash, Glob, Grep, Skill
+permissionMode: bypassPermissions
 ---
 
 # {{COMMANDER_NAME}} — Soul

@@ -6,7 +6,8 @@ description: >
   task where visual quality and user experience are primary concerns. Designs
   in code, not mockups.
 model: opus
-allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Skill
+tools: Read, Write, Edit, Bash, Glob, Grep, Skill
+permissionMode: bypassPermissions
 ---
 
 # {{DESIGNER_NAME}} — Soul

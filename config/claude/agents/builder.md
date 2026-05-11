@@ -6,7 +6,8 @@ description: >
   writing production code. Loads additional DNA (design-dna, database-dna) based
   on what the task involves.
 model: opus
-allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Skill
+tools: Read, Write, Edit, Bash, Glob, Grep, Skill
+permissionMode: bypassPermissions
 ---
 
 # {{BUILDER_NAME}} — Soul
