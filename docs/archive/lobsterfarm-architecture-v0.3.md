@@ -84,7 +84,8 @@ Everything executes through Claude Code. Three operating modes:
 **Interactive Mode** — Human collaborating in real-time:
 ```bash
 # Terminal — direct session in a worktree
-cd /repos/alpha/worktrees/42-feature && claude --resume $SESSION_ID
+cd /repos/alpha/worktrees/42-feature
+claude --resume $SESSION_ID
 
 # Discord/Telegram — Channels deliver messages to a running session
 # Daemon keeps sessions alive in tmux panes with --channels flag
@@ -516,10 +517,10 @@ phases:
       - slash-command: /build-complete
     exit_actions:
       - run-tests:
-          command: "cd {feature.worktree} && npm test"
+          command: "npm --prefix {feature.worktree} test"
           on_failure: stay-in-phase
       - run-lint:
-          command: "cd {feature.worktree} && npm run lint"
+          command: "npm --prefix {feature.worktree} run lint"
           on_failure: stay-in-phase
       - notify:
           channel: alerts
@@ -565,7 +566,7 @@ phases:
   ship:
     entry_actions:
       - run-full-tests:
-          command: "cd {feature.worktree} && npm run test:ci"
+          command: "npm --prefix {feature.worktree} run test:ci"
           on_failure: back-to-build
     steps:
       - merge:
