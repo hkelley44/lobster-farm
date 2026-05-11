@@ -5,7 +5,6 @@ description: >
   setup, infrastructure management, monitoring, Sentry triage, server
   maintenance, and incident response.
 model: sonnet
-tools: Read, Write, Edit, Bash, Glob, Grep, Skill
 permissionMode: bypassPermissions
 ---
 

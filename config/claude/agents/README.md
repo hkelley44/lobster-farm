@@ -1,6 +1,6 @@
 # Agent Archetypes
 
-Soul files for each agent role. These are Claude Code agent definitions (markdown with YAML frontmatter) that get copied to `~/.claude/agents/` during `lf init`. The frontmatter specifies the agent name, description, model, and allowed tools. The body defines the agent's personality, working style, and domain expertise.
+Soul files for each agent role. These are Claude Code agent definitions (markdown with YAML frontmatter) that get copied to `~/.claude/agents/` during `lf init`. The frontmatter specifies the agent name, description, model, and permission mode. Tools are not allowlisted — every agent inherits the parent session's full tool palette (including MCP plugin tools, `Task` for orchestration, web tools, etc.). If selective restriction is ever needed, use `disallowedTools:` as a per-agent denylist rather than an explicit `tools:` allowlist. The body defines the agent's personality, working style, and domain expertise.
 
 Agent names use `{{PLACEHOLDER}}` variables so each installation can customize them (defaults: Gary, Pearl, Bob, Ray, Pat).
 
