@@ -35,6 +35,12 @@ gh pr list --repo {url} --state open --json number,title,headRefName,updatedAt
 
 When a new or updated PR is found that isn't already being processed, the daemon triggers this SOP.
 
+## Critical — never `cd <path> && git ...` in any step below
+
+PR review and merge is where worktree-touching shell commands cluster: `git worktree list`, `git worktree remove`, `git branch -D`, `git fetch`, `git rebase`, the post-merge cleanup recipe in `MEMORY.md`. Every one of these must run as `git -C <path> <subcommand>`. The `cd <path> && git ...` compound shape is intercepted by the Claude Code harness's bare-repository safety backstop, which always prompts for approval — even under `--permission-mode bypassPermissions` — and unanswered prompts in pool-bot sessions cause the agent to exit and the daemon to crash-loop on restart. Crash data from issue #55 showed these crashes cluster around PR review/merge activity specifically because this is the venue where the bad shape is most likely to be emitted.
+
+The full rationale and the universal `-C` translation rules live in `coding-dna` → "Git in non-cwd directories." Read that section if you haven't. The short version for this SOP: write `git -C worktrees/<slug> status`, never `cd worktrees/<slug> && git status`. Same for every git subcommand used in any step below, including the post-merge cleanup.
+
 ## Steps
 
 ### 0. Pre-flight check before spawning a reviewer
@@ -257,6 +263,7 @@ Cycle counting and branch detection are agent-side responsibilities for v1. A fu
 - Don't loop past 3 cycles — escalate to Hunter instead, the loop has exhausted its budget
 - Don't auto-promote staging → main — Hunter's ✅ is the only valid signal, no timeout fallback
 - Don't spawn a reviewer without running the step-0 pre-flight check — a duplicate pass on a fresh review wastes a cycle and produces conflicting findings
+- Don't emit `cd <path> && git ...` compounds anywhere in this SOP — use `git -C <path> ...` for every git invocation against a non-cwd repo or worktree (the harness backstop crash-loops pool bots; see the "Critical" callout near the top of this file)
 
 ## Worked example — pre-flight catches a duplicate
 
