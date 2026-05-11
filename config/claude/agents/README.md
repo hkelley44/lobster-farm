@@ -9,6 +9,6 @@ Agent names use `{{PLACEHOLDER}}` variables so each installation can customize t
 - `planner.md` -- Gary. Strategic planner and project coordinator. Socratic discovery, spec writing, scope management. Uses Opus.
 - `designer.md` -- Pearl. Design engineer. Brand kits, design systems, component libraries. Designs in code, not mockups. Uses Opus.
 - `builder.md` -- Bob. Full-stack engineer. Feature implementation, testing, documentation. Clarity over cleverness. Uses Opus.
-- `reviewer.md` -- Reviewer. Code review and QA gate. Always ephemeral -- no memory of building the feature. Uses Sonnet. Has reduced tool access (Read, Glob, Grep, Bash only).
+- `reviewer.md` -- Reviewer. Code review and QA gate. Always ephemeral -- no memory of building the feature. Uses Sonnet. Inherits full parent toolset; if write-blind guardrail is desired, add `disallowedTools: Edit, Write, NotebookEdit`.
 - `operator.md` -- Ray. DevOps and operations. Deployment, CI/CD, monitoring, incident response. Uses Sonnet.
 - `commander.md` -- Pat. System administrator and orchestrator. The only agent that operates at the platform level. Connected to Discord via the channel plugin. Uses Opus.
