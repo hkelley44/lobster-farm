@@ -37,6 +37,27 @@ When a new or updated PR is found that isn't already being processed, the daemon
 
 ## Steps
 
+### 0. Pre-flight check before spawning a reviewer
+
+**Run this before every reviewer spawn.** The daemon's autonomous review-merge cron and Hunter's manual "review PR <n>" requests both terminate at the same point — spawning a reviewer subagent. Without a pre-flight, two parallel passes can land on the same PR (observed 2026-05-09, PR #41), wasting a cycle and producing conflicting findings comments.
+
+Required actions for Tidus (or whichever orchestrator is about to spawn the reviewer):
+
+1. **Query the PR's current review state:**
+   ```bash
+   gh pr view <num> --json reviews,latestReviews,state,statusCheckRollup
+   ```
+2. **Inspect `latestReviews` (and, in single-dev mode, recent findings comments) for a reviewer pass within the last 10 minutes.** In single-dev mode the Reviewer posts findings comments rather than formal `PullRequestReview` entries, so also check:
+   ```bash
+   gh pr view <num> --json comments --jq \
+     '[.comments[] | select(.body | startswith("**Verdict:")) | {created: .createdAt, verdict: (.body | split("\n")[0])}] | sort_by(.created) | last'
+   ```
+3. **If a recent pass exists (within ~10 min):** do **not** spawn a new reviewer. Surface the existing result back to Hunter on Discord with the verdict, timestamp, and a summary of findings, then ask whether to act on those findings or trigger a fresh pass anyway. Hunter's explicit "fresh pass" instruction is the only thing that overrides this guard.
+4. **If no recent pass exists:** proceed to step 1 (spawn the reviewer).
+5. **If you're unsure whether the daemon cron has fired** (e.g., logs are stale, daemon was restarted mid-window, race window suspected): there is no daemon-side review-state query today. A `GET /pr/:num/review-state` endpoint would let the orchestrator confirm authoritatively, but it does **not** exist — flagged as a Layer 2 prerequisite. Absent that endpoint, the `gh pr view` query above is sufficient because GitHub is the source of truth for posted reviews and comments.
+
+This is a Layer 1 guardrail. It does **not** eliminate the race window (two orchestrators could both pass pre-flight in the gap between query and spawn), but it closes the common case: a manual trigger arriving a few minutes after a cron pass has already completed and posted its findings. If a collision is observed in the wild post-this-merge, file a new issue and scope Layer 2 (daemon mutex + the `/pr/:num/review-state` endpoint).
+
 ### 1. Review
 
 Spawn a reviewer agent scoped to the PR.
@@ -235,3 +256,29 @@ Cycle counting and branch detection are agent-side responsibilities for v1. A fu
 - Don't hold a PR open waiting for a response longer than 24h without re-pinging
 - Don't loop past 3 cycles — escalate to Hunter instead, the loop has exhausted its budget
 - Don't auto-promote staging → main — Hunter's ✅ is the only valid signal, no timeout fallback
+- Don't spawn a reviewer without running the step-0 pre-flight check — a duplicate pass on a fresh review wastes a cycle and produces conflicting findings
+
+## Worked example — pre-flight catches a duplicate
+
+Hunter posts in Discord: "review PR 41".
+
+Tidus, before spawning a reviewer, runs:
+
+```bash
+gh pr view 41 --json reviews,latestReviews,state,statusCheckRollup
+gh pr view 41 --json comments --jq \
+  '[.comments[] | select(.body | startswith("**Verdict:")) | {created: .createdAt, verdict: (.body | split("\n")[0])}] | sort_by(.created) | last'
+```
+
+The query shows the daemon cron already fired four minutes ago and the Reviewer posted a findings comment at `21:20Z` with `**Verdict: Approved**` plus three non-blocking nits.
+
+Tidus does **not** spawn a new reviewer. Instead, Tidus replies on Discord:
+
+> Reviewer already passed at 21:20Z (4 min ago) — verdict **Approved** with 3 non-blocking findings:
+> 1. <nit 1>
+> 2. <nit 2>
+> 3. <nit 3>
+>
+> Want me to act on these (open a follow-up issue / patch in-PR) or trigger a fresh pass anyway?
+
+Tidus then waits for Hunter's direction. Only an explicit "fresh pass" overrides the guard and authorizes a new reviewer spawn.
