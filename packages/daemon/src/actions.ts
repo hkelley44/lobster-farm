@@ -29,6 +29,7 @@ import { entity_config_path, expand_home, write_yaml } from "@lobster-farm/share
 import { is_discord_snowflake } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
 import type { BotPool } from "./pool.js";
+import { detect_verdict_from_comments, get_authenticated_login } from "./review-utils.js";
 import * as sentry from "./sentry.js";
 
 const exec = promisify(execFile);
@@ -351,24 +352,78 @@ export async function release_work_room(
 // ── Review outcome detection ──
 
 export type ReviewOutcome = "approved" | "changes_requested" | "dismissed" | "pending";
+export type ReviewOutcomeSource = "review" | "comment";
+
+export interface ReviewOutcomeResult {
+  outcome: ReviewOutcome;
+  /** Where the outcome came from. Useful for diagnostics + persisted on `ProcessedPR`. */
+  source: ReviewOutcomeSource;
+}
+
+/**
+ * Options for `detect_review_outcome` (#46).
+ *
+ * - `gh_token`: GitHub token for cross-account authentication. Without this,
+ *   `gh` inherits the daemon's default auth.
+ * - `is_self_authored`: when true and `reviewDecision` is empty, fall back to
+ *   parsing findings-comment verdicts. Single-dev repos block
+ *   `gh pr review --approve` on self-authored PRs, so Reviewer posts comments
+ *   with `**Verdict: Approved**` / `**Verdict: Changes Requested**` instead.
+ *   The caller decides what counts as self-authored (typically
+ *   `pr.author.login === entity.accounts.github.user`).
+ */
+export interface DetectReviewOutcomeOptions {
+  gh_token?: string;
+  is_self_authored?: boolean;
+}
 
 /**
  * Detect the review outcome for a PR by querying GitHub.
+ *
  * Returns "approved", "changes_requested", "dismissed", or "pending".
  * An already-merged PR is treated as "approved".
  * A "dismissed" outcome means all reviews were dismissed (e.g., duplicate
  * cleanup) — the caller should trigger a fresh review.
  *
- * @param gh_token - Optional GitHub token for cross-account authentication.
- *   Without this, `gh` inherits the daemon's default auth, which can't see
- *   private repos on other GitHub accounts.
+ * Resolution order (#46):
+ *   1. PR state == MERGED → approved (source: "review")
+ *   2. `reviewDecision` is APPROVED / CHANGES_REQUESTED / DISMISSED → use it
+ *      (source: "review")
+ *   3. `reviewDecision` is empty AND `is_self_authored` is true → poll
+ *      `gh pr view --json comments` for findings-comment verdicts authored by
+ *      the daemon's `gh api user` login (source: "comment")
+ *   4. Otherwise → pending (source: "review")
+ *
+ * The comment-fallback path is intentionally gated on `is_self_authored`: in
+ * multi-dev repos formal reviews work, so we don't open a side channel that
+ * could shadow the official decision.
  */
 export async function detect_review_outcome(
   pr_number: number,
   repo_path: string,
-  gh_token?: string,
+  gh_token_or_opts?: string | DetectReviewOutcomeOptions,
 ): Promise<ReviewOutcome> {
-  const env = gh_token ? { GH_TOKEN: gh_token } : undefined;
+  const result = await detect_review_outcome_with_source(pr_number, repo_path, gh_token_or_opts);
+  return result.outcome;
+}
+
+/**
+ * Variant that also returns where the outcome came from (`"review"` vs
+ * `"comment"`). Persisted on `ProcessedPR.verdict_source` so a future debugging
+ * session can see at a glance whether the daemon read a formal review or a
+ * findings-comment fallback.
+ */
+export async function detect_review_outcome_with_source(
+  pr_number: number,
+  repo_path: string,
+  gh_token_or_opts?: string | DetectReviewOutcomeOptions,
+): Promise<ReviewOutcomeResult> {
+  const opts: DetectReviewOutcomeOptions =
+    typeof gh_token_or_opts === "string" || gh_token_or_opts === undefined
+      ? { gh_token: gh_token_or_opts }
+      : gh_token_or_opts;
+
+  const env = opts.gh_token ? { GH_TOKEN: opts.gh_token } : undefined;
 
   try {
     // Check if PR is already merged
@@ -380,7 +435,7 @@ export async function detect_review_outcome(
     );
 
     if (state === "MERGED") {
-      return "approved";
+      return { outcome: "approved", source: "review" };
     }
 
     // Check review decision
@@ -393,14 +448,38 @@ export async function detect_review_outcome(
 
     switch (decision.toUpperCase()) {
       case "APPROVED":
-        return "approved";
+        return { outcome: "approved", source: "review" };
       case "CHANGES_REQUESTED":
-        return "changes_requested";
+        return { outcome: "changes_requested", source: "review" };
       case "DISMISSED":
-        return "dismissed";
-      default:
-        return "pending";
+        return { outcome: "dismissed", source: "review" };
     }
+
+    // reviewDecision is empty. In single-dev / self-authored mode, Reviewer
+    // can't post a formal review via `gh pr review --approve` — GitHub blocks
+    // self-review. Fall back to the findings-comment verdict format (#46).
+    if (opts.is_self_authored) {
+      // Resolve the daemon's effective GitHub login. We MUST be able to
+      // identify the author before trusting any comment-based verdict;
+      // otherwise a stray human comment could be misread as a Reviewer call.
+      const login = await get_authenticated_login(repo_path, env);
+      if (login) {
+        // Pass the merged env (process.env + GH_TOKEN) so the gh CLI invocation
+        // inside detect_verdict_from_comments sees the override token too.
+        const merged_env = env ? { ...process.env, ...env } : undefined;
+        const detection = await detect_verdict_from_comments(
+          pr_number,
+          repo_path,
+          login,
+          merged_env,
+        );
+        if (detection) {
+          return { outcome: detection.verdict, source: "comment" };
+        }
+      }
+    }
+
+    return { outcome: "pending", source: "review" };
   } catch (err) {
     console.error(
       `[actions] Failed to detect review outcome for PR #${String(pr_number)}: ${String(err)}`,
@@ -409,7 +488,7 @@ export async function detect_review_outcome(
       tags: { module: "actions", action: "detect_review_outcome" },
       contexts: { pr: { number: pr_number } },
     });
-    return "pending";
+    return { outcome: "pending", source: "review" };
   }
 }
 

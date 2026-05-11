@@ -667,6 +667,200 @@ describe("detect_review_outcome", () => {
   });
 });
 
+// ── Findings-comment verdict fallback (#46) ──
+
+/**
+ * Build an exec mock that mimics the responses `detect_review_outcome` and
+ * `detect_verdict_from_comments` make through the gh CLI:
+ *   - `gh pr view <n> --json state`           → `state`
+ *   - `gh pr view <n> --json reviewDecision`  → `review_decision`
+ *   - `gh api user`                           → `login`
+ *   - `gh pr view <n> --json comments`        → `comments` (JSON-encoded)
+ */
+function set_review_outcome_responses(opts: {
+  state?: string;
+  review_decision?: string;
+  login?: string;
+  comments?: Array<{
+    body: string;
+    createdAt: string;
+    author: { login: string } | null;
+  }>;
+}) {
+  exec_mock_impl = async (_cmd, args) => {
+    if (args[0] === "api" && args[1] === "user") {
+      return { stdout: opts.login ?? "", stderr: "" };
+    }
+    if (args.includes("state")) {
+      return { stdout: opts.state ?? "OPEN", stderr: "" };
+    }
+    if (args.includes("reviewDecision")) {
+      return { stdout: opts.review_decision ?? "", stderr: "" };
+    }
+    if (args.includes("--json") && args.includes("comments")) {
+      return { stdout: JSON.stringify(opts.comments ?? []), stderr: "" };
+    }
+    return { stdout: "", stderr: "" };
+  };
+}
+
+describe("detect_review_outcome — findings-comment fallback (#46)", () => {
+  const REVIEWER = "reviewer-bot";
+
+  it("prefers reviewDecision when present, even if is_self_authored=true", async () => {
+    // Regression guard: if reviewDecision is APPROVED, we must NOT consult
+    // comments — formal reviews always win.
+    set_review_outcome_responses({
+      review_decision: "APPROVED",
+      login: REVIEWER,
+      comments: [
+        // A stale "Changes Requested" comment that would flip the verdict if read.
+        {
+          body: "**Verdict: Changes Requested**\n\nstale",
+          createdAt: "2026-05-09T10:00:00Z",
+          author: { login: REVIEWER },
+        },
+      ],
+    });
+
+    const result = await detect_review_outcome(42, "/repos/test-repo", {
+      is_self_authored: true,
+    });
+
+    expect(result).toBe("approved");
+
+    // And we should never have asked for comments.
+    const comments_call = exec_calls.find(
+      (c) => c.command === "gh" && c.args.includes("--json") && c.args.includes("comments"),
+    );
+    expect(comments_call).toBeUndefined();
+  });
+
+  it("falls back to the comment verdict when reviewDecision is empty and PR is self-authored", async () => {
+    set_review_outcome_responses({
+      review_decision: "",
+      login: REVIEWER,
+      comments: [
+        {
+          body: "**Verdict: Changes Requested**\n\nFix the foo.",
+          createdAt: "2026-05-09T10:00:00Z",
+          author: { login: REVIEWER },
+        },
+      ],
+    });
+
+    const result = await detect_review_outcome(42, "/repos/test-repo", {
+      is_self_authored: true,
+    });
+
+    expect(result).toBe("changes_requested");
+  });
+
+  it("uses the most recent matching comment when multiple exist", async () => {
+    set_review_outcome_responses({
+      review_decision: "",
+      login: REVIEWER,
+      comments: [
+        {
+          body: "**Verdict: Changes Requested**\n\nfirst pass",
+          createdAt: "2026-05-09T10:00:00Z",
+          author: { login: REVIEWER },
+        },
+        {
+          body: "**Verdict: Approved**\n\nafter the fix",
+          createdAt: "2026-05-09T12:00:00Z",
+          author: { login: REVIEWER },
+        },
+      ],
+    });
+
+    const result = await detect_review_outcome(42, "/repos/test-repo", {
+      is_self_authored: true,
+    });
+
+    expect(result).toBe("approved");
+  });
+
+  it("does NOT fall back when is_self_authored is false (multi-dev path)", async () => {
+    set_review_outcome_responses({
+      review_decision: "",
+      login: REVIEWER,
+      comments: [
+        {
+          body: "**Verdict: Approved**\n\nshould be ignored",
+          createdAt: "2026-05-09T10:00:00Z",
+          author: { login: REVIEWER },
+        },
+      ],
+    });
+
+    const result = await detect_review_outcome(42, "/repos/test-repo", {
+      is_self_authored: false,
+    });
+
+    expect(result).toBe("pending");
+
+    // Make sure we never even asked for comments — the multi-dev path must
+    // stay on formal reviews only.
+    const comments_call = exec_calls.find(
+      (c) => c.command === "gh" && c.args.includes("--json") && c.args.includes("comments"),
+    );
+    expect(comments_call).toBeUndefined();
+  });
+
+  it("stays pending when reviewDecision is empty, self-authored, but `gh api user` fails", async () => {
+    // Without an authenticated login we cannot safely filter comments, so the
+    // helper must refuse to guess and leave the outcome pending.
+    exec_mock_impl = async (_cmd, args) => {
+      if (args[0] === "api" && args[1] === "user") {
+        throw new Error("gh: not authenticated");
+      }
+      if (args.includes("state")) return { stdout: "OPEN", stderr: "" };
+      if (args.includes("reviewDecision")) return { stdout: "", stderr: "" };
+      // If we somehow asked for comments anyway, return a verdict to make the
+      // failure mode obvious.
+      if (args.includes("--json") && args.includes("comments")) {
+        return {
+          stdout: JSON.stringify([
+            {
+              body: "**Verdict: Approved**",
+              createdAt: "2026-05-09T10:00:00Z",
+              author: { login: "reviewer-bot" },
+            },
+          ]),
+          stderr: "",
+        };
+      }
+      return { stdout: "", stderr: "" };
+    };
+
+    const result = await detect_review_outcome(42, "/repos/test-repo", {
+      is_self_authored: true,
+    });
+
+    expect(result).toBe("pending");
+  });
+
+  it("accepts the legacy positional gh_token signature (backwards-compat)", async () => {
+    // The old call signature was `detect_review_outcome(pr, repo, gh_token?)`.
+    // We keep that working so existing call sites that haven't migrated still
+    // compile and run correctly.
+    set_review_outcome_responses({ review_decision: "APPROVED" });
+    const result = await detect_review_outcome(42, "/repos/test-repo", "ghs_legacy_token");
+    expect(result).toBe("approved");
+
+    // And the token still gets injected into the gh env.
+    const gh_calls = exec_calls.filter((c) => c.command === "gh");
+    expect(gh_calls.length).toBeGreaterThan(0);
+    for (const call of gh_calls) {
+      const env = (call.options as Record<string, unknown>)?.env as
+        | Record<string, string>
+        | undefined;
+      expect(env?.GH_TOKEN).toBe("ghs_legacy_token");
+    }
+  });
+});
+
 describe("classify_merge_error", () => {
   it("returns 'conflict' for merge conflict errors", () => {
     expect(classify_merge_error("MERGE CONFLICT in file.ts")).toBe("conflict");

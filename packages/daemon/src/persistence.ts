@@ -44,6 +44,14 @@ export interface ProcessedPR {
    * Incremented each time a builder is spawned to fix CI failures.
    * Reset when new commits arrive from a non-builder source. (#196) */
   ci_fix_attempts?: number;
+  /** Diagnostic-only: where the last review outcome came from (#46).
+   * "review" = formal `PullRequestReview` via `reviewDecision`.
+   * "comment" = findings-comment fallback in single-dev repos. */
+  verdict_source?: "review" | "comment";
+  /** Cycle index at which we escalated to #alerts for hitting the review
+   * cycle cap (#46). Set so subsequent cron ticks don't re-alert for the
+   * same cap-hit state. */
+  escalated_at_cycle?: number;
 
   // ── v2 PR lifecycle (#257) ──
   /** Last head SHA the v2 check-suite-handler dispatched on.

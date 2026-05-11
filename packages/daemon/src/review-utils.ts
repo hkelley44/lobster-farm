@@ -63,6 +63,201 @@ export async function fetch_review_comments(pr_number: number, repo_path: string
   }
 }
 
+// ── Findings-comment verdict detection (#46) ──
+
+/**
+ * The verdict a reviewer can express in a findings-comment fallback.
+ *
+ * In single-dev repos GitHub blocks `gh pr review --approve` on self-authored
+ * PRs, so Reviewer falls back to posting a regular comment whose first line
+ * is `**Verdict: Approved**` or `**Verdict: Changes Requested**`. The daemon
+ * polls those comments here when GraphQL's `reviewDecision` field is empty.
+ */
+export type CommentVerdict = "approved" | "changes_requested";
+
+interface GHCommentForVerdict {
+  body: string;
+  createdAt: string;
+  author: { login: string } | null;
+}
+
+/** Verdict match shape from `detect_verdict_from_comments`. */
+export interface VerdictDetection {
+  verdict: CommentVerdict;
+  /** ISO timestamp of the comment carrying the verdict. */
+  created_at: string;
+}
+
+/** Format mandated by `pr-review-merge/SKILL.md` — must be the literal first line. */
+const APPROVED_PREFIX = "**Verdict: Approved**";
+const CHANGES_REQUESTED_PREFIX = "**Verdict: Changes Requested**";
+
+/** Extract the verdict from a single comment body, if it matches the mandated format. */
+function verdict_of(body: string): CommentVerdict | null {
+  // Must be the literal first line. Case-sensitive — matches the SKILL spec.
+  // Use indexOf instead of split to avoid allocating the whole array.
+  const first_newline = body.indexOf("\n");
+  const first_line = first_newline === -1 ? body : body.slice(0, first_newline);
+  if (first_line === APPROVED_PREFIX) return "approved";
+  if (first_line === CHANGES_REQUESTED_PREFIX) return "changes_requested";
+  return null;
+}
+
+/**
+ * Resolve the GitHub login that the daemon (and therefore Reviewer in single-dev
+ * mode) authenticates as. Returned login is used to filter comment authors.
+ *
+ * Returns null when `gh api user` fails — the caller should treat that as
+ * "cannot determine fallback verdict" and stay pending rather than risk a
+ * false positive by accepting any author's verdict comment.
+ */
+export async function get_authenticated_login(
+  repo_path: string,
+  env?: NodeJS.ProcessEnv,
+  gh_bin = "gh",
+): Promise<string | null> {
+  try {
+    const { stdout } = await exec_async(gh_bin, ["api", "user", "--jq", ".login"], {
+      cwd: repo_path,
+      env,
+      timeout: 15_000,
+    });
+    const login = stdout.trim();
+    return login || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Detect the most recent verdict expressed via findings-comment fallback (#46).
+ *
+ * Used in single-dev repos where `gh pr review --approve` is blocked on
+ * self-authored PRs and Reviewer instead posts a comment whose first line is
+ * `**Verdict: Approved**` or `**Verdict: Changes Requested**`.
+ *
+ * Behavior:
+ * - Calls `gh pr view <n> --json comments`
+ * - Filters comments authored by `authenticated_login` (the daemon's
+ *   effective GitHub user — same login Reviewer posts as in single-dev mode)
+ * - Returns the verdict from the **most recent** matching comment whose body
+ *   starts with the mandated literal prefix
+ * - Returns `null` if no qualifying comment exists, or on any gh CLI failure
+ *
+ * Match is case-sensitive and requires the prefix to be the literal first
+ * line — matches the format `pr-review-merge/SKILL.md` mandates.
+ */
+export async function detect_verdict_from_comments(
+  pr_number: number,
+  repo_path: string,
+  authenticated_login: string,
+  env?: NodeJS.ProcessEnv,
+  gh_bin = "gh",
+): Promise<VerdictDetection | null> {
+  let comments: GHCommentForVerdict[];
+  try {
+    const { stdout } = await exec_async(
+      gh_bin,
+      ["pr", "view", String(pr_number), "--json", "comments", "--jq", ".comments"],
+      { cwd: repo_path, env, timeout: 15_000 },
+    );
+    const parsed: unknown = JSON.parse(stdout || "[]");
+    comments = Array.isArray(parsed) ? (parsed as GHCommentForVerdict[]) : [];
+  } catch {
+    return null;
+  }
+
+  let best: VerdictDetection | null = null;
+  let best_ts = -1;
+
+  for (const comment of comments) {
+    if (!comment || typeof comment.body !== "string") continue;
+    if (comment.author?.login !== authenticated_login) continue;
+    const verdict = verdict_of(comment.body);
+    if (!verdict) continue;
+    const ts = new Date(comment.createdAt).getTime();
+    if (Number.isNaN(ts)) continue;
+    if (ts > best_ts) {
+      best_ts = ts;
+      best = { verdict, created_at: comment.createdAt };
+    }
+  }
+
+  return best;
+}
+
+/**
+ * Count comments authored by `authenticated_login` whose body starts with a
+ * verdict prefix. Used to enforce the per-PR review-cycle cap in single-dev
+ * repos (#46). Multi-dev mode counts formal reviews instead — see pr-cron.ts.
+ *
+ * Returns 0 on any gh CLI failure (we'd rather under-count and spawn an extra
+ * Builder than over-count and silently stall the loop).
+ */
+export async function count_verdict_comments(
+  pr_number: number,
+  repo_path: string,
+  authenticated_login: string,
+  env?: NodeJS.ProcessEnv,
+  gh_bin = "gh",
+): Promise<number> {
+  let comments: GHCommentForVerdict[];
+  try {
+    const { stdout } = await exec_async(
+      gh_bin,
+      ["pr", "view", String(pr_number), "--json", "comments", "--jq", ".comments"],
+      { cwd: repo_path, env, timeout: 15_000 },
+    );
+    const parsed: unknown = JSON.parse(stdout || "[]");
+    comments = Array.isArray(parsed) ? (parsed as GHCommentForVerdict[]) : [];
+  } catch {
+    return 0;
+  }
+
+  let n = 0;
+  for (const comment of comments) {
+    if (!comment || typeof comment.body !== "string") continue;
+    if (comment.author?.login !== authenticated_login) continue;
+    if (verdict_of(comment.body) !== null) n++;
+  }
+  return n;
+}
+
+/**
+ * Count formal `PullRequestReview` objects authored by the given login.
+ * Used to enforce the per-PR review-cycle cap in multi-dev mode (#46).
+ *
+ * Counts any review state — APPROVED / CHANGES_REQUESTED / COMMENTED /
+ * DISMISSED — because each represents a Reviewer pass through the PR. The
+ * cap is on number of passes, not on the verdict distribution.
+ *
+ * Returns 0 on any gh CLI failure.
+ */
+export async function count_reviews_by_login(
+  pr_number: number,
+  repo_path: string,
+  reviewer_login: string,
+  env?: NodeJS.ProcessEnv,
+  gh_bin = "gh",
+): Promise<number> {
+  try {
+    const { stdout } = await exec_async(
+      gh_bin,
+      ["pr", "view", String(pr_number), "--json", "reviews", "--jq", ".reviews"],
+      { cwd: repo_path, env, timeout: 15_000 },
+    );
+    const parsed: unknown = JSON.parse(stdout || "[]");
+    if (!Array.isArray(parsed)) return 0;
+    let n = 0;
+    for (const review of parsed as Array<{ author?: { login?: string } | null }>) {
+      if (review?.author?.login === reviewer_login) n++;
+    }
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
 /**
  * Check if a PR has merge conflicts by inspecting its mergeable state.
  */

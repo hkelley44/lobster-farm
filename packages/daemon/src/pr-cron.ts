@@ -3,7 +3,12 @@ import { stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { expand_home } from "@lobster-farm/shared";
-import { type ReviewOutcome, detect_review_outcome } from "./actions.js";
+import {
+  type ReviewOutcome,
+  type ReviewOutcomeSource,
+  detect_review_outcome,
+  detect_review_outcome_with_source,
+} from "./actions.js";
 import { ALERT_COLOR_AMBER, type AlertRouter } from "./alert-router.js";
 import type { DiscordBot } from "./discord.js";
 import { resolve_binary } from "./env.js";
@@ -24,8 +29,11 @@ import {
   build_ci_fix_prompt,
   build_review_fix_prompt,
   check_ci_status,
+  count_reviews_by_login,
+  count_verdict_comments,
   fetch_ci_failure_logs,
   fetch_review_comments,
+  get_authenticated_login,
 } from "./review-utils.js";
 import * as sentry from "./sentry.js";
 import type { ClaudeSessionManager } from "./session.js";
@@ -107,6 +115,15 @@ const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 /** Buffer in ms to avoid re-reviewing when commit and review timestamps are very close. */
 const TIMESTAMP_BUFFER_MS = 60_000; // 60 seconds
+
+/**
+ * Hard cap on review→fix cycles per PR before escalating to a human (#46).
+ *
+ * Matches the spec amendment on issue #38 — three swings at the bat. When the
+ * counter reaches this value, the daemon stops spawning Builder and instead
+ * posts an amber alert. Configurability per-repo is v2.
+ */
+export const MAX_REVIEW_CYCLES = 3;
 
 export class PRReviewCron {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -557,7 +574,17 @@ export class PRReviewCron {
     // authenticate against the correct GitHub account (cross-account repos).
     const gh_token = await this.resolve_entity_token(entity_config);
 
-    const outcome = await detect_review_outcome(pr.number, repo_path, gh_token);
+    // In single-dev repos GitHub blocks `gh pr review --approve` on
+    // self-authored PRs, so Reviewer falls back to a `**Verdict:` comment.
+    // We pass `is_self_authored` so detect_review_outcome can poll comments
+    // when reviewDecision is empty. See #46.
+    const github_user = entity_config.entity.accounts?.github?.user;
+    const is_self_authored = github_user != null && pr.author.login === github_user;
+
+    const { outcome, source } = await detect_review_outcome_with_source(pr.number, repo_path, {
+      gh_token,
+      is_self_authored,
+    });
 
     // Don't persist "dismissed" — the dedup check (`pr.updatedAt <= prior.reviewed_at`)
     // would skip the PR on the next cycle, breaking the "will be re-reviewed" promise.
@@ -566,21 +593,25 @@ export class PRReviewCron {
       console.log(
         `[pr-cron] Dismissed outcome for PR #${String(pr.number)} — not persisting, will re-review next cycle`,
       );
-      await this.handle_review_completion(entity_id, repo_path, pr, outcome, gh_token);
+      await this.handle_review_completion(entity_id, repo_path, pr, outcome, gh_token, source);
       return;
     }
 
     this.processed[key] = {
+      ...(this.processed[key] ?? {}),
       entity_id,
       pr_number: pr.number,
       reviewed_at: new Date().toISOString(),
       outcome,
+      verdict_source: source,
     };
     await save_pr_reviews(this.processed, this.config);
-    console.log(`[pr-cron] Persisted review for PR #${String(pr.number)} (${outcome})`);
+    console.log(
+      `[pr-cron] Persisted review for PR #${String(pr.number)} (${outcome}, source=${source})`,
+    );
 
     // Route the outcome (alerts, fix spawning, etc.)
-    await this.handle_review_completion(entity_id, repo_path, pr, outcome, gh_token);
+    await this.handle_review_completion(entity_id, repo_path, pr, outcome, gh_token, source);
   }
 
   /** After a reviewer session completes, detect the outcome and route accordingly. */
@@ -590,23 +621,73 @@ export class PRReviewCron {
     pr: OpenPR,
     review_outcome?: ReviewOutcome,
     gh_token?: string,
+    verdict_source?: ReviewOutcomeSource,
   ): Promise<void> {
-    const review_state =
-      review_outcome ?? (await detect_review_outcome(pr.number, repo_path, gh_token));
-
     // Determine if internal (our agents) or truly external
     const entity_config = this.registry.get(entity_id);
     const github_user = entity_config?.entity.accounts?.github?.user;
     const is_internal = github_user != null && pr.author.login === github_user;
 
+    let review_state: ReviewOutcome;
+    if (review_outcome) {
+      review_state = review_outcome;
+    } else {
+      review_state = await detect_review_outcome(pr.number, repo_path, {
+        gh_token,
+        is_self_authored: is_internal,
+      });
+    }
+
     if (review_state === "changes_requested") {
+      // Enforce the per-PR review-cycle cap (#46). Single-dev repos count
+      // findings-comment verdicts; multi-dev repos count formal reviews by
+      // the daemon's login. The latter mirrors today's mental model and is
+      // a strict subset of "all reviews" — we only count Reviewer's passes.
+      const cycles = await this.count_review_cycles(pr.number, repo_path, is_internal, gh_token);
+      const key = `${entity_id}:${String(pr.number)}`;
+      const already_escalated = this.processed[key]?.escalated_at_cycle != null;
+
+      if (cycles >= MAX_REVIEW_CYCLES) {
+        // Don't spawn a Builder — escalate. Persist `escalated_at_cycle` so
+        // the next cron tick sees we already alerted and stays quiet.
+        if (!already_escalated) {
+          await this.alert_router?.post_alert({
+            entity_id,
+            tier: "action_required",
+            title: `\u26a0\ufe0f PR #${String(pr.number)} hit max review cycles (${String(MAX_REVIEW_CYCLES)})`,
+            body: `${pr.title}\nVerdict: Changes Requested (cycle ${String(cycles)}/${String(MAX_REVIEW_CYCLES)})\n${pr.url}\nNeeds human pickup — paging Hunter.`,
+            embed_color: ALERT_COLOR_AMBER,
+          });
+          this.processed[key] = {
+            ...(this.processed[key] ?? {
+              entity_id,
+              pr_number: pr.number,
+              reviewed_at: new Date().toISOString(),
+              outcome: "changes_requested" as const,
+            }),
+            outcome: "changes_requested",
+            ...(verdict_source ? { verdict_source } : {}),
+            escalated_at_cycle: cycles,
+          };
+          await save_pr_reviews(this.processed, this.config);
+          console.log(
+            `[pr-cron] PR #${String(pr.number)} hit cycle cap (${String(cycles)}/${String(MAX_REVIEW_CYCLES)}) — escalated, not spawning builder`,
+          );
+        } else {
+          console.log(
+            `[pr-cron] PR #${String(pr.number)} already escalated at cycle ${String(this.processed[key]?.escalated_at_cycle)} — staying quiet`,
+          );
+        }
+        return;
+      }
+
       await this.spawn_external_pr_fixer(entity_id, repo_path, pr, entity_config);
       const prefix = is_internal ? "" : `External (from @${pr.author.login}) `;
       await this.alert_router?.post_alert({
         entity_id,
         tier: "routine",
         title: `${prefix}PR #${String(pr.number)} changes requested`,
-        body: `${pr.title} — spawning builder to fix`,
+        body: `${pr.title} — spawning builder to fix (cycle ${String(cycles)}/${String(MAX_REVIEW_CYCLES)})`,
       });
     } else if (review_state === "approved") {
       // Check if the reviewer already merged (they're instructed to merge on approval)
@@ -749,8 +830,13 @@ export class PRReviewCron {
         // PR-cron path: we already know the outcome from the previous review
         is_approved = true;
       } else if (!processed_entry) {
-        // Webhook handler path: no processed entry, check GitHub directly
-        const outcome = await detect_review_outcome(pr.number, repo_path, gh_token);
+        // Webhook handler path: no processed entry, check GitHub directly.
+        // Mirror persist_review_completion's is_self_authored signal so the
+        // findings-comment fallback (#46) fires when applicable.
+        const outcome = await detect_review_outcome(pr.number, repo_path, {
+          gh_token,
+          is_self_authored: is_internal,
+        });
         if (outcome === "approved") {
           is_approved = true;
         }
@@ -1053,6 +1139,37 @@ export class PRReviewCron {
   }
 
   // notify_alerts removed — all call sites migrated to this.alert_router.post_alert()
+
+  /**
+   * Count review cycles for cycle-cap enforcement (#46).
+   *
+   * - Single-dev / self-authored: count findings-comment verdicts authored by
+   *   the daemon's `gh api user` login (the same login Reviewer posts as).
+   * - Multi-dev / external: count formal `PullRequestReview` objects by that
+   *   same login.
+   *
+   * Returns 0 when the authenticated login cannot be resolved — under-counting
+   * is safer than over-counting: an extra Builder spawn is cheap, a missed cap
+   * means an infinite loop.
+   *
+   * Visibility is `protected` so test subclasses can override and inject
+   * deterministic counts without stubbing the gh CLI.
+   */
+  protected async count_review_cycles(
+    pr_number: number,
+    repo_path: string,
+    is_self_authored: boolean,
+    gh_token?: string,
+  ): Promise<number> {
+    const env = gh_token ? { ...process.env, GH_TOKEN: gh_token } : process.env;
+    const login = await get_authenticated_login(repo_path, env, this.gh_bin);
+    if (!login) return 0;
+
+    if (is_self_authored) {
+      return count_verdict_comments(pr_number, repo_path, login, env, this.gh_bin);
+    }
+    return count_reviews_by_login(pr_number, repo_path, login, env, this.gh_bin);
+  }
 
   /** Check if a PR has been merged. */
   private async check_pr_merged(
