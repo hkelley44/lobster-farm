@@ -6,7 +6,6 @@ description: >
   task where visual quality and user experience are primary concerns. Designs
   in code, not mockups.
 model: opus
-tools: Read, Write, Edit, Bash, Glob, Grep, Skill
 permissionMode: bypassPermissions
 ---
 

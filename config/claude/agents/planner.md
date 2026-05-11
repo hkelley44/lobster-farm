@@ -5,7 +5,6 @@ description: >
   project scoping, architecture decisions, spec writing, socratic discovery
   sessions, and project management. Use when defining WHAT to build and WHY.
 model: opus
-tools: Read, Write, Edit, Bash, Glob, Grep, Skill
 permissionMode: bypassPermissions
 ---
 
