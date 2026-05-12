@@ -1,8 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
+import {
+  DIST_SHA_STAMP_REL,
+  type DistFsIo,
+  type StalenessResult,
+  check_dist_staleness,
+  default_dist_fs_io,
+} from "../lib/dist-staleness.js";
 
 /**
  * Resolve the monorepo root directory.
@@ -48,9 +55,101 @@ function git(repo_dir: string, args: string[]): string {
   }).trim();
 }
 
+/** Reason a rebuild was decided to be necessary. */
+export type RebuildReason =
+  | { kind: "force" }
+  | { kind: "pulled" }
+  | { kind: "stale"; detail: string }
+  | { kind: "fresh" };
+
+/**
+ * Decide whether to rebuild based on three independent signals.
+ *
+ * Pulled commits trump everything; --force is the next escape hatch;
+ * staleness is the silent path that fixes the original bug. Order matters
+ * only for the log message — the rebuild action is the same.
+ */
+export function decide_rebuild(opts: {
+  pulled: boolean;
+  force: boolean;
+  staleness: StalenessResult;
+}): RebuildReason {
+  if (opts.pulled) return { kind: "pulled" };
+  if (opts.force) return { kind: "force" };
+  if (opts.staleness.stale) return { kind: "stale", detail: opts.staleness.reason };
+  return { kind: "fresh" };
+}
+
+/** Human-readable log line describing why we're rebuilding (or not). */
+export function describe_rebuild_decision(reason: RebuildReason): string {
+  switch (reason.kind) {
+    case "force":
+      return "Rebuilding (forced via --force)...";
+    case "pulled":
+      return "Rebuilding (pulled new commits)...";
+    case "stale":
+      return `Rebuilding (dist stale: ${reason.detail})...`;
+    case "fresh":
+      return "Already up to date.";
+  }
+}
+
+/**
+ * Wrap `check_dist_staleness` in an "assume stale" error boundary.
+ *
+ * `check_dist_staleness` performs two `fs_io.exists` + read/stat pairs,
+ * each of which is vulnerable to a TOCTOU race: the file is reported as
+ * present, then deleted (by another `lf update` process, a manual
+ * `rm -rf dist/`, etc.) before the follow-up read/stat. When that
+ * happens, `readFileSync` / `statSync` throws `ENOENT` and the user
+ * would otherwise see a raw Node.js stack trace.
+ *
+ * The safe semantic on any IO error is to assume stale and rebuild —
+ * never abort the update. Exported (and accepting an injectable
+ * `fs_io` + `warn` seam) so it can be unit-tested without real disk IO.
+ */
+export function safe_check_dist_staleness(
+  repo_dir: string,
+  head_sha: string,
+  head_commit_time_s: number,
+  fs_io: DistFsIo = default_dist_fs_io,
+  warn: (msg: string) => void = console.warn,
+): StalenessResult {
+  try {
+    return check_dist_staleness(repo_dir, head_sha, head_commit_time_s, fs_io);
+  } catch (err) {
+    warn(
+      `Could not determine dist staleness (${err instanceof Error ? err.message : String(err)}); rebuilding to be safe.`,
+    );
+    return { stale: true, reason: "staleness check failed; rebuilding to be safe" };
+  }
+}
+
+/** Read HEAD's commit time as unix epoch seconds. */
+function get_head_commit_time(repo_dir: string): number {
+  const raw = git(repo_dir, ["log", "-1", "--format=%ct", "HEAD"]);
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Could not parse HEAD commit time from git output: ${raw}`);
+  }
+  return parsed;
+}
+
+/** Stamp the SHA we just built so future runs can compare against HEAD. */
+function stamp_dist_sha(repo_dir: string, sha: string): void {
+  writeFileSync(join(repo_dir, DIST_SHA_STAMP_REL), `${sha}\n`, "utf-8");
+}
+
 export const update_command = new Command("update")
   .description("Pull latest code and rebuild")
-  .action(() => {
+  .option(
+    "--force",
+    "Force rebuild even when source and compiled output appear in sync " +
+      "(useful after a manual git operation that left dist/ out of sync)",
+  )
+  .action((options: { force?: boolean }) => {
+    const force = options.force === true;
+
     let repo_dir: string;
     try {
       repo_dir = resolve_repo_root();
@@ -72,30 +171,53 @@ export const update_command = new Command("update")
       process.exit(1);
     }
 
-    // Check if the local main branch is behind origin/main
+    // Pull if behind. We must check before deciding rebuild, because the
+    // pull itself advances HEAD and changes the staleness computation.
     const status = git(repo_dir, ["status", "-uno"]);
-    if (status.includes("Your branch is up to date")) {
-      console.log("Already up to date.");
-      return;
+    const up_to_date = status.includes("Your branch is up to date");
+    let pulled = false;
+
+    if (!up_to_date) {
+      console.log("Pulling latest from origin/main...");
+      try {
+        execFileSync("git", ["pull", "origin", "main"], {
+          cwd: repo_dir,
+          stdio: "inherit",
+        });
+        pulled = true;
+      } catch {
+        console.error(
+          "Pull failed. You may have local changes that conflict.\n" +
+            "Resolve conflicts manually, then re-run: lf update",
+        );
+        process.exit(1);
+      }
     }
 
-    // Pull from origin/main
-    console.log("Pulling latest from origin/main...");
+    // Now compute staleness against the (possibly newly-pulled) HEAD.
+    let head_sha: string;
+    let head_time_s: number;
     try {
-      execFileSync("git", ["pull", "origin", "main"], {
-        cwd: repo_dir,
-        stdio: "inherit",
-      });
-    } catch {
+      head_sha = git(repo_dir, ["rev-parse", "HEAD"]);
+      head_time_s = get_head_commit_time(repo_dir);
+    } catch (err) {
       console.error(
-        "Pull failed. You may have local changes that conflict.\n" +
-          "Resolve conflicts manually, then re-run: lf update",
+        `Failed to read HEAD state: ${err instanceof Error ? err.message : String(err)}`,
       );
       process.exit(1);
     }
 
+    const staleness = safe_check_dist_staleness(repo_dir, head_sha, head_time_s);
+    const reason = decide_rebuild({ pulled, force, staleness });
+
+    if (reason.kind === "fresh") {
+      console.log(describe_rebuild_decision(reason));
+      return;
+    }
+
+    console.log(describe_rebuild_decision(reason));
+
     // Rebuild
-    console.log("Rebuilding...");
     try {
       execFileSync("pnpm", ["install"], {
         cwd: repo_dir,
@@ -112,8 +234,21 @@ export const update_command = new Command("update")
       process.exit(1);
     }
 
+    // Stamp the SHA so the next run can detect a clean state precisely
+    // (instead of falling back to mtime). Best-effort — a stamp failure
+    // doesn't fail the update; it just means the next run will use mtime.
+    try {
+      stamp_dist_sha(repo_dir, head_sha);
+    } catch (err) {
+      console.warn(
+        `Built successfully, but failed to write dist SHA stamp: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+
     // Report success with the new commit hash
-    const hash = git(repo_dir, ["rev-parse", "--short", "HEAD"]);
-    console.log(`\nLobsterFarm updated to commit ${hash}`);
+    const short = head_sha.slice(0, 7);
+    console.log(`\nLobsterFarm updated to commit ${short}`);
     console.log("Restart the daemon to apply: lf restart");
   });
