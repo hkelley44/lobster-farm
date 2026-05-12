@@ -4,9 +4,18 @@
  * (`decide_rebuild`, `describe_rebuild_decision`) directly.
  */
 
-import { describe, expect, it } from "vitest";
-import { decide_rebuild, describe_rebuild_decision } from "../commands/update.js";
-import type { StalenessResult } from "../lib/dist-staleness.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  decide_rebuild,
+  describe_rebuild_decision,
+  safe_check_dist_staleness,
+} from "../commands/update.js";
+import {
+  DIST_INDEX_REL,
+  DIST_SHA_STAMP_REL,
+  type DistFsIo,
+  type StalenessResult,
+} from "../lib/dist-staleness.js";
 
 const FRESH: StalenessResult = { stale: false, reason: "dist matches HEAD (abcd1234)" };
 const STALE: StalenessResult = {
@@ -65,5 +74,104 @@ describe("describe_rebuild_decision", () => {
 
   it("fresh message reads as the legacy 'Already up to date' line", () => {
     expect(describe_rebuild_decision({ kind: "fresh" })).toBe("Already up to date.");
+  });
+});
+
+describe("safe_check_dist_staleness", () => {
+  const REPO = "/repo";
+  const HEAD_SHA = "abcd1234abcd1234abcd1234abcd1234abcd1234";
+  const HEAD_TIME = 1_700_000_000;
+
+  /** Build a `DistFsIo` from per-method stubs, defaulting unused methods to throw. */
+  function make_fs_io(overrides: Partial<DistFsIo>): DistFsIo {
+    return {
+      exists: overrides.exists ?? (() => false),
+      mtime_seconds:
+        overrides.mtime_seconds ??
+        (() => {
+          throw new Error("mtime_seconds not stubbed");
+        }),
+      read_text:
+        overrides.read_text ??
+        (() => {
+          throw new Error("read_text not stubbed");
+        }),
+    };
+  }
+
+  it("falls back to stale + warns when .build-sha disappears between exists() and read_text() (TOCTOU)", () => {
+    const sha_stamp_path = `${REPO}/${DIST_SHA_STAMP_REL}`;
+    const dist_index_path = `${REPO}/${DIST_INDEX_REL}`;
+    const enoent = Object.assign(
+      new Error("ENOENT: no such file or directory, open '.build-sha'"),
+      {
+        code: "ENOENT",
+      },
+    );
+    const fs_io = make_fs_io({
+      // Both dist/index.js and .build-sha report present...
+      exists: (p) => p === dist_index_path || p === sha_stamp_path,
+      // ...but the follow-up read_text races and throws ENOENT.
+      read_text: () => {
+        throw enoent;
+      },
+    });
+    const warn = vi.fn();
+
+    const result = safe_check_dist_staleness(REPO, HEAD_SHA, HEAD_TIME, fs_io, warn);
+
+    expect(result).toEqual({
+      stale: true,
+      reason: "staleness check failed; rebuilding to be safe",
+    });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain(enoent.message);
+  });
+
+  it("falls back to stale + warns when dist/index.js disappears between exists() and mtime_seconds() (TOCTOU)", () => {
+    const sha_stamp_path = `${REPO}/${DIST_SHA_STAMP_REL}`;
+    const dist_index_path = `${REPO}/${DIST_INDEX_REL}`;
+    const enoent = Object.assign(
+      new Error("ENOENT: no such file or directory, stat 'dist/index.js'"),
+      {
+        code: "ENOENT",
+      },
+    );
+    const fs_io = make_fs_io({
+      // dist/index.js reports present; no SHA stamp → mtime fallback path.
+      exists: (p) => p === dist_index_path && p !== sha_stamp_path,
+      // ...then the stat for mtime races and throws ENOENT.
+      mtime_seconds: () => {
+        throw enoent;
+      },
+    });
+    const warn = vi.fn();
+
+    const result = safe_check_dist_staleness(REPO, HEAD_SHA, HEAD_TIME, fs_io, warn);
+
+    expect(result).toEqual({
+      stale: true,
+      reason: "staleness check failed; rebuilding to be safe",
+    });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain(enoent.message);
+  });
+
+  it("is transparent on the happy path — returns check_dist_staleness's result verbatim", () => {
+    const sha_stamp_path = `${REPO}/${DIST_SHA_STAMP_REL}`;
+    const dist_index_path = `${REPO}/${DIST_INDEX_REL}`;
+    const fs_io = make_fs_io({
+      exists: (p) => p === dist_index_path || p === sha_stamp_path,
+      read_text: () => HEAD_SHA,
+    });
+    const warn = vi.fn();
+
+    const result = safe_check_dist_staleness(REPO, HEAD_SHA, HEAD_TIME, fs_io, warn);
+
+    expect(result).toEqual({
+      stale: false,
+      reason: `dist matches HEAD (${HEAD_SHA.slice(0, 8)})`,
+    });
+    expect(warn).not.toHaveBeenCalled();
   });
 });

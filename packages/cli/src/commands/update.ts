@@ -5,8 +5,10 @@ import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import {
   DIST_SHA_STAMP_REL,
+  type DistFsIo,
   type StalenessResult,
   check_dist_staleness,
+  default_dist_fs_io,
 } from "../lib/dist-staleness.js";
 
 /**
@@ -92,6 +94,37 @@ export function describe_rebuild_decision(reason: RebuildReason): string {
   }
 }
 
+/**
+ * Wrap `check_dist_staleness` in an "assume stale" error boundary.
+ *
+ * `check_dist_staleness` performs two `fs_io.exists` + read/stat pairs,
+ * each of which is vulnerable to a TOCTOU race: the file is reported as
+ * present, then deleted (by another `lf update` process, a manual
+ * `rm -rf dist/`, etc.) before the follow-up read/stat. When that
+ * happens, `readFileSync` / `statSync` throws `ENOENT` and the user
+ * would otherwise see a raw Node.js stack trace.
+ *
+ * The safe semantic on any IO error is to assume stale and rebuild —
+ * never abort the update. Exported (and accepting an injectable
+ * `fs_io` + `warn` seam) so it can be unit-tested without real disk IO.
+ */
+export function safe_check_dist_staleness(
+  repo_dir: string,
+  head_sha: string,
+  head_commit_time_s: number,
+  fs_io: DistFsIo = default_dist_fs_io,
+  warn: (msg: string) => void = console.warn,
+): StalenessResult {
+  try {
+    return check_dist_staleness(repo_dir, head_sha, head_commit_time_s, fs_io);
+  } catch (err) {
+    warn(
+      `Could not determine dist staleness (${err instanceof Error ? err.message : String(err)}); rebuilding to be safe.`,
+    );
+    return { stale: true, reason: "staleness check failed; rebuilding to be safe" };
+  }
+}
+
 /** Read HEAD's commit time as unix epoch seconds. */
 function get_head_commit_time(repo_dir: string): number {
   const raw = git(repo_dir, ["log", "-1", "--format=%ct", "HEAD"]);
@@ -174,7 +207,7 @@ export const update_command = new Command("update")
       process.exit(1);
     }
 
-    const staleness = check_dist_staleness(repo_dir, head_sha, head_time_s);
+    const staleness = safe_check_dist_staleness(repo_dir, head_sha, head_time_s);
     const reason = decide_rebuild({ pulled, force, staleness });
 
     if (reason.kind === "fresh") {
