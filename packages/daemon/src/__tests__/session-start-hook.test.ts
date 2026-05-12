@@ -42,8 +42,14 @@ try {
 
 /** Invoke the hook script with the given env. Returns stdout + exit code. */
 function run_hook(env: Record<string, string>): { stdout: string; stderr: string; code: number } {
+  // Scrub LF_PENDING_FILE from the parent process env before merging caller
+  // overrides. Without this, the daemon-parent's exported LF_PENDING_FILE leaks
+  // into the subprocess via the spread, causing the "unset" test to see the var
+  // as set. Callers that need the var pass it explicitly via the `env` argument.
+  const base = { ...process.env };
+  delete base.LF_PENDING_FILE;
   const result = spawnSync("bash", [HOOK_SCRIPT], {
-    env: { ...process.env, ...env },
+    env: { ...base, ...env },
     encoding: "utf-8",
     timeout: 5000,
   });
