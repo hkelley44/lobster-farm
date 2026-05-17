@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # LobsterFarm installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/ultim88888888/lobster-farm/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/hkelley44/lobster-farm/main/install.sh | bash
 
-REPO="ultim88888888/lobster-farm"
+REPO="hkelley44/lobster-farm"
 INSTALL_DIR="$HOME/.lobsterfarm/src"
 BIN_DIR="$HOME/.local/bin"
 

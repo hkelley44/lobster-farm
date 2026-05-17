@@ -5,7 +5,7 @@ Autonomous orchestration platform built on Claude Code. Turns a single machine i
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ultim88888888/lobster-farm/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/hkelley44/lobster-farm/main/install.sh | bash
 ```
 
 Then run the setup wizard:
@@ -19,7 +19,7 @@ The wizard checks for prerequisites (Claude Code, 1Password, sudo), configures y
 ### Manual install
 
 ```bash
-git clone https://github.com/ultim88888888/lobster-farm.git ~/.lobsterfarm/src
+git clone https://github.com/hkelley44/lobster-farm.git ~/.lobsterfarm/src
 cd ~/.lobsterfarm/src
 pnpm install && pnpm build
 chmod +x $(pwd)/packages/cli/dist/index.js
