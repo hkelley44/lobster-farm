@@ -1,9 +1,17 @@
 import type { ModelName, ModelTier, ThinkLevel } from "@lobster-farm/shared";
 
-/** Map abstract model names to Claude CLI model identifiers. */
+/**
+ * Map abstract model names to Claude CLI model identifiers.
+ *
+ * The `sonnet` tier intentionally resolves to Opus 4-8 — review and triage are
+ * decision-quality work where the Opus uplift is worth the rate-limit cost.
+ * The `haiku` tier stays on actual Haiku because its primary consumer is the
+ * Stop-hook heartbeat generator (every-minute one-line summaries), where Opus
+ * would 10x cost for zero perceptible quality lift.
+ */
 const MODEL_IDS: Record<ModelName, string> = {
-  opus: "claude-opus-4-7",
-  sonnet: "claude-sonnet-4-6",
+  opus: "claude-opus-4-8",
+  sonnet: "claude-opus-4-8",
   haiku: "claude-haiku-4-5-20251001",
 };
 
