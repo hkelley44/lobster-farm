@@ -2653,10 +2653,17 @@ export class BotPool extends EventEmitter {
     }
 
     if (this.is_at_prompt(tmux_session)) {
+      let confirmed: boolean;
       try {
-        await this.send_via_tmux(tmux_session, message);
+        confirmed = await this.send_via_tmux(tmux_session, message);
       } catch (err) {
         console.warn(`[pool] Failed to inject message into ${tmux_session}: ${String(err)}`);
+        return false;
+      }
+      if (!confirmed) {
+        console.warn(
+          `[pool] Injected message into ${tmux_session} but submit not confirmed — message may be dropped`,
+        );
         return false;
       }
       console.log(`[pool] Injected message into ${tmux_session}`);
@@ -2695,9 +2702,11 @@ export class BotPool extends EventEmitter {
   }
 
   /** Send a message to a tmux session via send-keys, verifying the submit
-   * landed and retrying the Enter if the input box is left unsubmitted (#65). */
-  private async send_via_tmux(session_name: string, message: string): Promise<void> {
-    await send_keys_with_submit_retry(session_name, message);
+   * landed and retrying the Enter if the input box is left unsubmitted (#65).
+   * Returns true only when the submit was confirmed; false on exhausted
+   * retries or an unreadable pane (message likely dropped). */
+  private async send_via_tmux(session_name: string, message: string): Promise<boolean> {
+    return send_keys_with_submit_retry(session_name, message);
   }
 
   /** Drain queued messages for bots that are now at the prompt. Called from health check. */
@@ -2711,16 +2720,26 @@ export class BotPool extends EventEmitter {
         continue;
       }
       if (this.is_at_prompt(session)) {
+        let confirmed = 0;
         try {
           for (const message of messages) {
-            await this.send_via_tmux(session, message);
+            if (await this.send_via_tmux(session, message)) confirmed++;
           }
-          this.pending_injections.delete(session);
-          console.log(
-            `[pool] Delivered ${String(messages.length)} queued message(s) to ${session}`,
-          );
         } catch (err) {
           console.warn(`[pool] Failed to deliver queued messages to ${session}: ${String(err)}`);
+        }
+        // Drop the queue regardless — the bounded submit retries are exhausted,
+        // and re-queueing a likely-dead session would just loop the same failure.
+        // Dead-session recovery is issue #66's job.
+        this.pending_injections.delete(session);
+        const failed = messages.length - confirmed;
+        if (confirmed > 0) {
+          console.log(`[pool] Delivered ${String(confirmed)} queued message(s) to ${session}`);
+        }
+        if (failed > 0) {
+          console.warn(
+            `[pool] ${String(failed)} queued message(s) to ${session} unconfirmed — may be dropped`,
+          );
         }
       }
       // Still busy — keep queued, will retry next cycle
@@ -2758,8 +2777,14 @@ export class BotPool extends EventEmitter {
       // Bot is ready with an undelivered pending file — deliver it
       try {
         const prompt = `A user messaged you earlier but the message wasn't delivered. Read ${pending_path} for their message and respond to them.`;
-        await this.send_via_tmux(bot.tmux_session, prompt);
-        console.log(`[pool] Drained pending file for ${bot.tmux_session} via health check`);
+        const confirmed = await this.send_via_tmux(bot.tmux_session, prompt);
+        if (confirmed) {
+          console.log(`[pool] Drained pending file for ${bot.tmux_session} via health check`);
+        } else {
+          console.warn(
+            `[pool] Drained pending file for ${bot.tmux_session} but submit not confirmed — may be dropped`,
+          );
+        }
         // Clean up shortly after — Claude has the prompt and will read it within seconds.
         // Keep this well under the 30s health-check interval to prevent self-re-delivery
         // on the next tick.
