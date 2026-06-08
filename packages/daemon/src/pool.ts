@@ -238,15 +238,20 @@ export async function wait_for_bot_ready_with_retries(
 
 // ── Keystroke injection with submit-race retry ──
 
-/** Full visible pane content. Empty string on failure. */
-function capture_pane(tmux_session: string): string {
+/**
+ * Full visible pane content, or `null` if the capture itself failed (dead/killed
+ * session, timeout). A failed read is NOT the same as a genuinely empty pane —
+ * callers must treat `null` as "indeterminate" and never infer submit success
+ * from it, or a dead session would silently mask a dropped message (#65).
+ */
+function capture_pane(tmux_session: string): string | null {
   try {
     return execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
       encoding: "utf-8",
       timeout: 2000,
     });
   } catch {
-    return "";
+    return null;
   }
 }
 
@@ -283,18 +288,40 @@ export async function send_keys_with_submit_retry(
   const confirm_ms = opts?.confirm_ms ?? 800;
   const max_retries = opts?.max_retries ?? 3;
 
-  // Send the message text and the initial submit in one send-keys call.
-  execFileSync("tmux", ["send-keys", "-t", tmux_session, message, "Enter"], {
-    stdio: "ignore",
-    timeout: 5000,
-  });
+  // Send the message text and the initial submit in one send-keys call. If the
+  // session died between the at-prompt check and now, this throws — log and
+  // treat as not-confirmed so the retry/give-up path handles it rather than
+  // aborting the surrounding health-check iteration mid-loop.
+  try {
+    execFileSync("tmux", ["send-keys", "-t", tmux_session, message, "Enter"], {
+      stdio: "ignore",
+      timeout: 5000,
+    });
+  } catch (err) {
+    console.warn(`[pool] Initial send-keys failed for ${tmux_session}: ${String(err)}`);
+    return false;
+  }
 
   // A turn started if the status bar shows the active-generation indicator, or
   // the input box no longer echoes the message text we just typed. Scan the
   // whole pane — long input wraps across lines, so a last-line check would
   // falsely report "submitted" for wrapped text still sitting in the box.
+  //
+  // A failed pane read (null) is indeterminate, NOT confirmed — returning true
+  // there would fail-open and silently mask a dropped message on a dead session.
+  // Warn once (not per-poll) so a dead session doesn't spam the log.
+  let warned_pane_read = false;
   const submit_confirmed = (): boolean => {
     const pane = capture_pane(tmux_session);
+    if (pane === null) {
+      if (!warned_pane_read) {
+        warned_pane_read = true;
+        console.warn(
+          `[pool] Pane read failed for ${tmux_session} — cannot confirm submit (treating as not confirmed)`,
+        );
+      }
+      return false;
+    }
     if (pane.includes("esc to interrupt")) return true;
     return !pane.includes(message);
   };
@@ -331,7 +358,7 @@ export async function send_keys_with_submit_retry(
   }
 
   console.warn(
-    `[pool] Submit never confirmed for ${tmux_session} after ${String(max_retries)} retries — message may be dropped`,
+    `[pool] Submit never confirmed for ${tmux_session} after ${String(max_retries)} retries — could not confirm submit (pane unreadable or input stuck, session may be dead); message may be dropped`,
   );
   return false;
 }
@@ -2626,7 +2653,12 @@ export class BotPool extends EventEmitter {
     }
 
     if (this.is_at_prompt(tmux_session)) {
-      await this.send_via_tmux(tmux_session, message);
+      try {
+        await this.send_via_tmux(tmux_session, message);
+      } catch (err) {
+        console.warn(`[pool] Failed to inject message into ${tmux_session}: ${String(err)}`);
+        return false;
+      }
       console.log(`[pool] Injected message into ${tmux_session}`);
       return true;
     }
