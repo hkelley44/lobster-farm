@@ -2592,8 +2592,6 @@ export class BotPool extends EventEmitter {
     });
   }
 
-  /** Look up the github_token_ref for an entity from the registry.
-   * Returns the 1Password reference string if configured, or null. */
   /** Human-readable label for a channel in #alerts messages: the channel's
    * configured purpose if known, else the raw id, else "unknown". */
   private channel_label(entity_id: string | null, channel_id: string | null): string {
@@ -2605,6 +2603,8 @@ export class BotPool extends EventEmitter {
     );
   }
 
+  /** Look up the github_token_ref for an entity from the registry.
+   * Returns the 1Password reference string if configured, or null. */
   private resolve_github_token_ref(entity_id: string): string | null {
     if (!this.registry) return null;
     const entity_config = this.registry.get(entity_id);
