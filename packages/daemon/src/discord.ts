@@ -1550,7 +1550,7 @@ export class DiscordBot extends EventEmitter {
       agents.builder.name.toLowerCase(),
       agents.operator.name.toLowerCase(),
       agents.commander.name.toLowerCase(),
-      agents.marketer.name.toLowerCase(),
+      agents.marketer?.name.toLowerCase() ?? "tristan",
     ];
 
     // Discover avatar files on disk
