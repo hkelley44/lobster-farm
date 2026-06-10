@@ -83,6 +83,8 @@ function resolve_agent_name(archetype: ArchetypeRole, config: LobsterFarmConfig)
       return agents.operator.name.toLowerCase();
     case "commander":
       return agents.commander.name.toLowerCase();
+    case "marketer":
+      return agents.marketer.name.toLowerCase();
     case "reviewer":
       return "reviewer";
   }

@@ -11,6 +11,7 @@ describe("enums", () => {
   it("validates archetype roles", () => {
     expect(ArchetypeRoleSchema.parse("planner")).toBe("planner");
     expect(ArchetypeRoleSchema.parse("builder")).toBe("builder");
+    expect(ArchetypeRoleSchema.parse("marketer")).toBe("marketer");
     expect(() => ArchetypeRoleSchema.parse("invalid")).toThrow();
   });
 
@@ -38,6 +39,7 @@ describe("LobsterFarmConfigSchema", () => {
     expect(config.agents.designer.name).toBe("Pearl");
     expect(config.agents.builder.name).toBe("Bob");
     expect(config.agents.operator.name).toBe("Ray");
+    expect(config.agents.marketer.name).toBe("Tristan");
   });
 
   it("accepts custom agent names", () => {
@@ -183,6 +185,39 @@ describe("EntityConfigSchema", () => {
     expect(config.entity.channels.list[1]!.assigned_feature).toBe("alpha-42");
   });
 
+  it("accepts assigned_archetype on a channel and defaults it to undefined", () => {
+    const config = EntityConfigSchema.parse({
+      ...MINIMAL_ENTITY,
+      entity: {
+        ...MINIMAL_ENTITY.entity,
+        channels: {
+          category_id: "cat-123",
+          list: [
+            { type: "work_room", id: "discord-marketing", assigned_archetype: "marketer" },
+            { type: "work_room", id: "discord-default" },
+          ],
+        },
+      },
+    });
+    expect(config.entity.channels.list[0]!.assigned_archetype).toBe("marketer");
+    expect(config.entity.channels.list[1]!.assigned_archetype).toBeUndefined();
+  });
+
+  it("rejects an invalid assigned_archetype value", () => {
+    expect(() =>
+      EntityConfigSchema.parse({
+        ...MINIMAL_ENTITY,
+        entity: {
+          ...MINIMAL_ENTITY.entity,
+          channels: {
+            category_id: "cat-123",
+            list: [{ type: "work_room", id: "discord-x", assigned_archetype: "wizard" }],
+          },
+        },
+      }),
+    ).toThrow();
+  });
+
   it("accepts channels with role_id (#295)", () => {
     const config = EntityConfigSchema.parse({
       ...MINIMAL_ENTITY,
@@ -310,6 +345,8 @@ describe("TemplateVariablesSchema", () => {
     expect(vars.USER_NAME).toBe("Jax");
     expect(vars.PLANNER_NAME).toBe("Gary");
     expect(vars.PLANNER_NAME_LOWER).toBe("gary");
+    expect(vars.MARKETER_NAME).toBe("Tristan");
+    expect(vars.MARKETER_NAME_LOWER).toBe("tristan");
     expect(vars.PROJECTS_DIR).toBe("~/entities");
     expect(vars.SHARED_SERVICES).toBe("");
   });

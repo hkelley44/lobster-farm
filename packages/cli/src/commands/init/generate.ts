@@ -48,6 +48,28 @@ function config_templates_dir(): string {
   );
 }
 
+/**
+ * Recursively copy a directory tree from src to dest, creating directories as
+ * needed. Returns the absolute paths of every file written (for the caller's
+ * created-files manifest). Files are copied verbatim — no template resolution.
+ */
+async function copy_dir_recursive(src: string, dest: string): Promise<string[]> {
+  const written: string[] = [];
+  await mkdir(dest, { recursive: true });
+  const entries = await readdir(src, { withFileTypes: true });
+  for (const entry of entries) {
+    const src_path = join(src, entry.name);
+    const dest_path = join(dest, entry.name);
+    if (entry.isDirectory()) {
+      written.push(...(await copy_dir_recursive(src_path, dest_path)));
+    } else if (entry.isFile()) {
+      await copyFile(src_path, dest_path);
+      written.push(dest_path);
+    }
+  }
+  return written;
+}
+
 /** Agent archetype role to template filename mapping. */
 const AGENT_TEMPLATE_MAP: Record<string, string> = {
   planner: "planner.md",
@@ -55,6 +77,7 @@ const AGENT_TEMPLATE_MAP: Record<string, string> = {
   builder: "builder.md",
   operator: "operator.md",
   commander: "commander.md",
+  marketer: "marketer.md",
 };
 
 /**
@@ -64,7 +87,10 @@ const AGENT_TEMPLATE_MAP: Record<string, string> = {
  */
 export async function generate_config_files(
   vars: Partial<TemplateVariables>,
-  agent_names: Record<"planner" | "designer" | "builder" | "operator", string>,
+  agent_names: Record<
+    "planner" | "designer" | "builder" | "operator" | "commander" | "marketer",
+    string
+  >,
   path_overrides?: Partial<PathConfig>,
 ): Promise<string[]> {
   const created: string[] = [];
@@ -105,18 +131,19 @@ export async function generate_config_files(
   created.push(reviewer_out);
 
   // ── Skills: copy all skill directories ──
+  // A skill is a directory under config/claude/skills/. Most are a single
+  // SKILL.md, but some (e.g. marketing-dna) ship supporting files in
+  // subdirectories. Copy the whole tree so multi-file skills deploy intact.
   const skills_src = join(config_dir, "claude", "skills");
   try {
     const skill_dirs = await readdir(skills_src, { withFileTypes: true });
     for (const entry of skill_dirs) {
       if (!entry.isDirectory()) continue;
       const skill_name = entry.name;
-      const src_skill_file = join(skills_src, skill_name, "SKILL.md");
+      const src_skill_dir = join(skills_src, skill_name);
       const dest_skill_dir = join(skills_dir(path_overrides), skill_name);
-      const dest_skill_file = join(dest_skill_dir, "SKILL.md");
-      await mkdir(dest_skill_dir, { recursive: true });
-      await copyFile(src_skill_file, dest_skill_file);
-      created.push(dest_skill_file);
+      const copied = await copy_dir_recursive(src_skill_dir, dest_skill_dir);
+      created.push(...copied);
     }
   } catch {
     // skills directory might not exist — not fatal

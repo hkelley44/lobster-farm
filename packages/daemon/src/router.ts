@@ -125,6 +125,20 @@ const INTENT_KEYWORDS: Record<ArchetypeRole, string[]> = {
     "sentry",
   ],
   commander: ["scaffold", "entity", "system", "platform", "daemon", "config"],
+  marketer: [
+    "marketing",
+    "copy",
+    "copywriting",
+    "positioning",
+    "headline",
+    "landing page",
+    "ad",
+    "campaign",
+    "email sequence",
+    "funnel",
+    "offer",
+    "brand voice",
+  ],
 };
 
 function classify_intent(content: string): Classification | null {
