@@ -127,7 +127,14 @@ export const init_command = new Command("init")
 
       // ── Step 2: Agent names ──
       const agent_names = non_interactive
-        ? { planner: "Gary", designer: "Pearl", builder: "Bob", operator: "Ray", commander: "Pat" }
+        ? {
+            planner: "Gary",
+            designer: "Pearl",
+            builder: "Bob",
+            operator: "Ray",
+            commander: "Pat",
+            marketer: "Tristan",
+          }
         : await prompt_agent_names();
 
       // ── Step 3: Machine detection ──
@@ -919,11 +926,13 @@ Always clean up after yourself:
         BUILDER_NAME: agent_names.builder,
         OPERATOR_NAME: agent_names.operator,
         COMMANDER_NAME: agent_names.commander,
+        MARKETER_NAME: agent_names.marketer,
         PLANNER_NAME_LOWER: agent_names.planner.toLowerCase(),
         DESIGNER_NAME_LOWER: agent_names.designer.toLowerCase(),
         BUILDER_NAME_LOWER: agent_names.builder.toLowerCase(),
         OPERATOR_NAME_LOWER: agent_names.operator.toLowerCase(),
         COMMANDER_NAME_LOWER: agent_names.commander.toLowerCase(),
+        MARKETER_NAME_LOWER: agent_names.marketer.toLowerCase(),
         PROJECTS_DIR: "~/.lobsterfarm/entities",
         GITHUB_USERNAME: github.username,
         GITHUB_ORG: "",
@@ -946,6 +955,7 @@ Always clean up after yourself:
           builder: { name: agent_names.builder },
           operator: { name: agent_names.operator },
           commander: { name: agent_names.commander },
+          marketer: { name: agent_names.marketer },
         },
       };
 
@@ -1227,7 +1237,7 @@ Always clean up after yourself:
       const summary_lines = [
         `Config:     ${config_path}`,
         `Settings:   ${settings_path}`,
-        `Agents:     ${agent_names.planner} (planner), ${agent_names.designer} (designer), ${agent_names.builder} (builder), ${agent_names.operator} (operator), ${agent_names.commander} (commander)`,
+        `Agents:     ${agent_names.planner} (planner), ${agent_names.designer} (designer), ${agent_names.builder} (builder), ${agent_names.operator} (operator), ${agent_names.commander} (commander), ${agent_names.marketer} (marketer)`,
         "Entities:   ~/.lobsterfarm/entities/",
         `Machine:    ${machine.name}`,
         `Sudo:       ${sudo.status}`,

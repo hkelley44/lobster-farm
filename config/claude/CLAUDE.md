@@ -66,6 +66,7 @@ The LobsterFarm daemon sets up your environment before you wake up — you're al
 | **{{BUILDER_NAME}}** | Builder | coding-dna | Feature implementation, backend, frontend integration, testing |
 | **Reviewer** | QA | review-dna | PR reviews — always ephemeral, always fresh eyes |
 | **{{OPERATOR_NAME}}** | Operator | operator-dna | Infrastructure, CI/CD, deployment, monitoring, incident response |
+| **{{MARKETER_NAME}}** | Marketer | marketing-dna | Positioning, copywriting, ads, email sequences, content strategy, funnel design, conversion analysis |
 
 ### How Agents Work Together
 - **{{PLANNER_NAME}} is the orchestrator** for each entity. Users riff with {{PLANNER_NAME}} in Discord. When work needs doing, {{PLANNER_NAME}} spawns other agents as subagents — {{BUILDER_NAME}} for code, {{DESIGNER_NAME}} for design, {{OPERATOR_NAME}} for infra.

@@ -33,6 +33,7 @@ If a SKILL.md is ever found as a regular file (not a symlink) under `~/.claude/s
 - `database-dna/` -- Database design, schema architecture, query optimization. PostgreSQL/Prisma/SQLAlchemy patterns.
 - `design-dna/` -- Visual systems, UI implementation, animation, and design-in-code principles.
 - `planning-dna/` -- Spec writing, scope management, socratic discovery methodology.
+- `marketing-dna/` -- Positioning, copywriting, offer/funnel design. Synthesizes six lineages (Hormozi, Sabri Suby, Brunson, Robbins, Schwartz, Cialdini). Multi-file: `authors/`, `frameworks/`, `templates/` subtrees. Loaded by the marketer archetype.
 - `review-dna/` -- Code review standards, priority order, frontend criteria, CI awareness.
 - `secrets-guideline/` -- 1Password-based secret management. The "never handle raw secrets" rule.
 - `readme-guideline/` -- Directory documentation standards. When and how to write READMEs.
