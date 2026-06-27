@@ -11,6 +11,9 @@ const mock_exec_file_sync = vi.fn();
 vi.mock("node:child_process", () => ({
   execFileSync: (...args: unknown[]) => mock_exec_file_sync(...args),
   spawn: vi.fn(),
+  // pool.ts transitively imports hooks.ts, which does promisify(execFile) at
+  // module load. cwd-health never triggers extraction, so a stub suffices.
+  execFile: vi.fn(),
 }));
 
 // ── Mock fs/promises — check_cwd_health uses stat() ──

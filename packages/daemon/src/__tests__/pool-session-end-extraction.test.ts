@@ -75,25 +75,42 @@ function make_config(): LobsterFarmConfig {
 
 /** Test subclass that exposes the private surface we need to drive
  * session-end transitions directly, and short-circuits side-effecting
- * helpers (tmux, access.json, persist). */
+ * helpers (tmux, access.json, persist).
+ *
+ * Production fires extraction with `void` (fire-and-forget). To assert on
+ * the daily-log side effect deterministically, we capture every launched
+ * extraction promise and expose `flush_extractions()` as a join point. */
 class TestPool extends BotPoolTestBase {
+  private launched_extractions: Promise<void>[] = [];
+
+  protected override extract_on_session_end(bot: PoolBot): Promise<void> {
+    const p = super.extract_on_session_end(bot);
+    this.launched_extractions.push(p);
+    return p;
+  }
+
+  /** Await all extraction work launched so far, then clear the buffer. */
+  async flush_extractions(): Promise<void> {
+    await Promise.all(this.launched_extractions);
+    this.launched_extractions = [];
+  }
+
   inject_bots(bots: PoolBot[]): void {
     (this as unknown as { bots: PoolBot[] }).bots = bots;
   }
   get_bots(): PoolBot[] {
     return (this as unknown as { bots: PoolBot[] }).bots;
   }
-  /** Direct passthrough to the private park_bot — the test's primary entry
-   * point for the "park a bot" acceptance case. */
+  /** Drive park_bot (the primary "park a bot" acceptance entry point), then
+   * flush the fire-and-forget extraction it launched. */
   async test_park(bot: PoolBot): Promise<void> {
     await (this as unknown as { park_bot: (b: PoolBot) => Promise<void> }).park_bot(bot);
+    await this.flush_extractions();
   }
-  /** Direct passthrough to the protected extract_on_session_end so we can
-   * assert the gate-on-state semantic without juggling park_bot/release. */
+  /** Drive extract_on_session_end directly so we can assert the gate-on-state
+   * semantic without juggling park_bot/release. */
   async test_extract(bot: PoolBot): Promise<void> {
-    await (
-      this as unknown as { extract_on_session_end: (b: PoolBot) => Promise<void> }
-    ).extract_on_session_end(bot);
+    await this.extract_on_session_end(bot);
   }
 }
 
@@ -298,5 +315,38 @@ describe("pool session-end extraction (#43)", () => {
     const entries = await read_daily_entries("test-entity", config);
     expect(entries).toHaveLength(1);
     expect(entries[0]).toContain("extraction skipped");
+  });
+
+  it("does not block the lifecycle on the Haiku round-trip", async () => {
+    // Extraction is fire-and-forget: park_bot must complete (bot parked, tmux
+    // killed) without waiting on the slow `claude -p` call. Gate a manual
+    // resolver so the Haiku call is still pending when we assert.
+    let release_haiku: (() => void) | undefined;
+    execFile_mock.mockImplementationOnce(
+      (
+        _cmd,
+        _args,
+        _opts,
+        cb: (err: Error | null, r: { stdout: string; stderr: string }) => void,
+      ) => {
+        release_haiku = () => cb(null, { stdout: "- slow summary", stderr: "" });
+      },
+    );
+
+    const bot = assigned_bot(8);
+    pool.inject_bots([bot]);
+
+    // park_bot returns immediately even though Haiku hasn't resolved.
+    await (pool as unknown as { park_bot: (b: PoolBot) => Promise<void> }).park_bot(bot);
+    expect(bot.state).toBe("parked");
+    expect(execFile_mock).toHaveBeenCalledTimes(1);
+
+    // The daily log hasn't been written yet — extraction is still in flight.
+    expect(await read_daily_entries("test-entity", config)).toHaveLength(0);
+
+    // Now let Haiku finish and flush; the entry lands after the fact.
+    release_haiku?.();
+    await pool.flush_extractions();
+    expect(await read_daily_entries("test-entity", config)).toHaveLength(1);
   });
 });
