@@ -9,6 +9,7 @@ import { DEFAULT_ARCHETYPES, entity_dir, expand_home, lobsterfarm_dir } from "@l
 import type { ChannelType } from "@lobster-farm/shared";
 import { notify } from "./actions.js";
 import { resolve_binary } from "./env.js";
+import { extract_session_learnings } from "./hooks.js";
 import { resolve_effort, resolve_model_id } from "./models.js";
 import { load_pool_state, save_pool_state } from "./persistence.js";
 import type { PersistedBotAvatarState, PersistedPoolBot } from "./persistence.js";
@@ -657,10 +658,9 @@ export class BotPool extends EventEmitter {
           );
         }
       } else {
-        // tmux is dead — mark as parked with preserved session ID.
-        // When someone messages the channel, existing parked-bot auto-resume
-        // logic in assign() reclaims this bot with --resume {session_id}.
-        bot.state = "parked";
+        // tmux is dead. Restore session metadata onto the bot first; we'll
+        // either run post-mortem extraction (if it was assigned at shutdown)
+        // and then flip to parked, or just flip to parked directly.
         bot.channel_id = entry.channel_id;
         bot.entity_id = entry.entity_id;
         bot.archetype = entry.archetype;
@@ -672,6 +672,20 @@ export class BotPool extends EventEmitter {
         bot.last_active = entry.last_active ? new Date(entry.last_active) : null;
         bot.assigned_at = entry.assigned_at ? new Date(entry.assigned_at) : bot.last_active;
         bot.last_avatar_archetype = entry.last_avatar_archetype ?? null;
+
+        // Post-mortem session-end extraction: if this bot was actively
+        // ASSIGNED before the daemon went away (tmux now dead, persisted
+        // state says assigned), the conversation ended dirty without ever
+        // hitting park_bot/release. Temporarily mark the bot as `assigned`
+        // so the helper's gate accepts the call, then flip to `parked` for
+        // the auto-resume path. Entries already persisted as `parked` are
+        // skipped — they ran their extraction at the original park() call
+        // site. See issue #43.
+        if (entry.state === "assigned") {
+          bot.state = "assigned";
+          await this.extract_on_session_end(bot);
+        }
+        bot.state = "parked";
 
         // If this bot was actively assigned (not already parked) before shutdown
         // and has a session_id, it's a candidate for proactive resume.
@@ -1231,6 +1245,9 @@ export class BotPool extends EventEmitter {
 
     try {
       const bot_id = bot.id;
+      // Fire memory-extraction BEFORE we null out entity/archetype/session_id.
+      // Best-effort; never blocks the release.
+      await this.extract_on_session_end(bot);
       this.kill_tmux(bot.tmux_session);
       this.cancel_session_watcher(bot_id);
 
@@ -1271,6 +1288,10 @@ export class BotPool extends EventEmitter {
 
   /** Park a bot — preserve session ID for later resume, free the bot. */
   private async park_bot(bot: PoolBot): Promise<void> {
+    // Fire memory-extraction BEFORE killing tmux / mutating state so the
+    // session metadata (entity, archetype, session_id, channel) is still on
+    // the bot when we read it. Best-effort; never blocks parking on failure.
+    await this.extract_on_session_end(bot);
     this.kill_tmux(bot.tmux_session);
     bot.state = "parked";
     // session_id, channel_id, entity_id, archetype preserved for resume in memory.
@@ -1283,6 +1304,70 @@ export class BotPool extends EventEmitter {
         `(session: ${bot.session_id?.slice(0, 8) ?? "none"}, ` +
         `channel: ${bot.channel_id})`,
     );
+  }
+
+  /**
+   * Run Haiku-powered session-learnings extraction when a bot transitions out
+   * of `assigned`. Resolves the (entity, archetype, session, feature) tuple
+   * from the bot's current in-memory state and delegates to the existing
+   * `extract_session_learnings` helper (which already swallows its own errors
+   * and writes a fallback marker entry to the daily log on Haiku failure).
+   *
+   * Wired to: `park_bot`, `release`, the two force-free branches in
+   * `restart_crashed_session`, the inline force-free branch in
+   * `handle_crash_loop`, and the post-mortem path in `initialize` for bots
+   * whose persisted state was `assigned` but whose tmux died across the
+   * daemon restart. NOT wired to `server.ts`'s `handle_stop_hook` — that
+   * fires once per assistant turn, which is the wrong cadence.
+   *
+   * Once per session lifecycle (one transition out of `assigned`), never
+   * per turn. Subagents are covered by their parent's session-end — they
+   * run inside the parent's pool session and have no separate hook.
+   *
+   * Best-effort: failure to extract (missing fields, Haiku error, write
+   * failure) is logged but never thrown. The session-end transition that
+   * triggered this MUST proceed regardless. Protected so tests can spy on
+   * call counts and assert once-per-lifecycle semantics.
+   */
+  protected async extract_on_session_end(bot: PoolBot): Promise<void> {
+    // Exactly-once gate: only fire when the bot is still in the `assigned`
+    // state. Callers MUST invoke this helper BEFORE flipping the bot to
+    // `parked` or `free`. A re-park transition on an already-parked bot (or
+    // a redundant release() call on an already-released bot) is a no-op
+    // here — that's the guarantee callers depend on for "one extraction
+    // per session arc". The post-mortem path in `initialize` honors this
+    // by setting `bot.state = "assigned"` briefly before calling, then
+    // moving on to `parked`.
+    if (bot.state !== "assigned") {
+      return;
+    }
+    const entity_id = bot.entity_id;
+    const archetype = bot.archetype;
+    if (!entity_id || !archetype) {
+      // Bot wasn't fully assigned (missing required fields) — nothing to
+      // summarize. Common for force-free paths after a partial-spawn failure.
+      return;
+    }
+    // feature_id isn't a first-class field on PoolBot — sessions are bound
+    // to a channel, not a feature. Fall back to channel_id as the stable
+    // identifier for the daily-log entry; if even that's missing, use a
+    // sentinel so the entry is still useful for debugging.
+    const feature_id = bot.channel_id ?? "unknown-session";
+    // session_id may legitimately be null if extraction fires before the
+    // confirmation watcher promoted the fresh UUID. Use a sentinel so the
+    // log entry still lands rather than silently dropping the call.
+    const session_id = bot.session_id ?? "no-session";
+    try {
+      await extract_session_learnings(entity_id, feature_id, archetype, session_id, this.config);
+    } catch (err) {
+      // `extract_session_learnings` already does best-effort-swallow internally;
+      // this catch is defense-in-depth for anything that bubbles past it (e.g.,
+      // daily-log write failure). Never let a memory-extraction failure block
+      // the session-end transition that triggered it.
+      console.warn(
+        `[pool] extract_on_session_end failed for pool-${String(bot.id)}: ${String(err)}`,
+      );
+    }
   }
 
   /** Get the assignment for a channel. */
@@ -1653,6 +1738,14 @@ export class BotPool extends EventEmitter {
       console.error(`[pool] Cannot restart pool-${String(bot.id)}: missing fields — force-freeing`);
       this.cancel_session_watcher(bot.id);
 
+      // Post-mortem extraction: the bot was assigned and crashed, and we
+      // can't restart it. Fire BEFORE state mutation so any salvageable
+      // entity/archetype lands in the daily log. The helper bails internally
+      // when both are null (which is the only way we reach this branch), so
+      // this call is a no-op in the common case — kept for symmetry and to
+      // catch partial-init races where one field survived.
+      await this.extract_on_session_end(bot);
+
       // Stash session history when possible — allows a future assignment on
       // this channel to resume the session even though we can't restart now.
       // Only stash *confirmed* sessions (JSONL on disk) to avoid planting
@@ -1780,6 +1873,11 @@ export class BotPool extends EventEmitter {
         console.log(`[pool] Stashed session history for ${key}: ${session_id.slice(0, 8)}`);
       }
 
+      // Post-mortem extraction: the session crashed and the restart failed.
+      // The bot is about to be force-freed; extract now while we still have
+      // entity/archetype/session_id on the bot. Best-effort, never re-throws.
+      await this.extract_on_session_end(bot);
+
       bot.state = "free";
       bot.channel_id = null;
       bot.entity_id = null;
@@ -1876,10 +1974,14 @@ export class BotPool extends EventEmitter {
     if (channel_id) {
       await this.release(channel_id);
     } else {
-      // No channel_id — can't go through release(), force-free inline
+      // No channel_id — can't go through release(), force-free inline.
+      // The channel_id path above delegates to release(), which fires
+      // extract_on_session_end() itself; we only need to call it here on
+      // the inline branch to avoid double-extraction.
       console.error(
         `[pool] Crash loop for pool-${String(bot.id)} with no channel_id — force-freeing`,
       );
+      await this.extract_on_session_end(bot);
       this.kill_tmux(bot.tmux_session);
       void unlink(pending_file_path(bot.tmux_session)).catch(() => {});
       bot.state = "free";
