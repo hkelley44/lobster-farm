@@ -205,10 +205,13 @@ entity_command
       const channels: DiscordChannel[] = [];
 
       if (setup_discord_flag) {
-        // Work rooms are created on demand via /room slash command
+        // Work rooms are created on demand via /room slash command.
+        // work_log is the agent activity feed (config type underscored, Discord
+        // channel hyphenated #work-log). See #56.
         const channel_types = [
           { type: "general", purpose: "Entity-level discussion" },
           { type: "alerts", purpose: "Approvals, blockers, questions" },
+          { type: "work_log", purpose: "Agent activity feed" },
         ];
 
         for (const ch of channel_types) {

@@ -358,6 +358,40 @@ describe("BotPool.ensure_entity_channels_allowlisted", () => {
     expect(content.groups["tos-chan"]).toBeUndefined();
   });
 
+  it("preserves the work_log channel through the prune (#56)", async () => {
+    // work_log is an outbound-only grant (requireMention: true) written by
+    // write_access_json. It must survive the self-healing prune — otherwise it
+    // would be granted on assign and then immediately stripped.
+    const pool = new TestBotPool(make_config("owner-1"));
+    pool.set_registry(
+      make_registry({
+        healthydogs: make_entity("healthydogs", [
+          { type: "general", id: "general-chan" },
+          { type: "alerts", id: "alerts-chan" },
+          { type: "work_log", id: "work-log-chan" },
+          { type: "tos", id: "tos-chan" },
+        ]),
+      }),
+    );
+
+    await seed_access(tmp_dir, {
+      "general-chan": { requireMention: false, allowFrom: [] },
+      "alerts-chan": { requireMention: true, allowFrom: [] },
+      "work-log-chan": { requireMention: true, allowFrom: [] },
+      "tos-chan": { requireMention: false, allowFrom: [] }, // foreign — to be pruned
+    });
+
+    await pool.ensure_entity_channels_allowlisted(tmp_dir, "healthydogs", "general-chan");
+
+    const content = JSON.parse(await readFile(join(tmp_dir, "access.json"), "utf-8"));
+    // Permitted channels preserved, including work_log as output-only.
+    expect(content.groups["general-chan"]).toEqual({ requireMention: false, allowFrom: [] });
+    expect(content.groups["alerts-chan"]).toEqual({ requireMention: true, allowFrom: [] });
+    expect(content.groups["work-log-chan"]).toEqual({ requireMention: true, allowFrom: [] });
+    // Foreign channel pruned.
+    expect(content.groups["tos-chan"]).toBeUndefined();
+  });
+
   it("no-ops when the registry has no entry for the entity", async () => {
     const pool = new TestBotPool(make_config("owner-1"));
     pool.set_registry(make_registry({})); // empty registry
