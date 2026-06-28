@@ -37,6 +37,18 @@ export interface PoolBot {
   last_active: Date | null;
   /** When this bot was assigned to its current channel. Used for uptime calculation. */
   assigned_at: Date | null;
+  /** When the daemon last routed an inbound human message to this assigned bot.
+   * Set at the discord.ts steady-state `touch()` call-site. Drives the
+   * plugin-liveness probe (#73): the inbound→bot path is pure MCP plugin with
+   * no daemon send-keys, so this timestamp is the daemon's only record that a
+   * message was handed to a live-but-possibly-deaf bot. In-memory only —
+   * never persisted (a fresh daemon has no in-flight inbound to probe). */
+  last_inbound_at: Date | null;
+  /** When the plugin-liveness probe (#73) last observed this bot actually
+   * processing (tmux pane non-idle). Used to distinguish "received the inbound
+   * and started working" (healthy) from "stayed idle at the prompt the whole
+   * time" (plugin deaf). In-memory only. */
+  last_processing_at: Date | null;
   state_dir: string;
   /** Claude CLI model ID used for this session (e.g., "claude-opus-4-6"). */
   model: string | null;
@@ -501,6 +513,24 @@ export type AvatarHandler = (state_dir: string, agent_name: string) => Promise<v
  * hour per bot — this gives comfortable margin. */
 export const AVATAR_COOLDOWN_MS = 30 * 60 * 1000;
 
+// ── Plugin-liveness probe (#73) ──
+
+/**
+ * How long an assigned, tmux-alive bot may stay continuously idle after an
+ * inbound human message before the MCP plugin is judged deaf.
+ *
+ * A healthy bot transitions to "working" (pane shows "esc to interrupt" /
+ * "← discord" / "local agent") within a few seconds of the plugin delivering
+ * the message. If the pane is *still* at the idle prompt this long after the
+ * inbound — and the bot showed no processing in between — the plugin has
+ * stopped delivering and the bot is silently deaf.
+ *
+ * 90s comfortably clears: MCP delivery latency (several seconds), the typing
+ * loop's 15s grace window, and a brief Claude startup/tool-permission pause —
+ * while still catching a genuinely deaf bot within ~2 health-check cycles.
+ */
+export const PLUGIN_DEAF_THRESHOLD_MS = 90_000;
+
 // ── Pool Manager ──
 
 export class BotPool extends EventEmitter {
@@ -543,6 +573,11 @@ export class BotPool extends EventEmitter {
   private session_watchers = new Map<number, ReturnType<typeof setTimeout>>();
   /** Timer for the rate-limit modal recovery scan (60s interval, issue #270). */
   private rate_limit_timer: ReturnType<typeof setInterval> | null = null;
+  /** In-flight lock: bot IDs currently being recovered by the plugin-liveness
+   * probe (#73). The probe's recovery kills + respawns the tmux session, which
+   * takes longer than the 30s health-check interval — this prevents a second
+   * pass from firing a duplicate recovery on a bot that's already mid-restart. */
+  private recovering_plugin = new Set<number>();
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -652,6 +687,8 @@ export class BotPool extends EventEmitter {
         tmux_session,
         last_active: is_running ? new Date() : null,
         assigned_at: is_running ? new Date() : null,
+        last_inbound_at: null,
+        last_processing_at: null,
         state_dir,
         model: null,
         effort: null,
@@ -1772,6 +1809,24 @@ export class BotPool extends EventEmitter {
   }
 
   /**
+   * Record that the daemon just routed an inbound human message to this
+   * channel's assigned bot (issue #73 — plugin-liveness probe).
+   *
+   * The inbound Discord→live-bot delivery path is pure MCP plugin with no
+   * daemon send-keys, so the daemon otherwise has no record that a message was
+   * handed to a (live but possibly deaf) bot. This timestamp is what the probe
+   * uses to detect prolonged inbound silence: if the bot never starts
+   * processing after an inbound, the plugin is deaf. Called from the discord.ts
+   * steady-state `touch()` call-site for already-assigned, live bots.
+   */
+  mark_inbound(channel_id: string): void {
+    const bot = this.bots.find((b) => b.channel_id === channel_id && b.state === "assigned");
+    if (bot) {
+      bot.last_inbound_at = new Date();
+    }
+  }
+
+  /**
    * Start the tmux session health monitor.
    * Checks every 30 seconds for assigned bots whose tmux sessions have died.
    * When a dead session is found, attempts to restart it automatically.
@@ -1888,6 +1943,10 @@ export class BotPool extends EventEmitter {
         if (this.is_tmux_alive(bot.tmux_session)) {
           // Session alive — check for orphaned cwd (directory deleted out from under it)
           await this.check_cwd_health(bot);
+          // Session alive in tmux is NOT the same as the MCP plugin actually
+          // delivering inbound Discord messages. Probe for a live-but-deaf bot
+          // that received a message it never processed (issue #73).
+          await this.check_plugin_liveness(bot);
           continue;
         }
 
@@ -1934,6 +1993,143 @@ export class BotPool extends EventEmitter {
       }
     } finally {
       this._health_check_running = false;
+    }
+  }
+
+  // ── Plugin-liveness probe (#73) ──
+
+  /**
+   * Probe an assigned, tmux-alive bot for MCP plugin deafness.
+   *
+   * The inbound Discord→bot path is pure MCP plugin — no daemon send-keys — so a
+   * bot can be perfectly alive in tmux yet silently stop receiving messages if
+   * the plugin's channel listener dies (observed after a crash-loop on #new-ui).
+   * `reconcile_assigned_health` / `check_assigned_health` only verify tmux
+   * liveness, which this gap slips right past.
+   *
+   * Detection is purely observational — no synthetic echo messages that would
+   * pollute the channel. We compare two timestamps the daemon already owns:
+   *   - `last_inbound_at`: set when discord.ts routed a human message here.
+   *   - whether the bot is currently/recently *working* (pane non-idle).
+   *
+   * A healthy bot starts working within seconds of the plugin delivering the
+   * message. A deaf bot stays at the idle prompt forever. So a bot is deaf when:
+   *   1. it received an inbound (`last_inbound_at` set),
+   *   2. that inbound is older than PLUGIN_DEAF_THRESHOLD_MS but not so old it's
+   *      already stale/handled (we cap the window so we never re-probe an
+   *      ancient inbound after the bot legitimately went idle),
+   *   3. it has shown ZERO processing since that inbound — never went non-idle.
+   *
+   * Healthy observation (bot non-idle, or processed after the inbound) clears
+   * the inbound marker so we don't keep probing a bot that's done its work.
+   *
+   * Protected so tests can drive it directly without the 30s interval.
+   */
+  protected async check_plugin_liveness(bot: PoolBot): Promise<void> {
+    if (this._draining) return;
+    if (bot.state !== "assigned" || !bot.channel_id) return;
+    if (this.recovering_plugin.has(bot.id)) return; // recovery already in flight
+
+    const inbound = bot.last_inbound_at;
+    if (!inbound) return; // nothing was delivered — nothing to be deaf to
+
+    const since_inbound = Date.now() - inbound.getTime();
+
+    // The bot is actively working (or was, after the inbound) → plugin delivered
+    // the message. Healthy: record processing and clear the inbound marker so a
+    // later idle period (the bot waiting for the next human reply) is never
+    // mistaken for deafness.
+    if (!this.is_bot_idle(bot)) {
+      bot.last_processing_at = new Date();
+      bot.last_inbound_at = null;
+      return;
+    }
+    if (bot.last_processing_at && bot.last_processing_at.getTime() >= inbound.getTime()) {
+      // Processed at some point after the inbound, then returned to idle —
+      // message was received and handled. Not deaf.
+      bot.last_inbound_at = null;
+      return;
+    }
+
+    // Still idle and no processing observed since the inbound. Give the plugin
+    // its delivery + startup grace before judging.
+    if (since_inbound < PLUGIN_DEAF_THRESHOLD_MS) return;
+
+    // Deaf: the bot has sat idle since the inbound for longer than the grace
+    // window without ever picking the message up. Recover it.
+    console.error(
+      `[pool] pool-${String(bot.id)} appears DEAF to inbound Discord — idle ${String(
+        Math.round(since_inbound / 1000),
+      )}s after a message with no processing (channel: ${bot.channel_id}). MCP plugin likely stopped delivering — recovering.`,
+    );
+    await this.recover_deaf_bot(bot);
+  }
+
+  /**
+   * Recover a bot whose MCP plugin has gone deaf to inbound Discord messages.
+   *
+   * Unlike a tmux crash, the process is *alive* — but its plugin channel
+   * listener is dead, so a fresh session is the only fix. We kill the live tmux
+   * (otherwise `start_tmux` collides on the session name), then route through
+   * the same `restart_crashed_session` path crash recovery uses: it resumes the
+   * confirmed session (preserving conversation context) with a brand-new plugin
+   * connection, or spawns fresh, and posts its own success alert. On failure it
+   * frees the bot, which we detect and surface to #alerts so the channel never
+   * goes silently dark.
+   */
+  private async recover_deaf_bot(bot: PoolBot): Promise<void> {
+    if (this.recovering_plugin.has(bot.id)) return;
+    this.recovering_plugin.add(bot.id);
+
+    const entity_id = bot.entity_id;
+    const channel_id = bot.channel_id;
+    const archetype = bot.archetype;
+
+    // Consume the inbound marker up-front so a concurrent/next probe pass can't
+    // re-trigger on the same silence while we're mid-recovery.
+    bot.last_inbound_at = null;
+    bot.last_processing_at = null;
+
+    try {
+      await notify(
+        "alerts",
+        `\ud83d\udd34 Pool bot ${String(bot.id)} (${archetype ?? "unknown"}) went DEAF to inbound Discord for ${entity_id ?? "unknown"}/${this.channel_label(entity_id, channel_id)} — alive in tmux but the MCP plugin stopped delivering messages. Restarting the session to restore delivery.`,
+        entity_id ? this.registry?.get(entity_id) : undefined,
+      );
+    } catch (notify_err) {
+      console.warn(
+        `[pool] Failed to alert #alerts for deaf pool-${String(bot.id)}: ${String(notify_err)}`,
+      );
+    }
+
+    try {
+      // Kill the live-but-deaf tmux so restart_crashed_session can recreate it
+      // with a fresh plugin connection. The session name is reused.
+      this.kill_tmux(bot.tmux_session);
+
+      await this.restart_crashed_session(bot);
+
+      // If the bot is no longer assigned, the respawn failed and the channel is
+      // now dark — surface it so it isn't silently unattended.
+      if (bot.state !== "assigned") {
+        const label = this.channel_label(entity_id, channel_id);
+        console.error(
+          `[pool] pool-${String(bot.id)} could not be restarted after plugin deafness — channel ${label} is dark`,
+        );
+        try {
+          await notify(
+            "alerts",
+            `\ud83d\udd34 Pool bot ${String(bot.id)} (${archetype ?? "unknown"}) could not be restarted after going deaf for ${entity_id ?? "unknown"}/${label}. Channel is unattended — check daemon logs.`,
+            entity_id ? this.registry?.get(entity_id) : undefined,
+          );
+        } catch (notify_err) {
+          console.warn(
+            `[pool] Failed to alert #alerts for un-recoverable deaf pool-${String(bot.id)}: ${String(notify_err)}`,
+          );
+        }
+      }
+    } finally {
+      this.recovering_plugin.delete(bot.id);
     }
   }
 
