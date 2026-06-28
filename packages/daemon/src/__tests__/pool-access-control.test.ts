@@ -195,6 +195,70 @@ describe("pool bot access control", () => {
     });
   });
 
+  // ── #56: work_log channel outbound allowlist enrichment ──
+
+  it("includes the entity's #work-log channel as output-only in groups (#56)", async () => {
+    const config = make_config("111");
+    const pool = new TestBotPool(config);
+    pool.set_registry(
+      make_registry({
+        healthydogs: make_entity("healthydogs", [
+          { type: "general", id: "general-chan" },
+          { type: "alerts", id: "alerts-chan" },
+          { type: "work_log", id: "work-log-chan" },
+          { type: "work_room", id: "wr-chan" },
+        ]),
+      }),
+    );
+
+    await pool.test_write_access_json(tmp_dir, "wr-chan", "healthydogs");
+
+    const content = JSON.parse(await readFile(join(tmp_dir, "access.json"), "utf-8"));
+    // Inbound channel: requireMention false (normal listening)
+    expect(content.groups["wr-chan"]).toEqual({ requireMention: false, allowFrom: [] });
+    // work_log channel: outbound-only — requireMention true so the activity feed
+    // is never consumed as an input surface.
+    expect(content.groups["work-log-chan"]).toEqual({ requireMention: true, allowFrom: [] });
+    // alerts is also present and output-only — both broadcast surfaces.
+    expect(content.groups["alerts-chan"]).toEqual({ requireMention: true, allowFrom: [] });
+  });
+
+  it("omits the work_log entry when the entity has no work_log channel (content entity) (#56)", async () => {
+    const config = make_config("111");
+    const pool = new TestBotPool(config);
+    pool.set_registry(
+      make_registry({
+        // Content-blueprint entities don't declare a work_log channel.
+        somecontent: make_entity("somecontent", [
+          { type: "general", id: "general-chan" },
+          { type: "alerts", id: "alerts-chan" },
+        ]),
+      }),
+    );
+
+    await pool.test_write_access_json(tmp_dir, "general-chan", "somecontent");
+
+    const content = JSON.parse(await readFile(join(tmp_dir, "access.json"), "utf-8"));
+    expect(Object.keys(content.groups).sort()).toEqual(["alerts-chan", "general-chan"]);
+  });
+
+  it("does not duplicate an entry when the bot is bound directly to its #work-log channel (#56)", async () => {
+    const config = make_config("111");
+    const pool = new TestBotPool(config);
+    pool.set_registry(
+      make_registry({
+        healthydogs: make_entity("healthydogs", [{ type: "work_log", id: "work-log-chan" }]),
+      }),
+    );
+
+    await pool.test_write_access_json(tmp_dir, "work-log-chan", "healthydogs");
+
+    const content = JSON.parse(await readFile(join(tmp_dir, "access.json"), "utf-8"));
+    // The inbound entry wins — requireMention: false (no duplicate output entry).
+    expect(content.groups["work-log-chan"]).toEqual({ requireMention: false, allowFrom: [] });
+    expect(Object.keys(content.groups)).toEqual(["work-log-chan"]);
+  });
+
   it("does not duplicate an entry when the bot is bound directly to its #alerts channel", async () => {
     const config = make_config("111");
     const pool = new TestBotPool(config);

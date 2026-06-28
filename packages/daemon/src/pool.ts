@@ -1311,13 +1311,15 @@ export class BotPool extends EventEmitter {
       this.kill_tmux(bot.tmux_session);
 
       // Update access.json with the channel ID. Pass entity_id so the
-      // entity's #alerts channel is also added to the outbound allowlist (#40).
+      // entity's #alerts channel (#40) and #work-log channel (#56) are also
+      // added to the outbound allowlist.
       await this.write_access_json(bot.state_dir, channel_id, entity_id);
 
       // Prune any foreign entity channels from the bot's access.json that
       // may have been over-granted by a prior buggy backfill. Only the
-      // assigned channel and the entity's alerts channel belong in the groups
-      // map; everything else from the same entity is removed. Non-fatal.
+      // assigned channel, the entity's alerts channel, and the entity's
+      // work_log channel belong in the groups map; everything else from the
+      // same entity is removed. Non-fatal.
       try {
         await this.ensure_entity_channels_allowlisted(bot.state_dir, entity_id, channel_id);
       } catch (err) {
@@ -2504,11 +2506,37 @@ export class BotPool extends EventEmitter {
   }
 
   /**
-   * Reconcile a pool bot's `access.json.groups` on assignment so that exactly
-   * two entity channels are present:
+   * Resolve the work_log channel ID for an entity, if any.
+   * Returns null when the registry isn't ready, the entity isn't registered,
+   * or the entity has no `type: "work_log"` channel configured.
+   *
+   * Mirrors `resolve_alerts_channel_id`: pool bots are bound to a single
+   * inbound channel, but agents are expected to *post* progress to their
+   * entity's #work-log channel (the activity feed mandated by the global
+   * CLAUDE.md "Communication" norm). The Discord plugin only permits outbound
+   * `reply` to channels present in `access.json.groups`, so we add work_log as
+   * an outbound-only entry (see `write_access_json`). Only software-blueprint
+   * entities declare a work_log channel — content entities have none, so this
+   * returns null for them and the channel is simply omitted.
+   */
+  private resolve_work_log_channel_id(entity_id: string | null): string | null {
+    if (!entity_id || !this.registry) return null;
+    const entity_config = this.registry.get(entity_id);
+    if (!entity_config) return null;
+    const work_log_channel = entity_config.entity.channels.list.find(
+      (ch) => ch.type === "work_log",
+    );
+    return work_log_channel?.id ?? null;
+  }
+
+  /**
+   * Reconcile a pool bot's `access.json.groups` on assignment so that only the
+   * permitted entity channels are present:
    *   1. The bot's **assigned channel** — `requireMention: false` (already
    *      written by `write_access_json`; this method is a no-op for it).
    *   2. The entity's **alerts channel** — `requireMention: true` (already
+   *      written by `write_access_json`; this method is a no-op for it).
+   *   3. The entity's **work_log channel** — `requireMention: true` (already
    *      written by `write_access_json`; this method is a no-op for it).
    *
    * All other same-entity channels are **removed** from the groups map if
@@ -2520,6 +2548,7 @@ export class BotPool extends EventEmitter {
    *   - The assigned channel entry is never touched (it was written by
    *     `write_access_json` with the correct policy).
    *   - The alerts channel entry is never touched (same).
+   *   - The work_log channel entry is never touched (same).
    *   - dmPolicy and top-level allowFrom are never modified.
    *   - Only called for pool bots, never for infrastructure bots.
    *
@@ -2539,12 +2568,17 @@ export class BotPool extends EventEmitter {
     const all_entity_channel_ids = new Set(entity_config.entity.channels.list.map((ch) => ch.id));
     if (all_entity_channel_ids.size === 0) return;
 
-    // The two channels that belong in the groups map — anything else from
-    // this entity is a foreign channel and must be pruned.
+    // The channels that belong in the groups map — anything else from this
+    // entity is a foreign channel and must be pruned. work_log is permitted
+    // here for the same reason as alerts: write_access_json grants it as an
+    // outbound-only entry, so it must survive the self-healing prune (otherwise
+    // it would be granted and then immediately stripped on assign). See #56.
     const alerts_channel_id = this.resolve_alerts_channel_id(entity_id);
+    const work_log_channel_id = this.resolve_work_log_channel_id(entity_id);
     const permitted = new Set<string>();
     if (assigned_channel_id) permitted.add(assigned_channel_id);
     if (alerts_channel_id) permitted.add(alerts_channel_id);
+    if (work_log_channel_id) permitted.add(work_log_channel_id);
 
     const target = join(state_dir, "access.json");
 
@@ -2619,9 +2653,10 @@ export class BotPool extends EventEmitter {
    *
    * Pool bots are assigned to ONE inbound channel (general or work_room). They
    * also need OUTBOUND access to their entity's #alerts channel so agents can
-   * escalate. We add the alerts channel with `requireMention: true` so the bot
-   * doesn't accidentally consume alert posts as commands — alerts are meant to
-   * be broadcast-only output to Hunter, not an agent input surface. See #40.
+   * escalate, and to #work-log so they can post progress. Both are added with
+   * `requireMention: true` so the bot doesn't accidentally consume their posts
+   * as commands — both are broadcast-only output surfaces, not agent input.
+   * See #40 (alerts) and #56 (work_log).
    */
   private async write_access_json(
     state_dir: string,
@@ -2640,6 +2675,16 @@ export class BotPool extends EventEmitter {
     const alerts_channel_id = this.resolve_alerts_channel_id(entity_id);
     if (alerts_channel_id && alerts_channel_id !== channel_id) {
       groups[alerts_channel_id] = { requireMention: true, allowFrom: [] };
+    }
+
+    // Same rationale as #alerts: agents post progress to #work-log, so the bot
+    // needs OUTBOUND access to it. `requireMention: true` keeps it output-only —
+    // the work-log feed is a broadcast surface, never an agent input. Resolves
+    // to null (and is skipped) for entities without a work_log channel, e.g.
+    // content-blueprint entities. See #56.
+    const work_log_channel_id = this.resolve_work_log_channel_id(entity_id);
+    if (work_log_channel_id && work_log_channel_id !== channel_id) {
+      groups[work_log_channel_id] = { requireMention: true, allowFrom: [] };
     }
 
     // The owner's Discord user ID controls who can DM pool bots.

@@ -2057,10 +2057,16 @@ export class DiscordBot extends EventEmitter {
       await this.set_entity_category_permissions(category, entity_role, bot_role);
       permissions_set = true;
 
-      // Standard entity channels — work rooms are created on demand via /room
+      // Standard entity channels — work rooms are created on demand via /room.
+      // #work-log is the agent activity feed: spawned sessions post progress here
+      // (mandated by the global CLAUDE.md "Communication" norm). Created
+      // find-or-create like general/alerts so re-scaffolds are idempotent. Note
+      // the hyphenated channel name vs. the underscored config type — same
+      // convention as work_room → work-room-N.
       const entity_channels = [
         { name: "general", type: "general", purpose: "Entity-level discussion" },
         { name: "alerts", type: "alerts", purpose: "Approvals, blockers, questions" },
+        { name: "work-log", type: "work_log", purpose: "Agent activity feed" },
       ];
 
       for (const ch of entity_channels) {
