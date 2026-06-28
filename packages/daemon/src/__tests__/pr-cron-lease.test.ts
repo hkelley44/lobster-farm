@@ -132,6 +132,44 @@ describe("PRReviewCron review mutex (#60)", () => {
     expect(leases.get(OWNER_REPO, OPEN_PR.number)?.holder).toBe("tidus-manual");
   });
 
+  it("releases the lease when the spawn itself throws (no TTL-length lockout)", async () => {
+    // The catch block in review_pr must release the lease when session_manager
+    // .spawn rejects. Otherwise a transient spawn failure would lock the PR out
+    // of review for the full 20-min TTL — exactly the duplicate-suppression
+    // mechanism turning into a denial of review. See pr-cron.ts catch (#60).
+    const leases = new ReviewLeaseStore();
+    const cron = new TestCron(leases);
+    cron.spawn_spy.mockRejectedValueOnce(new Error("boom: spawn failed"));
+
+    await cron.run_review_pr();
+
+    // Spawn was attempted (and threw)...
+    expect(cron.spawn_spy).toHaveBeenCalledTimes(1);
+    // ...but the lease was released, so the PR is immediately re-acquirable.
+    expect(leases.get(OWNER_REPO, OPEN_PR.number)).toBeNull();
+    const retry = leases.acquire(OWNER_REPO, OPEN_PR.number, "daemon-cron");
+    expect(retry.ok).toBe(true);
+  });
+
+  it("cron skips the spawn when the webhook already holds the lease", async () => {
+    // The webhook-arm tests cover cron-holds → webhook-skips. This is the
+    // missing direction: the webhook grabbed the lease first, so a cron tick
+    // for the SAME PR must back off and not double-review. Exercises the real
+    // cron acquire/skip path against a webhook-held lease (#60).
+    const leases = new ReviewLeaseStore();
+    // Webhook grabbed the lease first.
+    const webhook = leases.acquire(OWNER_REPO, OPEN_PR.number, "daemon-webhook");
+    expect(webhook.ok).toBe(true);
+
+    const cron = new TestCron(leases);
+    await cron.run_review_pr();
+
+    // No reviewer spawned — the cron backed off this tick.
+    expect(cron.spawn_spy).not.toHaveBeenCalled();
+    // The webhook's lease is untouched (still the holder).
+    expect(leases.get(OWNER_REPO, OPEN_PR.number)?.holder).toBe("daemon-webhook");
+  });
+
   it("releases the lease when the reviewer session completes", async () => {
     const leases = new ReviewLeaseStore();
     const cron = new TestCron(leases);

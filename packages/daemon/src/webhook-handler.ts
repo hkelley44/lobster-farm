@@ -609,6 +609,10 @@ async function spawn_review(
 
   // Release the lease on any early-exit path so a failed spawn never deadlocks
   // the PR until TTL. Pairs with the acquire above; no-op when no store/lease.
+  // NOTE: this closure only covers the pre-spawn early-exits and the spawn-threw
+  // catch. Once a session is live, the lease is released by
+  // cleanup_and_maybe_requeue on the on_complete/on_fail handlers — that path
+  // must release before re-acquiring for a requeue, so it owns the release.
   const release_lease = () =>
     ctx.review_leases?.release(repo_full_name, pr.number, "daemon-webhook");
 
