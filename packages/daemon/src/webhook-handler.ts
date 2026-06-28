@@ -44,6 +44,7 @@ import type { BotPool } from "./pool.js";
 import type { PRWatchStore } from "./pr-watches.js";
 import type { EntityRegistry } from "./registry.js";
 import { find_entity_for_repo as find_entity_for_repo_full } from "./repo-utils.js";
+import type { ReviewLeaseStore } from "./review-lease.js";
 import {
   MAX_CI_FIX_ATTEMPTS,
   MAX_DEPLOY_FIX_ATTEMPTS,
@@ -74,6 +75,8 @@ export interface WebhookContext {
   pool: BotPool | null;
   pr_watches: PRWatchStore | null;
   alert_router: AlertRouter | null;
+  /** Per-PR review mutex (#60). Null in legacy callers/tests that don't gate. */
+  review_leases: ReviewLeaseStore | null;
 }
 
 /** Minimal PR shape from webhook payload. */
@@ -577,6 +580,23 @@ async function spawn_review(
   const head_sha = pr.head.sha || "unknown";
   const key = review_key(entity_id, pr.number, head_sha);
 
+  // Per-PR review mutex (#60). Acquire BEFORE marking the review in-flight so a
+  // cron tick that fires in the same window backs off cleanly. The lease is keyed
+  // on owner_repo (= repo_full_name), so it's shared with the cron's in-process
+  // acquire and Tidus's HTTP acquire. If another holder already owns it, skip the
+  // spawn — the existing reviewer covers this PR. Null store (legacy/test) =
+  // fail-open: behave exactly as before the mutex existed.
+  if (ctx.review_leases) {
+    const acquired = ctx.review_leases.acquire(repo_full_name, pr.number, "daemon-webhook");
+    if (!acquired.ok) {
+      console.log(
+        `[webhook] Review lease for PR #${String(pr.number)} held by ${acquired.current_lease.holder} ` +
+          `(expires ${acquired.current_lease.expires_at}) — skipping webhook spawn`,
+      );
+      return;
+    }
+  }
+
   // Track active review
   active_reviews.set(key, {
     entity_id,
@@ -586,6 +606,11 @@ async function spawn_review(
     needs_requeue: false,
     created_at: Date.now(),
   });
+
+  // Release the lease on any early-exit path so a failed spawn never deadlocks
+  // the PR until TTL. Pairs with the acquire above; no-op when no store/lease.
+  const release_lease = () =>
+    ctx.review_leases?.release(repo_full_name, pr.number, "daemon-webhook");
 
   // Get installation token for the reviewer subprocess
   let gh_token: string;
@@ -598,6 +623,7 @@ async function spawn_review(
       contexts: { pr: { number: pr.number, title: pr.title } },
     });
     active_reviews.delete(key);
+    release_lease();
     return;
   }
 
@@ -690,6 +716,7 @@ async function spawn_review(
       contexts: { pr: { number: pr.number, title: pr.title } },
     });
     active_reviews.delete(key);
+    release_lease();
   }
 }
 
@@ -1155,6 +1182,12 @@ function cleanup_and_maybe_requeue(
     review.state = "completed";
     review.completed_at = Date.now();
   }
+
+  // Release the review lease (#60) BEFORE any requeue spawn. The requeue path
+  // below calls spawn_review again, which re-acquires the lease for the new
+  // HEAD SHA — if we held the lease through that call, the re-acquire would
+  // collide with itself and silently drop the requeue. Order is load-bearing.
+  ctx.review_leases?.release(repo_full_name, pr.number, "daemon-webhook");
 
   if (review?.needs_requeue) {
     // A new HEAD SHA arrived while this review was in-flight. Spawn a fresh

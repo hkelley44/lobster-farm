@@ -4,6 +4,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GitHubAppAuth } from "../github-app.js";
 import type { EntityRegistry } from "../registry.js";
+import { ReviewLeaseStore } from "../review-lease.js";
 import type { ClaudeSessionManager } from "../session.js";
 import {
   type WebhookContext,
@@ -233,6 +234,8 @@ function make_context(overrides: Partial<WebhookContext> = {}): WebhookContext {
     } as WebhookContext["config"],
     pool: null,
     pr_watches: null,
+    alert_router: null,
+    review_leases: null,
     ...overrides,
   };
 }
@@ -1025,6 +1028,137 @@ describe("handle_github_webhook", () => {
       const sha_b_after = active_after.find((r) => r.head_sha === "sha-bbb");
       expect(sha_b_after).toBeDefined();
       expect(sha_b_after!.needs_requeue).toBe(true);
+    });
+  });
+
+  describe("review mutex (#60)", () => {
+    const OWNER_REPO = "test-org/lobster-farm";
+
+    it("webhook acquires the lease — a cron acquire then collides", async () => {
+      // The webhook spawns a reviewer and grabs the shared lease. A cron tick
+      // attempting to acquire for the SAME PR must collide and back off.
+      const leases = new ReviewLeaseStore();
+      const ctx = make_context({ review_leases: leases });
+
+      const body = make_pr_payload("opened", 6001, OWNER_REPO, {}, { head_sha: "sha-lease" });
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      await handle_github_webhook(req, make_response(), ctx);
+
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
+
+      // Lease is now held by the webhook. Cron's acquire must conflict.
+      const cron_attempt = leases.acquire(OWNER_REPO, 6001, "daemon-cron");
+      expect(cron_attempt.ok).toBe(false);
+      if (!cron_attempt.ok) {
+        expect(cron_attempt.current_lease.holder).toBe("daemon-webhook");
+      }
+    });
+
+    it("a held lease (e.g. cron) makes the webhook skip its spawn", async () => {
+      // Inverse direction: the cron already holds the lease when a webhook event
+      // arrives. The webhook must NOT spawn a second reviewer.
+      const leases = new ReviewLeaseStore();
+      const first = leases.acquire(OWNER_REPO, 6002, "daemon-cron");
+      expect(first.ok).toBe(true);
+
+      const ctx = make_context({ review_leases: leases });
+      const body = make_pr_payload("opened", 6002, OWNER_REPO, {}, { head_sha: "sha-held" });
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      await handle_github_webhook(req, make_response(), ctx);
+      await new Promise((r) => setTimeout(r, 100));
+
+      // No reviewer spawned — the cron's lease blocked it.
+      expect((ctx.session_manager as any).spawn).not.toHaveBeenCalled();
+      // And no in-flight webhook review entry was created.
+      const active = get_active_webhook_reviews();
+      expect(active.find((r) => r.pr_number === 6002)).toBeUndefined();
+    });
+
+    it("requeue still fires after release on a HEAD move — lease re-acquires cleanly", async () => {
+      // CRITICAL ordering test. SHA-A is in-flight (lease held). SHA-B arrives →
+      // requeue flagged. SHA-A completes → lease released BEFORE the requeue
+      // spawn re-acquires for SHA-B. If release happened after (or not at all),
+      // the requeue's acquire would collide with the still-held lease and the
+      // re-review would be silently dropped.
+      const leases = new ReviewLeaseStore();
+      const ctx = make_context({ review_leases: leases });
+
+      // SHA-A opens
+      const body1 = make_pr_payload("opened", 6003, OWNER_REPO, {}, { head_sha: "sha-aaa" });
+      const req1 = make_request(body1, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body1),
+      });
+      await handle_github_webhook(req1, make_response(), ctx);
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
+      // Lease held by webhook for SHA-A's review.
+      expect(leases.get(OWNER_REPO, 6003)?.holder).toBe("daemon-webhook");
+
+      // SHA-B arrives mid-review → requeue
+      const body2 = make_pr_payload("synchronize", 6003, OWNER_REPO, {}, { head_sha: "sha-bbb" });
+      const req2 = make_request(body2, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body2),
+      });
+      await handle_github_webhook(req2, make_response(), ctx);
+      await new Promise((r) => setTimeout(r, 50));
+      expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+
+      // SHA-A completes → release then requeue-spawn for SHA-B
+      const spawn_result = await (ctx.session_manager as any).spawn.mock.results[0].value;
+      (ctx.session_manager as any).emit("session:completed", {
+        session_id: spawn_result.session_id,
+        exit_code: 0,
+      });
+
+      // The requeue must fire — SHA-B gets reviewed.
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(2);
+        },
+        { timeout: 2000 },
+      );
+
+      // SHA-B's review re-acquired the lease cleanly (still held, webhook holder).
+      expect(leases.get(OWNER_REPO, 6003)?.holder).toBe("daemon-webhook");
+
+      const active = get_active_webhook_reviews();
+      const sha_b = active.find((r) => r.head_sha === "sha-bbb");
+      expect(sha_b).toBeDefined();
+      expect(sha_b!.state).toBe("in_flight");
+    });
+
+    it("no lease store (legacy) → spawns exactly as before (fail-open)", async () => {
+      // review_leases: null must not change behavior — the mutex is additive.
+      const ctx = make_context({ review_leases: null });
+      const body = make_pr_payload("opened", 6004, OWNER_REPO, {}, { head_sha: "sha-nolease" });
+      const req = make_request(body, {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": sign_payload(body),
+      });
+      await handle_github_webhook(req, make_response(), ctx);
+      await vi.waitFor(
+        () => {
+          expect((ctx.session_manager as any).spawn).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 2000 },
+      );
     });
   });
 

@@ -90,6 +90,13 @@ export const LobsterFarmConfigSchema = z.object({
   pr_cron: z
     .object({
       enabled: z.boolean().default(true),
+      /**
+       * Per-PR review lease TTL in ms (#60). A reviewer-spawn path holds the
+       * lease for this long before it auto-expires, so a crashed reviewer can't
+       * deadlock the PR. Default 20 min — long enough for a full review pass,
+       * short enough that a stuck lease self-heals within one cron window.
+       */
+      review_lease_ttl_ms: z.number().int().positive().default(1_200_000),
     })
     .optional(),
 

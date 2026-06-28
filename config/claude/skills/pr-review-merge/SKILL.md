@@ -43,26 +43,39 @@ The full rationale and the universal `-C` translation rules live in `coding-dna`
 
 ## Steps
 
-### 0. Pre-flight check before spawning a reviewer
+### 0. Acquire the review lease before spawning a reviewer
 
-**Run this before every reviewer spawn.** The daemon's autonomous review-merge cron and Hunter's manual "review PR <n>" requests both terminate at the same point — spawning a reviewer subagent. Without a pre-flight, two parallel passes can land on the same PR (observed 2026-05-09, PR #41), wasting a cycle and producing conflicting findings comments.
+**Run this before every reviewer spawn.** Three independent paths spawn reviewer subagents for a PR: the daemon's autonomous review-merge cron, the GitHub webhook handler, and Hunter's manual "review PR <n>" requests routed through Tidus. Without a shared lock, two of them can land on the same PR at once (observed PR #41 2026-05-09 and PR #54 2026-05-11), wasting a cycle and producing conflicting findings comments.
+
+Layer 2 (issue #60) closes the race with a daemon-side **per-PR review mutex**. Before spawning, the orchestrator acquires a lease; whoever holds it owns the review. The cron and webhook paths acquire their own leases in-process — Tidus acquires over the daemon HTTP API (port 7749).
 
 Required actions for Tidus (or whichever orchestrator is about to spawn the reviewer):
 
-1. **Query the PR's current review state:**
+1. **Acquire the lease** for the PR (`OWNER/REPO` is the GitHub `owner/repo` slug, `NUM` the PR number):
    ```bash
-   gh pr view <num> --json reviews,latestReviews,state,statusCheckRollup
+   curl -fsS -X POST "http://localhost:7749/pr/OWNER/REPO/NUM/review-lease" \
+     -H 'Content-Type: application/json' \
+     -d '{"holder":"tidus-manual"}' -w '\n%{http_code}'
    ```
-2. **Inspect `latestReviews` (and, in single-dev mode, recent findings comments) for a reviewer pass within the last 10 minutes.** In single-dev mode the Reviewer posts findings comments rather than formal `PullRequestReview` entries, so also check:
+2. **On `200`** → you hold the lease. Proceed to step 1 (spawn the reviewer).
+3. **On `409`** → another holder (the cron or webhook) is already reviewing this PR. The response body carries the `current_lease` (holder, `acquired_at`, `expires_at`). Do **not** spawn. Surface to Hunter on Discord: "the daemon is reviewing PR #NUM right now (holder X, started Y, expires Z) — watching for completion." Hunter's explicit "fresh pass" instruction is the only thing that overrides this. Optionally confirm the in-flight state with `GET /pr/OWNER/REPO/NUM/review-state`.
+4. **After the Reviewer posts its verdict** → release the lease so a legitimate re-review can proceed:
    ```bash
-   gh pr view <num> --json comments --jq \
-     '[.comments[] | select(.body | startswith("**Verdict:")) | {created: .createdAt, verdict: (.body | split("\n")[0])}] | sort_by(.created) | last'
+   curl -fsS -X DELETE "http://localhost:7749/pr/OWNER/REPO/NUM/review-lease" \
+     -H 'Content-Type: application/json' \
+     -d '{"holder":"tidus-manual"}' -w '\n%{http_code}'
    ```
-3. **If a recent pass exists (within ~10 min):** do **not** spawn a new reviewer. Surface the existing result back to Hunter on Discord with the verdict, timestamp, and a summary of findings, then ask whether to act on those findings or trigger a fresh pass anyway. Hunter's explicit "fresh pass" instruction is the only thing that overrides this guard.
-4. **If no recent pass exists:** proceed to step 1 (spawn the reviewer).
-5. **If you're unsure whether the daemon cron has fired** (e.g., logs are stale, daemon was restarted mid-window, race window suspected): there is no daemon-side review-state query today. A `GET /pr/:num/review-state` endpoint would let the orchestrator confirm authoritatively, but it does **not** exist — flagged as a Layer 2 prerequisite. Absent that endpoint, the `gh pr view` query above is sufficient because GitHub is the source of truth for posted reviews and comments.
+   (A lease also auto-expires after its TTL — 20 min by default, tunable via `pr_cron.review_lease_ttl_ms` — so a crashed orchestrator can never deadlock a PR.)
 
-This is a Layer 1 guardrail. It does **not** eliminate the race window (two orchestrators could both pass pre-flight in the gap between query and spawn), but it closes the common case: a manual trigger arriving a few minutes after a cron pass has already completed and posted its findings. If a collision is observed in the wild post-this-merge, file a new issue and scope Layer 2 (daemon mutex + the `/pr/:num/review-state` endpoint).
+**FAIL-OPEN.** The mutex must never block all reviews. If the daemon HTTP call errors or times out (`curl` non-zero exit, connection refused, 5xx), **fall back to the Layer 1 pre-flight** and proceed:
+
+```bash
+gh pr view <num> --json reviews,latestReviews,state,statusCheckRollup
+gh pr view <num> --json comments --jq \
+  '[.comments[] | select(.body | startswith("**Verdict:")) | {created: .createdAt, verdict: (.body | split("\n")[0])}] | sort_by(.created) | last'
+```
+
+If that shows a reviewer pass within the last ~10 min, surface it to Hunter instead of spawning (Layer 1 behavior). If not, spawn. The cost of one duplicate review is small; the cost of blocking every review because the daemon is briefly unreachable is high — so on doubt, proceed.
 
 ### 1. Review
 
@@ -262,30 +275,33 @@ Cycle counting and branch detection are agent-side responsibilities for v1. A fu
 - Don't hold a PR open waiting for a response longer than 24h without re-pinging
 - Don't loop past 3 cycles — escalate to Hunter instead, the loop has exhausted its budget
 - Don't auto-promote staging → main — Hunter's ✅ is the only valid signal, no timeout fallback
-- Don't spawn a reviewer without running the step-0 pre-flight check — a duplicate pass on a fresh review wastes a cycle and produces conflicting findings
+- Don't spawn a reviewer without first acquiring the review lease (step 0) — the lease is the shared mutex across all three spawn paths (daemon cron, GitHub webhook, this manual SOP); skipping it lets two reviewers collide on the same PR and produce conflicting findings
 - Don't emit `cd <path> && git ...` compounds anywhere in this SOP — use `git -C <path> ...` for every git invocation against a non-cwd repo or worktree (the harness backstop crash-loops pool bots; see the "Critical" callout near the top of this file)
 
-## Worked example — pre-flight catches a duplicate
+## Worked example — the lease catches a duplicate
 
 Hunter posts in Discord: "review PR 41".
 
-Tidus, before spawning a reviewer, runs:
+Tidus, before spawning a reviewer, tries to acquire the lease (owner/repo `hkelley44/lobster-farm`, PR 41):
 
 ```bash
-gh pr view 41 --json reviews,latestReviews,state,statusCheckRollup
-gh pr view 41 --json comments --jq \
-  '[.comments[] | select(.body | startswith("**Verdict:")) | {created: .createdAt, verdict: (.body | split("\n")[0])}] | sort_by(.created) | last'
+curl -fsS -X POST "http://localhost:7749/pr/hkelley44/lobster-farm/41/review-lease" \
+  -H 'Content-Type: application/json' \
+  -d '{"holder":"tidus-manual"}'
 ```
 
-The query shows the daemon cron already fired four minutes ago and the Reviewer posted a findings comment at `21:20Z` with `**Verdict: Approved**` plus three non-blocking nits.
+The daemon cron already grabbed the lease four minutes ago, so the POST returns **409** with the current holder:
 
-Tidus does **not** spawn a new reviewer. Instead, Tidus replies on Discord:
+```json
+{ "current_lease": { "holder": "daemon-cron", "expires_at": "2026-06-27T21:36:00Z" } }
+```
 
-> Reviewer already passed at 21:20Z (4 min ago) — verdict **Approved** with 3 non-blocking findings:
-> 1. <nit 1>
-> 2. <nit 2>
-> 3. <nit 3>
+Tidus does **not** spawn a new reviewer — the cron's reviewer is already (or about to be) in flight. Instead, Tidus replies on Discord:
+
+> A review is already in flight on PR 41 — the daemon cron acquired the review lease ~4 min ago (`daemon-cron`, lease expires 21:36Z). I'm holding off so we don't run two reviewers against the same PR.
 >
-> Want me to act on these (open a follow-up issue / patch in-PR) or trigger a fresh pass anyway?
+> I'll let the cron's pass land and report its verdict. Want me to force a fresh pass anyway?
 
-Tidus then waits for Hunter's direction. Only an explicit "fresh pass" overrides the guard and authorizes a new reviewer spawn.
+Tidus then waits for the in-flight pass to finish (the cron releases the lease on completion) and surfaces its verdict, or waits for Hunter's explicit "fresh pass" to override.
+
+**Fail-open note:** if the lease POST fails to reach the daemon (connection refused, timeout, non-JSON body), Tidus does **not** block. It falls back to the Layer 1 `gh pr view 41 --json reviews,latestReviews,state` duplicate check and proceeds — a degraded daemon must never freeze all reviews.

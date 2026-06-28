@@ -23,6 +23,7 @@ import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { PRReviewState } from "./persistence.js";
 import type { PRWatchStore } from "./pr-watches.js";
 import type { EntityRegistry } from "./registry.js";
+import type { ReviewLeaseStore } from "./review-lease.js";
 import {
   MAX_CI_FIX_ATTEMPTS,
   attempt_auto_merge,
@@ -141,6 +142,7 @@ export class PRReviewCron {
     private github_app: GitHubAppAuth | null = null,
     private pr_watches: PRWatchStore | null = null,
     private alert_router: AlertRouter | null = null,
+    private review_leases: ReviewLeaseStore | null = null,
   ) {}
 
   /** Start the polling cron. Loads persisted review state before first poll. */
@@ -424,6 +426,18 @@ export class PRReviewCron {
     }
   }
 
+  /**
+   * Resolve the `owner/repo` slug for a repo path from entity config, for use
+   * as the review-lease key (#60). Returns null when the path can't be matched
+   * or the URL can't be parsed — callers treat null as "skip the mutex".
+   */
+  private owner_repo_for(repo_path: string, entity_config: EntityConfig): string | null {
+    const repo = entity_config.entity.repos.find((r) => expand_home(r.path) === repo_path);
+    // nwo_from_url returns undefined on an unparseable URL — normalize to null so
+    // callers have a single "skip the mutex" sentinel.
+    return (repo ? nwo_from_url(repo.url) : null) ?? null;
+  }
+
   /** Spawn a reviewer session for a PR. */
   private async review_pr(
     entity_id: string,
@@ -432,6 +446,31 @@ export class PRReviewCron {
     entity_config: EntityConfig,
   ): Promise<void> {
     const key = `${entity_id}:${String(pr.number)}`;
+
+    // Per-PR review mutex (#60). Acquire BEFORE marking the review active so a
+    // webhook or Tidus spawn racing in the same window backs off cleanly. The
+    // lease is keyed on owner/repo, shared across all three spawn paths. On
+    // collision we skip this tick — the holder's reviewer covers the PR; the
+    // next cron cycle re-checks. Null store / unresolvable slug = fail-open.
+    const owner_repo = this.review_leases ? this.owner_repo_for(repo_path, entity_config) : null;
+    if (this.review_leases && owner_repo) {
+      const acquired = this.review_leases.acquire(owner_repo, pr.number, "daemon-cron");
+      if (!acquired.ok) {
+        console.log(
+          `[pr-cron] Review lease for PR #${String(pr.number)} held by ${acquired.current_lease.holder} ` +
+            `(expires ${acquired.current_lease.expires_at}) — skipping cron spawn this tick`,
+        );
+        return;
+      }
+    }
+
+    // Release the lease on every exit path below (deadlock guard). No-op when
+    // there's no store or no resolvable slug.
+    const release_lease = () => {
+      if (this.review_leases && owner_repo) {
+        this.review_leases.release(owner_repo, pr.number, "daemon-cron");
+      }
+    };
 
     this.active_reviews.set(key, {
       pr_number: pr.number,
@@ -518,6 +557,7 @@ export class PRReviewCron {
         this.session_manager.removeListener("session:failed", on_fail);
 
         this.active_reviews.delete(key);
+        release_lease(); // free the PR for legitimate re-review (#60)
         console.log(`[pr-cron] Review completed for PR #${String(pr.number)} in ${entity_id}`);
 
         // Persist completion so we don't re-review after restart
@@ -540,6 +580,7 @@ export class PRReviewCron {
         this.session_manager.removeListener("session:failed", on_fail);
 
         this.active_reviews.delete(key);
+        release_lease(); // free the PR — TTL would too, but don't wait on it (#60)
         console.error(`[pr-cron] Review failed for PR #${String(pr.number)}: ${error}`);
         sentry.captureException(new Error(error), {
           tags: { module: "pr-cron", entity: entity_id },
@@ -551,6 +592,7 @@ export class PRReviewCron {
       this.session_manager.on("session:failed", on_fail);
     } catch (err) {
       this.active_reviews.delete(key);
+      release_lease(); // spawn threw — release so the PR isn't locked until TTL (#60)
       console.error(
         `[pr-cron] Failed to spawn reviewer for PR #${String(pr.number)}: ${String(err)}`,
       );
