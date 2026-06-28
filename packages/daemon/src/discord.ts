@@ -2689,6 +2689,11 @@ export class DiscordBot extends EventEmitter {
       } else {
         // Bot is assigned and tmux is alive — touch for LRU tracking
         this._pool.touch(message.channelId);
+        // Record the inbound delivery so the plugin-liveness probe can detect
+        // a live-but-deaf bot that never picks the message up (#73). This is the
+        // pure-MCP-plugin steady-state path — no daemon send-keys, so this is the
+        // daemon's only record that a message was handed to the bot.
+        this._pool.mark_inbound(message.channelId);
         // Start typing indicator loop + status embed while bot processes the new message
         this.start_typing_loop(message.channelId);
         void this.send_status_embed(message.channelId, assignment.archetype ?? "planner");
