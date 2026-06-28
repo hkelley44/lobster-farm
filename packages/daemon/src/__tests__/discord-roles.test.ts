@@ -230,6 +230,7 @@ describe("/lockdown route guards (#295)", () => {
       null,
       null,
       null,
+      null,
       0,
     );
     // Wait for listen

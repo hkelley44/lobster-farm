@@ -275,6 +275,7 @@ describe("POST /entities/:id/members (#308)", () => {
       null,
       null,
       null,
+      null,
       0,
     );
     await new Promise<void>((resolve) => server.on("listening", resolve));
@@ -496,6 +497,7 @@ describe("DELETE /entities/:id/members/:user_id (#308)", () => {
       queue,
       null,
       discord as never,
+      null,
       null,
       null,
       null,

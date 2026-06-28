@@ -14,6 +14,7 @@ import { PRReviewCron } from "./pr-cron.js";
 import { PRWatchStore } from "./pr-watches.js";
 import { TaskQueue } from "./queue.js";
 import { EntityRegistry } from "./registry.js";
+import { ReviewLeaseStore } from "./review-lease.js";
 import * as sentry from "./sentry.js";
 import { start_server } from "./server.js";
 import { ClaudeSessionManager } from "./session.js";
@@ -268,6 +269,11 @@ async function main(): Promise<void> {
   const discord_for_routing = discord_connected ? discord : null;
   const alert_router = new AlertRouter(discord_for_routing, config);
 
+  // Per-PR review mutex (#60). Single in-memory store shared by all three
+  // reviewer-spawn paths: HTTP routes (Tidus manual), the cron, and the webhook
+  // handler. Instantiated once here so they contend on the same leases.
+  const review_leases = new ReviewLeaseStore(config.pr_cron?.review_lease_ttl_ms);
+
   // Start HTTP server
   const server = start_server(
     registry,
@@ -280,6 +286,7 @@ async function main(): Promise<void> {
     github_app,
     pr_watches,
     alert_router,
+    review_leases,
   );
 
   // Start PR review cron (safety net — 30 min when webhooks are active, 5 min otherwise)
@@ -291,6 +298,7 @@ async function main(): Promise<void> {
     github_app,
     pr_watches,
     alert_router,
+    review_leases,
   );
   const pr_cron_enabled = config.pr_cron?.enabled !== false; // default true for backward compat
   if (pr_cron_enabled) {

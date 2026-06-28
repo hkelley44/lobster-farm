@@ -21,6 +21,7 @@ import { QueueFullError } from "./queue.js";
 import type { TaskQueue, TaskSubmission } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
 import { evaluate_stop } from "./reply-enforcement.js";
+import { type ReviewLeaseStore, is_lease_holder } from "./review-lease.js";
 import {
   format_sentry_alert,
   format_sentry_alert_minimal,
@@ -47,6 +48,7 @@ interface ServerContext {
   github_app: GitHubAppAuth | null;
   pr_watches: PRWatchStore | null;
   alert_router: AlertRouter | null;
+  review_leases: ReviewLeaseStore | null;
 }
 
 type RouteHandler = (
@@ -156,6 +158,7 @@ const handle_webhook_github: RouteHandler = async (req, res, ctx) => {
     pool: ctx.pool,
     pr_watches: ctx.pr_watches,
     alert_router: ctx.alert_router,
+    review_leases: ctx.review_leases,
   };
 
   await handle_github_webhook(req, res, webhook_ctx);
@@ -708,6 +711,134 @@ const handle_pr_watch: RouteHandler = async (req, res, ctx) => {
   json_response(res, 201, { ok: true, watch_key: `${params.repo}#${String(params.pr_number)}` });
 };
 
+// ── Review lease routes (#60) ──
+//
+// Per-PR review mutex. Tidus's manual review-merge SOP acquires "tidus-manual"
+// here before spawning a reviewer; the cron and webhook paths acquire their own
+// holders in-process. The owner/repo segments use GitHub's repo charset
+// (alphanumeric plus . _ -) — mirrors how handle_entity_detail parses path
+// params, but widened past [a-z0-9-] since GitHub names allow uppercase/dots.
+const GH_SEGMENT = "[A-Za-z0-9._-]+";
+const REVIEW_LEASE_PATH = new RegExp(`^/pr/(${GH_SEGMENT})/(${GH_SEGMENT})/(\\d+)/review-lease$`);
+const REVIEW_STATE_PATH = new RegExp(`^/pr/(${GH_SEGMENT})/(${GH_SEGMENT})/(\\d+)/review-state$`);
+
+/** Parse `/pr/:owner/:repo/:num/...` into the lease store's key components. */
+function parse_pr_path(
+  pathname: string,
+  pattern: RegExp,
+): { owner_repo: string; pr_number: number } | null {
+  const match = pathname.match(pattern);
+  if (!match) return null;
+  const [, owner, repo, num] = match;
+  if (!owner || !repo || !num) return null;
+  const pr_number = Number.parseInt(num, 10);
+  if (!Number.isInteger(pr_number) || pr_number <= 0) return null;
+  return { owner_repo: `${owner}/${repo}`, pr_number };
+}
+
+const handle_review_state: RouteHandler = (req, res, ctx) => {
+  if (!ctx.review_leases) {
+    json_response(res, 503, { error: "Review lease store not initialized" });
+    return;
+  }
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const parsed = parse_pr_path(url.pathname, REVIEW_STATE_PATH);
+  if (!parsed) {
+    json_response(res, 400, { error: "Invalid PR path" });
+    return;
+  }
+
+  const lease = ctx.review_leases.get(parsed.owner_repo, parsed.pr_number);
+  json_response(res, 200, {
+    status: lease ? "in_flight" : "idle",
+    ...(lease ? { lease } : {}),
+  });
+};
+
+const handle_review_lease_acquire: RouteHandler = async (req, res, ctx) => {
+  if (!ctx.review_leases) {
+    json_response(res, 503, { error: "Review lease store not initialized" });
+    return;
+  }
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const parsed = parse_pr_path(url.pathname, REVIEW_LEASE_PATH);
+  if (!parsed) {
+    json_response(res, 400, { error: "Invalid PR path" });
+    return;
+  }
+
+  const body = await read_body(req);
+  let params: { holder?: unknown; ttl_ms?: unknown; session_id?: unknown };
+  try {
+    params = JSON.parse(body) as typeof params;
+  } catch {
+    json_response(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+
+  if (!is_lease_holder(params.holder)) {
+    json_response(res, 400, {
+      error: "Unknown holder — must be one of: daemon-cron, daemon-webhook, tidus-manual",
+    });
+    return;
+  }
+
+  const ttl_ms = typeof params.ttl_ms === "number" ? params.ttl_ms : undefined;
+  const session_id = typeof params.session_id === "string" ? params.session_id : undefined;
+
+  const result = ctx.review_leases.acquire(parsed.owner_repo, parsed.pr_number, params.holder, {
+    ttl_ms,
+    session_id,
+  });
+
+  if (result.ok) {
+    json_response(res, 200, { lease: result.lease });
+  } else {
+    // Another holder owns it — 409 with the current lease so the caller can
+    // surface "who's reviewing and until when" instead of blindly retrying.
+    json_response(res, 409, { current_lease: result.current_lease });
+  }
+};
+
+const handle_review_lease_release: RouteHandler = async (req, res, ctx) => {
+  if (!ctx.review_leases) {
+    json_response(res, 503, { error: "Review lease store not initialized" });
+    return;
+  }
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const parsed = parse_pr_path(url.pathname, REVIEW_LEASE_PATH);
+  if (!parsed) {
+    json_response(res, 400, { error: "Invalid PR path" });
+    return;
+  }
+
+  const body = await read_body(req);
+  let params: { holder?: unknown };
+  try {
+    params = JSON.parse(body) as typeof params;
+  } catch {
+    json_response(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+
+  if (!is_lease_holder(params.holder)) {
+    json_response(res, 400, {
+      error: "Unknown holder — must be one of: daemon-cron, daemon-webhook, tidus-manual",
+    });
+    return;
+  }
+
+  const result = ctx.review_leases.release(parsed.owner_repo, parsed.pr_number, params.holder);
+  if (result === "released") {
+    res.writeHead(204);
+    res.end();
+  } else if (result === "not_found") {
+    json_response(res, 404, { error: "No lease held for this PR" });
+  } else {
+    json_response(res, 403, { error: "Lease held by a different holder" });
+  }
+};
+
 // ── Channel routes ──
 
 const PROTECTED_CHANNEL_TYPES = ["general", "alerts"];
@@ -998,6 +1129,11 @@ const routes: Route[] = [
   { method: "POST", pattern: /^\/pool\/assign$/, handler: handle_pool_assign },
   { method: "POST", pattern: /^\/pool\/release$/, handler: handle_pool_release },
   { method: "POST", pattern: /^\/pr\/watch$/, handler: handle_pr_watch },
+  // Review lease mutex (#60). Listed before any broader /pr/* patterns so the
+  // specific review-state / review-lease paths match first.
+  { method: "GET", pattern: REVIEW_STATE_PATH, handler: handle_review_state },
+  { method: "POST", pattern: REVIEW_LEASE_PATH, handler: handle_review_lease_acquire },
+  { method: "DELETE", pattern: REVIEW_LEASE_PATH, handler: handle_review_lease_release },
   { method: "POST", pattern: /^\/channels\/delete$/, handler: handle_channel_delete },
   {
     method: "POST",
@@ -1051,6 +1187,7 @@ export function start_server(
   github_app: GitHubAppAuth | null = null,
   pr_watches: PRWatchStore | null = null,
   alert_router: AlertRouter | null = null,
+  review_leases: ReviewLeaseStore | null = null,
   port: number = DAEMON_PORT,
 ): Server {
   const ctx: ServerContext = {
@@ -1064,6 +1201,7 @@ export function start_server(
     github_app,
     pr_watches,
     alert_router,
+    review_leases,
   };
 
   const server = createServer((req, res) => {
