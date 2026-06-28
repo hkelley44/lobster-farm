@@ -1293,13 +1293,15 @@ export class BotPool extends EventEmitter {
       this.kill_tmux(bot.tmux_session);
 
       // Update access.json with the channel ID. Pass entity_id so the
-      // entity's #alerts channel is also added to the outbound allowlist (#40).
+      // entity's #alerts channel (#40) and #work-log channel (#56) are also
+      // added to the outbound allowlist.
       await this.write_access_json(bot.state_dir, channel_id, entity_id);
 
       // Prune any foreign entity channels from the bot's access.json that
       // may have been over-granted by a prior buggy backfill. Only the
-      // assigned channel and the entity's alerts channel belong in the groups
-      // map; everything else from the same entity is removed. Non-fatal.
+      // assigned channel, the entity's alerts channel, and the entity's
+      // work_log channel belong in the groups map; everything else from the
+      // same entity is removed. Non-fatal.
       try {
         await this.ensure_entity_channels_allowlisted(bot.state_dir, entity_id, channel_id);
       } catch (err) {

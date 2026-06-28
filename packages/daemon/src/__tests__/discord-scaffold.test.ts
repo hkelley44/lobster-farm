@@ -140,4 +140,37 @@ describe("DiscordBot.scaffold_entity — work_log channel (#56)", () => {
     const work_log = result.channels.find((c) => c.type === "work_log");
     expect(work_log?.id).toBe("existing-work-log");
   });
+
+  it("is fully idempotent — when general, alerts, and work-log all exist, zero channels are created", async () => {
+    // Seed the category plus all three standard channels under it. A re-scaffold
+    // of an already-provisioned entity must be a complete no-op on creation —
+    // every channel resolves via find-or-create, so create() is never called.
+    const existing = new Map<string, { id: string; name: string; parentId?: string }>();
+    const category = { id: CATEGORY_ID, name: "Acme", parentId: undefined } as {
+      id: string;
+      name: string;
+      parentId?: string;
+      type?: number;
+    };
+    category.type = DiscordChannelType.GuildCategory;
+    existing.set(CATEGORY_ID, category);
+    for (const name of ["general", "alerts", "work-log"]) {
+      existing.set(`existing-${name}`, {
+        id: `existing-${name}`,
+        name,
+        parentId: CATEGORY_ID,
+      });
+    }
+
+    const { guild, created } = make_guild(existing);
+    const bot = make_bot(guild);
+
+    const result = await bot.scaffold_entity("acme", "Acme");
+
+    // Full-idempotency: nothing was created.
+    expect(created).toHaveLength(0);
+    // Every standard channel is still reported, resolved to its existing ID.
+    expect(result.channels.find((c) => c.type === "work_log")?.id).toBe("existing-work-log");
+    expect(result.channels.find((c) => c.type === "alerts")?.id).toBe("existing-alerts");
+  });
 });
