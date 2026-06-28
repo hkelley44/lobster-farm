@@ -380,9 +380,25 @@ async function main(): Promise<void> {
   // Graceful shutdown handler
   let shutting_down = false;
 
+  // Hard deadline for the drain loop. launchctl kickstart -k sends a single
+  // SIGTERM and waits ExitTimeout (300s) before force-killing. If we drain
+  // indefinitely on the first signal, kickstart times out → status 37, and
+  // the daemon wedges mid-shutdown with KeepAlive unable to respawn (#75).
+  // Default 90s — well inside launchd's 300s ExitTimeout, long enough for
+  // typical agent turns (p99 <60s), env-overridable for testing or operator
+  // control.
+  const SHUTDOWN_DRAIN_TIMEOUT_MS = (() => {
+    const raw = process.env.SHUTDOWN_DRAIN_TIMEOUT_MS;
+    if (raw !== undefined) {
+      const parsed = Number.parseInt(raw, 10);
+      if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+    }
+    return 90_000;
+  })();
+
   async function shutdown(signal: string): Promise<void> {
     if (shutting_down) {
-      // Second signal = force kill
+      // Second signal = force kill immediately (manual override)
       console.log("[shutdown] Second signal received — forcing shutdown.");
       process.exit(1);
     }
@@ -402,8 +418,9 @@ async function main(): Promise<void> {
       const names = work_check.working_bots
         .map((b) => `${b.archetype} (pool-${String(b.id)})`)
         .join(", ");
+      const timeout_secs = Math.round(SHUTDOWN_DRAIN_TIMEOUT_MS / 1000);
       console.log(
-        `[shutdown] Draining — ${String(work_check.working_bots.length)} agent(s) still working: ${names}`,
+        `[shutdown] Draining — ${String(work_check.working_bots.length)} agent(s) still working: ${names} (deadline: ${String(timeout_secs)}s)`,
       );
 
       // Notify #system-status (mirrors the startup notification path).
@@ -415,7 +432,7 @@ async function main(): Promise<void> {
           if (status_channel) {
             await discord.send(
               status_channel,
-              `Daemon shutting down — waiting for ${String(work_check.working_bots.length)} active agent(s) to finish: ${names}. Send another signal to force.`,
+              `Daemon shutting down — waiting for ${String(work_check.working_bots.length)} active agent(s) to finish: ${names}. Deadline: ${String(timeout_secs)}s. Send another signal to force immediately.`,
             );
           }
         } catch {
@@ -423,15 +440,45 @@ async function main(): Promise<void> {
         }
       }
 
-      // Wait indefinitely for agents to finish (second SIGTERM forces)
-      while (true) {
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-        const recheck = pool.has_active_work();
-        if (!recheck.active) {
-          console.log("[shutdown] All agents idle. Proceeding with shutdown.");
-          break;
+      // Race the drain loop against a hard deadline. Pool tmux sessions
+      // survive a forced exit (they're independent tmux processes), so
+      // forcing exit here is safe — bots resume from pool-state.json on
+      // the next startup with no context lost.
+      const drain_done = Symbol("drain_done");
+      const deadline_hit = Symbol("deadline_hit");
+
+      const drain_loop = async (): Promise<typeof drain_done> => {
+        while (true) {
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+          const recheck = pool.has_active_work();
+          if (!recheck.active) {
+            console.log("[shutdown] All agents idle. Proceeding with shutdown.");
+            return drain_done;
+          }
+          console.log(`[shutdown] ${String(recheck.working_bots.length)} still working...`);
         }
-        console.log(`[shutdown] ${String(recheck.working_bots.length)} still working...`);
+      };
+
+      const deadline_timer = (): Promise<typeof deadline_hit> =>
+        new Promise((resolve) =>
+          setTimeout(() => resolve(deadline_hit), SHUTDOWN_DRAIN_TIMEOUT_MS),
+        );
+
+      const result = await Promise.race([drain_loop(), deadline_timer()]);
+
+      if (result === deadline_hit) {
+        const stuck = pool.has_active_work();
+        const stuck_names = stuck.working_bots
+          .map((b) => `${b.archetype} (pool-${String(b.id)})`)
+          .join(", ");
+        console.log(
+          `[shutdown] Drain deadline elapsed (${String(timeout_secs)}s). Forcing exit. Still working: ${stuck_names || "none"}`,
+        );
+        // Force-exit without clean teardown — pool tmux sessions are
+        // independent and survive; bots resume on next daemon start.
+        await pool.shutdown();
+        await remove_pid(config);
+        process.exit(0);
       }
     }
 
