@@ -388,13 +388,22 @@ async function main(): Promise<void> {
   // typical agent turns (p99 <60s), env-overridable for testing or operator
   // control.
   const SHUTDOWN_DRAIN_TIMEOUT_MS = (() => {
+    const MINIMUM_MS = 1_000;
+    const DEFAULT_MS = 90_000;
     const raw = process.env.SHUTDOWN_DRAIN_TIMEOUT_MS;
     if (raw !== undefined) {
-      const parsed = Number.parseInt(raw, 10);
-      if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+      // Number() handles scientific notation (e.g. "1e5" → 100000).
+      // parseInt("1e5", 10) silently returns 1 — a 1ms timeout that always
+      // force-exits without draining, recreating the original bug.
+      const parsed = Number(raw);
+      if (!Number.isNaN(parsed) && parsed >= MINIMUM_MS) return parsed;
+      console.warn(
+        `[shutdown] SHUTDOWN_DRAIN_TIMEOUT_MS="${raw}" is invalid or below minimum ${String(MINIMUM_MS)}ms — using default ${String(DEFAULT_MS)}ms`,
+      );
     }
-    return 90_000;
+    return DEFAULT_MS;
   })();
+  console.log(`[shutdown] Drain timeout: ${String(SHUTDOWN_DRAIN_TIMEOUT_MS)}ms`);
 
   async function shutdown(signal: string): Promise<void> {
     if (shutting_down) {
@@ -477,6 +486,9 @@ async function main(): Promise<void> {
         // Force-exit without clean teardown — pool tmux sessions are
         // independent and survive; bots resume on next daemon start.
         await pool.shutdown();
+        // Flush pending Sentry events before force-exit so we don't lose
+        // telemetry for exactly the sessions that caused the drain to hang.
+        await sentry.flush(2000);
         await remove_pid(config);
         process.exit(0);
       }

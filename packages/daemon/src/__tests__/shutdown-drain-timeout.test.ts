@@ -144,36 +144,67 @@ describe("shutdown drain-timeout race", () => {
       process.env = { ...ORIGINAL_ENV };
     });
 
+    /**
+     * Mirror the parsing logic from index.ts so tests stay in sync with the
+     * implementation.  Any change to index.ts parsing must be reflected here.
+     *
+     * Rules:
+     *   - Use Number() (not parseInt) — handles scientific notation like "1e5"
+     *   - Minimum 1000ms — reject smaller values as operationally unsafe
+     *   - Fall back to 90_000ms for anything invalid
+     */
+    function parse_timeout(raw: string | undefined): number {
+      const MINIMUM_MS = 1_000;
+      const DEFAULT_MS = 90_000;
+      if (raw !== undefined) {
+        const parsed = Number(raw);
+        if (!Number.isNaN(parsed) && parsed >= MINIMUM_MS) return parsed;
+      }
+      return DEFAULT_MS;
+    }
+
     it("parses a valid numeric override", () => {
-      process.env.SHUTDOWN_DRAIN_TIMEOUT_MS = "30000";
-      const raw = process.env.SHUTDOWN_DRAIN_TIMEOUT_MS;
-      const parsed = Number.parseInt(raw ?? "", 10);
-      const value = !Number.isNaN(parsed) && parsed > 0 ? parsed : 90_000;
-      expect(value).toBe(30_000);
+      expect(parse_timeout("30000")).toBe(30_000);
+    });
+
+    it("parses scientific notation correctly — 1e5 → 100000, not 1", () => {
+      // parseInt("1e5", 10) returns 1 (silent truncation after "e").
+      // Number("1e5") returns 100000. This test guards against regression.
+      expect(parse_timeout("1e5")).toBe(100_000);
+    });
+
+    it("parses scientific notation with decimal — 9e4 → 90000", () => {
+      expect(parse_timeout("9e4")).toBe(90_000);
     });
 
     it("falls back to 90s for a non-numeric value", () => {
-      process.env.SHUTDOWN_DRAIN_TIMEOUT_MS = "not-a-number";
-      const raw = process.env.SHUTDOWN_DRAIN_TIMEOUT_MS;
-      const parsed = Number.parseInt(raw ?? "", 10);
-      const value = !Number.isNaN(parsed) && parsed > 0 ? parsed : 90_000;
-      expect(value).toBe(90_000);
+      expect(parse_timeout("not-a-number")).toBe(90_000);
     });
 
     it("falls back to 90s for zero", () => {
-      process.env.SHUTDOWN_DRAIN_TIMEOUT_MS = "0";
-      const raw = process.env.SHUTDOWN_DRAIN_TIMEOUT_MS;
-      const parsed = Number.parseInt(raw ?? "", 10);
-      const value = !Number.isNaN(parsed) && parsed > 0 ? parsed : 90_000;
-      expect(value).toBe(90_000);
+      expect(parse_timeout("0")).toBe(90_000);
+    });
+
+    it("falls back to 90s for a small-positive value below the 1000ms minimum", () => {
+      // A value like "500" is not a parse error but is operationally dangerous
+      // (daemon always force-exits before draining).  Reject it.
+      expect(parse_timeout("500")).toBe(90_000);
+    });
+
+    it("falls back to 90s for value of exactly 999 (one below minimum)", () => {
+      expect(parse_timeout("999")).toBe(90_000);
+    });
+
+    it("accepts exactly 1000ms (the minimum)", () => {
+      expect(parse_timeout("1000")).toBe(1_000);
+    });
+
+    it("falls back to 90s for a negative value", () => {
+      expect(parse_timeout("-1")).toBe(90_000);
     });
 
     it("falls back to 90s when env var is absent", () => {
-      delete process.env.SHUTDOWN_DRAIN_TIMEOUT_MS;
-      const raw = process.env.SHUTDOWN_DRAIN_TIMEOUT_MS;
-      const parsed = Number.parseInt(raw ?? "", 10);
-      const value = !Number.isNaN(parsed) && parsed > 0 ? parsed : 90_000;
-      expect(value).toBe(90_000);
+      expect(parse_timeout(undefined)).toBe(90_000);
     });
 
     it("resolves deadline_hit quickly with a short override", async () => {

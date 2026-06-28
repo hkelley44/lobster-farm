@@ -10,19 +10,83 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// vi.mock must be at the top level (hoisted before imports).
+// In ESM mode, vi.spyOn on a namespace import is not configurable — use
+// vi.mock with a factory and access the mock via the same import path.
+vi.mock("node:child_process", () => ({
+  execFileSync: vi.fn(),
+  spawnSync: vi.fn(),
+}));
+
+import * as child_process from "node:child_process";
 import { kickstart_daemon, sigkill_pid } from "../commands/restart.js";
 
 // ---------------------------------------------------------------------------
 // kickstart_daemon — wraps spawnSync("launchctl", ["kickstart", "-k", ...])
 // ---------------------------------------------------------------------------
 
+function make_spawn_result(overrides: {
+  status: number | null;
+  error?: Error;
+}): ReturnType<typeof child_process.spawnSync> {
+  return {
+    pid: 0,
+    output: [],
+    stdout: Buffer.from(""),
+    stderr: Buffer.from(""),
+    signal: null,
+    ...overrides,
+  };
+}
+
 describe("kickstart_daemon", () => {
-  it("returns 0 on success", () => {
-    // spawnSync is real here; this test verifies the function returns the
-    // status code from the underlying call.  We mock spawnSync at the
-    // module level to avoid touching the real launchctl.
-    // (Full integration tested via the flow tests below.)
-    expect(typeof kickstart_daemon).toBe("function");
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.mocked(child_process.spawnSync).mockReset();
+  });
+
+  it("returns 0 when launchctl exits with status 0 (success)", () => {
+    vi.mocked(child_process.spawnSync).mockReturnValue(make_spawn_result({ status: 0 }));
+
+    const result = kickstart_daemon(501);
+
+    expect(result).toBe(0);
+    expect(child_process.spawnSync).toHaveBeenCalledWith(
+      "launchctl",
+      expect.arrayContaining(["kickstart", "-k"]),
+      expect.any(Object),
+    );
+  });
+
+  it("returns 37 when launchctl exits with status 37 (drain timeout)", () => {
+    vi.mocked(child_process.spawnSync).mockReturnValue(make_spawn_result({ status: 37 }));
+
+    const result = kickstart_daemon(501);
+
+    expect(result).toBe(37);
+  });
+
+  it("returns 1 and logs a distinct message when the spawn itself fails (ENOENT)", () => {
+    const spawn_error = Object.assign(new Error("spawn launchctl ENOENT"), { code: "ENOENT" });
+    vi.mocked(child_process.spawnSync).mockReturnValue(
+      make_spawn_result({ status: null, error: spawn_error }),
+    );
+
+    const console_error_spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = kickstart_daemon(501);
+
+    // Returns 1 to trigger fallback — same as a non-zero launchctl exit.
+    expect(result).toBe(1);
+    // Message must distinguish spawn failure from launchctl exit status.
+    expect(console_error_spy).toHaveBeenCalledWith(
+      expect.stringContaining("failed to spawn launchctl"),
+    );
+    // Must NOT claim launchctl exited with status 1 (misleading).
+    expect(console_error_spy).not.toHaveBeenCalledWith(
+      expect.stringContaining("kickstart exited with status"),
+    );
   });
 });
 
@@ -149,5 +213,83 @@ describe("kickstart fallback flow", () => {
     const timeout = kickstart_ok ? NORMAL_TIMEOUT_MS : FALLBACK_TIMEOUT_MS;
 
     expect(timeout).toBe(NORMAL_TIMEOUT_MS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pidfile-race guard — SIGKILL should be skipped when the pidfile changed
+// between the is_process_running check and the intended kill, indicating that
+// KeepAlive already spawned a replacement daemon that reused the old PID.
+// ---------------------------------------------------------------------------
+
+describe("pidfile-race guard", () => {
+  /**
+   * Inline simulation of the guard logic from restart.ts so the test remains
+   * self-contained and deterministic without spinning up the real command.
+   *
+   *   if (old_pid !== null && is_process_running(old_pid)) {
+   *     const current_pid = await read_pid_file(pid_file_path());
+   *     if (current_pid !== old_pid) { // skip }
+   *     else { sigkill_pid(old_pid) }
+   *   }
+   */
+  async function simulate_sigkill_guard(
+    old_pid: number,
+    current_pid: number | null,
+    process_running: boolean,
+    kill_fn: (pid: number) => boolean,
+  ): Promise<"skipped" | "killed" | "not_running"> {
+    if (!process_running) return "not_running";
+
+    // Re-read pidfile (simulated by current_pid param)
+    if (current_pid !== old_pid) return "skipped";
+
+    kill_fn(old_pid);
+    return "killed";
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("skips SIGKILL when pidfile changed to a new PID (new daemon already up)", async () => {
+    const kill_fn = vi.fn(() => true);
+    const old_pid = 1111;
+    const new_pid = 2222; // KeepAlive spawned a replacement
+
+    const outcome = await simulate_sigkill_guard(old_pid, new_pid, true, kill_fn);
+
+    expect(outcome).toBe("skipped");
+    expect(kill_fn).not.toHaveBeenCalled();
+  });
+
+  it("skips SIGKILL when pidfile is gone (new daemon not yet written pidfile)", async () => {
+    const kill_fn = vi.fn(() => true);
+    const old_pid = 1111;
+
+    const outcome = await simulate_sigkill_guard(old_pid, null, true, kill_fn);
+
+    expect(outcome).toBe("skipped");
+    expect(kill_fn).not.toHaveBeenCalled();
+  });
+
+  it("sends SIGKILL when pidfile still contains old_pid (daemon is genuinely wedged)", async () => {
+    const kill_fn = vi.fn(() => true);
+    const old_pid = 1111;
+
+    const outcome = await simulate_sigkill_guard(old_pid, old_pid, true, kill_fn);
+
+    expect(outcome).toBe("killed");
+    expect(kill_fn).toHaveBeenCalledWith(old_pid);
+  });
+
+  it("skips everything when the process is no longer running at check time", async () => {
+    const kill_fn = vi.fn(() => true);
+    const old_pid = 1111;
+
+    const outcome = await simulate_sigkill_guard(old_pid, old_pid, false, kill_fn);
+
+    expect(outcome).toBe("not_running");
+    expect(kill_fn).not.toHaveBeenCalled();
   });
 });

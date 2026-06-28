@@ -33,6 +33,15 @@ export function kickstart_daemon(uid: number): number {
   const result = spawnSync("launchctl", ["kickstart", "-k", `gui/${uid}/${LAUNCHD_LABEL}`], {
     stdio: "inherit",
   });
+  if (result.error !== undefined) {
+    // The spawn itself failed (ENOENT, EACCES, etc.) — launchctl never ran.
+    // Log a distinct message so operators don't conflate this with a status-1
+    // exit from launchctl (which would mean "daemon may be wedged").
+    console.error(
+      `Warning: failed to spawn launchctl — ${result.error.message}. Falling back to SIGKILL.`,
+    );
+    return 1;
+  }
   return result.status ?? 1;
 }
 
@@ -103,15 +112,28 @@ export const restart_command = new Command("restart")
 
       // Attempt to SIGKILL the old process so KeepAlive respawns it.
       if (old_pid !== null && is_process_running(old_pid)) {
-        const killed = sigkill_pid(old_pid);
-        if (killed) {
+        // Guard against PID-reuse race: if the wedged daemon exited between
+        // kickstart returning and the is_process_running() check, KeepAlive
+        // may have already spawned a *new* daemon that reused old_pid.  The
+        // new daemon writes a fresh pidfile on startup, so if the pidfile now
+        // contains a *different* PID (or is gone), the new daemon is already
+        // up — don't SIGKILL it.
+        const current_pid = await read_pid_file(pid_file_path());
+        if (current_pid !== old_pid) {
           console.log(
-            `Sent SIGKILL to old daemon (PID ${String(old_pid)}). KeepAlive will respawn on the new dist.`,
+            `Pidfile changed (was ${String(old_pid)}, now ${current_pid === null ? "gone" : String(current_pid)}) — new daemon already up. Skipping SIGKILL.`,
           );
         } else {
-          console.log(
-            `Old daemon (PID ${String(old_pid)}) was already gone — KeepAlive should respawn shortly.`,
-          );
+          const killed = sigkill_pid(old_pid);
+          if (killed) {
+            console.log(
+              `Sent SIGKILL to old daemon (PID ${String(old_pid)}). KeepAlive will respawn on the new dist.`,
+            );
+          } else {
+            console.log(
+              `Old daemon (PID ${String(old_pid)}) was already gone — KeepAlive should respawn shortly.`,
+            );
+          }
         }
       } else if (old_pid === null) {
         console.log("No PID file found — cannot identify old daemon process. Check logs.");
