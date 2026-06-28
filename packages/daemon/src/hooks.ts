@@ -4,8 +4,91 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { entity_daily_dir, lobsterfarm_dir } from "@lobster-farm/shared";
+import { find_session_file } from "./session-context.js";
 
 const exec = promisify(execFile);
+
+// ── Session transcript reading ──
+
+/** Null-sentinel used by the pool when a bot transitions out of `assigned`
+ * before its JSONL was confirmed on disk. There is no transcript to read for
+ * these, so `extract_session_learnings` skips the read and emits a marker. */
+export const NO_SESSION = "no-session";
+
+/** Cap the number of recent assistant turns we feed Haiku. The transcript is
+ * read tail-first, so this keeps the most recent (most relevant) work while
+ * bounding prompt size. Generous enough to capture a full session's arc. */
+const MAX_ASSISTANT_TURNS = 40;
+
+/** Hard char cap on the transcript slice handed to Haiku, applied after the
+ * turn cap. Belt-and-suspenders so a handful of very long turns can't blow
+ * past Haiku's context. ~12k chars ≈ a few thousand tokens. */
+const MAX_TRANSCRIPT_CHARS = 12_000;
+
+/**
+ * Read the last N assistant text turns from a session's JSONL transcript.
+ *
+ * We pull only the `text` blocks from assistant messages — that's the agent's
+ * user-facing reasoning and conclusions, the actual signal. Tool-call noise,
+ * thinking blocks, and raw tool output are deliberately skipped so Haiku
+ * summarizes what the agent *concluded*, not the mechanics of how it got there.
+ *
+ * Bounded two ways: the last `MAX_ASSISTANT_TURNS` turns, then a trailing
+ * `MAX_TRANSCRIPT_CHARS` slice. Tail-first so the most recent work wins when
+ * we have to truncate.
+ *
+ * Best-effort: returns "" on any failure (file missing, parse error). The
+ * caller falls back to its marker-entry behavior when this is empty.
+ */
+async function read_session_transcript(session_id: string): Promise<string> {
+  // The null-sentinel means the JSONL was never confirmed on disk — nothing
+  // to read. Skip straight to the caller's marker fallback.
+  if (session_id === NO_SESSION) return "";
+
+  try {
+    const file_path = await find_session_file(session_id);
+    if (!file_path) return "";
+
+    const content = await readFile(file_path, "utf-8");
+    const lines = content.split("\n").filter(Boolean);
+
+    // Collect assistant text turns in order, then keep only the tail.
+    const turns: string[] = [];
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line) as Record<string, unknown>;
+        if (entry.type !== "assistant") continue;
+        const message = entry.message as Record<string, unknown> | undefined;
+        const blocks = message?.content;
+        if (!Array.isArray(blocks)) continue;
+        const text = blocks
+          .filter(
+            (b): b is { type: "text"; text: string } =>
+              typeof b === "object" &&
+              b !== null &&
+              (b as { type?: unknown }).type === "text" &&
+              typeof (b as { text?: unknown }).text === "string",
+          )
+          .map((b) => b.text.trim())
+          .filter(Boolean)
+          .join("\n");
+        if (text) turns.push(text);
+      } catch {
+        // skip malformed lines
+      }
+    }
+
+    if (turns.length === 0) return "";
+
+    const recent = turns.slice(-MAX_ASSISTANT_TURNS).join("\n\n");
+    // Char cap applied tail-first so the latest content survives truncation.
+    return recent.length > MAX_TRANSCRIPT_CHARS ? recent.slice(-MAX_TRANSCRIPT_CHARS) : recent;
+  } catch {
+    // Transcript read is best-effort — a missing or unreadable file just
+    // means Haiku gets the marker fallback instead of real content.
+    return "";
+  }
+}
 
 // ── Daily log management ──
 
@@ -57,6 +140,21 @@ export async function extract_session_learnings(
   session_id: string,
   config: LobsterFarmConfig,
 ): Promise<void> {
+  // Pull the real session content so Haiku summarizes what actually happened
+  // rather than hallucinating from metadata alone. Empty when there's no
+  // confirmed transcript (the `no-session` sentinel, or a file we can't read).
+  const transcript = await read_session_transcript(session_id);
+
+  // No transcript → no signal to summarize. Skip the Haiku round-trip and
+  // write a marker entry directly, rather than asking Haiku to invent a
+  // summary from metadata (which produces generic filler / hallucination).
+  if (!transcript) {
+    const entry = `**Session ended: ${archetype} on ${feature_id}** (${session_id.slice(0, 8)}) — no transcript to summarize`;
+    await append_to_daily_log(entity_id, entry, config);
+    console.log(`[hooks] Session-end marker written for ${feature_id} (no transcript)`);
+    return;
+  }
+
   const prompt = [
     "You are a memory extraction assistant. A Claude Code session just completed.",
     "",
@@ -65,8 +163,15 @@ export async function extract_session_learnings(
     `Archetype: ${archetype}`,
     `Session: ${session_id}`,
     "",
-    "Based on the session that just completed, write a brief summary for the daily log.",
-    "Include:",
+    "Below is the transcript of the session (the agent's own messages, most",
+    "recent last). Summarize ONLY what these messages show — do not invent",
+    "details that aren't present.",
+    "",
+    "--- SESSION TRANSCRIPT ---",
+    transcript,
+    "--- END TRANSCRIPT ---",
+    "",
+    "Write a brief summary for the daily log. Include:",
     "- What was worked on",
     "- Key decisions made",
     "- Any gotchas or issues encountered",

@@ -110,6 +110,13 @@ class TestBotPool extends BotPool {
   protected override watch_session_confirmation(bot: PoolBot): void {
     bot.session_confirmed = true;
   }
+
+  /** No-op fire-and-forget session-end extraction — its transcript read +
+   * Haiku call would otherwise outlive the test and race afterEach's rm,
+   * causing ENOTEMPTY. Extraction itself is covered in its own suite. */
+  protected override extract_on_session_end(): Promise<void> {
+    return Promise.resolve();
+  }
 }
 
 // ── #256: session_id persistence hardening ──

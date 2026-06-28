@@ -9,7 +9,7 @@ import { DEFAULT_ARCHETYPES, entity_dir, expand_home, lobsterfarm_dir } from "@l
 import type { ChannelType } from "@lobster-farm/shared";
 import { notify } from "./actions.js";
 import { resolve_binary } from "./env.js";
-import { extract_session_learnings } from "./hooks.js";
+import { NO_SESSION, extract_session_learnings } from "./hooks.js";
 import { resolve_effort, resolve_model_id } from "./models.js";
 import { load_pool_state, save_pool_state } from "./persistence.js";
 import type { PersistedBotAvatarState, PersistedPoolBot } from "./persistence.js";
@@ -677,6 +677,14 @@ export class BotPool extends EventEmitter {
         // with now-dead tmux ended dirty without hitting park_bot/release.
         // Mark it `assigned` so the gate accepts, fire, then flip to `parked`.
         // Bots persisted as `parked` already extracted at their park() site.
+        //
+        // Known edge case: this fires per-bot during restore, BEFORE the
+        // channel-dedup loop below. If a prior race persisted two bots as
+        // `assigned` to the SAME channel (abnormal state), both fire extraction
+        // here — the dedup loop only frees the duplicate afterward. The result
+        // is two daily-log entries for one logical session: non-crashing, very
+        // low-probability, and self-limited to redundant log noise. Not worth
+        // pre-deduplicating the restore loop to prevent.
         if (entry.state === "assigned") {
           bot.state = "assigned";
           void this.extract_on_session_end(bot);
@@ -1346,7 +1354,7 @@ export class BotPool extends EventEmitter {
     // daily-log identifier. session_id may be null pre-confirmation. Sentinels
     // keep the entry useful rather than dropping the call.
     const feature_id = bot.channel_id ?? "unknown-session";
-    const session_id = bot.session_id ?? "no-session";
+    const session_id = bot.session_id ?? NO_SESSION;
     const bot_id = bot.id;
 
     return extract_session_learnings(
