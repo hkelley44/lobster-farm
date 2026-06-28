@@ -21,4 +21,14 @@ export class BotPoolTestBase extends BotPool {
   protected override watch_session_confirmation(bot: PoolBot): void {
     bot.session_confirmed = true;
   }
+
+  /** No-op session-end extraction by default. It's fire-and-forget async work
+   * (reads the JSONL transcript off disk, then shells to Haiku) that lifecycle
+   * tests don't care about — and its in-flight promise races afterEach's rm,
+   * causing ENOTEMPTY on teardown. Tests that actually exercise extraction
+   * (pool-session-end-extraction) opt back into the real implementation via
+   * BotPool.prototype.extract_on_session_end. */
+  protected override extract_on_session_end(): Promise<void> {
+    return Promise.resolve();
+  }
 }
