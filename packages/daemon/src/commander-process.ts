@@ -158,6 +158,14 @@ export class CommanderProcess extends EventEmitter {
     return is_tmux_session_idle(PAT_TMUX_SESSION);
   }
 
+  /** Read `state` as the full union, defeating literal narrowing.
+   * `state` is mutated asynchronously by start()'s close handler, so TS's
+   * control-flow analysis can wrongly narrow it to the value set before an
+   * `await`. Reading through this restores the real runtime type. */
+  private current_state(): CommanderHealth["state"] {
+    return this.state;
+  }
+
   /** State directory for Pat's Discord channel plugin. */
   private state_dir(): string {
     return join(lobsterfarm_dir(this.config.paths), "channels", "pat");
@@ -568,6 +576,36 @@ export class CommanderProcess extends EventEmitter {
     }
   }
 
+  /** Post a farm-level alert, swallowing notifier failures (best-effort — a dead
+   * alert sink must never crash recovery). Centralizes the try/catch the deaf,
+   * success, and failure surfaces all share. */
+  private async post_alert(message: string): Promise<void> {
+    try {
+      await this.alert_notifier?.(message);
+    } catch (notify_err) {
+      console.warn(`[commander] Failed to post alert: ${String(notify_err)}`);
+    }
+  }
+
+  /**
+   * Wait for a just-started session to leave the transient "starting" state.
+   *
+   * `start()` returns as soon as `tmux new-session` is spawned; its close
+   * handler then flips state asynchronously to "running" (session confirmed) or
+   * "crashed" (spawn failed). This polls until state settles or a short ceiling
+   * is hit, so callers reading the post-start verdict don't race the handler.
+   * No-op when state is already settled (e.g. has_token() early-returned with
+   * state left "stopped"). The 3s ceiling comfortably covers the detached
+   * new-session's immediate exit; if it's still "starting" past that, treat it
+   * as not-running (the failure surface catches it).
+   */
+  private async wait_for_session_settled(ceiling_ms = 3_000): Promise<void> {
+    const deadline = Date.now() + ceiling_ms;
+    while (this.state === "starting" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   /**
    * Recover a commander whose MCP plugin has gone deaf to inbound Discord (#77).
    *
@@ -578,6 +616,15 @@ export class CommanderProcess extends EventEmitter {
    * existing `start()` path. Because the session_id was persisted on the
    * previous start, `start()` takes its `--resume` branch and restores the
    * conversation with a fresh plugin connection — it does NOT start fresh.
+   *
+   * On a confirmed resume (`state === "running"`) we post a "recovered" alert so
+   * the operator gets closure after the up-front "resuming" message. On failure
+   * — `start()` throws, OR it returns early leaving `state !== "running"` (e.g.
+   * `has_token()` now false: start() no-ops, the health timer's running-guard
+   * goes inert, `schedule_restart()` never fires, and the commander is silently
+   * dark) — we post a "recovery FAILED — commander is dark" alert. This mirrors
+   * the pool's `bot.state !== "assigned"` failure surface; without it #77's whole
+   * point (no silent manual-SSH situation) breaks on the resume-fails path.
    *
    * The in-flight guard (`recovering_plugin`) holds across the whole respawn so
    * the 10s health poll can't fire a second concurrent recovery while the first
@@ -592,13 +639,9 @@ export class CommanderProcess extends EventEmitter {
     this.last_inbound_at = null;
     this.last_processing_at = null;
 
-    try {
-      await this.alert_notifier?.(
-        "🔴 Commander (Pat) went DEAF to inbound Discord — alive in tmux but the MCP plugin stopped delivering messages. Resuming the session to restore delivery.",
-      );
-    } catch (notify_err) {
-      console.warn(`[commander] Failed to post deaf alert: ${String(notify_err)}`);
-    }
+    await this.post_alert(
+      "🔴 Commander (Pat) went DEAF to inbound Discord — alive in tmux but the MCP plugin stopped delivering messages. Resuming the session to restore delivery.",
+    );
 
     try {
       // Kill the live-but-deaf tmux so start() can recreate it with a fresh
@@ -615,14 +658,50 @@ export class CommanderProcess extends EventEmitter {
       // Mark stopped so start()'s running/starting guard doesn't no-op the
       // resume. start() re-reads the persisted session_id and resumes.
       this.state = "stopped";
-      this.emit("deaf_recovering");
       await this.start();
+
+      // start() resolves the moment `tmux new-session` is spawned, BEFORE its
+      // async close handler flips state "starting"→"running" (or "crashed").
+      // Wait out that window so the success/failure verdict reads the settled
+      // state, not the transient "starting".
+      await this.wait_for_session_settled();
+
+      // start() can return WITHOUT running (e.g. has_token() now false → early
+      // return, state left "stopped"). Mirrors the pool's bot.state check: a
+      // non-running state here means the resume silently failed and the
+      // commander is dark, so surface it rather than leave the operator believing
+      // the "resuming" message succeeded.
+      if (this.current_state() === "running") {
+        await this.post_alert(
+          "✅ Commander (Pat) recovered — session resumed with a fresh MCP plugin connection. Inbound Discord delivery restored.",
+        );
+      } else {
+        console.error(
+          "[commander] Deaf-recovery resume did not bring the commander back to running — it is dark",
+        );
+        sentry.captureMessage(
+          "Commander deaf-recovery resume left the session non-running -- commander is dark",
+          "error",
+          { tags: { module: "commander", action: "deaf_recovery" } },
+        );
+        await this.post_alert(
+          "🔴 Commander (Pat) recovery FAILED — the session did not come back up and the commander is dark (no inbound Discord). Check daemon logs; a daemon restart may be required.",
+        );
+      }
     } catch (err) {
       console.error(`[commander] Deaf-recovery restart failed: ${String(err)}`);
       sentry.captureException(err instanceof Error ? err : new Error(String(err)), {
         tags: { module: "commander", action: "deaf_recovery" },
       });
+      await this.post_alert(
+        "🔴 Commander (Pat) recovery FAILED — restarting the session threw and the commander is dark (no inbound Discord). Check daemon logs; a daemon restart may be required.",
+      );
     } finally {
+      // The lock is released here, after start() resolves but BEFORE the async
+      // proc.on("close") confirms the session is actually up. Benign: the health
+      // timer's state-guard + the cleared inbound marker prevent a re-trigger
+      // during the brief "starting" window, so a stale lock isn't needed to hold
+      // off a duplicate recovery.
       this.recovering_plugin = false;
     }
   }

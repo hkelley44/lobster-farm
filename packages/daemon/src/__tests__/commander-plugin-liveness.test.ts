@@ -30,6 +30,10 @@ function make_config(): LobsterFarmConfig {
 class TestCommander extends CommanderProcess {
   start_calls = 0;
   start_should_throw = false;
+  /** When true, the stubbed start() leaves state "stopped" instead of flipping
+   * to "running" — simulates start()'s has_token()-false early return, the
+   * real path where the commander goes silently dark. */
+  start_leaves_stopped = false;
 
   // Drive the probe directly without the 10s interval.
   async run_probe(): Promise<void> {
@@ -69,8 +73,14 @@ class TestCommander extends CommanderProcess {
     vi.spyOn(this as unknown as { start: () => Promise<void> }, "start").mockImplementation(
       async () => {
         this.start_calls++;
-        (this as unknown as { state: string }).state = "running";
         if (this.start_should_throw) throw new Error("respawn failed");
+        // Mirror start()'s outcomes: either confirm running, or (has_token()
+        // false) early-return leaving state "stopped". recover_deaf_commander
+        // sets state "stopped" before calling start(), so the stopped case is
+        // simply "leave it as-is".
+        if (!this.start_leaves_stopped) {
+          (this as unknown as { state: string }).state = "running";
+        }
       },
     );
   }
@@ -152,9 +162,34 @@ describe("commander plugin-liveness probe (issue #77)", () => {
     expect(commander.start_calls).toBe(1);
     // The inbound marker is consumed so we don't re-trigger on the same silence.
     expect(commander.get_inbound()).toBeNull();
-    // A "went DEAF" alert fired.
-    expect(alert_mock).toHaveBeenCalledTimes(1);
+    // Two alerts: the up-front "went DEAF" and the closing "recovered ✅".
+    expect(alert_mock).toHaveBeenCalledTimes(2);
     expect(String(alert_mock.mock.calls[0]?.[0])).toContain("went DEAF");
+    expect(String(alert_mock.mock.calls[1]?.[0])).toContain("recovered");
+  });
+
+  it("surfaces a FAILED recovery when start() leaves the commander non-running (dark)", async () => {
+    // Real-world reachable: has_token() returns false at recovery time, so
+    // start() early-returns leaving state "stopped". Without a failure alert the
+    // operator would see "resuming" and never learn the commander is dark.
+    commander.start_leaves_stopped = true;
+    commander.set_inbound(new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000));
+    commander.set_processing(null);
+    idle_mock.mockReturnValue(true);
+
+    await commander.run_probe();
+
+    expect(commander.start_calls).toBe(1);
+    // Two alerts: "went DEAF" then "recovery FAILED — ... dark".
+    expect(alert_mock).toHaveBeenCalledTimes(2);
+    expect(String(alert_mock.mock.calls[0]?.[0])).toContain("went DEAF");
+    const failure = String(alert_mock.mock.calls[1]?.[0]);
+    expect(failure).toContain("recovery FAILED");
+    expect(failure).toContain("dark");
+    // No false "recovered ✅" surface on the dark path.
+    expect(failure).not.toContain("✅");
+    // Lock released so a future probe can retry.
+    expect((commander as unknown as { recovering_plugin: boolean }).recovering_plugin).toBe(false);
   });
 
   it("in-flight lock prevents a second concurrent recovery", async () => {
@@ -196,9 +231,12 @@ describe("commander plugin-liveness probe (issue #77)", () => {
 
     await commander.run_probe();
 
-    // Alert fired, start attempted, and the lock was released in finally so a
+    // Two alerts: the up-front "went DEAF" and the "recovery FAILED" surface
+    // from the catch. start attempted, and the lock was released in finally so a
     // subsequent probe is not permanently blocked.
-    expect(alert_mock).toHaveBeenCalledTimes(1);
+    expect(alert_mock).toHaveBeenCalledTimes(2);
+    expect(String(alert_mock.mock.calls[0]?.[0])).toContain("went DEAF");
+    expect(String(alert_mock.mock.calls[1]?.[0])).toContain("recovery FAILED");
     expect(commander.start_calls).toBe(1);
     expect((commander as unknown as { recovering_plugin: boolean }).recovering_plugin).toBe(false);
   });
