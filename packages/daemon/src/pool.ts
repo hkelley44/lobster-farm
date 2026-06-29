@@ -13,6 +13,11 @@ import { NO_SESSION, extract_session_learnings } from "./hooks.js";
 import { resolve_effort, resolve_model_id } from "./models.js";
 import { load_pool_state, save_pool_state } from "./persistence.js";
 import type { PersistedBotAvatarState, PersistedPoolBot } from "./persistence.js";
+import {
+  PLUGIN_DEAF_THRESHOLD_MS,
+  evaluate_plugin_liveness,
+  is_tmux_session_idle,
+} from "./plugin-liveness.js";
 import { scan_and_recover } from "./rate-limit-recovery.js";
 import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
@@ -91,42 +96,9 @@ export type ActivityState = "idle" | "working" | "waiting_for_human" | "active_c
 
 // ── Tmux idle detection ──
 
-/**
- * Check whether a tmux session is idle (showing a prompt, not actively processing).
- * Reads the last line of the tmux pane and looks for prompt or permission dialog indicators.
- *
- * Checks three things (in order):
- * 1. "esc to interrupt" → actively generating → NOT idle
- * 2. "local agent" → background subagent running → NOT idle
- * 3. "❯" or "bypass permissions" → at prompt with no active work → idle
- *
- * Fails open (returns true) when the pane can't be read — safe default for eviction
- * and typing-loop termination.
- */
-export function is_tmux_session_idle(tmux_session: string): boolean {
-  try {
-    const output = execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
-      encoding: "utf-8",
-      timeout: 2000,
-    });
-    const lines = output.trim().split("\n");
-    const last_line = lines[lines.length - 1] ?? "";
-
-    // Claude Code's status bar shows "esc to interrupt" only during active generation.
-    if (last_line.includes("esc to interrupt")) return false;
-
-    // Background subagents: status bar shows "N local agent(s)" when subagents are running.
-    // The parent is at the prompt but work is still happening — NOT idle.
-    if (last_line.includes("local agent")) return false;
-
-    // If no active indicators, check for idle indicators:
-    // - "❯" prompt visible (waiting for input)
-    // - "bypass permissions" in status bar without active-work indicators (idle at prompt)
-    return last_line.includes("❯") || last_line.includes("bypass permissions");
-  } catch {
-    return true; // Can't check — assume idle (fail-open)
-  }
-}
+/** Re-exported from the shared probe module so existing pool importers keep
+ * working. The live pane-idle reading is shared with the commander probe (#77). */
+export { is_tmux_session_idle };
 
 // ── Pending file paths ──
 
@@ -513,23 +485,12 @@ export type AvatarHandler = (state_dir: string, agent_name: string) => Promise<v
  * hour per bot — this gives comfortable margin. */
 export const AVATAR_COOLDOWN_MS = 30 * 60 * 1000;
 
-// ── Plugin-liveness probe (#73) ──
+// ── Plugin-liveness probe (#73, #77) ──
 
-/**
- * How long an assigned, tmux-alive bot may stay continuously idle after an
- * inbound human message before the MCP plugin is judged deaf.
- *
- * A healthy bot transitions to "working" (pane shows "esc to interrupt" /
- * "← discord" / "local agent") within a few seconds of the plugin delivering
- * the message. If the pane is *still* at the idle prompt this long after the
- * inbound — and the bot showed no processing in between — the plugin has
- * stopped delivering and the bot is silently deaf.
- *
- * 90s comfortably clears: MCP delivery latency (several seconds), the typing
- * loop's 15s grace window, and a brief Claude startup/tool-permission pause —
- * while still catching a genuinely deaf bot within ~2 health-check cycles.
- */
-export const PLUGIN_DEAF_THRESHOLD_MS = 90_000;
+/** Re-exported from the shared probe module so existing pool importers keep
+ * working. The decision logic lives in `plugin-liveness.ts` and is shared with
+ * the commander probe (#77). */
+export { PLUGIN_DEAF_THRESHOLD_MS };
 
 // ── Pool Manager ──
 
@@ -2031,38 +1992,46 @@ export class BotPool extends EventEmitter {
     if (this.recovering_plugin.has(bot.id)) return; // recovery already in flight
 
     const inbound = bot.last_inbound_at;
-    if (!inbound) return; // nothing was delivered — nothing to be deaf to
+    if (!inbound) return; // nothing delivered — skip the tmux pane read entirely
 
-    const since_inbound = Date.now() - inbound.getTime();
-
-    // The bot is actively working (or was, after the inbound) → plugin delivered
-    // the message. Healthy: record processing and clear the inbound marker so a
-    // later idle period (the bot waiting for the next human reply) is never
-    // mistaken for deafness.
-    if (!this.is_bot_idle(bot)) {
-      bot.last_processing_at = new Date();
-      bot.last_inbound_at = null;
-      return;
-    }
-    if (bot.last_processing_at && bot.last_processing_at.getTime() >= inbound.getTime()) {
-      // Processed at some point after the inbound, then returned to idle —
-      // message was received and handled. Not deaf.
-      bot.last_inbound_at = null;
-      return;
-    }
-
-    // Still idle and no processing observed since the inbound. Give the plugin
-    // its delivery + startup grace before judging.
-    if (since_inbound < PLUGIN_DEAF_THRESHOLD_MS) return;
-
-    // Deaf: the bot has sat idle since the inbound for longer than the grace
-    // window without ever picking the message up. Recover it.
-    console.error(
-      `[pool] pool-${String(bot.id)} appears DEAF to inbound Discord — idle ${String(
-        Math.round(since_inbound / 1000),
-      )}s after a message with no processing (channel: ${bot.channel_id}). MCP plugin likely stopped delivering — recovering.`,
+    const verdict = evaluate_plugin_liveness(
+      {
+        last_inbound_at: inbound,
+        last_processing_at: bot.last_processing_at,
+        is_idle: this.is_bot_idle(bot),
+      },
+      Date.now(),
     );
-    await this.recover_deaf_bot(bot);
+
+    switch (verdict) {
+      case "no_inbound":
+      case "grace":
+        // Still within the delivery/startup grace window. Preserve the inbound
+        // marker so a later pass can still catch deafness.
+        return;
+      case "healthy_working":
+        // Actively working → plugin delivered. Record processing and clear the
+        // inbound marker so a later idle period (the bot awaiting the next human
+        // reply) is never mistaken for deafness.
+        bot.last_processing_at = new Date();
+        bot.last_inbound_at = null;
+        return;
+      case "healthy_processed":
+        // Processed after the inbound, then returned to idle — received and
+        // handled. Clear the marker.
+        bot.last_inbound_at = null;
+        return;
+      case "deaf": {
+        const since_inbound = Date.now() - inbound.getTime();
+        console.error(
+          `[pool] pool-${String(bot.id)} appears DEAF to inbound Discord — idle ${String(
+            Math.round(since_inbound / 1000),
+          )}s after a message with no processing (channel: ${bot.channel_id}). MCP plugin likely stopped delivering — recovering.`,
+        );
+        await this.recover_deaf_bot(bot);
+        return;
+      }
+    }
   }
 
   /**

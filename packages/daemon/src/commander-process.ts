@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import { resolve_model_id } from "./models.js";
+import { evaluate_plugin_liveness, is_tmux_session_idle } from "./plugin-liveness.js";
 import * as sentry from "./sentry.js";
 import { sq } from "./shell.js";
 
@@ -24,6 +25,15 @@ const BACKOFF_SCHEDULE = [0, 5_000, 15_000, 60_000, 300_000];
 const BACKOFF_RESET_MS = 10 * 60 * 1000; // 10 min stable → reset counter
 const MAX_RESTARTS = 5;
 const HEALTH_INTERVAL_MS = 10_000; // check every 10s
+
+/**
+ * Callback for posting a farm-level alert (e.g. to #system-status), injected by
+ * the Discord wiring. The commander is farm-level — it has no entity-scoped
+ * #alerts channel like pool bots do — so the daemon supplies a notifier rather
+ * than the process reaching into Discord directly. Best-effort: failures are
+ * logged, never thrown.
+ */
+export type AlertNotifier = (message: string) => Promise<void>;
 
 /** Shape of Pat's access.json. Mirrors the Discord plugin's Access type
  *  (server.ts:105-121). Fields beyond the defaults are optional — we
@@ -98,8 +108,62 @@ export class CommanderProcess extends EventEmitter {
   private backoff_reset_timer: ReturnType<typeof setTimeout> | null = null;
   private health_timer: ReturnType<typeof setInterval> | null = null;
 
+  // ── Plugin-liveness probe (#77) ──
+
+  /** When the daemon last routed an inbound human message to the commander's
+   * #command-center channel. Set from discord.ts's command-center routing path.
+   * The inbound→commander delivery is pure MCP plugin (no daemon send-keys), so
+   * this is the daemon's only record that a message was handed to a live-but-
+   * possibly-deaf commander. In-memory only — a fresh process has no in-flight
+   * inbound to probe. */
+  private last_inbound_at: Date | null = null;
+  /** When the probe last observed the commander actually processing (pane
+   * non-idle). Distinguishes "received the inbound and started working" (healthy)
+   * from "stayed idle at the prompt the whole time" (plugin deaf). In-memory. */
+  private last_processing_at: Date | null = null;
+  /** In-flight lock: true while a deaf-commander recovery is mid-flight. The
+   * recovery kills + respawns the tmux session, which spans multiple 10s health
+   * cycles — this stops a second pass from firing a duplicate recovery (mirrors
+   * the pool's `recovering_plugin` set). */
+  private recovering_plugin = false;
+  /** Optional farm-level alert sink (e.g. #system-status). Set by the daemon. */
+  private alert_notifier: AlertNotifier | null = null;
+
   constructor(private config: LobsterFarmConfig) {
     super();
+  }
+
+  /** Register a callback for farm-level alerts (deaf detection + recovery).
+   * Wired by the Discord module so the process never touches the gateway directly. */
+  set_alert_notifier(notifier: AlertNotifier): void {
+    this.alert_notifier = notifier;
+  }
+
+  /**
+   * Record that the daemon just routed an inbound human message to the
+   * commander's #command-center channel (issue #77 — plugin-liveness probe).
+   *
+   * Mirrors the pool's `mark_inbound`. Called from discord.ts when a human
+   * message lands in #command-center, which the commander handles via its own
+   * MCP Discord plugin. This timestamp is what the probe uses to detect
+   * prolonged inbound silence: if the commander never starts processing after
+   * an inbound, the plugin is deaf.
+   */
+  mark_inbound(): void {
+    this.last_inbound_at = new Date();
+  }
+
+  /** Whether the commander's tmux pane is currently idle at the prompt. */
+  private is_commander_idle(): boolean {
+    return is_tmux_session_idle(PAT_TMUX_SESSION);
+  }
+
+  /** Read `state` as the full union, defeating literal narrowing.
+   * `state` is mutated asynchronously by start()'s close handler, so TS's
+   * control-flow analysis can wrongly narrow it to the value set before an
+   * `await`. Reading through this restores the real runtime type. */
+  private current_state(): CommanderHealth["state"] {
+    return this.state;
   }
 
   /** State directory for Pat's Discord channel plugin. */
@@ -426,7 +490,8 @@ export class CommanderProcess extends EventEmitter {
     });
   }
 
-  /** Poll tmux session health. If it dies, trigger restart. */
+  /** Poll tmux session health. If the session dies, trigger restart; if it is
+   * alive but the MCP plugin has gone deaf to inbound Discord, recover it (#77). */
   private start_health_polling(): void {
     this.stop_health_polling();
     this.health_timer = setInterval(() => {
@@ -442,8 +507,203 @@ export class CommanderProcess extends EventEmitter {
         }
         this.emit("crashed", 1);
         this.schedule_restart();
+        return;
       }
+
+      // Session alive in tmux is NOT the same as the MCP plugin actually
+      // delivering inbound Discord messages. Probe for a live-but-deaf commander
+      // that received a message it never processed (issue #77).
+      void this.check_plugin_liveness();
     }, HEALTH_INTERVAL_MS);
+  }
+
+  /**
+   * Probe the live commander session for MCP plugin deafness (issue #77).
+   *
+   * The inbound Discord→commander path is pure MCP plugin — no daemon send-keys
+   * — so the commander can be perfectly alive in tmux yet silently stop
+   * receiving messages if the plugin's channel listener dies ("deaf but alive").
+   * `is_tmux_alive()` slips right past this gap; this probe closes it using the
+   * same signal model as the pool's probe (#73), shared via
+   * `evaluate_plugin_liveness`.
+   *
+   * Protected so tests can drive it directly without the 10s interval.
+   */
+  protected async check_plugin_liveness(): Promise<void> {
+    if (this.state !== "running") return;
+    if (this.recovering_plugin) return; // recovery already in flight
+
+    const inbound = this.last_inbound_at;
+    if (!inbound) return; // nothing delivered — skip the tmux pane read entirely
+
+    const verdict = evaluate_plugin_liveness(
+      {
+        last_inbound_at: inbound,
+        last_processing_at: this.last_processing_at,
+        is_idle: this.is_commander_idle(),
+      },
+      Date.now(),
+    );
+
+    switch (verdict) {
+      case "no_inbound":
+      case "grace":
+        // Still within the delivery/startup grace window. Preserve the inbound
+        // marker so a later pass can still catch deafness.
+        return;
+      case "healthy_working":
+        // Actively working → plugin delivered. Record processing and clear the
+        // inbound marker so a later idle period (awaiting the next reply) is
+        // never mistaken for deafness.
+        this.last_processing_at = new Date();
+        this.last_inbound_at = null;
+        return;
+      case "healthy_processed":
+        // Processed after the inbound, then returned to idle — received and
+        // handled. Clear the marker.
+        this.last_inbound_at = null;
+        return;
+      case "deaf": {
+        const since_inbound = Date.now() - inbound.getTime();
+        console.error(
+          `[commander] appears DEAF to inbound Discord — idle ${String(
+            Math.round(since_inbound / 1000),
+          )}s after a message with no processing. MCP plugin likely stopped delivering — recovering.`,
+        );
+        await this.recover_deaf_commander();
+        return;
+      }
+    }
+  }
+
+  /** Post a farm-level alert, swallowing notifier failures (best-effort — a dead
+   * alert sink must never crash recovery). Centralizes the try/catch the deaf,
+   * success, and failure surfaces all share. */
+  private async post_alert(message: string): Promise<void> {
+    try {
+      await this.alert_notifier?.(message);
+    } catch (notify_err) {
+      console.warn(`[commander] Failed to post alert: ${String(notify_err)}`);
+    }
+  }
+
+  /**
+   * Wait for a just-started session to leave the transient "starting" state.
+   *
+   * `start()` returns as soon as `tmux new-session` is spawned; its close
+   * handler then flips state asynchronously to "running" (session confirmed) or
+   * "crashed" (spawn failed). This polls until state settles or a short ceiling
+   * is hit, so callers reading the post-start verdict don't race the handler.
+   * No-op when state is already settled (e.g. has_token() early-returned with
+   * state left "stopped"). The 3s ceiling comfortably covers the detached
+   * new-session's immediate exit; if it's still "starting" past that, treat it
+   * as not-running (the failure surface catches it).
+   */
+  private async wait_for_session_settled(ceiling_ms = 3_000): Promise<void> {
+    const deadline = Date.now() + ceiling_ms;
+    while (this.state === "starting" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  /**
+   * Recover a commander whose MCP plugin has gone deaf to inbound Discord (#77).
+   *
+   * Unlike a tmux crash, the process is *alive* — but its plugin channel
+   * listener is dead, so only a fresh session restores delivery. We post a
+   * "went DEAF" alert (mirroring the pool's notify), kill the live-but-deaf tmux
+   * so `start()` doesn't collide on the session name, then route through the
+   * existing `start()` path. Because the session_id was persisted on the
+   * previous start, `start()` takes its `--resume` branch and restores the
+   * conversation with a fresh plugin connection — it does NOT start fresh.
+   *
+   * On a confirmed resume (`state === "running"`) we post a "recovered" alert so
+   * the operator gets closure after the up-front "resuming" message. On failure
+   * — `start()` throws, OR it returns early leaving `state !== "running"` (e.g.
+   * `has_token()` now false: start() no-ops, the health timer's running-guard
+   * goes inert, `schedule_restart()` never fires, and the commander is silently
+   * dark) — we post a "recovery FAILED — commander is dark" alert. This mirrors
+   * the pool's `bot.state !== "assigned"` failure surface; without it #77's whole
+   * point (no silent manual-SSH situation) breaks on the resume-fails path.
+   *
+   * The in-flight guard (`recovering_plugin`) holds across the whole respawn so
+   * the 10s health poll can't fire a second concurrent recovery while the first
+   * is mid-restart.
+   */
+  private async recover_deaf_commander(): Promise<void> {
+    if (this.recovering_plugin) return;
+    this.recovering_plugin = true;
+
+    // Consume the inbound marker up-front so a concurrent/next probe pass can't
+    // re-trigger on the same silence while we're mid-recovery.
+    this.last_inbound_at = null;
+    this.last_processing_at = null;
+
+    await this.post_alert(
+      "🔴 Commander (Pat) went DEAF to inbound Discord — alive in tmux but the MCP plugin stopped delivering messages. Resuming the session to restore delivery.",
+    );
+
+    try {
+      // Kill the live-but-deaf tmux so start() can recreate it with a fresh
+      // plugin connection, resuming the persisted session. The session name is
+      // reused; the persisted session_id drives the --resume branch in start().
+      if (this.is_tmux_alive()) {
+        try {
+          execFileSync("tmux", ["kill-session", "-t", PAT_TMUX_SESSION], { stdio: "ignore" });
+        } catch {
+          /* ignore — best effort */
+        }
+      }
+
+      // Mark stopped so start()'s running/starting guard doesn't no-op the
+      // resume. start() re-reads the persisted session_id and resumes.
+      this.state = "stopped";
+      await this.start();
+
+      // start() resolves the moment `tmux new-session` is spawned, BEFORE its
+      // async close handler flips state "starting"→"running" (or "crashed").
+      // Wait out that window so the success/failure verdict reads the settled
+      // state, not the transient "starting".
+      await this.wait_for_session_settled();
+
+      // start() can return WITHOUT running (e.g. has_token() now false → early
+      // return, state left "stopped"). Mirrors the pool's bot.state check: a
+      // non-running state here means the resume silently failed and the
+      // commander is dark, so surface it rather than leave the operator believing
+      // the "resuming" message succeeded.
+      if (this.current_state() === "running") {
+        await this.post_alert(
+          "✅ Commander (Pat) recovered — session resumed with a fresh MCP plugin connection. Inbound Discord delivery restored.",
+        );
+      } else {
+        console.error(
+          "[commander] Deaf-recovery resume did not bring the commander back to running — it is dark",
+        );
+        sentry.captureMessage(
+          "Commander deaf-recovery resume left the session non-running -- commander is dark",
+          "error",
+          { tags: { module: "commander", action: "deaf_recovery" } },
+        );
+        await this.post_alert(
+          "🔴 Commander (Pat) recovery FAILED — the session did not come back up and the commander is dark (no inbound Discord). Check daemon logs; a daemon restart may be required.",
+        );
+      }
+    } catch (err) {
+      console.error(`[commander] Deaf-recovery restart failed: ${String(err)}`);
+      sentry.captureException(err instanceof Error ? err : new Error(String(err)), {
+        tags: { module: "commander", action: "deaf_recovery" },
+      });
+      await this.post_alert(
+        "🔴 Commander (Pat) recovery FAILED — restarting the session threw and the commander is dark (no inbound Discord). Check daemon logs; a daemon restart may be required.",
+      );
+    } finally {
+      // The lock is released here, after start() resolves but BEFORE the async
+      // proc.on("close") confirms the session is actually up. Benign: the health
+      // timer's state-guard + the cleared inbound marker prevent a re-trigger
+      // during the brief "starting" window, so a stale lock isn't needed to hold
+      // off a duplicate recovery.
+      this.recovering_plugin = false;
+    }
   }
 
   private stop_health_polling(): void {
