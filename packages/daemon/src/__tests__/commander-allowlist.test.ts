@@ -365,6 +365,8 @@ describe("DiscordBot.handle_message — Pat allowlist trigger", () => {
     const ensure = vi.fn().mockResolvedValue(undefined);
     bot.set_commander({
       ensure_channel_allowlisted: ensure,
+      set_alert_notifier: vi.fn(),
+      mark_inbound: vi.fn(),
     } as unknown as CommanderProcess);
 
     await bot.invoke_handle_message(
@@ -380,6 +382,8 @@ describe("DiscordBot.handle_message — Pat allowlist trigger", () => {
     const ensure = vi.fn().mockResolvedValue(undefined);
     bot.set_commander({
       ensure_channel_allowlisted: ensure,
+      set_alert_notifier: vi.fn(),
+      mark_inbound: vi.fn(),
     } as unknown as CommanderProcess);
 
     await bot.invoke_handle_message(
@@ -395,6 +399,8 @@ describe("DiscordBot.handle_message — Pat allowlist trigger", () => {
     const ensure = vi.fn().mockResolvedValue(undefined);
     bot.set_commander({
       ensure_channel_allowlisted: ensure,
+      set_alert_notifier: vi.fn(),
+      mark_inbound: vi.fn(),
     } as unknown as CommanderProcess);
 
     await bot.invoke_handle_message(fake_message({ author_id: "owner-id", channel_id: "cc-1" }));
@@ -418,6 +424,8 @@ describe("DiscordBot.handle_message — Pat allowlist trigger", () => {
     const ensure = vi.fn().mockResolvedValue(undefined);
     bot.set_commander({
       ensure_channel_allowlisted: ensure,
+      set_alert_notifier: vi.fn(),
+      mark_inbound: vi.fn(),
     } as unknown as CommanderProcess);
 
     await bot.invoke_handle_message(
@@ -432,6 +440,8 @@ describe("DiscordBot.handle_message — Pat allowlist trigger", () => {
     const ensure = vi.fn().mockResolvedValue(undefined);
     bot.set_commander({
       ensure_channel_allowlisted: ensure,
+      set_alert_notifier: vi.fn(),
+      mark_inbound: vi.fn(),
     } as unknown as CommanderProcess);
 
     await bot.invoke_handle_message(
@@ -446,6 +456,8 @@ describe("DiscordBot.handle_message — Pat allowlist trigger", () => {
     const ensure = vi.fn().mockRejectedValue(new Error("disk full"));
     bot.set_commander({
       ensure_channel_allowlisted: ensure,
+      set_alert_notifier: vi.fn(),
+      mark_inbound: vi.fn(),
     } as unknown as CommanderProcess);
 
     await expect(

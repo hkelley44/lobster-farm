@@ -2496,6 +2496,19 @@ export class DiscordBot extends EventEmitter {
    */
   set_commander(commander: CommanderProcess): void {
     this._commander = commander;
+
+    // Wire a farm-level alert sink so the commander's plugin-liveness probe (#77)
+    // can surface deaf-detection + recovery. The commander has no entity-scoped
+    // #alerts channel (it's farm-level), so route to the global #system-status
+    // channel — the same target the daemon uses for other farm-wide alerts.
+    commander.set_alert_notifier(async (msg: string) => {
+      const channel_id = await this.find_system_status_channel();
+      if (!channel_id) {
+        console.warn(`[discord] Cannot post commander alert — #system-status not found: ${msg}`);
+        return;
+      }
+      await this.send(channel_id, msg);
+    });
   }
 
   set_pool(pool: BotPool): void {
@@ -2548,6 +2561,11 @@ export class DiscordBot extends EventEmitter {
     // narrow window between bot ready and the async find_command_center_channel).
     const cc_id = this.command_center_channel_id ?? (await this.find_command_center_channel());
     if (!entry && cc_id === message.channelId) {
+      // Record the inbound delivery so the commander's plugin-liveness probe can
+      // detect a live-but-deaf Pat that never picks the message up (#77). The
+      // inbound→commander path is pure MCP plugin — no daemon send-keys — so this
+      // is the daemon's only record that a message was handed to the commander.
+      this._commander?.mark_inbound();
       this.start_commander_typing_loop(message.channelId);
       void this.send_status_embed(message.channelId, "commander");
       return;
