@@ -1,9 +1,11 @@
 /**
- * Tests for reply-enforcement.ts (issue #39).
+ * Tests for reply-enforcement.ts (issues #39 + #79).
  *
  * Covers all acceptance-criteria checkboxes from the issue spec:
  *   - text + reply  → ok, no enforcement (Discord-bound + non-bound)
- *   - text + no-reply, bound → block + reminder
+ *   - text + no-reply, bound + discord + text → daemon delivers, no block (#79 mode A)
+ *   - text + no-reply, bound, no discord / empty text / send throws → block + reminder
+ *   - text + no-reply, same turn twice → no re-send (idempotency, #79)
  *   - text + no-reply, NOT bound → ok pass-through
  *   - silent turn, bound → heartbeat posted
  *   - silent turn within cooldown → no second heartbeat
@@ -11,9 +13,11 @@
  *   - subagent / sidechain → pass-through
  *   - JSONL flush race → retry loop tolerates a brief absence
  *   - Haiku timeout → graceful fail open
+ *   - run_claude_print → resolves on exit 0, rejects on non-zero + timeout (#79 a)
+ *   - parse_last_assistant_turn → reply_text = joined text blocks (#79 b)
  */
 
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -30,6 +34,7 @@ import {
   parse_last_assistant_turn,
   read_last_assistant_turn,
   resolve_bound_channel,
+  run_claude_print,
 } from "../reply-enforcement.js";
 import type { TurnSummary } from "../reply-enforcement.js";
 
@@ -178,6 +183,57 @@ describe("parse_last_assistant_turn", () => {
   it("skips malformed lines without throwing", () => {
     const jsonl = `not json\n${assistant_line({ text: "ok" })}\n`;
     expect(parse_last_assistant_turn(jsonl).found).toBe(true);
+  });
+
+  // ── reply_text (issue #79 b) ──
+
+  it("captures reply_text = the single text block", () => {
+    const jsonl = `${assistant_line({ text: "Hello there." })}\n`;
+    expect(parse_last_assistant_turn(jsonl).reply_text).toBe("Hello there.");
+  });
+
+  it("joins multiple text blocks with a blank line", () => {
+    // Build an assistant entry with two separate text blocks.
+    const jsonl = `${JSON.stringify({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "First paragraph." },
+          { type: "tool_use", id: "t1", name: "Bash", input: {} },
+          { type: "text", text: "Second paragraph." },
+        ],
+      },
+    })}\n`;
+    const turn = parse_last_assistant_turn(jsonl);
+    expect(turn.reply_text).toBe("First paragraph.\n\nSecond paragraph.");
+    expect(turn.produced_text).toBe(true);
+  });
+
+  it("returns empty reply_text for a tool-only turn", () => {
+    const jsonl = `${assistant_line({ tools: ["Bash", "Read"] })}\n`;
+    const turn = parse_last_assistant_turn(jsonl);
+    expect(turn.reply_text).toBe("");
+    expect(turn.produced_text).toBe(false);
+  });
+
+  it("returns empty reply_text for a whitespace-only text block", () => {
+    const jsonl = `${assistant_line({ text: "   \n\t" })}\n`;
+    expect(parse_last_assistant_turn(jsonl).reply_text).toBe("");
+  });
+
+  it("returns empty reply_text for a tool-only sidechain turn", () => {
+    // Sidechain (subagent) turns are forced to pass-through downstream via the
+    // is_sidechain marker; a tool-only sidechain turn harvests no text.
+    const jsonl = `${assistant_line({ tools: ["Bash"], is_sidechain: true })}\n`;
+    const turn = parse_last_assistant_turn(jsonl);
+    expect(turn.is_sidechain).toBe(true);
+    expect(turn.reply_text).toBe("");
+  });
+
+  it("returns empty reply_text for a not-found transcript", () => {
+    expect(parse_last_assistant_turn("").reply_text).toBe("");
+    expect(parse_last_assistant_turn(`${user_line()}\n`).reply_text).toBe("");
   });
 });
 
@@ -367,6 +423,7 @@ describe("evaluate_stop — acceptance criteria", () => {
   function make_turn_reader(turn: Partial<TurnSummary>) {
     return async (): Promise<TurnSummary> => ({
       produced_text: false,
+      reply_text: "",
       called_reply: false,
       is_sidechain: false,
       tool_summary: "",
@@ -390,19 +447,208 @@ describe("evaluate_stop — acceptance criteria", () => {
     expect(sends.length).toBe(0);
   });
 
-  it("text + no-reply, Discord-bound → block + reminder", async () => {
+  it("text + no-reply, Discord-bound, empty reply_text → block + reminder (fallback)", async () => {
+    // produced_text is true but reply_text is empty (the parser flagged text
+    // but there's nothing deliverable) → the daemon can't deliver, so we keep
+    // the old block+reminder behavior.
     const { discord, sends } = make_discord();
     const result = await evaluate_stop(
       { session_id, working_dir },
       {
         pool: bound_pool(),
         discord,
-        read_turn: make_turn_reader({ produced_text: true, called_reply: false }),
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "",
+        }),
       },
     );
     expect(result).toEqual({ ok: true, block: true, reminder: REPLY_REMINDER });
-    // Must NOT post a heartbeat on the blocked path.
+    // Must NOT post anything on the blocked path.
     expect(sends.length).toBe(0);
+  });
+
+  // ── mode A: daemon delivers the harvested text (issue #79 b) ──
+
+  it("mode A: text + no-reply, discord + non-empty text → daemon sends verbatim, no block", async () => {
+    const { discord, sends } = make_discord();
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "Here is your answer.",
+        }),
+      },
+    );
+    // Delivered — pass through, do NOT block.
+    expect(result).toEqual({ ok: true });
+    // Posted verbatim, NO heartbeat prefix.
+    expect(sends).toEqual([{ channel_id: "C123", content: "Here is your answer." }]);
+  });
+
+  it("mode A: trims surrounding whitespace before sending", async () => {
+    const { discord, sends } = make_discord();
+    await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "  padded answer  \n",
+        }),
+      },
+    );
+    expect(sends).toEqual([{ channel_id: "C123", content: "padded answer" }]);
+  });
+
+  it("mode A fallback: discord=null → block + reminder", async () => {
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord: null,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "Undeliverable because no discord client.",
+        }),
+      },
+    );
+    expect(result).toEqual({ ok: true, block: true, reminder: REPLY_REMINDER });
+  });
+
+  it("mode A fallback: empty reply_text → block + reminder", async () => {
+    const { discord, sends } = make_discord();
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "   ",
+        }),
+      },
+    );
+    expect(result).toEqual({ ok: true, block: true, reminder: REPLY_REMINDER });
+    expect(sends.length).toBe(0);
+  });
+
+  it("mode A fallback: discord.send throws → block + reminder", async () => {
+    const throwing_discord = {
+      async send() {
+        throw new Error("discord 500");
+      },
+    } as unknown as DiscordBot;
+    const result = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord: throwing_discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "This send will fail.",
+        }),
+      },
+    );
+    expect(result).toEqual({ ok: true, block: true, reminder: REPLY_REMINDER });
+  });
+
+  it("mode A idempotency: same turn evaluated twice → second call does not re-send", async () => {
+    const { discord, sends } = make_discord();
+    const deps = {
+      pool: bound_pool(),
+      discord,
+      read_turn: make_turn_reader({
+        produced_text: true,
+        called_reply: false,
+        reply_text: "Deliver me exactly once.",
+      }),
+    };
+    const first = await evaluate_stop({ session_id, working_dir }, deps);
+    const second = await evaluate_stop({ session_id, working_dir }, deps);
+    expect(first).toEqual({ ok: true });
+    expect(second).toEqual({ ok: true });
+    // Only one send — the idempotency guard suppressed the re-fire.
+    expect(sends.length).toBe(1);
+    expect(sends[0]).toEqual({ channel_id: "C123", content: "Deliver me exactly once." });
+  });
+
+  it("mode A idempotency: whitespace-varying reply_text keys on trimmed text → sends once", async () => {
+    // Regression guard: the idempotency key must reflect what is actually sent
+    // (the trimmed text), NOT the raw reply_text. On a Stop-hook re-fire,
+    // whitespace can vary between transcript reads; if the key were derived from
+    // the untrimmed text, the two reads would hash differently and BOTH sends
+    // would fire, double-posting to the user. We evaluate the same session twice
+    // with different surrounding whitespace but identical trimmed content and
+    // assert exactly one send of the trimmed form.
+    const { discord, sends } = make_discord();
+    const first = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "  answer  \n",
+        }),
+      },
+    );
+    const second = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "\n answer ",
+        }),
+      },
+    );
+    expect(first).toEqual({ ok: true });
+    expect(second).toEqual({ ok: true });
+    // Exactly one send, and it's the trimmed form.
+    expect(sends).toEqual([{ channel_id: "C123", content: "answer" }]);
+  });
+
+  it("mode A idempotency: different harvested text is NOT suppressed", async () => {
+    const { discord, sends } = make_discord();
+    await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "First answer.",
+        }),
+      },
+    );
+    await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "A genuinely different answer.",
+        }),
+      },
+    );
+    expect(sends.length).toBe(2);
   });
 
   it("text + no-reply, NOT Discord-bound → pass-through (no enforcement)", async () => {
@@ -619,5 +865,65 @@ describe("evaluate_stop — acceptance criteria", () => {
     );
     expect(result).toEqual({ ok: true });
     expect(sends.length).toBe(0);
+  });
+});
+
+// ── run_claude_print (issue #79 a — heartbeat stdin fix) ──
+
+describe("run_claude_print", () => {
+  let bin_dir: string;
+
+  beforeEach(async () => {
+    bin_dir = await mkdtemp(join(tmpdir(), "lf-claude-bin-"));
+  });
+
+  afterEach(async () => {
+    await rm(bin_dir, { recursive: true, force: true });
+  });
+
+  /** Write an executable shell script and return its path. */
+  async function make_script(name: string, body: string): Promise<string> {
+    const path = join(bin_dir, name);
+    await writeFile(path, `#!/usr/bin/env bash\n${body}\n`, "utf-8");
+    await chmod(path, 0o755);
+    return path;
+  }
+
+  it("resolves with stdout when the child exits 0", async () => {
+    // Echoes back whatever it reads on stdin, proving the prompt is fed there
+    // and stdin is closed (otherwise `cat` would block forever).
+    const bin = await make_script("ok", "cat");
+    const out = await run_claude_print(bin, [], "hello over stdin", 5_000);
+    expect(out).toBe("hello over stdin");
+  });
+
+  it("closes stdin so a stdin-reading child never hangs", async () => {
+    // `cat` with no args reads until EOF. If stdin were left open this would
+    // hang until the 1s timeout and reject. It must resolve fast instead.
+    const bin = await make_script("cat-eof", "cat");
+    const out = await run_claude_print(bin, [], "", 1_000);
+    expect(out).toBe("");
+  });
+
+  it("rejects when the child exits non-zero, surfacing stderr", async () => {
+    const bin = await make_script("fail", 'echo "boom" >&2\nexit 3');
+    await expect(run_claude_print(bin, [], "x", 5_000)).rejects.toThrow(/claude exited 3/);
+  });
+
+  it("rejects and kills the child on timeout", async () => {
+    // Sleeps well past the timeout; run_claude_print must SIGKILL it and reject.
+    const bin = await make_script("slow", "sleep 5");
+    const started = Date.now();
+    // The rejection message is generic over `bin` — it names the binary and the
+    // elapsed budget rather than a hardcoded "claude -p timeout" string.
+    await expect(run_claude_print(bin, [], "x", 150)).rejects.toThrow(/timed out after 150ms/);
+    // Should reject promptly at the timeout, not wait out the full 5s sleep.
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("rejects when the binary does not exist (spawn error)", async () => {
+    await expect(
+      run_claude_print(join(bin_dir, "does-not-exist"), [], "x", 1_000),
+    ).rejects.toBeInstanceOf(Error);
   });
 });

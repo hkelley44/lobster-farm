@@ -7,25 +7,26 @@
  *   produced_text  called_reply   action
  *   ─────────────  ────────────   ─────────────────────────────────────────
  *   true           true           pass through (normal)
- *   true           false          block: hook script exits 2 with reminder
+ *   true           false          mode A: daemon delivers the harvested text
+ *                                  itself, then passes through. Falls back to
+ *                                  block+reminder only when it can't deliver.
  *   false          true           pass through (mid-turn streaming reply)
  *   false          false          heartbeat: daemon posts Haiku-summary itself
  *
  * Non-Discord-bound sessions (CLI agents, subagents, queue tasks) always pass
- * through. Heartbeats are debounced per-channel to avoid spam.
+ * through. Heartbeats are debounced per-channel to avoid spam; mode-A delivery
+ * is deduped per (session, harvested-text) so a re-fire can't double-post.
  *
- * See issue #39 for the full spec.
+ * See issue #39 for the original spec and issue #79 for the (a)+(b) hardening.
  */
 
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { promisify } from "node:util";
 import type { DiscordBot } from "./discord.js";
 import { claude_session_jsonl_path } from "./pool.js";
 import type { BotPool } from "./pool.js";
 import * as sentry from "./sentry.js";
-
-const exec = promisify(execFile);
 
 // ── Tool name constants ──
 
@@ -52,6 +53,13 @@ function is_reply_tool_name(name: string): boolean {
 export interface TurnSummary {
   /** True if the last assistant turn produced a non-empty text content block. */
   produced_text: boolean;
+  /**
+   * Concatenated non-empty text blocks of the last assistant turn, joined with
+   * `\n\n`. Empty string when the turn produced no user-facing text (tool-only
+   * turn, sidechain, or not-found). Used by mode-A to deliver the harvested
+   * answer to Discord directly when the agent forgot to call `reply`.
+   */
+  reply_text: string;
   /** True if the last assistant turn called a Discord reply tool. */
   called_reply: boolean;
   /** True if the last assistant turn was a sidechain (subagent) message. */
@@ -92,9 +100,24 @@ interface CooldownEntry {
  * are skipped on subsequent silent turns. */
 const heartbeat_cooldown = new Map<string, CooldownEntry>();
 
-/** Reset cooldowns. Test-only. */
+/**
+ * Idempotency guard for mode-A daemon-delivered text. Keyed on a hash of
+ * `session_id + harvested_text` (the trimmed text we actually send) so that if
+ * enforcement re-runs on the same transcript tail (e.g. a liveness restart
+ * re-fires the Stop hook), we do not re-post the harvested answer. Keying on the
+ * trimmed text is essential: raw `reply_text` whitespace can vary between reads
+ * and would defeat the guard. Same module-level style as `heartbeat_cooldown`.
+ */
+const mode_a_delivered = new Set<string>();
+
+function mode_a_key(session_id: string, harvested_text: string): string {
+  return createHash("sha256").update(`${session_id}\u0000${harvested_text}`).digest("hex");
+}
+
+/** Reset cooldowns + mode-A delivery guard. Test-only. */
 export function _reset_cooldown_for_tests(): void {
   heartbeat_cooldown.clear();
+  mode_a_delivered.clear();
 }
 
 function in_cooldown(channel_id: string, now: number): boolean {
@@ -154,6 +177,7 @@ export async function read_last_assistant_turn(
   if (!content) {
     return {
       produced_text: false,
+      reply_text: "",
       called_reply: false,
       is_sidechain: false,
       tool_summary: "",
@@ -203,10 +227,12 @@ export function parse_last_assistant_turn(jsonl_content: string): TurnSummary {
     let produced_text = false;
     let called_reply = false;
     const tool_names: string[] = [];
+    const text_parts: string[] = [];
 
     for (const block of content) {
       if (block.type === "text" && typeof block.text === "string" && block.text.trim() !== "") {
         produced_text = true;
+        text_parts.push(block.text);
       }
       if (block.type === "tool_use" && typeof block.name === "string") {
         tool_names.push(block.name);
@@ -218,6 +244,7 @@ export function parse_last_assistant_turn(jsonl_content: string): TurnSummary {
 
     return {
       produced_text,
+      reply_text: text_parts.join("\n\n"),
       called_reply,
       is_sidechain: entry.isSidechain === true,
       tool_summary: tool_names.join(", "),
@@ -227,6 +254,7 @@ export function parse_last_assistant_turn(jsonl_content: string): TurnSummary {
 
   return {
     produced_text: false,
+    reply_text: "",
     called_reply: false,
     is_sidechain: false,
     tool_summary: "",
@@ -262,9 +290,81 @@ export function is_discord_bound(session_id: string, pool: BotPool | null): bool
 // ── Heartbeat generation ──
 
 /**
+ * Run `claude -p --print` with the prompt fed over **stdin**, returning stdout.
+ *
+ * Why spawn (not `promisify(execFile)`): `execFile` never closes the child's
+ * stdin, so `claude -p` sits waiting on stdin even when the prompt is passed as
+ * an arg — it logs `no stdin data received` and routinely blows past the tight
+ * heartbeat budget, so the backstop never posts (issue #79).
+ *
+ * The fix, verified against the pinned `CLAUDE_BIN`: pipe the prompt into stdin
+ * and `end()` it immediately. This is the documented `claude -p` invocation and
+ * removes the wait entirely. The essential invariant is **stdin is never left
+ * open** — we always close it, whether or not we write.
+ *
+ * Kills the child on timeout and rejects. Rejects on any non-zero exit. Never
+ * leaves a dangling process or timer.
+ */
+export function run_claude_print(
+  bin: string,
+  args: string[],
+  input: string,
+  timeout_ms: number,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(new Error(`${bin} timed out after ${String(timeout_ms)}ms`));
+    }, timeout_ms);
+
+    child.stdout.on("data", (d) => {
+      stdout += String(d);
+    });
+    child.stderr.on("data", (d) => {
+      stderr += String(d);
+    });
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        reject(new Error(`claude exited ${String(code)}: ${stderr.slice(0, 200)}`));
+      }
+    });
+
+    // Feed the prompt over stdin, then close it — this is what unblocks
+    // `claude -p`. Guard the write in case the child died before stdin opened.
+    try {
+      child.stdin.write(input);
+      child.stdin.end();
+    } catch {
+      // The `error`/`close` handlers above will settle the promise.
+    }
+  });
+}
+
+/**
  * Ask Haiku for a one-line "what just happened" summary. Mirrors the shape of
  * `extract_session_learnings` in hooks.ts but bounded tighter — Stop hooks
  * have a 10s budget and Haiku takes 2–5s, so we cap at 6s and bail gracefully.
+ *
+ * The prompt is fed over stdin (not passed as a positional arg) — see
+ * `run_claude_print` for why leaving stdin open breaks the call.
  */
 export async function generate_heartbeat(turn: TurnSummary): Promise<string> {
   const tool_list = turn.tool_summary || "(no tools)";
@@ -282,10 +382,11 @@ export async function generate_heartbeat(turn: TurnSummary): Promise<string> {
   ].join("\n");
 
   const claude_bin = process.env.CLAUDE_BIN ?? "claude";
-  const { stdout } = await exec(
+  const stdout = await run_claude_print(
     claude_bin,
-    ["-p", "--model", "haiku", "--no-session-persistence", "--print", prompt],
-    { timeout: 6_000 },
+    ["-p", "--model", "haiku", "--no-session-persistence", "--print"],
+    prompt,
+    6_000,
   );
   return stdout.trim();
 }
@@ -361,7 +462,56 @@ export async function evaluate_stop(
 
   // Step 3: decide.
   if (turn.produced_text && !turn.called_reply) {
-    // Failure mode (a): hard enforce.
+    // Failure mode (a): the agent produced user-facing text but forgot to route
+    // it to Discord. Rather than block-and-pray (ask the agent to call `reply`,
+    // with nothing guaranteeing it does), the daemon delivers the harvested text
+    // itself — delivery becomes guaranteed, not requested. We only fall back to
+    // the block+reminder path when the daemon *couldn't* deliver.
+    const harvested = turn.reply_text.trim();
+    if (deps.discord && harvested) {
+      // Key on the *trimmed* text — the exact string we deliver. Keying on the
+      // raw `reply_text` would let whitespace variation between transcript reads
+      // yield different keys on a Stop-hook re-fire, defeating the guard and
+      // double-posting the same answer.
+      const key = mode_a_key(session_id, harvested);
+      if (mode_a_delivered.has(key)) {
+        // Enforcement re-ran on the same transcript tail — already delivered.
+        // Do NOT re-post; pass through. Low-noise breadcrumb for debuggability
+        // (no Discord side effect on this path).
+        sentry.addBreadcrumb({
+          category: "reply-enforce",
+          level: "debug",
+          message: "mode-a: re-fire suppressed (already delivered)",
+          data: { session_id: session_id.slice(0, 8), len: harvested.length },
+        });
+        return { ok: true };
+      }
+      try {
+        await deps.discord.send(channel_id, harvested);
+        mode_a_delivered.add(key);
+        sentry.addBreadcrumb({
+          category: "reply-enforce",
+          level: "info",
+          message: "mode-a: daemon delivered harvested text",
+          data: { session_id: session_id.slice(0, 8), len: harvested.length },
+        });
+        return { ok: true }; // delivered — do NOT block the agent
+      } catch (err) {
+        console.warn(
+          `[reply-enforce] mode-a harvest send failed for ${session_id.slice(0, 8)}: ${String(err)}`,
+        );
+        sentry.addBreadcrumb({
+          category: "reply-enforce",
+          level: "warning",
+          message: "mode-a send failed",
+          data: { session_id: session_id.slice(0, 8), err: String(err) },
+        });
+        // Fall through to the reminder as a last resort.
+      }
+    }
+    // Fallback (no discord client, empty text, or send failed): keep the old
+    // block+reminder behavior so a produced-but-undelivered answer is never
+    // silently dropped.
     return { ok: true, block: true, reminder: REPLY_REMINDER };
   }
 
