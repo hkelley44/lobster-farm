@@ -15,9 +15,12 @@
  *
  * Non-Discord-bound sessions (CLI agents, subagents, queue tasks) always pass
  * through. Heartbeats are debounced per-channel to avoid spam; mode-A delivery
- * is deduped per (session, harvested-text) so a re-fire can't double-post.
+ * is deduped per (session, assistant-turn-uuid) — bounded LRU — so a re-fire on
+ * the same transcript tail can't double-post, while two distinct turns with
+ * identical text still both deliver.
  *
- * See issue #39 for the original spec and issue #79 for the (a)+(b) hardening.
+ * See issue #39 for the original spec, #79 for the (a)+(b) hardening, and #81
+ * for the review-follow-up (stdin EPIPE guard, bounded guard, uuid re-key).
  */
 
 import { spawn } from "node:child_process";
@@ -65,6 +68,14 @@ export interface TurnSummary {
   /** True if the last assistant turn was a sidechain (subagent) message. */
   is_sidechain: boolean;
   /**
+   * Top-level `uuid` of the assistant JSONL entry this summary was parsed from.
+   * Per-turn (per-transcript-entry), not per-content — two distinct turns that
+   * harvest identical text still carry different uuids. Empty string when no
+   * assistant entry was found or the entry lacked a uuid. Used as the mode-A
+   * idempotency key so a genuine new turn is never mistaken for a re-fire.
+   */
+  uuid: string;
+  /**
    * Comma-separated list of tool names invoked in the last assistant turn,
    * used by the heartbeat generator. May be empty when the turn was pure text.
    */
@@ -102,16 +113,56 @@ const heartbeat_cooldown = new Map<string, CooldownEntry>();
 
 /**
  * Idempotency guard for mode-A daemon-delivered text. Keyed on a hash of
- * `session_id + harvested_text` (the trimmed text we actually send) so that if
- * enforcement re-runs on the same transcript tail (e.g. a liveness restart
- * re-fires the Stop hook), we do not re-post the harvested answer. Keying on the
- * trimmed text is essential: raw `reply_text` whitespace can vary between reads
- * and would defeat the guard. Same module-level style as `heartbeat_cooldown`.
+ * `session_id + assistant-turn-uuid` (the top-level `uuid` of the JSONL entry we
+ * parsed) so that if enforcement re-runs on the *same* transcript tail (e.g. a
+ * liveness restart re-fires the Stop hook), we do not re-post the harvested
+ * answer — while two DISTINCT turns that happen to harvest identical text (two
+ * separate `"Done."`) both deliver, because they carry different uuids.
+ *
+ * Keyed on uuid, NOT on content: content-keying silently dropped a legitimately
+ * repeated answer (issue #81 item 3). Trimming the text made those collisions
+ * more likely, not less.
+ *
+ * Bounded to `MODE_A_MAX_KEYS` via LRU eviction (insertion-ordered Map: delete +
+ * re-insert on access, evict the oldest when over cap). This caps memory on a
+ * long-lived daemon — unlike `heartbeat_cooldown`, which is naturally bounded by
+ * channel count, this Set/Map would otherwise grow once per mode-A delivery
+ * forever (issue #81 item 2).
  */
-const mode_a_delivered = new Set<string>();
+export const MODE_A_MAX_KEYS = 2_048;
 
-function mode_a_key(session_id: string, harvested_text: string): string {
-  return createHash("sha256").update(`${session_id}\u0000${harvested_text}`).digest("hex");
+/** Insertion-ordered Map used as an LRU set — the value is a placeholder; only
+ * key presence and insertion order matter. Map (not Set) so a future time-window
+ * policy could store a timestamp without reshaping the structure. */
+const mode_a_delivered = new Map<string, true>();
+
+function mode_a_key(session_id: string, turn_uuid: string): string {
+  return createHash("sha256").update(`${session_id}\u0000${turn_uuid}`).digest("hex");
+}
+
+/** True if this key was already delivered. LRU touch: move to most-recent. */
+function mode_a_seen(key: string): boolean {
+  if (!mode_a_delivered.has(key)) return false;
+  mode_a_delivered.delete(key);
+  mode_a_delivered.set(key, true);
+  return true;
+}
+
+/** Record a delivered key, evicting the oldest entries past the cap. */
+function mode_a_mark(key: string): void {
+  mode_a_delivered.delete(key);
+  mode_a_delivered.set(key, true);
+  while (mode_a_delivered.size > MODE_A_MAX_KEYS) {
+    // Map iteration is insertion-ordered — the first key is the oldest.
+    const oldest = mode_a_delivered.keys().next().value;
+    if (oldest === undefined) break;
+    mode_a_delivered.delete(oldest);
+  }
+}
+
+/** Current size of the mode-A delivery guard. Test-only introspection. */
+export function _mode_a_size_for_tests(): number {
+  return mode_a_delivered.size;
 }
 
 /** Reset cooldowns + mode-A delivery guard. Test-only. */
@@ -181,6 +232,7 @@ export async function read_last_assistant_turn(
       called_reply: false,
       is_sidechain: false,
       tool_summary: "",
+      uuid: "",
       found: false,
     };
   }
@@ -190,6 +242,7 @@ export async function read_last_assistant_turn(
 
 interface JsonlEntry {
   type?: string;
+  uuid?: string;
   isSidechain?: boolean;
   message?: {
     role?: string;
@@ -248,6 +301,7 @@ export function parse_last_assistant_turn(jsonl_content: string): TurnSummary {
       called_reply,
       is_sidechain: entry.isSidechain === true,
       tool_summary: tool_names.join(", "),
+      uuid: typeof entry.uuid === "string" ? entry.uuid : "",
       found: true,
     };
   }
@@ -258,6 +312,7 @@ export function parse_last_assistant_turn(jsonl_content: string): TurnSummary {
     called_reply: false,
     is_sidechain: false,
     tool_summary: "",
+    uuid: "",
     found: false,
   };
 }
@@ -347,8 +402,19 @@ export function run_claude_print(
       }
     });
 
+    // Swallow async stdin errors. A broken-pipe (EPIPE) is emitted
+    // asynchronously as an `'error'` event on the stdin *stream* when the child
+    // dies before draining a payload larger than the pipe buffer. Without this
+    // listener Node treats it as an unhandled stream error and crashes the
+    // process — violating the module's "NEVER throw / fail-open inside the
+    // Stop-hook budget" invariant. The `child.on("error")` and `try/catch`
+    // below do NOT catch it (it's neither a spawn error nor synchronous). The
+    // `close` handler still settles the promise with the real exit reason.
+    child.stdin.on("error", () => {});
+
     // Feed the prompt over stdin, then close it — this is what unblocks
-    // `claude -p`. Guard the write in case the child died before stdin opened.
+    // `claude -p`. Guard the synchronous write in case the child died before
+    // stdin opened; the async guard above covers the post-write EPIPE case.
     try {
       child.stdin.write(input);
       child.stdin.end();
@@ -469,12 +535,18 @@ export async function evaluate_stop(
     // the block+reminder path when the daemon *couldn't* deliver.
     const harvested = turn.reply_text.trim();
     if (deps.discord && harvested) {
-      // Key on the *trimmed* text — the exact string we deliver. Keying on the
-      // raw `reply_text` would let whitespace variation between transcript reads
-      // yield different keys on a Stop-hook re-fire, defeating the guard and
-      // double-posting the same answer.
-      const key = mode_a_key(session_id, harvested);
-      if (mode_a_delivered.has(key)) {
+      // Key on the assistant turn's JSONL `uuid`, NOT the harvested content. A
+      // genuine new turn carries a fresh uuid, so two distinct turns with the
+      // SAME text both deliver (content-keying silently dropped the second —
+      // issue #81 item 3). A true Stop-hook re-fire re-parses the same tail
+      // entry → same uuid → suppressed, preserving the double-post protection.
+      //
+      // When the entry lacks a uuid (empty string — legacy transcripts or a
+      // parse edge), we skip the dedup guard entirely and deliver. Double-post
+      // beats never-post: the original guard exists to stop re-posts, not to
+      // gate first delivery, and a missing uuid can't safely identify a re-fire.
+      const key = turn.uuid ? mode_a_key(session_id, turn.uuid) : null;
+      if (key && mode_a_seen(key)) {
         // Enforcement re-ran on the same transcript tail — already delivered.
         // Do NOT re-post; pass through. Low-noise breadcrumb for debuggability
         // (no Discord side effect on this path).
@@ -488,7 +560,7 @@ export async function evaluate_stop(
       }
       try {
         await deps.discord.send(channel_id, harvested);
-        mode_a_delivered.add(key);
+        if (key) mode_a_mark(key);
         sentry.addBreadcrumb({
           category: "reply-enforce",
           level: "info",

@@ -27,7 +27,9 @@ import type { BotPool, PoolBot } from "../pool.js";
 import {
   HEARTBEAT_COOLDOWN_MS,
   HEARTBEAT_PREFIX,
+  MODE_A_MAX_KEYS,
   REPLY_REMINDER,
+  _mode_a_size_for_tests,
   _reset_cooldown_for_tests,
   evaluate_stop,
   is_discord_bound,
@@ -90,6 +92,7 @@ function assistant_line(opts: {
   text?: string;
   tools?: string[];
   is_sidechain?: boolean;
+  uuid?: string;
 }): string {
   const blocks: Array<Record<string, unknown>> = [];
   if (opts.text !== undefined) {
@@ -98,14 +101,18 @@ function assistant_line(opts: {
   for (const name of opts.tools ?? []) {
     blocks.push({ type: "tool_use", id: `t-${name}`, name, input: {} });
   }
-  return JSON.stringify({
+  const entry: Record<string, unknown> = {
     type: "assistant",
     isSidechain: opts.is_sidechain === true,
     message: {
       role: "assistant",
       content: blocks,
     },
-  });
+  };
+  if (opts.uuid !== undefined) {
+    entry.uuid = opts.uuid;
+  }
+  return JSON.stringify(entry);
 }
 
 function user_line(): string {
@@ -234,6 +241,32 @@ describe("parse_last_assistant_turn", () => {
   it("returns empty reply_text for a not-found transcript", () => {
     expect(parse_last_assistant_turn("").reply_text).toBe("");
     expect(parse_last_assistant_turn(`${user_line()}\n`).reply_text).toBe("");
+  });
+
+  // ── uuid (issue #81 item 3 — per-turn idempotency key) ──
+
+  it("captures the top-level uuid of the last assistant entry", () => {
+    const jsonl = `${assistant_line({ text: "hi", uuid: "u-123" })}\n`;
+    expect(parse_last_assistant_turn(jsonl).uuid).toBe("u-123");
+  });
+
+  it("returns empty uuid when the assistant entry has no uuid field", () => {
+    const jsonl = `${assistant_line({ text: "hi" })}\n`;
+    expect(parse_last_assistant_turn(jsonl).uuid).toBe("");
+  });
+
+  it("returns empty uuid for a not-found transcript", () => {
+    expect(parse_last_assistant_turn("").uuid).toBe("");
+  });
+
+  it("captures the uuid of the LAST assistant turn, not an earlier one", () => {
+    const jsonl = [
+      assistant_line({ text: "old", uuid: "u-old" }),
+      user_line(),
+      assistant_line({ text: "new", uuid: "u-new" }),
+      "",
+    ].join("\n");
+    expect(parse_last_assistant_turn(jsonl).uuid).toBe("u-new");
   });
 });
 
@@ -427,6 +460,9 @@ describe("evaluate_stop — acceptance criteria", () => {
       called_reply: false,
       is_sidechain: false,
       tool_summary: "",
+      // Default a stable uuid so mode-A dedup keys deterministically. Tests that
+      // exercise the per-turn idempotency semantics override this explicitly.
+      uuid: "turn-uuid-default",
       found: true,
       ...turn,
     });
@@ -563,7 +599,10 @@ describe("evaluate_stop — acceptance criteria", () => {
     expect(result).toEqual({ ok: true, block: true, reminder: REPLY_REMINDER });
   });
 
-  it("mode A idempotency: same turn evaluated twice → second call does not re-send", async () => {
+  it("mode A idempotency: same turn (same uuid) evaluated twice → second call does not re-send", async () => {
+    // A true Stop-hook re-fire re-parses the SAME transcript tail entry, so it
+    // carries the same top-level uuid. The guard keys on that uuid and
+    // suppresses the second delivery — this is the double-post protection.
     const { discord, sends } = make_discord();
     const deps = {
       pool: bound_pool(),
@@ -572,6 +611,7 @@ describe("evaluate_stop — acceptance criteria", () => {
         produced_text: true,
         called_reply: false,
         reply_text: "Deliver me exactly once.",
+        uuid: "turn-A",
       }),
     };
     const first = await evaluate_stop({ session_id, working_dir }, deps);
@@ -583,14 +623,10 @@ describe("evaluate_stop — acceptance criteria", () => {
     expect(sends[0]).toEqual({ channel_id: "C123", content: "Deliver me exactly once." });
   });
 
-  it("mode A idempotency: whitespace-varying reply_text keys on trimmed text → sends once", async () => {
-    // Regression guard: the idempotency key must reflect what is actually sent
-    // (the trimmed text), NOT the raw reply_text. On a Stop-hook re-fire,
-    // whitespace can vary between transcript reads; if the key were derived from
-    // the untrimmed text, the two reads would hash differently and BOTH sends
-    // would fire, double-posting to the user. We evaluate the same session twice
-    // with different surrounding whitespace but identical trimmed content and
-    // assert exactly one send of the trimmed form.
+  it("mode A idempotency: re-fire is suppressed even when whitespace varies (uuid, not content, is the key)", async () => {
+    // On a Stop-hook re-fire, surrounding whitespace can vary between transcript
+    // reads. Because the guard keys on the per-turn uuid (not the content), the
+    // same turn is suppressed regardless of whitespace drift — exactly one send.
     const { discord, sends } = make_discord();
     const first = await evaluate_stop(
       { session_id, working_dir },
@@ -601,6 +637,7 @@ describe("evaluate_stop — acceptance criteria", () => {
           produced_text: true,
           called_reply: false,
           reply_text: "  answer  \n",
+          uuid: "turn-A",
         }),
       },
     );
@@ -613,6 +650,7 @@ describe("evaluate_stop — acceptance criteria", () => {
           produced_text: true,
           called_reply: false,
           reply_text: "\n answer ",
+          uuid: "turn-A",
         }),
       },
     );
@@ -622,7 +660,69 @@ describe("evaluate_stop — acceptance criteria", () => {
     expect(sends).toEqual([{ channel_id: "C123", content: "answer" }]);
   });
 
-  it("mode A idempotency: different harvested text is NOT suppressed", async () => {
+  it("mode A idempotency (issue #81): two DISTINCT turns with identical text BOTH deliver", async () => {
+    // The bug this fixes: content-keying suppressed a legitimately-repeated
+    // answer. Two separate tasks both ending in "Done." are distinct turns with
+    // distinct uuids — both must reach the user. Under the old (session, text)
+    // key the second was silently dropped (returned pass-through, neither
+    // delivered nor blocked). Under uuid-keying both deliver.
+    const { discord, sends } = make_discord();
+    const first = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "Done.",
+          uuid: "turn-1",
+        }),
+      },
+    );
+    const second = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "Done.",
+          uuid: "turn-2",
+        }),
+      },
+    );
+    expect(first).toEqual({ ok: true });
+    expect(second).toEqual({ ok: true });
+    // Both "Done." messages delivered — no silent drop.
+    expect(sends).toEqual([
+      { channel_id: "C123", content: "Done." },
+      { channel_id: "C123", content: "Done." },
+    ]);
+  });
+
+  it("mode A idempotency: missing uuid → deliver (never gate first delivery on an absent id)", async () => {
+    // A transcript entry without a uuid can't safely identify a re-fire. We
+    // deliver rather than risk silently dropping — double-post beats never-post.
+    // Two reads with empty uuid both deliver (no dedup applied).
+    const { discord, sends } = make_discord();
+    const deps = {
+      pool: bound_pool(),
+      discord,
+      read_turn: make_turn_reader({
+        produced_text: true,
+        called_reply: false,
+        reply_text: "No uuid here.",
+        uuid: "",
+      }),
+    };
+    await evaluate_stop({ session_id, working_dir }, deps);
+    await evaluate_stop({ session_id, working_dir }, deps);
+    expect(sends.length).toBe(2);
+  });
+
+  it("mode A idempotency: different uuid is NOT suppressed", async () => {
     const { discord, sends } = make_discord();
     await evaluate_stop(
       { session_id, working_dir },
@@ -633,6 +733,7 @@ describe("evaluate_stop — acceptance criteria", () => {
           produced_text: true,
           called_reply: false,
           reply_text: "First answer.",
+          uuid: "turn-1",
         }),
       },
     );
@@ -645,10 +746,36 @@ describe("evaluate_stop — acceptance criteria", () => {
           produced_text: true,
           called_reply: false,
           reply_text: "A genuinely different answer.",
+          uuid: "turn-2",
         }),
       },
     );
     expect(sends.length).toBe(2);
+  });
+
+  it("mode A guard stays bounded under many distinct deliveries (issue #81 item 2)", async () => {
+    // Prove the mode-A delivery guard never grows without limit. Deliver far
+    // more distinct turns than the cap and assert the guard size holds at
+    // MODE_A_MAX_KEYS via LRU eviction, rather than leaking one entry per
+    // delivery on a long-lived daemon.
+    const { discord } = make_discord();
+    const overflow = MODE_A_MAX_KEYS + 500;
+    for (let i = 0; i < overflow; i++) {
+      await evaluate_stop(
+        { session_id, working_dir },
+        {
+          pool: bound_pool(),
+          discord,
+          read_turn: make_turn_reader({
+            produced_text: true,
+            called_reply: false,
+            reply_text: `answer ${String(i)}`,
+            uuid: `turn-${String(i)}`,
+          }),
+        },
+      );
+    }
+    expect(_mode_a_size_for_tests()).toBe(MODE_A_MAX_KEYS);
   });
 
   it("text + no-reply, NOT Discord-bound → pass-through (no enforcement)", async () => {
@@ -925,5 +1052,66 @@ describe("run_claude_print", () => {
     await expect(
       run_claude_print(join(bin_dir, "does-not-exist"), [], "x", 1_000),
     ).rejects.toBeInstanceOf(Error);
+  });
+
+  // ── async stdin EPIPE (issue #81 item 1 — PRIORITY, daemon-crash vector) ──
+
+  it("settles cleanly when the child exits before draining a large stdin payload (async EPIPE)", async () => {
+    // Regression for the daemon-crash vector: a child that exits immediately
+    // leaves its stdin pipe with no reader. Writing a payload LARGER than the OS
+    // pipe buffer (~64 KiB on Darwin/Linux) can't complete synchronously — the
+    // kernel raises EPIPE on the stdin stream ASYNCHRONOUSLY, as an 'error'
+    // event. Without `child.stdin.on("error", ...)` Node escalates that to an
+    // uncaught exception and kills the whole daemon. This test drives the REAL
+    // spawn/stdin path (a real child process that exits at once) and asserts the
+    // promise settles instead of throwing uncaught.
+    const bin = await make_script("exit-fast", "exit 0");
+    // 1 MiB — well past any pipe buffer, guaranteeing the write outlives the child.
+    const big_payload = "x".repeat(1024 * 1024);
+
+    // A rejection is a clean settle (the child exited non-zero or the write path
+    // errored); a resolve is also clean. The ONLY unacceptable outcome is an
+    // uncaught 'error' event crashing the process — which manifests here as the
+    // test runner recording an unhandled error. Guard against that explicitly.
+    let uncaught: unknown;
+    const on_uncaught = (err: unknown) => {
+      uncaught = err;
+    };
+    process.on("uncaughtException", on_uncaught);
+    try {
+      await run_claude_print(bin, [], big_payload, 5_000).then(
+        () => undefined,
+        () => undefined, // reject is a valid clean settle
+      );
+      // Give any async EPIPE a tick to surface before we assert.
+      await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      process.off("uncaughtException", on_uncaught);
+    }
+    expect(uncaught).toBeUndefined();
+  });
+
+  it("does not crash when the child dies mid-write on a large payload", async () => {
+    // Complementary case: the child reads a little then exits, so the writer is
+    // still pushing bytes when the read end closes — the classic broken-pipe
+    // race the reviewer called out (SIGKILL-on-timeout / instant-exit). Must
+    // settle without an uncaught throw.
+    const bin = await make_script("read-then-die", "head -c 10 >/dev/null; exit 0");
+    const big_payload = "y".repeat(1024 * 1024);
+    let uncaught: unknown;
+    const on_uncaught = (err: unknown) => {
+      uncaught = err;
+    };
+    process.on("uncaughtException", on_uncaught);
+    try {
+      await run_claude_print(bin, [], big_payload, 5_000).then(
+        () => undefined,
+        () => undefined,
+      );
+      await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      process.off("uncaughtException", on_uncaught);
+    }
+    expect(uncaught).toBeUndefined();
   });
 });
