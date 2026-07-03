@@ -583,6 +583,45 @@ describe("evaluate_stop — acceptance criteria", () => {
     expect(sends[0]).toEqual({ channel_id: "C123", content: "Deliver me exactly once." });
   });
 
+  it("mode A idempotency: whitespace-varying reply_text keys on trimmed text → sends once", async () => {
+    // Regression guard: the idempotency key must reflect what is actually sent
+    // (the trimmed text), NOT the raw reply_text. On a Stop-hook re-fire,
+    // whitespace can vary between transcript reads; if the key were derived from
+    // the untrimmed text, the two reads would hash differently and BOTH sends
+    // would fire, double-posting to the user. We evaluate the same session twice
+    // with different surrounding whitespace but identical trimmed content and
+    // assert exactly one send of the trimmed form.
+    const { discord, sends } = make_discord();
+    const first = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "  answer  \n",
+        }),
+      },
+    );
+    const second = await evaluate_stop(
+      { session_id, working_dir },
+      {
+        pool: bound_pool(),
+        discord,
+        read_turn: make_turn_reader({
+          produced_text: true,
+          called_reply: false,
+          reply_text: "\n answer ",
+        }),
+      },
+    );
+    expect(first).toEqual({ ok: true });
+    expect(second).toEqual({ ok: true });
+    // Exactly one send, and it's the trimmed form.
+    expect(sends).toEqual([{ channel_id: "C123", content: "answer" }]);
+  });
+
   it("mode A idempotency: different harvested text is NOT suppressed", async () => {
     const { discord, sends } = make_discord();
     await evaluate_stop(
@@ -875,7 +914,9 @@ describe("run_claude_print", () => {
     // Sleeps well past the timeout; run_claude_print must SIGKILL it and reject.
     const bin = await make_script("slow", "sleep 5");
     const started = Date.now();
-    await expect(run_claude_print(bin, [], "x", 150)).rejects.toThrow(/timeout/);
+    // The rejection message is generic over `bin` — it names the binary and the
+    // elapsed budget rather than a hardcoded "claude -p timeout" string.
+    await expect(run_claude_print(bin, [], "x", 150)).rejects.toThrow(/timed out after 150ms/);
     // Should reject promptly at the timeout, not wait out the full 5s sleep.
     expect(Date.now() - started).toBeLessThan(2_000);
   });

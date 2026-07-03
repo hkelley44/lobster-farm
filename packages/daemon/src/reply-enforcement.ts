@@ -102,14 +102,16 @@ const heartbeat_cooldown = new Map<string, CooldownEntry>();
 
 /**
  * Idempotency guard for mode-A daemon-delivered text. Keyed on a hash of
- * `session_id + reply_text` so that if enforcement re-runs on the same
- * transcript tail (e.g. a liveness restart re-fires the Stop hook), we do not
- * re-post the harvested answer. Same module-level style as `heartbeat_cooldown`.
+ * `session_id + harvested_text` (the trimmed text we actually send) so that if
+ * enforcement re-runs on the same transcript tail (e.g. a liveness restart
+ * re-fires the Stop hook), we do not re-post the harvested answer. Keying on the
+ * trimmed text is essential: raw `reply_text` whitespace can vary between reads
+ * and would defeat the guard. Same module-level style as `heartbeat_cooldown`.
  */
 const mode_a_delivered = new Set<string>();
 
-function mode_a_key(session_id: string, reply_text: string): string {
-  return createHash("sha256").update(`${session_id}\u0000${reply_text}`).digest("hex");
+function mode_a_key(session_id: string, harvested_text: string): string {
+  return createHash("sha256").update(`${session_id}\u0000${harvested_text}`).digest("hex");
 }
 
 /** Reset cooldowns + mode-A delivery guard. Test-only. */
@@ -319,7 +321,7 @@ export function run_claude_print(
       if (settled) return;
       settled = true;
       child.kill("SIGKILL");
-      reject(new Error("claude -p timeout"));
+      reject(new Error(`${bin} timed out after ${String(timeout_ms)}ms`));
     }, timeout_ms);
 
     child.stdout.on("data", (d) => {
@@ -467,10 +469,21 @@ export async function evaluate_stop(
     // the block+reminder path when the daemon *couldn't* deliver.
     const harvested = turn.reply_text.trim();
     if (deps.discord && harvested) {
-      const key = mode_a_key(session_id, turn.reply_text);
+      // Key on the *trimmed* text — the exact string we deliver. Keying on the
+      // raw `reply_text` would let whitespace variation between transcript reads
+      // yield different keys on a Stop-hook re-fire, defeating the guard and
+      // double-posting the same answer.
+      const key = mode_a_key(session_id, harvested);
       if (mode_a_delivered.has(key)) {
         // Enforcement re-ran on the same transcript tail — already delivered.
-        // Do NOT re-post; pass through.
+        // Do NOT re-post; pass through. Low-noise breadcrumb for debuggability
+        // (no Discord side effect on this path).
+        sentry.addBreadcrumb({
+          category: "reply-enforce",
+          level: "debug",
+          message: "mode-a: re-fire suppressed (already delivered)",
+          data: { session_id: session_id.slice(0, 8), len: harvested.length },
+        });
         return { ok: true };
       }
       try {
@@ -480,7 +493,7 @@ export async function evaluate_stop(
           category: "reply-enforce",
           level: "info",
           message: "mode-a: daemon delivered harvested text",
-          data: { session_id: session_id.slice(0, 8), len: turn.reply_text.length },
+          data: { session_id: session_id.slice(0, 8), len: harvested.length },
         });
         return { ok: true }; // delivered — do NOT block the agent
       } catch (err) {
