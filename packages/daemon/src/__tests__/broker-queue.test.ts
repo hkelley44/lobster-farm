@@ -102,7 +102,7 @@ describe("BrokerQueue", () => {
     expect(q.deliverable_for("chan-1", 1000).map((e) => e.id)).toEqual([entry.id]);
   });
 
-  it("dead-letters after exhausting the delivery budget and fires on_dead_letter once", () => {
+  it("dead-letters after exactly max_deliveries attempts and fires on_dead_letter once", () => {
     const dead: QueueEntry[] = [];
     const q = make({
       path,
@@ -112,16 +112,40 @@ describe("BrokerQueue", () => {
     });
     const entry = enqueue_one(q);
 
-    // 3 allowed attempts, then the 4th exhausts the budget.
+    // `max_deliveries: 3` means EXACTLY 3 real delivery attempts. Attempts 1..3
+    // each go out ("delivered"); the 4th call finds the budget spent and
+    // dead-letters WITHOUT counting a 4th attempt (the server skips the send on
+    // "dead", so a 4th increment would silently drop the 3rd real delivery).
     expect(q.mark_delivered(entry.id, 0)).toBe("delivered");
     expect(q.mark_delivered(entry.id, 1)).toBe("delivered");
     expect(q.mark_delivered(entry.id, 2)).toBe("delivered");
-    expect(q.mark_delivered(entry.id, 3)).toBe("dead");
+    // Boundary locked: after the 3rd attempt the count is exactly 3, not 4.
+    expect(q.all().find((e) => e.id === entry.id)!.deliveries).toBe(3);
 
+    expect(q.mark_delivered(entry.id, 3)).toBe("dead");
+    // The dead-lettering call must NOT have inflated the attempt count past the cap.
     expect(dead).toHaveLength(1);
     expect(dead[0]!.id).toBe(entry.id);
+    expect(dead[0]!.deliveries).toBe(3);
     // Dead entries are not deliverable.
     expect(q.deliverable_for("chan-1")).toHaveLength(0);
+  });
+
+  it("max_deliveries: N permits exactly N real deliveries (name matches behavior)", () => {
+    // Regression pin for the off-by-one the reviewer flagged: with the old
+    // `deliveries > max` guard, max_deliveries: 5 permitted 6 attempts. The name
+    // says at most N — this locks that N=5 yields 5 "delivered" then "dead".
+    const q = make({ path, max_deliveries: 5, redeliver_after_ms: 0 });
+    const entry = enqueue_one(q);
+    const results = Array.from({ length: 6 }, (_, i) => q.mark_delivered(entry.id, i));
+    expect(results).toEqual([
+      "delivered",
+      "delivered",
+      "delivered",
+      "delivered",
+      "delivered",
+      "dead",
+    ]);
   });
 
   it("a failing on_dead_letter sink never breaks queue accounting", () => {

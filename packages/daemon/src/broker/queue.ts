@@ -51,7 +51,9 @@ interface PersistedQueue {
 export interface QueueOptions {
   /** Absolute path to the queue's JSON file. */
   path: string;
-  /** Max delivery attempts before dead-lettering. Default 5. */
+  /** Max delivery attempts before dead-lettering. `N` means the entry is
+   * delivered at most N times; the attempt after the budget is spent
+   * dead-letters instead of sending again. Default 5. */
   max_deliveries?: number;
   /** Ms to wait after a delivery before it's eligible for redelivery. Default 30s. */
   redeliver_after_ms?: number;
@@ -152,19 +154,26 @@ export class BrokerQueue {
   }
 
   /**
-   * Record a delivery attempt. Increments the attempt count and, if that
-   * exhausts the retry budget, dead-letters the entry (fires on_dead_letter).
-   * Returns the entry's post-attempt status so the caller knows whether the
-   * delivery actually went out (`delivered`) or was dropped (`dead`).
+   * Record a delivery attempt. If the entry has already used its full attempt
+   * budget, dead-letters it (fires on_dead_letter) and returns `dead` WITHOUT
+   * consuming another attempt — the caller must not send. Otherwise it counts
+   * this attempt and returns `delivered` so the caller sends.
+   *
+   * `max_deliveries: N` means at most N delivery attempts: the budget is
+   * checked BEFORE it is consumed, so the entry is delivered exactly N times
+   * (attempts 1..N), and the next `mark_delivered` after the budget is spent
+   * dead-letters instead of sending an (N+1)th time. Checking before consuming
+   * — rather than incrementing then testing `>=` — matters because the caller
+   * (`server.deliver`) skips the actual send when this returns `dead`; testing
+   * after the increment would drop the Nth real delivery.
    */
   mark_delivered(id: string, now_ms = Date.now()): QueueEntryStatus | null {
     const e = this.entries.get(id);
     if (!e || e.status === "dead") return e?.status ?? null;
 
-    e.deliveries += 1;
-    e.last_delivery_ms = now_ms;
-
-    if (e.deliveries > this.max_deliveries) {
+    // Budget already spent (N attempts made, still unacked) → dead-letter now,
+    // without counting or sending an (N+1)th attempt.
+    if (e.deliveries >= this.max_deliveries) {
       e.status = "dead";
       this.schedule_persist();
       try {
@@ -175,6 +184,8 @@ export class BrokerQueue {
       return "dead";
     }
 
+    e.deliveries += 1;
+    e.last_delivery_ms = now_ms;
     e.status = "delivered";
     this.schedule_persist();
     return "delivered";

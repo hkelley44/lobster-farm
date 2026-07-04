@@ -2133,6 +2133,20 @@ export class BotPool extends EventEmitter {
     if (bot.state !== "assigned" || !bot.channel_id) return;
     if (this.recovering_plugin.has(bot.id)) return; // recovery already in flight
 
+    // Broker-transport sessions are exempt from the DEAF probe. The observational
+    // probe exists to catch a plugin whose channel listener silently died — but a
+    // broker session has no plugin listener: the daemon's durable queue holds each
+    // inbound and redelivers with its own ack until the shim consumes it, so the
+    // broker's redelivery IS the liveness mechanism. Worse, the probe would fight
+    // the broker: during a shim reconnect backoff (up to ~10s) the agent legitimately
+    // hasn't processed yet, and a spurious DEAF restart would kill the shim the broker
+    // is mid-redelivery to — a self-defeating loop. `broker_owns` is the same
+    // broker-transport signal threaded through bring-up (registered in
+    // prepare_broker_session, dropped on release); it returns false when the flag is
+    // off or the broker is unset, so plugin-transport sessions are entirely unaffected
+    // and flag-OFF behavior is byte-identical.
+    if (this.broker_owns(bot.channel_id)) return;
+
     const inbound = bot.last_inbound_at;
     if (!inbound) return; // nothing delivered — skip the tmux pane read entirely
 

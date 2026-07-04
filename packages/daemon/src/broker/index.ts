@@ -44,18 +44,20 @@ export interface DiscordBrokerOptions {
 }
 
 export class DiscordBroker {
-  private readonly config: LobsterFarmConfig;
   private readonly queue: BrokerQueue;
   private readonly server: BrokerServer;
   private readonly executor: OutboundExecutor;
+  /** The resolved IPC socket path — the injected `opts.socket_path` if given,
+   * else the default under lobsterfarm_dir. Stored so the getter returns exactly
+   * what the server bound (getter can't recompute or it would ignore injection). */
+  private readonly _socket_path: string;
   /** channel_id → ownership. The broker's source of truth for outbound identity. */
   private readonly ownership = new Map<string, ChannelOwnership>();
   private started = false;
 
   constructor(opts: DiscordBrokerOptions) {
-    this.config = opts.config;
     const dir = lobsterfarm_dir(opts.config.paths);
-    const socket_path = opts.socket_path ?? join(dir, BROKER_SOCKET_RELATIVE);
+    this._socket_path = opts.socket_path ?? join(dir, BROKER_SOCKET_RELATIVE);
     const queue_path = opts.queue_path ?? join(dir, "state", "broker-queue.json");
 
     this.executor = new OutboundExecutor(opts.fetch_impl);
@@ -70,16 +72,18 @@ export class DiscordBroker {
       },
     });
     this.server = new BrokerServer({
-      socket_path,
+      socket_path: this._socket_path,
       queue: this.queue,
       outbound: (channel_id, _bot_id, tool, args) => this.execute_outbound(channel_id, tool, args),
     });
   }
 
   /** Absolute path to the IPC socket — used by pool.ts to tell the shim where
-   * to connect (via env var). */
+   * to connect (via env var). Returns the path the server actually bound (the
+   * injected `opts.socket_path` when provided, else the default), never a
+   * recomputed one. */
   get socket_path(): string {
-    return join(lobsterfarm_dir(this.config.paths), BROKER_SOCKET_RELATIVE);
+    return this._socket_path;
   }
 
   /** Load the durable backlog and bind the socket. On restart, any un-acked

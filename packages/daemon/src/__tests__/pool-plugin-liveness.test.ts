@@ -308,6 +308,70 @@ describe("check_plugin_liveness (issue #73)", () => {
     expect(messages.some((m) => m.includes("could not be restarted"))).toBe(true);
   });
 
+  it("skips the DEAF-restart path for a broker-transport session (broker redelivery is the liveness mechanism)", async () => {
+    const start_tmux = vi
+      .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
+      .mockResolvedValue(undefined as never);
+
+    // Same DEAF-eligible conditions as the plugin case below: inbound past the
+    // threshold, idle the whole time, never processed. The ONLY difference is
+    // that the broker owns this channel — the daemon's durable queue holds and
+    // redelivers the message, so the observational probe must NOT restart it
+    // (a restart mid-reconnect would fight the broker's redelivery).
+    (pool as unknown as { broker: { owns(id: string): boolean } | null }).broker = {
+      owns: (id: string) => id === "chan-foods",
+    };
+
+    const bot = make_assigned_bot(3, {
+      last_inbound_at: new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000),
+      last_processing_at: null,
+    });
+    pool.inject_bots([bot]);
+    pool.set_tmux_alive("pool-3", true);
+    pool.set_bot_idle_state(3, true);
+
+    await pool.run_probe(bot);
+
+    // No restart, no alert — the broker session is exempt.
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(notify_mock).not.toHaveBeenCalled();
+    // The inbound marker is untouched: the broker owns delivery liveness, so the
+    // probe leaves the session's markers entirely alone.
+    expect(bot.last_inbound_at).not.toBeNull();
+    expect(bot.state).toBe("assigned");
+  });
+
+  it("still restarts a plugin-transport session under the same DEAF conditions (broker exemption is targeted)", async () => {
+    const start_tmux = vi
+      .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
+      .mockResolvedValue(undefined as never);
+
+    // A broker exists but does NOT own this channel → plugin transport → the
+    // probe behaves exactly as before. This pins that the exemption is scoped to
+    // broker-owned channels only, not "any broker present".
+    (pool as unknown as { broker: { owns(id: string): boolean } | null }).broker = {
+      owns: () => false,
+    };
+
+    const bot = make_assigned_bot(3, {
+      last_inbound_at: new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000),
+      last_processing_at: null,
+    });
+    pool.inject_bots([bot]);
+    pool.set_tmux_alive("pool-3", true);
+    pool.set_bot_idle_state(3, true);
+
+    await pool.run_probe(bot);
+
+    // The plugin session IS deaf and IS restarted — unchanged behavior.
+    expect(start_tmux).toHaveBeenCalledTimes(1);
+    expect(bot.last_inbound_at).toBeNull();
+    const deaf_alert = notify_mock.mock.calls.some(
+      (call) => typeof call[1] === "string" && call[1].includes("went DEAF"),
+    );
+    expect(deaf_alert).toBe(true);
+  });
+
   it("skips a bot already mid-recovery (in-flight lock)", async () => {
     const start_tmux = vi
       .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)

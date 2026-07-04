@@ -43,6 +43,28 @@ describe("DiscordBroker facade", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it("socket_path getter returns the injected socket_path, not a recomputed default", () => {
+    const injected = join(dir, "custom-broker.sock");
+    const broker = new DiscordBroker({
+      config: make_config(dir),
+      socket_path: injected,
+      queue_path,
+    });
+    // The getter must reflect the path the server actually bound (the injected
+    // one), never a path recomputed from config — otherwise any injected-path
+    // caller (all tests, and pool.ts when it reads socket_path to tell the shim
+    // where to connect) gets the wrong path.
+    expect(broker.socket_path).toBe(injected);
+  });
+
+  it("socket_path getter falls back to the default under lobsterfarm_dir when not injected", () => {
+    const broker = new DiscordBroker({ config: make_config(dir), queue_path });
+    // No socket_path injected → default is <lobsterfarm_dir>/<BROKER_SOCKET_RELATIVE>.
+    // make_config sets lobsterfarm_dir to `dir`, so the resolved path lives under it.
+    expect(broker.socket_path.startsWith(dir)).toBe(true);
+    expect(broker.socket_path.endsWith(".sock")).toBe(true);
+  });
+
   it("owns() reflects channel registration", () => {
     const broker = new DiscordBroker({ config: make_config(dir), socket_path, queue_path });
     expect(broker.owns("chan-1")).toBe(false);
