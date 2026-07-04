@@ -17,8 +17,8 @@
  * the entire point of the broker.
  */
 
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { join, sep } from "node:path";
 import type { BrokerToolName } from "./protocol.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
@@ -78,6 +78,34 @@ export function chunk_text(text: string, limit: number, mode: "length" | "newlin
  * before it lands in a tool-result string. */
 function safe_att_name(name: string | null | undefined, id: string): string {
   return (name ?? id).replace(/[[\]\r\n;]/g, "_");
+}
+
+/**
+ * Refuse to upload the channel's own state. A byte-for-byte port of the official
+ * plugin's `assertSendable` (server.ts ~L139-151): `reply`'s `files` param takes
+ * ANY absolute path, so without this a session could `reply(files:["<state>/.env"])`
+ * and exfil its DISCORD_BOT_TOKEN (or access.json, approved/, etc.). We reject any
+ * file whose realpath resolves under `state_dir` EXCEPT under `state_dir/inbox`
+ * (attachments the agent legitimately downloaded and may want to re-send).
+ *
+ * Async here (the plugin's is sync) because the broker's outbound path is async;
+ * the semantics — realpath both sides, allow only `inbox/` under state — are
+ * identical. If realpath fails (file absent, state dir absent) we return: the
+ * later `stat` fails properly, or there's simply nothing to leak.
+ */
+async function assert_sendable(f: string, state_dir: string): Promise<void> {
+  let real: string;
+  let state_real: string;
+  try {
+    real = await realpath(f);
+    state_real = await realpath(state_dir);
+  } catch {
+    return; // stat will fail properly; or state_dir absent → nothing to leak
+  }
+  const inbox = join(state_real, "inbox");
+  if (real.startsWith(state_real + sep) && !real.startsWith(inbox + sep)) {
+    throw new Error(`refusing to send channel state: ${f}`);
+  }
 }
 
 /** Read the bot's token from its .env. Throws if absent — the caller turns
@@ -155,6 +183,10 @@ export class OutboundExecutor {
 
     if (files.length > 10) throw new Error("Discord allows max 10 attachments per message");
     for (const f of files) {
+      // Exfil guard first (before we even stat): never let the bot's own state
+      // (.env token, access.json, approved/) leave as an upload. Only inbox/ is
+      // sendable. Mirrors the official plugin's assertSendable.
+      await assert_sendable(f, ctx.state_dir);
       const st = await stat(f);
       if (st.size > MAX_ATTACHMENT_BYTES) {
         throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 25MB)`);

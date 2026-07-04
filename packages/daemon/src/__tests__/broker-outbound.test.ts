@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -154,6 +154,43 @@ describe("broker outbound executor", () => {
     expect(result.is_error).toBe(false);
     expect(result.text).toContain("downloaded 1 attachment(s):");
     expect(result.text).toContain("(photo.png, image/png, 2KB)");
+  });
+
+  it("reply REFUSES to send the bot's own state (.env token exfil guard)", async () => {
+    // The .env holding DISCORD_BOT_TOKEN is written by the test setup at
+    // <state_dir>/.env. A session must never be able to upload it.
+    const fetch_impl = vi.fn(async () => json_response({ id: "999" }));
+    const exec = new OutboundExecutor(fetch_impl as unknown as typeof fetch);
+
+    const result = await exec.execute(
+      "reply",
+      { chat_id: "c1", text: "here", files: [join(dir, ".env")] },
+      ctx,
+    );
+
+    expect(result.is_error).toBe(true);
+    expect(result.text).toContain("refusing to send channel state");
+    // Guard fires BEFORE any Discord call — nothing left the machine.
+    expect(fetch_impl).not.toHaveBeenCalled();
+  });
+
+  it("reply ALLOWS sending a file from the inbox (downloaded attachment)", async () => {
+    // inbox/ is the one subtree under state_dir the agent may re-send from.
+    await mkdir(ctx.inbox_dir, { recursive: true });
+    const inbox_file = join(ctx.inbox_dir, "x.png");
+    await writeFile(inbox_file, "PNGDATA", "utf-8");
+
+    const fetch_impl = vi.fn(async () => json_response({ id: "777" }));
+    const exec = new OutboundExecutor(fetch_impl as unknown as typeof fetch);
+
+    const result = await exec.execute(
+      "reply",
+      { chat_id: "c1", text: "here", files: [inbox_file] },
+      ctx,
+    );
+
+    expect(result).toEqual({ text: "sent (id: 777)", is_error: false });
+    expect(fetch_impl).toHaveBeenCalledTimes(1);
   });
 
   it("a REST failure becomes a fail-open error result, never a throw", async () => {
