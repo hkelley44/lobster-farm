@@ -644,10 +644,19 @@ export class BotPool extends EventEmitter {
    * The config is keyed `plugin_discord_discord` so the resulting tool names are
    * `mcp__plugin_discord_discord__*` — byte-identical to the official plugin,
    * which the reply-enforcement harvest (#80) matches on by name.
+   *
+   * `--strict-mcp-config` (see start_tmux) loads ONLY this file, so any global
+   * `mcpServers` a plugin-path session would inherit from the resolved
+   * `.claude.json` (e.g. `playwright`) are dropped unless we carry them forward.
+   * We merge them in here so a broker session keeps the SAME MCP server set as a
+   * plugin session — the pilot swaps the Discord transport, nothing else. The
+   * shim's own `plugin_discord_discord` key is applied LAST so it always wins
+   * over any (stale) discord entry in the global config.
    */
   private async prepare_broker_session(
     bot: PoolBot,
     channel_id: string,
+    claude_config_dir: string | null,
   ): Promise<{ mcp_config_path: string; env: Record<string, string> } | null> {
     const broker = this.broker;
     if (!broker) return null;
@@ -663,8 +672,12 @@ export class BotPool extends EventEmitter {
       // is produced by tsup (see tsup.config.ts entry list). Resolve relative to
       // the running daemon module (dist/index.js) so it works from any cwd.
       const shim_entry = fileURLToPath(new URL("./shim/discord-shim.js", import.meta.url));
+      // Preserve global MCP parity under --strict-mcp-config: start from the
+      // global servers, then overlay the shim (last write wins for discord).
+      const global_servers = await this.read_global_mcp_servers(claude_config_dir);
       const mcp_config = {
         mcpServers: {
+          ...global_servers,
           plugin_discord_discord: {
             command: process.execPath,
             args: [shim_entry],
@@ -692,6 +705,39 @@ export class BotPool extends EventEmitter {
         `[pool] broker session prep failed for pool-${String(bot.id)} on ${channel_id}; falling back to plugin: ${err instanceof Error ? err.message : String(err)}`,
       );
       return null;
+    }
+  }
+
+  /**
+   * Read the global `mcpServers` block a plugin-path session would inherit, so a
+   * broker session under `--strict-mcp-config` keeps the same MCP server set.
+   *
+   * The CLI resolves its global config from `<config_dir>/.claude.json`, where
+   * `config_dir` is `CLAUDE_CONFIG_DIR` (a per-entity subscription override, if
+   * set) else the user's home dir. We mirror that resolution here. The official
+   * discord plugin is NOT delivered via `mcpServers` (it's a `--channels`
+   * plugin), so nothing here collides with the shim's `plugin_discord_discord`
+   * key — but we still overlay the shim last as a belt-and-suspenders guard.
+   *
+   * Fail-open: a missing/corrupt config, or any read error, yields `{}` — a
+   * broker session with no extra MCP servers is strictly safer than a failed
+   * bring-up, and matches the pre-broker behavior for configs that have none.
+   */
+  protected async read_global_mcp_servers(
+    claude_config_dir: string | null,
+  ): Promise<Record<string, unknown>> {
+    const config_path = join(claude_config_dir ?? homedir(), ".claude.json");
+    try {
+      const raw = await readFile(config_path, "utf-8");
+      const parsed = JSON.parse(raw) as { mcpServers?: unknown };
+      const servers = parsed.mcpServers;
+      if (servers && typeof servers === "object" && !Array.isArray(servers)) {
+        return servers as Record<string, unknown>;
+      }
+      return {};
+    } catch {
+      // ENOENT / corrupt / unreadable — no global servers to carry forward.
+      return {};
     }
   }
 
@@ -3050,7 +3096,11 @@ export class BotPool extends EventEmitter {
     // session bring-up.
     let broker_session: { mcp_config_path: string; env: Record<string, string> } | null = null;
     if (channel_id && this.uses_broker(channel_id)) {
-      broker_session = await this.prepare_broker_session(bot, channel_id);
+      // Read global mcpServers from the SAME config dir this session will use,
+      // so --strict-mcp-config parity holds even under a per-entity
+      // CLAUDE_CONFIG_DIR override.
+      const broker_claude_config = this.resolve_claude_config_dir(entity_id);
+      broker_session = await this.prepare_broker_session(bot, channel_id, broker_claude_config);
     }
     const use_broker = broker_session !== null;
     // Merge broker env into a local (never reassign the param) so both the tmux

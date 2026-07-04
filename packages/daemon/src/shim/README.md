@@ -35,6 +35,12 @@ reply-enforcement (#80), which matches on tool *name*, keeps working unchanged.
 The plugin path uses `--channels plugin:discord@claude-plugins-official` instead.
 The two are mutually exclusive per session and chosen at bring-up.
 
+Because `--strict-mcp-config` loads **only** `broker-mcp.json`, `prepare_broker_session`
+also merges in any global `mcpServers` from the resolved `.claude.json` (e.g.
+`playwright`) so a broker session keeps the **same MCP server set** as a plugin
+session — the pilot swaps the Discord transport and nothing else. The shim's
+`plugin_discord_discord` key is applied last, so it always wins.
+
 ## Env contract
 
 | Var                 | Meaning                                    |
