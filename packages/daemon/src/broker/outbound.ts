@@ -140,6 +140,9 @@ export class OutboundExecutor {
   constructor(
     private fetch_impl: typeof fetch = fetch,
     private now: () => number = Date.now,
+    /** Per-request fetch timeout. Defaults to the 15s Discord/CDN guard; a test
+     * seam so the abort path can be exercised without a wall-clock wait. */
+    private timeout_ms: number = REST_TIMEOUT_MS,
   ) {}
 
   /** Dispatch a forwarded tool call. Never throws — a failure becomes an
@@ -284,8 +287,18 @@ export class OutboundExecutor {
           `attachment too large: ${(att.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB`,
         );
       }
-      const res = await this.fetch_impl(att.url);
-      const buf = Buffer.from(await res.arrayBuffer());
+      // Bound the CDN fetch: a slow/hung CDN must not stall the daemon-side
+      // outbound worker indefinitely (same 15s AbortController pattern as
+      // post_message/rest). The full body read is inside the timeout window too.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), this.timeout_ms);
+      let buf: Buffer;
+      try {
+        const res = await this.fetch_impl(att.url, { signal: controller.signal });
+        buf = Buffer.from(await res.arrayBuffer());
+      } finally {
+        clearTimeout(timeout);
+      }
       const name = att.filename ?? att.id;
       const raw_ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "bin";
       const ext = raw_ext.replace(/[^a-zA-Z0-9]/g, "") || "bin";
@@ -351,7 +364,7 @@ export class OutboundExecutor {
 
     const url = `${DISCORD_API}/channels/${channel_id}/messages`;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REST_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), this.timeout_ms);
     try {
       let res: Response;
       if (opts.files && opts.files.length > 0) {
@@ -396,7 +409,7 @@ export class OutboundExecutor {
     body?: Record<string, unknown>,
   ): Promise<T> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REST_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), this.timeout_ms);
     try {
       const res = await this.fetch_impl(`${DISCORD_API}${path}`, {
         method,

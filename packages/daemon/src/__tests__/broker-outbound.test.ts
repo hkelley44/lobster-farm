@@ -193,6 +193,56 @@ describe("broker outbound executor", () => {
     expect(fetch_impl).toHaveBeenCalledTimes(1);
   });
 
+  it("download_attachment times out a hung CDN fetch via the AbortController (fails open)", async () => {
+    // The CDN fetch must carry the same AbortController+timeout guard as
+    // post_message/rest so a hung CDN can't stall the daemon-side worker
+    // forever. We inject a tiny timeout and hang the CDN response until its
+    // signal aborts (exactly what a real fetch does), then assert the tool
+    // returns an error result rather than hanging.
+    let saw_signal = false;
+    const fetch_impl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/messages/")) {
+        return Promise.resolve(
+          json_response({
+            id: "m1",
+            content: "",
+            author: { id: "u1", username: "hunter" },
+            timestamp: "2026-07-03T00:00:00.000Z",
+            attachments: [
+              {
+                id: "att1",
+                filename: "photo.png",
+                size: 2048,
+                url: "http://cdn/slow.png",
+                content_type: "image/png",
+              },
+            ],
+          }),
+        );
+      }
+      // Hung CDN: only settles when the caller's AbortSignal fires.
+      saw_signal = init?.signal instanceof AbortSignal;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("The operation was aborted", "AbortError")),
+        );
+      });
+    });
+    // 20ms timeout seam so the abort path resolves without a wall-clock wait.
+    const exec = new OutboundExecutor(fetch_impl as unknown as typeof fetch, Date.now, 20);
+
+    const result = await exec.execute(
+      "download_attachment",
+      { chat_id: "c1", message_id: "m1" },
+      ctx,
+    );
+
+    expect(saw_signal).toBe(true); // the CDN fetch was given an AbortSignal
+    expect(result.is_error).toBe(true);
+    expect(result.text).toContain("download_attachment failed");
+  });
+
   it("a REST failure becomes a fail-open error result, never a throw", async () => {
     const fetch_impl = vi.fn(async () => new Response("Unauthorized", { status: 401 }));
     const exec = new OutboundExecutor(fetch_impl as unknown as typeof fetch);
