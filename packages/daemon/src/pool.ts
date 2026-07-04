@@ -4,10 +4,13 @@ import { EventEmitter } from "node:events";
 import { access, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ArchetypeRole, LobsterFarmConfig } from "@lobster-farm/shared";
 import { DEFAULT_ARCHETYPES, entity_dir, expand_home, lobsterfarm_dir } from "@lobster-farm/shared";
 import type { ChannelType } from "@lobster-farm/shared";
 import { notify } from "./actions.js";
+import type { ChannelOwnership, DiscordBroker } from "./broker/index.js";
+import type { InboundMeta } from "./broker/protocol.js";
 import { resolve_binary } from "./env.js";
 import { NO_SESSION, extract_session_learnings } from "./hooks.js";
 import { resolve_effort, resolve_model_id } from "./models.js";
@@ -510,6 +513,11 @@ export class BotPool extends EventEmitter {
   private bot_user_ids = new Map<number, string>();
   private nickname_handler: NicknameHandler | null = null;
   private avatar_handler: AvatarHandler | null = null;
+  /** Daemon Discord broker (epic #84 / #85). Set only when
+   * `config.discord.broker.enabled` is true. When a channel is a broker pilot
+   * channel, bring-up registers ownership here and swaps the official plugin
+   * for the LF shim. Null (and every code path unchanged) when the flag is off. */
+  private broker: DiscordBroker | null = null;
   /** Bots that were actively assigned before shutdown and should be proactively resumed.
    * Populated during initialize(), consumed by resume_parked_bots(). */
   private resume_candidates: PersistedPoolBot[] = [];
@@ -557,6 +565,134 @@ export class BotPool extends EventEmitter {
    * .env file and makes a raw REST call. The pool never sees the token. */
   set_avatar_handler(handler: AvatarHandler): void {
     this.avatar_handler = handler;
+  }
+
+  /** Wire the daemon Discord broker (epic #84 / #85). Called from index.ts only
+   * when `config.discord.broker.enabled` is true. When unset, every transport
+   * decision resolves to "plugin" and behavior is byte-identical to today. */
+  set_broker(broker: DiscordBroker): void {
+    this.broker = broker;
+  }
+
+  /**
+   * Whether the channel's inbound should be routed through the broker instead
+   * of the official plugin. True only for channels the broker actually owns
+   * (registered at broker-session bring-up). discord.ts consults this on the
+   * steady-state inbound path to decide whether to feed the broker.
+   */
+  broker_owns(channel_id: string): boolean {
+    return this.broker?.owns(channel_id) ?? false;
+  }
+
+  /**
+   * Feed an inbound Discord message to the broker for a broker-owned channel.
+   * Fail-open: the broker's own feed() swallows errors, and this method never
+   * throws — the daemon's message hot path must not be derailed. No-op when
+   * the channel isn't broker-owned or the broker is unset.
+   */
+  feed_broker_inbound(input: {
+    channel_id: string;
+    content: string;
+    meta: InboundMeta;
+  }): void {
+    this.broker?.feed(input);
+  }
+
+  /**
+   * Whether a channel uses the broker transport. True only when the broker flag
+   * is enabled AND the channel is in the pilot allowlist. This is the single
+   * source of truth for the plugin-vs-broker fork at bring-up.
+   */
+  private uses_broker(channel_id: string): boolean {
+    if (!this.broker) return false;
+    const broker_cfg = this.config.discord?.broker;
+    if (!broker_cfg?.enabled) return false;
+    return broker_cfg.pilot_channels.includes(channel_id);
+  }
+
+  /**
+   * Read the bot's access.json chunk config (the same file the official plugin
+   * reads for reply chunking). Missing/corrupt → plugin runtime defaults, so
+   * broker outbound segments messages identically to the plugin. Never throws.
+   */
+  private async read_chunk_config(state_dir: string): Promise<ChannelOwnership["chunk_config"]> {
+    try {
+      const raw = await readFile(join(state_dir, "access.json"), "utf-8");
+      const parsed = JSON.parse(raw) as {
+        textChunkLimit?: number;
+        chunkMode?: "length" | "newline";
+        replyToMode?: "off" | "first" | "all";
+      };
+      return {
+        text_chunk_limit: parsed.textChunkLimit,
+        chunk_mode: parsed.chunkMode,
+        reply_to_mode: parsed.replyToMode,
+      };
+    } catch {
+      // No access.json (or malformed) — the executor falls back to plugin
+      // defaults (limit 2000, "length", "first"). Fail-open.
+      return {};
+    }
+  }
+
+  /**
+   * Prepare broker transport for a session: register channel ownership with the
+   * broker, write the shim's MCP config JSON to the bot's state dir, and return
+   * the env vars the shim needs to connect. Returns null (→ plugin transport)
+   * if anything fails, so a broker fault never blocks a session bring-up.
+   *
+   * The config is keyed `plugin_discord_discord` so the resulting tool names are
+   * `mcp__plugin_discord_discord__*` — byte-identical to the official plugin,
+   * which the reply-enforcement harvest (#80) matches on by name.
+   */
+  private async prepare_broker_session(
+    bot: PoolBot,
+    channel_id: string,
+  ): Promise<{ mcp_config_path: string; env: Record<string, string> } | null> {
+    const broker = this.broker;
+    if (!broker) return null;
+    try {
+      const chunk_config = await this.read_chunk_config(bot.state_dir);
+      broker.register_channel(channel_id, {
+        bot_id: bot.id,
+        state_dir: bot.state_dir,
+        chunk_config,
+      });
+
+      // The shim bundle ships alongside the daemon build. dist/shim/discord-shim.js
+      // is produced by tsup (see tsup.config.ts entry list). Resolve relative to
+      // the running daemon module (dist/index.js) so it works from any cwd.
+      const shim_entry = fileURLToPath(new URL("./shim/discord-shim.js", import.meta.url));
+      const mcp_config = {
+        mcpServers: {
+          plugin_discord_discord: {
+            command: process.execPath,
+            args: [shim_entry],
+            env: {
+              LF_BROKER_SOCKET: broker.socket_path,
+              LF_BROKER_CHANNEL: channel_id,
+              LF_BROKER_BOT_ID: String(bot.id),
+            },
+          },
+        },
+      };
+      const config_path = join(bot.state_dir, "broker-mcp.json");
+      await writeFile(config_path, JSON.stringify(mcp_config, null, 2), "utf-8");
+
+      return {
+        mcp_config_path: config_path,
+        env: {
+          LF_BROKER_SOCKET: broker.socket_path,
+          LF_BROKER_CHANNEL: channel_id,
+          LF_BROKER_BOT_ID: String(bot.id),
+        },
+      };
+    } catch (err) {
+      console.error(
+        `[pool] broker session prep failed for pool-${String(bot.id)} on ${channel_id}; falling back to plugin: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
   }
 
   /** Protected wrappers around JSONL existence checks so tests can override
@@ -1019,6 +1155,7 @@ export class BotPool extends EventEmitter {
           candidate.session_id!,
           true,
           extra_env,
+          candidate.channel_id,
         );
 
         // Update bot state to assigned. The resumed session is known to have
@@ -1384,6 +1521,7 @@ export class BotPool extends EventEmitter {
         session_id,
         !!resolved_session_id,
         extra_env,
+        channel_id,
       );
 
       // Update bot state
@@ -1487,6 +1625,10 @@ export class BotPool extends EventEmitter {
 
       // Clear access.json
       await this.write_access_json(bot.state_dir, null);
+
+      // Drop broker ownership + any queued backlog for this channel (#85).
+      // No-op when the channel was never broker-owned. Fail-open.
+      this.broker?.release_channel(channel_id);
 
       await this.persist();
 
@@ -2217,6 +2359,7 @@ export class BotPool extends EventEmitter {
         resume_id,
         is_resume,
         extra_env,
+        channel_id,
       );
 
       // Update state — bot stays assigned with refreshed timestamps.
@@ -2880,9 +3023,25 @@ export class BotPool extends EventEmitter {
     session_id: string,
     is_resume = false,
     extra_env: Record<string, string> = {},
+    channel_id: string | null = null,
   ): Promise<void> {
     const claude_bin = process.env.CLAUDE_BIN ?? "claude";
     const agent_name = resolve_agent_name(archetype, this.config);
+
+    // ── Transport selector (epic #84 / #85) ──
+    // Default is the official Discord plugin, byte-identical to today. Only when
+    // the broker flag is enabled AND this channel is in the pilot allowlist do
+    // we swap in the LF shim. If broker prep fails, we fall back to the plugin
+    // (prepare_broker_session returns null) — a broker fault never blocks a
+    // session bring-up.
+    let broker_session: { mcp_config_path: string; env: Record<string, string> } | null = null;
+    if (channel_id && this.uses_broker(channel_id)) {
+      broker_session = await this.prepare_broker_session(bot, channel_id);
+    }
+    const use_broker = broker_session !== null;
+    // Merge broker env into a local (never reassign the param) so both the tmux
+    // command string and the spawn env carry LF_BROKER_* for broker sessions.
+    const session_env = broker_session ? { ...extra_env, ...broker_session.env } : extra_env;
 
     // Resolve model and effort from archetype defaults
     const archetype_defaults = DEFAULT_ARCHETYPES[archetype];
@@ -2906,10 +3065,18 @@ export class BotPool extends EventEmitter {
     // the trusted set doesn't widen the blast radius, it just stops the
     // modal stalls. We resolve ~ via homedir() because tmux command-string
     // parsing doesn't expand tildes.
+    // Broker sessions register the LF shim via --mcp-config (keyed
+    // `plugin_discord_discord` so tool names stay byte-identical) with
+    // --strict-mcp-config so no other MCP servers leak in. Plugin sessions use
+    // the official channel plugin exactly as before.
+    const transport_args =
+      use_broker && broker_session
+        ? ["--mcp-config", sq(broker_session.mcp_config_path), "--strict-mcp-config"]
+        : ["--channels", "plugin:discord@claude-plugins-official"];
+
     const claude_args = [
       sq(claude_bin),
-      "--channels",
-      "plugin:discord@claude-plugins-official",
+      ...transport_args,
       "--agent",
       sq(agent_name),
       "--model",
@@ -2946,7 +3113,7 @@ export class BotPool extends EventEmitter {
     const git_env = `GIT_AUTHOR_NAME=${sq(display_name)} GIT_COMMITTER_NAME=${sq(display_name)}`;
 
     // Build extra env var prefix for the tmux command string (e.g., GH_TOKEN=...)
-    const extra_env_str = Object.entries(extra_env)
+    const extra_env_str = Object.entries(session_env)
       .map(([k, v]) => `${k}=${sq(v)}`)
       .join(" ");
 
@@ -2972,7 +3139,7 @@ export class BotPool extends EventEmitter {
           stdio: "ignore",
           env: {
             ...process.env,
-            ...extra_env,
+            ...session_env,
             DISCORD_STATE_DIR: bot.state_dir,
             GIT_AUTHOR_NAME: display_name,
             GIT_COMMITTER_NAME: display_name,

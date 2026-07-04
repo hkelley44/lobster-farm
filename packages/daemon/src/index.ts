@@ -1,6 +1,7 @@
 import type { Server } from "node:http";
 import { set_discord_bot, set_pool } from "./actions.js";
 import { AlertRouter } from "./alert-router.js";
+import { DiscordBroker } from "./broker/index.js";
 import { CommanderProcess } from "./commander-process.js";
 import { load_config } from "./config.js";
 import { DiscordBot, resolve_bot_token } from "./discord.js";
@@ -158,6 +159,51 @@ async function main(): Promise<void> {
   // Wire pool to actions module so assign_work_room() checks pool state
   set_pool(pool);
 
+  // ── Daemon-owned Discord gateway broker (epic #84 / #85) ──
+  // Default OFF: only constructed when config.discord.broker.enabled is true.
+  // When absent, every session uses the official plugin exactly as before and
+  // this whole block is skipped. The broker must be wired to the pool BEFORE
+  // resume_parked_bots() so resumed broker sessions register ownership on
+  // bring-up, and BEFORE discord connects so live inbound can be fed.
+  //
+  // The dead-letter alert is routed through the tiered AlertRouter, which is
+  // created further below. We capture it via a mutable ref so a message that
+  // exhausts redelivery surfaces to #alerts as an action_required item.
+  let broker: DiscordBroker | null = null;
+  let broker_alert_router: AlertRouter | null = null;
+  if (config.discord?.broker?.enabled) {
+    broker = new DiscordBroker({
+      config,
+      on_dead_letter: (entry) => {
+        const router = broker_alert_router;
+        if (!router) return;
+        void router
+          .post_alert({
+            entity_id: "lobster-farm",
+            tier: "action_required",
+            title: "Discord broker dead-lettered a message",
+            body:
+              `A broker inbound for channel \`${entry.channel_id}\` (pool-${String(entry.bot_id)}) ` +
+              `exhausted redelivery after ${String(entry.deliveries)} attempt(s) and was dropped.\n\n` +
+              `> ${entry.content.slice(0, 500)}`,
+          })
+          .catch((err) => {
+            console.error(`[broker] dead-letter alert failed: ${String(err)}`);
+          });
+      },
+    });
+    try {
+      await broker.start();
+      pool.set_broker(broker);
+      console.log(`[broker] enabled — socket at ${broker.socket_path}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[broker] failed to start — falling back to plugin transport: ${msg}`);
+      sentry.captureException(err, { tags: { module: "startup", phase: "broker" } });
+      broker = null;
+    }
+  }
+
   // Start health monitor for detecting dead tmux sessions
   pool.start_health_monitor();
 
@@ -268,6 +314,8 @@ async function main(): Promise<void> {
   // Initialize tiered alert router (#253)
   const discord_for_routing = discord_connected ? discord : null;
   const alert_router = new AlertRouter(discord_for_routing, config);
+  // Late-bind the broker's dead-letter sink now that the router exists (#85).
+  broker_alert_router = alert_router;
 
   // Per-PR review mutex (#60). Single in-memory store shared by all three
   // reviewer-spawn paths: HTTP routes (Tidus manual), the cron, and the webhook
@@ -486,6 +534,11 @@ async function main(): Promise<void> {
         // Force-exit without clean teardown — pool tmux sessions are
         // independent and survive; bots resume on next daemon start.
         await pool.shutdown();
+        // Flush the broker's durable queue even on the forced path so no
+        // un-acked inbound is lost (#85).
+        if (broker) {
+          await broker.stop();
+        }
         // Flush pending Sentry events before force-exit so we don't lose
         // telemetry for exactly the sessions that caused the drain to hang.
         await sentry.flush(2000);
@@ -498,6 +551,13 @@ async function main(): Promise<void> {
     // pool-state.json on every mutation, so on restart they'll be restored
     // as parked and resumed with --resume {session_id} — no context lost.
     await pool.shutdown();
+
+    // Stop the broker — flushes the durable queue so un-acked inbound survives
+    // the restart and resumes delivery once shims reconnect (#85). No-op when
+    // the broker was never enabled.
+    if (broker) {
+      await broker.stop();
+    }
 
     // Stop Commander
     await commander.stop();
