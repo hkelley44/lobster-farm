@@ -2,7 +2,9 @@ import { sentryEsbuildPlugin } from "@sentry/esbuild-plugin";
 import { defineConfig } from "tsup";
 
 export default defineConfig({
-  entry: ["src/index.ts", "src/instrument.ts"],
+  // The shim is a standalone MCP server spawned by the Claude CLI as its own
+  // process (via --mcp-config), so it needs its own entry/bundle.
+  entry: ["src/index.ts", "src/instrument.ts", "src/shim/discord-shim.ts"],
   format: ["esm"],
   dts: false,
   clean: true,

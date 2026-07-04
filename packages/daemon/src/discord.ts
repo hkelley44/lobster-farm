@@ -20,6 +20,7 @@ import {
 } from "@lobster-farm/shared";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import {
+  type Attachment,
   type AutocompleteInteraction,
   type CategoryChannel,
   type ChatInputCommandInteraction,
@@ -38,6 +39,7 @@ import {
   type TextChannel,
   type Webhook,
 } from "discord.js";
+import type { InboundMeta } from "./broker/protocol.js";
 import type { CommanderProcess } from "./commander-process.js";
 import { PAT_TMUX_SESSION } from "./commander-process.js";
 import { is_tmux_session_idle } from "./pool.js";
@@ -52,6 +54,46 @@ import { fetch_subscription_usage } from "./usage-api.js";
 /** Discord snowflake IDs are numeric strings, 17-20 digits. */
 export function is_discord_snowflake(id: string): boolean {
   return /^\d{17,20}$/.test(id);
+}
+
+/** att.name is uploader-controlled — strip the chars that would break the
+ * meta.attachments framing. Byte-identical to the plugin's `safeAttName`
+ * (server.ts:433-435) so the inbound notification matches exactly. */
+function safe_att_name(att: Attachment): string {
+  return (att.name ?? att.id).replace(/[[\]\r\n;]/g, "_");
+}
+
+/**
+ * Build the broker inbound payload (`content` + `meta`) from a discord.js
+ * Message. This is a faithful port of the official plugin's inbound
+ * construction (server.ts:824-879) so a broker-delivered message is
+ * byte-identical to a plugin-delivered one — the agent-facing surface must not
+ * drift, or reply-enforcement harvest (#80) and prompt context would diverge.
+ */
+export function build_broker_inbound(message: Message): {
+  channel_id: string;
+  content: string;
+  meta: InboundMeta;
+} {
+  const atts: string[] = [];
+  for (const att of message.attachments.values()) {
+    const kb = (att.size / 1024).toFixed(0);
+    atts.push(`${safe_att_name(att)} (${att.contentType ?? "unknown"}, ${kb}KB)`);
+  }
+  // Content mirrors the plugin: empty falls back to "(attachment)" only when
+  // the message carried attachments.
+  const content = message.content || (atts.length > 0 ? "(attachment)" : "");
+  const meta: InboundMeta = {
+    chat_id: message.channelId,
+    message_id: message.id,
+    user: message.author.username,
+    user_id: message.author.id,
+    ts: message.createdAt.toISOString(),
+    ...(atts.length > 0
+      ? { attachment_count: String(atts.length), attachments: atts.join("; ") }
+      : {}),
+  };
+  return { channel_id: message.channelId, content, meta };
 }
 
 // ── Member-management errors (#308) ──
@@ -2712,6 +2754,12 @@ export class DiscordBot extends EventEmitter {
         // pure-MCP-plugin steady-state path — no daemon send-keys, so this is the
         // daemon's only record that a message was handed to the bot.
         this._pool.mark_inbound(message.channelId);
+        // Broker-owned channels (#85): the plugin isn't listening on this
+        // channel — the daemon delivers inbound through the broker instead. On
+        // the plugin path this is a no-op. Fail-open: feed() never throws.
+        if (this._pool.broker_owns(message.channelId)) {
+          this._pool.feed_broker_inbound(build_broker_inbound(message));
+        }
         // Start typing indicator loop + status embed while bot processes the new message
         this.start_typing_loop(message.channelId);
         void this.send_status_embed(message.channelId, assignment.archetype ?? "planner");

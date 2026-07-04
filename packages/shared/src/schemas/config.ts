@@ -61,6 +61,22 @@ export const LobsterFarmConfigSchema = z.object({
        * channels because they don't share the pool prefix (#302).
        */
       infrastructure_bots: z.array(z.string()).default(["pat", "daemon", "failsafe", "merm"]),
+      /**
+       * Daemon-owned Discord gateway broker (epic #84 / Phase 1 #85).
+       * DEFAULT OFF — when disabled (or absent) every session uses the official
+       * plugin exactly as before. When `enabled` is true, only the channel IDs
+       * in `pilot_channels` are routed through the LF shim + broker; all other
+       * channels stay on the official plugin. This is the opt-in, pilot-first
+       * transport selector. Enabling it fleet-wide is a later phase.
+       */
+      broker: z
+        .object({
+          enabled: z.boolean().default(false),
+          /** Channel IDs that use the broker transport. Empty ⇒ broker off in
+           * practice even if `enabled` is true. */
+          pilot_channels: z.array(z.string()).default([]),
+        })
+        .optional(),
     })
     .optional(),
 
