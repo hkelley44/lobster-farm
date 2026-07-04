@@ -1,0 +1,273 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
+import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { type Mock, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// ── Mocks ──
+//
+// Mock fs to observe the pending-file write + unlink (the plugin hook path) and
+// keep every other fs call inert. child_process is mocked so start_tmux never
+// spawns a real tmux / claude — we only care about the delivery decision, not
+// the process.
+
+vi.mock("node:fs/promises", async () => {
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  return {
+    ...actual,
+    access: vi.fn().mockResolvedValue(undefined),
+    writeFile: vi.fn().mockResolvedValue(undefined),
+    readFile: vi.fn().mockResolvedValue("{}"),
+    readdir: vi.fn().mockResolvedValue([]),
+    mkdir: vi.fn().mockResolvedValue(undefined),
+    unlink: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
+vi.mock("node:child_process", async () => {
+  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  return {
+    ...actual,
+    execFileSync: vi.fn().mockReturnValue(""),
+    execSync: vi.fn().mockReturnValue(""),
+    spawn: vi.fn(),
+  };
+});
+
+import type { ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
+import { unlink, writeFile } from "node:fs/promises";
+import { DiscordBroker } from "../broker/index.js";
+import { BotPool, type PendingMessage, type PoolBot, pending_json_path } from "../pool.js";
+
+// A tmux spawn that "succeeds": close(0) on the next tick.
+function fake_tmux_proc(): ChildProcess {
+  return {
+    on: (ev: string, cb: (...a: unknown[]) => void) => {
+      if (ev === "close") setTimeout(() => cb(0), 0);
+      return undefined;
+    },
+  } as unknown as ChildProcess;
+}
+
+const PILOT_CHANNEL = "chan-broker-pilot";
+const PLUGIN_CHANNEL = "chan-plugin";
+
+let dir: string;
+
+function make_config(broker_enabled: boolean): LobsterFarmConfig {
+  return LobsterFarmConfigSchema.parse({
+    user: { name: "Test" },
+    paths: { lobsterfarm_dir: dir },
+    discord: {
+      server_id: "guild-1",
+      broker: { enabled: broker_enabled, pilot_channels: [PILOT_CHANNEL] },
+    },
+  });
+}
+
+function make_bot(id: number, state_dir: string, overrides: Partial<PoolBot> = {}): PoolBot {
+  return {
+    id,
+    state: "free",
+    channel_id: null,
+    entity_id: null,
+    archetype: null,
+    channel_type: null,
+    session_id: null,
+    session_confirmed: false,
+    tmux_session: `pool-${String(id)}`,
+    last_active: null,
+    assigned_at: null,
+    state_dir,
+    model: null,
+    effort: null,
+    last_avatar_archetype: null,
+    last_avatar_set_at: null,
+    ...overrides,
+  };
+}
+
+const PENDING: PendingMessage = {
+  user: "hunter",
+  channel_id: PILOT_CHANNEL,
+  message_id: "m-1",
+  content: "hello broker pilot",
+  ts: "2026-07-04T10:00:00.000Z",
+};
+
+// A TestPool that stubs assign()'s heavy side effects but runs the REAL start_tmux
+// so prepare_broker_session registers channel ownership on the broker path.
+class TestPool extends BotPool {
+  inject_bots(bots: PoolBot[]): void {
+    (this as unknown as { bots: PoolBot[] }).bots = bots;
+  }
+  protected override check_session_jsonl_exists_anywhere(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  protected override check_session_jsonl_exists(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  protected override watch_session_confirmation(bot: PoolBot): void {
+    bot.session_confirmed = true;
+  }
+  protected override is_tmux_alive(): boolean {
+    return true;
+  }
+  protected override async write_access_json(): Promise<void> {}
+  protected override async set_bot_nickname(): Promise<void> {}
+  protected override async set_bot_avatar(): Promise<void> {}
+  protected override async ensure_entity_channels_allowlisted(): Promise<void> {}
+  protected override kill_tmux(): void {}
+  protected override async persist(): Promise<void> {}
+}
+
+function pending_writes_for(session: string): unknown[] {
+  const path = pending_json_path(session);
+  return (writeFile as Mock).mock.calls.filter((c: unknown[]) => c[0] === path);
+}
+
+describe("assign() first-message delivery forks by transport (issue #87)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    dir = join(tmpdir(), `broker-first-msg-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    (spawn as unknown as Mock).mockImplementation(() => fake_tmux_proc());
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    const { rm } = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  // Create the real dir the broker queue persists into (the fs mock stubs mkdir,
+  // so the queue's atomic write-temp-rename would otherwise ENOENT — cosmetic,
+  // but we keep test output clean).
+  async function ensure_dir(): Promise<void> {
+    const { mkdir } = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    await mkdir(dir, { recursive: true });
+  }
+
+  it("BROKER: enqueues message #1 into the broker queue so the first turn runs", async () => {
+    await ensure_dir();
+    const config = make_config(true);
+    const pool = new TestPool(config);
+    const broker = new DiscordBroker({
+      config,
+      socket_path: join(dir, "b.sock"),
+      queue_path: join(dir, "q.json"),
+    });
+    const feed_spy = vi.spyOn(broker, "feed");
+    pool.set_broker(broker);
+
+    // state_dir must exist for prepare_broker_session to write broker-mcp.json —
+    // otherwise it fails open to the plugin transport. Real mkdir here (the fs
+    // mock only stubs the promises API our code calls, not the harness).
+    const state_dir = join(dir, "pool-4");
+    const { mkdir } = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    await mkdir(state_dir, { recursive: true });
+    // broker-mcp.json is written via the mocked writeFile, so we don't need the
+    // file itself — only the state_dir existing for any real reads.
+
+    pool.inject_bots([make_bot(4, state_dir)]);
+
+    const result = await pool.assign(
+      PILOT_CHANNEL,
+      "entity-1",
+      "planner",
+      undefined,
+      undefined,
+      undefined,
+      PENDING,
+    );
+
+    expect(result).not.toBeNull();
+    // The broker actually took ownership (prepare_broker_session succeeded).
+    expect(pool.broker_owns(PILOT_CHANNEL)).toBe(true);
+
+    // Message #1 is enqueued into the broker queue — this is what drives the
+    // first turn on the broker transport. Content + meta mirror steady-state.
+    expect(feed_spy).toHaveBeenCalledTimes(1);
+    expect(feed_spy).toHaveBeenCalledWith({
+      channel_id: PILOT_CHANNEL,
+      content: "hello broker pilot",
+      meta: {
+        chat_id: PILOT_CHANNEL,
+        message_id: "m-1",
+        user: "hunter",
+        user_id: "",
+        ts: "2026-07-04T10:00:00.000Z",
+      },
+    });
+
+    // No lingering pending file: it's unlinked on the broker path so the
+    // SessionStart hook no-ops and message #1 isn't double-delivered.
+    expect(unlink).toHaveBeenCalledWith(pending_json_path("pool-4"));
+
+    await broker.stop().catch(() => {});
+  });
+
+  it("PLUGIN: writes the pending file for the SessionStart hook, never feeds the broker", async () => {
+    await ensure_dir();
+    // Broker flag ON but this channel is NOT a pilot channel → plugin transport.
+    const config = make_config(true);
+    const pool = new TestPool(config);
+    const broker = new DiscordBroker({
+      config,
+      socket_path: join(dir, "b.sock"),
+      queue_path: join(dir, "q.json"),
+    });
+    const feed_spy = vi.spyOn(broker, "feed");
+    pool.set_broker(broker);
+
+    pool.inject_bots([make_bot(3, join(dir, "pool-3"))]);
+
+    const result = await pool.assign(
+      PLUGIN_CHANNEL,
+      "entity-1",
+      "planner",
+      undefined,
+      undefined,
+      undefined,
+      { ...PENDING, channel_id: PLUGIN_CHANNEL },
+    );
+
+    expect(result).not.toBeNull();
+    expect(pool.broker_owns(PLUGIN_CHANNEL)).toBe(false);
+
+    // Plugin path is byte-identical to today: pending file written, hook fires.
+    expect(pending_writes_for("pool-3").length).toBe(1);
+    // The broker is never fed on the plugin path.
+    expect(feed_spy).not.toHaveBeenCalled();
+    // And the pending file is NOT unlinked (the hook consumes it, not us).
+    expect(unlink).not.toHaveBeenCalledWith(pending_json_path("pool-3"));
+
+    await broker.stop().catch(() => {});
+  });
+
+  it("BROKER DISABLED: flag off keeps the plugin hook path even on a pilot channel id", async () => {
+    // broker.enabled = false → no broker constructed/wired → plugin everywhere.
+    const config = make_config(false);
+    const pool = new TestPool(config);
+    // No set_broker — mirrors index.ts skipping broker construction when disabled.
+
+    pool.inject_bots([make_bot(2, join(dir, "pool-2"))]);
+
+    const result = await pool.assign(
+      PILOT_CHANNEL,
+      "entity-1",
+      "planner",
+      undefined,
+      undefined,
+      undefined,
+      PENDING,
+    );
+
+    expect(result).not.toBeNull();
+    expect(pool.broker_owns(PILOT_CHANNEL)).toBe(false);
+    // Pending file written (plugin hook path); nothing unlinked.
+    expect(pending_writes_for("pool-2").length).toBe(1);
+    expect(unlink).not.toHaveBeenCalledWith(pending_json_path("pool-2"));
+  });
+});
