@@ -67,7 +67,12 @@ const mcp = new Server(
       tools: {},
       experimental: {
         "claude/channel": {},
-        "claude/channel/permission": {},
+        // NOTE: no "claude/channel/permission". Phase 1 runs bypassPermissions,
+        // so there are no permission prompts to relay. Declaring the capability
+        // would make the CLI route permission requests to a handler the shim
+        // doesn't implement — they'd be silently dropped. The full permission
+        // relay (outbound permission_request + inbound "yes <id>" intercept)
+        // returns in Phase 3; until then the transport is chat-only.
       },
     },
     instructions: [
