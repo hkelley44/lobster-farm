@@ -191,6 +191,41 @@ export class BrokerQueue {
     return "delivered";
   }
 
+  /**
+   * Age-based dead-letter sweep, independent of delivery attempts.
+   *
+   * `mark_delivered` only dead-letters an entry once it has EXHAUSTED its
+   * delivery budget — which requires a connected shim to drive attempts. If a
+   * pilot channel's shim never connects (session died without `release()`, or
+   * prep fell back to plugin while facade ownership stayed registered), the
+   * entry sits at `deliveries=0` forever and the durable file grows unbounded
+   * with no alert. This sweep closes that gap: any non-dead entry whose
+   * `enqueued_at` is older than `max_age_ms` is dead-lettered here, firing the
+   * same `on_dead_letter` alert, regardless of how many times it was delivered.
+   *
+   * Returns the entries that were dead-lettered this pass (for logging/tests).
+   */
+  sweep_expired(max_age_ms: number, now_ms = Date.now()): QueueEntry[] {
+    const swept: QueueEntry[] = [];
+    for (const e of this.entries.values()) {
+      if (e.status === "dead") continue;
+      const age = now_ms - Date.parse(e.enqueued_at);
+      // Date.parse → NaN on a malformed timestamp; NaN comparisons are false, so
+      // a bad stamp is simply never age-swept (it can still exhaust via delivery).
+      if (age >= max_age_ms) {
+        e.status = "dead";
+        swept.push(e);
+        try {
+          this.on_dead_letter?.(e);
+        } catch {
+          // A failing alert sink must not break queue accounting.
+        }
+      }
+    }
+    if (swept.length > 0) this.schedule_persist();
+    return swept;
+  }
+
   /** Acknowledge delivery — removes the entry permanently. Idempotent. */
   ack(id: string): boolean {
     const existed = this.entries.delete(id);

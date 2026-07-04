@@ -51,9 +51,21 @@ export interface BrokerServerOptions {
   outbound: OutboundHandler;
   /** Sweep interval for redelivery, ms. Default 5s. */
   sweep_interval_ms?: number;
+  /**
+   * Age after which a still-live queue entry is dead-lettered regardless of
+   * delivery attempts, ms. Default 10 min. This is a backstop for a
+   * registered-but-never-connected channel (a shim that never registers can't
+   * drive delivery attempts, so attempt-based dead-lettering never fires and
+   * the durable file would grow unbounded). 10 min sits comfortably above the
+   * normal delivery-based dead-letter horizon (default 5 attempts × 30s
+   * redelivery ≈ 2.5 min), so a normally-delivering entry always exhausts via
+   * attempts first; this only catches the truly stranded ones.
+   */
+  dead_letter_after_ms?: number;
 }
 
 const DEFAULT_SWEEP_INTERVAL_MS = 5_000;
+const DEFAULT_DEAD_LETTER_AFTER_MS = 10 * 60_000;
 
 export class BrokerServer {
   private server: Server | null = null;
@@ -61,6 +73,7 @@ export class BrokerServer {
   private readonly queue: BrokerQueue;
   private readonly outbound: OutboundHandler;
   private readonly sweep_interval_ms: number;
+  private readonly dead_letter_after_ms: number;
   private sweep_timer: NodeJS.Timeout | null = null;
 
   /** All open connections. One channel may briefly have two during reconnect;
@@ -74,6 +87,7 @@ export class BrokerServer {
     this.queue = opts.queue;
     this.outbound = opts.outbound;
     this.sweep_interval_ms = opts.sweep_interval_ms ?? DEFAULT_SWEEP_INTERVAL_MS;
+    this.dead_letter_after_ms = opts.dead_letter_after_ms ?? DEFAULT_DEAD_LETTER_AFTER_MS;
   }
 
   /** Bind the socket and begin serving. Removes any stale socket file first. */
@@ -241,8 +255,19 @@ export class BrokerServer {
     }
   }
 
-  /** Periodic redelivery pass for all connected channels. */
+  /**
+   * Periodic pass: (1) age-based dead-letter sweep across ALL entries — this is
+   * independent of connections, so it also catches a registered-but-never-
+   * connected channel whose entries would otherwise never accrue delivery
+   * attempts; (2) redelivery for every currently-connected channel.
+   */
   private sweep(): void {
+    const swept = this.queue.sweep_expired(this.dead_letter_after_ms);
+    if (swept.length > 0) {
+      console.warn(
+        `[broker-server] age-swept ${String(swept.length)} stranded entr${swept.length === 1 ? "y" : "ies"} to dead-letter`,
+      );
+    }
     for (const [channel_id, conn] of this.owners) {
       const due = this.queue.deliverable_for(channel_id);
       for (const entry of due) this.deliver(conn, entry);

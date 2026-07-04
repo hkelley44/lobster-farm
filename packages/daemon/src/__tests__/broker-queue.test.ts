@@ -162,6 +162,58 @@ describe("BrokerQueue", () => {
     expect(q.mark_delivered(entry.id, 1)).toBe("dead");
   });
 
+  it("sweep_expired dead-letters an entry past the age threshold with NO delivery attempt", () => {
+    const dead: QueueEntry[] = [];
+    const q = make({ path, on_dead_letter: (e) => dead.push(e) });
+    const entry = enqueue_one(q);
+
+    // Never delivered — attempt-based dead-lettering would never fire.
+    expect(entry.deliveries).toBe(0);
+
+    const enqueued_ms = Date.parse(entry.enqueued_at);
+    const max_age = 10 * 60_000; // 10 min
+
+    // Just under the threshold: not swept.
+    expect(q.sweep_expired(max_age, enqueued_ms + max_age - 1)).toHaveLength(0);
+    expect(q.all().find((e) => e.id === entry.id)!.status).toBe("pending");
+
+    // At/after the threshold: dead-lettered, alert fired, still zero deliveries.
+    const swept = q.sweep_expired(max_age, enqueued_ms + max_age);
+    expect(swept.map((e) => e.id)).toEqual([entry.id]);
+    expect(dead).toHaveLength(1);
+    expect(dead[0]!.id).toBe(entry.id);
+    expect(dead[0]!.deliveries).toBe(0);
+    // Dead entries are no longer deliverable.
+    expect(q.deliverable_for("chan-1")).toHaveLength(0);
+  });
+
+  it("sweep_expired is idempotent — an already-dead entry is not re-alerted", () => {
+    const dead: QueueEntry[] = [];
+    const q = make({ path, on_dead_letter: (e) => dead.push(e) });
+    const entry = enqueue_one(q);
+    const t = Date.parse(entry.enqueued_at) + 10 * 60_000;
+
+    expect(q.sweep_expired(10 * 60_000, t)).toHaveLength(1);
+    // Second pass: entry is already dead → nothing swept, no second alert.
+    expect(q.sweep_expired(10 * 60_000, t + 1)).toHaveLength(0);
+    expect(dead).toHaveLength(1);
+  });
+
+  it("a failing on_dead_letter sink never breaks the age sweep", () => {
+    const q = make({
+      path,
+      on_dead_letter: () => {
+        throw new Error("alert sink blew up");
+      },
+    });
+    const entry = enqueue_one(q);
+    const t = Date.parse(entry.enqueued_at) + 10 * 60_000;
+    // The sink throws, but the entry must still be marked dead and returned.
+    const swept = q.sweep_expired(10 * 60_000, t);
+    expect(swept.map((e) => e.id)).toEqual([entry.id]);
+    expect(q.all().find((e) => e.id === entry.id)!.status).toBe("dead");
+  });
+
   it("restart-reload resumes un-acked backlog and resets delivered → pending", async () => {
     // First "process lifetime": enqueue two, deliver one.
     const q1 = make({ path });

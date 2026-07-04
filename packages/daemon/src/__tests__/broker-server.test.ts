@@ -100,12 +100,18 @@ describe("BrokerServer IPC", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  async function start(outbound?: OutboundHandler): Promise<void> {
+  async function start(
+    outbound?: OutboundHandler,
+    opts?: { dead_letter_after_ms?: number },
+  ): Promise<void> {
     server = new BrokerServer({
       socket_path,
       queue,
       outbound: outbound ?? (async () => ({ text: "ok", is_error: false })),
       sweep_interval_ms: 30, // fast sweep for redelivery tests
+      ...(opts?.dead_letter_after_ms != null
+        ? { dead_letter_after_ms: opts.dead_letter_after_ms }
+        : {}),
     });
     await server.start();
   }
@@ -198,6 +204,36 @@ describe("BrokerServer IPC", () => {
     >;
     expect(resp.is_error).toBe(true);
     expect(resp.text).toContain("react failed: REST exploded");
+  });
+
+  it("age-sweeps a stranded entry for a NEVER-connected channel (no shim ever registers)", async () => {
+    // Rebuild the queue with a dead-letter sink so we can observe the alert.
+    const dead: string[] = [];
+    queue = new BrokerQueue({
+      path: join(dir, "queue2.json"),
+      redeliver_after_ms: 50,
+      on_dead_letter: (e) => dead.push(e.id),
+    });
+    // Tiny age threshold so the periodic sweep fires it almost immediately.
+    await start(undefined, { dead_letter_after_ms: 20 });
+
+    const entry = queue.enqueue({
+      channel_id: "orphan-chan",
+      bot_id: 5,
+      content: "nobody-home",
+      meta: META,
+    });
+    // No client ever registers for "orphan-chan" — attempt-based dead-lettering
+    // can never fire (deliveries stays 0). The age sweep must catch it.
+    await vi.waitFor(
+      () => {
+        expect(dead).toContain(entry.id);
+        expect(queue.all().find((e) => e.id === entry.id)?.status).toBe("dead");
+      },
+      { timeout: 2000 },
+    );
+    // Never delivered — proves this is age-based, not attempt-based.
+    expect(queue.all().find((e) => e.id === entry.id)?.deliveries).toBe(0);
   });
 
   it("newest registration wins ownership on reconnect", async () => {
