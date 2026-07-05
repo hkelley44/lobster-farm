@@ -599,6 +599,39 @@ export class BotPool extends EventEmitter {
   }
 
   /**
+   * Enqueue the triggering (first) message of a freshly-assigned broker session
+   * into the broker queue so the shim delivers it as a `notifications/claude/
+   * channel` inbound once connected — driving the session's first turn (#87).
+   *
+   * This is the broker analogue of the plugin path's SessionStart-hook injection:
+   * on the broker transport the hook's additionalContext alone does not drive a
+   * turn, so message #1 must ride the same queue → shim → channel-inbound path as
+   * steady-state messages. Called from assign() only for channels the broker
+   * actually owns; the pending-file hook is skipped for those to avoid
+   * double-delivery.
+   *
+   * The InboundMeta is built from the PendingMessage the same way the
+   * steady-state build_broker_inbound() maps a discord.js Message — chat_id is
+   * the channel, and we carry the user/message_id/ts through. user_id isn't
+   * available on a PendingMessage (it isn't needed for delivery or reply
+   * threading), so it's left empty, matching the resume-nudge daemon-authored
+   * shape. Fail-open: broker.feed() swallows its own errors.
+   */
+  feed_broker_first_message(channel_id: string, pending: PendingMessage): void {
+    this.broker?.feed({
+      channel_id,
+      content: pending.content,
+      meta: {
+        chat_id: channel_id,
+        message_id: pending.message_id,
+        user: pending.user,
+        user_id: "",
+        ts: pending.ts,
+      },
+    });
+  }
+
+  /**
    * Whether a channel uses the broker transport. True only when the broker flag
    * is enabled AND the channel is in the pilot allowlist. This is the single
    * source of truth for the plugin-vs-broker fork at bring-up.
@@ -1542,6 +1575,14 @@ export class BotPool extends EventEmitter {
       // hook (session-start-inject.sh) will pick it up during Claude CLI
       // init and inject it as additionalContext — no tmux bridging needed.
       // See issue #290.
+      //
+      // This is written for BOTH transports so the plugin path (and the broker→
+      // plugin fallback that prepare_broker_session takes on failure) always has
+      // the hook available. For a session that actually comes up on the broker
+      // transport, the pending file is unlinked and re-delivered through the
+      // broker queue after start_tmux — see the broker first-message block below
+      // (issue #87). Writing then conditionally unlinking keeps the plugin path
+      // byte-identical while making the broker path fall back safely.
       if (pending_message) {
         try {
           const path = await write_pending_message(bot.tmux_session, pending_message);
@@ -1569,6 +1610,32 @@ export class BotPool extends EventEmitter {
         extra_env,
         channel_id,
       );
+
+      // BROKER first-message delivery (issue #87).
+      //
+      // start_tmux → prepare_broker_session has now registered channel ownership
+      // IFF the broker transport was actually selected (broker prep can fall back
+      // to plugin on failure, in which case ownership is not registered). When the
+      // session truly came up on the broker transport, the SessionStart hook's
+      // additionalContext does NOT drive a first turn — on broker the turn is
+      // driven by the same `notifications/claude/channel` inbound the shim emits,
+      // and message #1 was never enqueued, so the session idles and is dropped as
+      // `unconfirmed … leaving unpersisted`. We fix that by:
+      //   1. unlinking the pending file we wrote above (so the hook no-ops → no
+      //      double-delivery alongside the queue), and
+      //   2. enqueuing message #1 into the broker queue so the shim delivers it
+      //      as a channel inbound and the session runs its first turn.
+      // This converges first- and steady-state delivery on the queue for broker
+      // sessions. On the plugin path (and the broker→plugin fallback) this block
+      // is skipped, so the hook fires exactly as before — plugin behavior is
+      // byte-identical.
+      if (pending_message && this.broker_owns(channel_id)) {
+        await unlink(pending_json_path(bot.tmux_session)).catch(() => {
+          // Best-effort: a missing file (write above failed) just means the hook
+          // was already going to no-op; the queue enqueue below is the delivery.
+        });
+        this.feed_broker_first_message(channel_id, pending_message);
+      }
 
       // Update bot state
       const assigned_defaults = DEFAULT_ARCHETYPES[archetype];
