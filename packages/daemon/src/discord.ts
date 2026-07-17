@@ -2730,20 +2730,48 @@ export class DiscordBot extends EventEmitter {
           this.start_typing_loop(message.channelId);
           void this.send_status_embed(message.channelId, archetype);
         } else {
+          // assign() returned null. On a broker channel this may mean a
+          // concurrent cold-start for THIS channel already won the assign lock
+          // (#83): rather than dropping this message or spawning a second
+          // session, hand it to the broker so it lands on the single
+          // cold-recreated session as an ordered follow-up turn. Returns true if
+          // the broker took it (delivered or buffered). On plugin channels (and
+          // flag-OFF) this is a no-op returning false, so the "busy" path below
+          // is byte-identical to today.
+          const taken = this._pool.deliver_or_buffer_broker_inbound(message.channelId, {
+            user: message.author.displayName,
+            channel_id: message.channelId,
+            message_id: message.id,
+            content: message.content,
+            ts: new Date(message.createdTimestamp).toISOString(),
+          });
           try {
             await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
           } catch {
             /* ignore */
           }
-          try {
-            await message.reply(
-              "All bots are busy right now. Your message will be picked up when a slot opens.",
-            );
-          } catch {
-            await this.send(
-              message.channelId,
-              "All bots are busy right now. Your message will be picked up when a slot opens.",
-            );
+          if (taken) {
+            // The broker owns delivery for this message — show the same
+            // "received" affordance as a normal broker inbound and let the
+            // cold-recreated session reply.
+            try {
+              await message.react("👀");
+            } catch {
+              /* ignore */
+            }
+            this.start_typing_loop(message.channelId);
+            void this.send_status_embed(message.channelId, archetype);
+          } else {
+            try {
+              await message.reply(
+                "All bots are busy right now. Your message will be picked up when a slot opens.",
+              );
+            } catch {
+              await this.send(
+                message.channelId,
+                "All bots are busy right now. Your message will be picked up when a slot opens.",
+              );
+            }
           }
         }
       } else {

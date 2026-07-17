@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DiscordBroker } from "../broker/index.js";
+import type { PersistedPoolBot } from "../persistence.js";
 import type { PoolBot } from "../pool.js";
 import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
 
@@ -84,6 +86,25 @@ class TestBotPool extends BotPoolTestBase {
   /** Expose check_assigned_health for direct invocation in tests. */
   async run_health_check(): Promise<void> {
     await this.check_assigned_health();
+  }
+
+  /** Expose reconcile_assigned_health (restart-time repair) for tests. */
+  async run_reconcile(): Promise<void> {
+    await this.reconcile_assigned_health();
+  }
+
+  /** Seed the restart-time proactive-resume queue and run it. */
+  set_resume_candidates(candidates: PersistedPoolBot[]): void {
+    (this as unknown as { resume_candidates: PersistedPoolBot[] }).resume_candidates = candidates;
+  }
+
+  async run_resume(): Promise<void> {
+    await this.resume_parked_bots();
+  }
+
+  /** Expose the canonical #89 gate for flag-OFF byte-identical assertions. */
+  is_broker_channel(channel_id: string): boolean {
+    return this.uses_broker(channel_id);
   }
 
   /** Override is_bot_idle — not relevant for crash recovery tests. */
@@ -892,6 +913,360 @@ describe("crash recovery (issue #157)", () => {
       const [, message] = mock_notify.mock.calls[0] as [string, string];
       expect(message).toContain("crash loop");
       expect(message).toContain("canal-street/ch-mystery");
+    });
+  });
+
+  // ── Broker lazy/message-driven crash handling (#89, closes #83) ──
+  //
+  // Broker channels are lazy: a session exists iff an inbound drives it. A dead
+  // broker session must be RELEASED to dark (history stashed for --resume, queue
+  // preserved for redelivery), never respawned into an idle session. The 07-05
+  // crash loop started because the watchdog respawned an idle session with no
+  // turn-driver; these tests prove the loop can't even begin.
+  describe("broker channels release to dark, never respawn (#89)", () => {
+    const BROKER_CHANNEL = "ch-broker-pilot";
+
+    function make_broker_config(): LobsterFarmConfig {
+      return LobsterFarmConfigSchema.parse({
+        user: { name: "Test" },
+        paths: { lobsterfarm_dir: temp_dir },
+        discord: {
+          server_id: "guild-1",
+          broker: { enabled: true, pilot_channels: [BROKER_CHANNEL] },
+        },
+      });
+    }
+
+    // Build a broker-enabled pool with the same side-effect stubs beforeEach
+    // installs on the plugin pool. We can't reuse the outer `pool` because its
+    // config has no broker block — uses_broker() would be false.
+    function make_broker_pool(): { pool: TestBotPool; broker: DiscordBroker } {
+      const broker_config = make_broker_config();
+      const bpool = new TestBotPool(broker_config);
+      const broker = new DiscordBroker({
+        config: broker_config,
+        socket_path: join(temp_dir, "b.sock"),
+        queue_path: join(temp_dir, "q.json"),
+      });
+      bpool.set_broker(broker);
+
+      vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "kill_tmux" as never,
+      ).mockImplementation(() => {});
+      vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "write_access_json" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "set_bot_nickname" as never,
+      ).mockResolvedValue(undefined);
+      vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "set_bot_avatar" as never,
+      ).mockResolvedValue(undefined);
+      // Dead tmux for every session (crash scenario) unless a test overrides.
+      vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "is_tmux_alive" as never,
+      ).mockReturnValue(false);
+      // Reuse the outer start_tmux spy so "not respawned" assertions can watch it.
+      vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "start_tmux" as never,
+      ).mockResolvedValue(undefined);
+      return { pool: bpool, broker };
+    }
+
+    it("watchdog releases a dead broker session to dark, never respawns", async () => {
+      const { pool: bpool } = make_broker_pool();
+      const local_start = vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "start_tmux" as never,
+      );
+      const bot = make_bot({
+        id: 3,
+        state: "assigned",
+        channel_id: BROKER_CHANNEL,
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-broker-1",
+        session_confirmed: true,
+      });
+      bpool.inject_bots([bot]);
+
+      const released: unknown[] = [];
+      bpool.on("bot:released", (d) => released.push(d));
+
+      await bpool.run_health_check();
+
+      // Released to dark — NOT respawned.
+      expect(bpool.get_bots()[0].state).toBe("free");
+      expect(bpool.get_bots()[0].channel_id).toBeNull();
+      expect(local_start).not.toHaveBeenCalled();
+      expect(released).toHaveLength(1);
+
+      // Continuity: session_id stashed for the cold-recreate's --resume.
+      expect(bpool.get_session_history().get(`test-entity:${BROKER_CHANNEL}`)).toBe(
+        "sess-broker-1",
+      );
+    });
+
+    it("old crash-loop scenario terminates: broker bot never records a crash, zero respawns", async () => {
+      const { pool: bpool } = make_broker_pool();
+      const local_start = vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "start_tmux" as never,
+      );
+      const bot = make_bot({
+        id: 4,
+        state: "assigned",
+        channel_id: BROKER_CHANNEL,
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-broker-loop",
+        session_confirmed: true,
+      });
+      bpool.inject_bots([bot]);
+
+      // Drive the health tick repeatedly — this is the 07-05 sequence (dead tmux,
+      // health tick, respawn-into-idle, repeat). Under the fix each tick releases
+      // to dark; the bot is free after the first, so subsequent ticks are no-ops.
+      await bpool.run_health_check();
+      // Re-arm the same scenario (as if a respawn had re-created the assigned bot)
+      // and confirm the crash counter stays empty — the loop cannot start.
+      await bpool.run_health_check();
+      await bpool.run_health_check();
+
+      // Zero respawns across every tick.
+      expect(local_start).not.toHaveBeenCalled();
+      // The crash-loop counter never even ticked — release-to-dark short-circuits
+      // BEFORE record_crash.
+      expect(bpool.get_crash_history().get(4) ?? []).toHaveLength(0);
+      expect(bpool.get_bots()[0].state).toBe("free");
+    });
+
+    it("restart-time reconcile releases a half-spawned broker bot to dark, no respawn", async () => {
+      const { pool: bpool } = make_broker_pool();
+      const local_start = vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "start_tmux" as never,
+      );
+      // A broker bot that came back `assigned` with dead tmux but was NOT a resume
+      // candidate (unconfirmed at drain) — the #66 half-spawn case.
+      const bot = make_bot({
+        id: 5,
+        state: "assigned",
+        channel_id: BROKER_CHANNEL,
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-broker-half",
+        session_confirmed: true,
+      });
+      bpool.inject_bots([bot]);
+
+      await bpool.run_reconcile();
+
+      expect(local_start).not.toHaveBeenCalled();
+      expect(bpool.get_bots()[0].state).toBe("free");
+      expect(bpool.get_bots()[0].channel_id).toBeNull();
+    });
+
+    it("does NOT stash an unconfirmed broker session (no phantom --resume, #256)", async () => {
+      const { pool: bpool } = make_broker_pool();
+      const bot = make_bot({
+        id: 3,
+        state: "assigned",
+        channel_id: BROKER_CHANNEL,
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-unconfirmed",
+        session_confirmed: false, // never wrote a JSONL turn
+      });
+      bpool.inject_bots([bot]);
+
+      await bpool.run_health_check();
+
+      expect(bpool.get_bots()[0].state).toBe("free");
+      // Unconfirmed → not stashed, so the cold-recreate spawns fresh instead of
+      // --resume-ing a phantom UUID.
+      expect(bpool.get_session_history().has(`test-entity:${BROKER_CHANNEL}`)).toBe(false);
+    });
+
+    it("PLUGIN channel is unaffected — still respawns on dead tmux (flag-scoped)", async () => {
+      // Same broker-enabled config, but this channel is NOT in the pilot allowlist
+      // → uses_broker() is false → unchanged plugin respawn path.
+      const { pool: bpool } = make_broker_pool();
+      const local_start = vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "start_tmux" as never,
+      );
+      const bot = make_bot({
+        id: 7,
+        state: "assigned",
+        channel_id: "ch-plugin-not-pilot",
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-plugin",
+        session_confirmed: true,
+      });
+      bpool.inject_bots([bot]);
+
+      await bpool.run_health_check();
+
+      // Plugin path: respawned, stays assigned.
+      expect(local_start).toHaveBeenCalledTimes(1);
+      expect(bpool.get_bots()[0].state).toBe("assigned");
+    });
+
+    it("proactive-resume-on-restart skips a broker channel — no spawn, stays dark", async () => {
+      const { pool: bpool } = make_broker_pool();
+      const local_start = vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "start_tmux" as never,
+      );
+      // A broker bot that was assigned before shutdown — restored as `parked`,
+      // queued for proactive-resume.
+      const bot = make_bot({
+        id: 3,
+        state: "parked",
+        channel_id: BROKER_CHANNEL,
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-parked-broker",
+        session_confirmed: true,
+      });
+      bpool.inject_bots([bot]);
+      bpool.set_resume_candidates([
+        {
+          id: 3,
+          state: "parked",
+          channel_id: BROKER_CHANNEL,
+          entity_id: "test-entity",
+          archetype: "planner",
+          channel_type: "general",
+          session_id: "sess-parked-broker",
+          last_active: null,
+        },
+      ]);
+
+      await bpool.run_resume();
+
+      // Never spawned an idle session — the channel goes dark.
+      expect(local_start).not.toHaveBeenCalled();
+      expect(bpool.get_bots()[0].state).toBe("free");
+      expect(bpool.get_bots()[0].channel_id).toBeNull();
+      // Continuity preserved for the cold-recreate: session_id stashed for --resume.
+      expect(bpool.get_session_history().get(`test-entity:${BROKER_CHANNEL}`)).toBe(
+        "sess-parked-broker",
+      );
+    });
+
+    it("proactive-resume still resumes a PLUGIN channel (flag-scoped)", async () => {
+      const { pool: bpool } = make_broker_pool();
+      const local_start = vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "start_tmux" as never,
+      );
+      // A non-pilot channel under the same broker-enabled config — uses_broker() is
+      // false, so the unchanged proactive-resume path spawns it.
+      const bot = make_bot({
+        id: 8,
+        state: "parked",
+        channel_id: "ch-plugin-not-pilot",
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-parked-plugin",
+        session_confirmed: true,
+      });
+      bpool.inject_bots([bot]);
+      bpool.set_resume_candidates([
+        {
+          id: 8,
+          state: "parked",
+          channel_id: "ch-plugin-not-pilot",
+          entity_id: "test-entity",
+          archetype: "planner",
+          channel_type: "general",
+          session_id: "sess-parked-plugin",
+          last_active: null,
+        },
+      ]);
+
+      await bpool.run_resume();
+
+      // Plugin path: resumed with --resume, stays assigned.
+      expect(local_start).toHaveBeenCalledTimes(1);
+      const call = local_start.mock.calls[0] as unknown[];
+      expect(call[4]).toBe("sess-parked-plugin"); // session_id
+      expect(call[5]).toBe(true); // is_resume
+      expect(bpool.get_bots()[0].state).toBe("assigned");
+    });
+  });
+
+  describe("flag OFF is byte-identical to the plugin path (#89 merge-safety)", () => {
+    // The outer `pool` uses make_config() — NO discord.broker block, and no
+    // set_broker() call — mirroring index.ts when broker.enabled is false. Every
+    // #89 branch gates on uses_broker(), which returns false here, so the modified
+    // drivers behave exactly like today's plugin path.
+
+    it("uses_broker() is false with the flag off — even for a would-be pilot channel id", () => {
+      // No broker wired at all → the gate is false regardless of channel id.
+      expect(pool.is_broker_channel("ch-broker-pilot")).toBe(false);
+      expect(pool.is_broker_channel("any-channel")).toBe(false);
+    });
+
+    it("a dead session still RESPAWNS via the plugin path (no release-to-dark)", async () => {
+      const bot = make_bot({
+        id: 3,
+        state: "assigned",
+        channel_id: "ch-broker-pilot", // pilot-looking id, but flag is OFF
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-off",
+        session_confirmed: true,
+      });
+      pool.inject_bots([bot]);
+      mock_is_tmux_alive.mockReturnValue(false);
+
+      await pool.run_health_check();
+
+      // Unchanged plugin behavior: respawned + stays assigned, NOT released to dark.
+      expect(mock_start_tmux).toHaveBeenCalledTimes(1);
+      expect(pool.get_bots()[0].state).toBe("assigned");
+    });
+
+    it("proactive-resume still resumes a would-be pilot channel with the flag off", async () => {
+      const bot = make_bot({
+        id: 3,
+        state: "parked",
+        channel_id: "ch-broker-pilot",
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-off-parked",
+        session_confirmed: true,
+      });
+      pool.inject_bots([bot]);
+      mock_is_tmux_alive.mockReturnValue(false);
+      pool.set_resume_candidates([
+        {
+          id: 3,
+          state: "parked",
+          channel_id: "ch-broker-pilot",
+          entity_id: "test-entity",
+          archetype: "planner",
+          channel_type: "general",
+          session_id: "sess-off-parked",
+          last_active: null,
+        },
+      ]);
+
+      await pool.run_resume();
+
+      // Plugin proactive-resume: spawned with --resume, stays assigned.
+      expect(mock_start_tmux).toHaveBeenCalledTimes(1);
+      expect(pool.get_bots()[0].state).toBe("assigned");
     });
   });
 });

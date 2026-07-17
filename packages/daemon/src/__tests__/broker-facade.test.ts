@@ -128,6 +128,98 @@ describe("DiscordBroker facade", () => {
     }
   });
 
+  it("deregister_channel drops ownership but PRESERVES the queue (#89 no-loss-on-crash)", async () => {
+    const broker = new DiscordBroker({ config: make_config(dir), socket_path, queue_path });
+    await broker.start();
+    try {
+      const state_dir = join(dir, "pool-3");
+      broker.register_channel("chan-1", { bot_id: 3, state_dir, chunk_config: {} });
+      broker.feed({ channel_id: "chan-1", content: "unacked-on-crash", meta: META });
+
+      // Release-to-dark path: ownership drops (so owns() → false → cold-recreate),
+      // but the unacked entry MUST survive for at-least-once redelivery.
+      broker.deregister_channel("chan-1");
+      expect(broker.owns("chan-1")).toBe(false);
+
+      // The cold-recreated session re-registers and its shim reconnects; the
+      // preserved entry is redelivered. Re-register so the server will deliver.
+      broker.register_channel("chan-1", { bot_id: 3, state_dir, chunk_config: {} });
+
+      const socket = connect(socket_path);
+      socket.setEncoding("utf-8");
+      const decoder = new NdjsonDecoder();
+      const inbound = await new Promise<BrokerEnvelope>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("no redelivery")), 2000);
+        socket.on("connect", () => {
+          socket.write(encode_envelope({ type: "register", channel_id: "chan-1", bot_id: 3 }));
+        });
+        socket.on("data", (chunk: string) => {
+          const { envelopes } = decoder.push(chunk);
+          for (const env of envelopes) {
+            if (env.type === "inbound") {
+              clearTimeout(timer);
+              resolve(env);
+            }
+          }
+        });
+        socket.on("error", reject);
+      });
+
+      expect(inbound.type).toBe("inbound");
+      if (inbound.type === "inbound") {
+        // Same message the crash left unacked — proof the queue was NOT cleared.
+        expect(inbound.payload.content).toBe("unacked-on-crash");
+      }
+      socket.destroy();
+    } finally {
+      await broker.stop();
+    }
+  });
+
+  it("release_channel drops ownership AND clears the queue (unchanged full-release path)", async () => {
+    const broker = new DiscordBroker({ config: make_config(dir), socket_path, queue_path });
+    await broker.start();
+    try {
+      const state_dir = join(dir, "pool-3");
+      broker.register_channel("chan-1", { bot_id: 3, state_dir, chunk_config: {} });
+      broker.feed({ channel_id: "chan-1", content: "will-be-dropped", meta: META });
+
+      // Full release clears the backlog (channel genuinely released, not lazy).
+      broker.release_channel("chan-1");
+      expect(broker.owns("chan-1")).toBe(false);
+
+      // Re-register + reconnect a shim: NO inbound should arrive (queue cleared).
+      broker.register_channel("chan-1", { bot_id: 3, state_dir, chunk_config: {} });
+      const socket = connect(socket_path);
+      socket.setEncoding("utf-8");
+      const decoder = new NdjsonDecoder();
+      const got_inbound = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), 600);
+        socket.on("connect", () => {
+          socket.write(encode_envelope({ type: "register", channel_id: "chan-1", bot_id: 3 }));
+        });
+        socket.on("data", (chunk: string) => {
+          const { envelopes } = decoder.push(chunk);
+          for (const env of envelopes) {
+            if (env.type === "inbound") {
+              clearTimeout(timer);
+              resolve(true);
+            }
+          }
+        });
+        socket.on("error", () => {
+          clearTimeout(timer);
+          resolve(false);
+        });
+      });
+
+      expect(got_inbound).toBe(false);
+      socket.destroy();
+    } finally {
+      await broker.stop();
+    }
+  });
+
   it("dead-letter callback fires when redelivery is exhausted", async () => {
     const on_dead_letter = vi.fn();
     const broker = new DiscordBroker({

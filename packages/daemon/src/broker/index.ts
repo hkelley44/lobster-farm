@@ -119,6 +119,21 @@ export class DiscordBroker {
   }
 
   /**
+   * Forget a channel's ownership WITHOUT dropping its queued backlog (#89).
+   *
+   * Used by the lazy release-to-dark path: when a broker session dies or is
+   * released on restart we want the channel to go dark (so `owns()` returns
+   * false and the next inbound cold-recreates the session), but we must NOT ack
+   * or drop any unacked inbound still in the queue. The queue's at-least-once
+   * redelivery re-delivers those entries once the cold-recreated session's shim
+   * registers again — no message is lost on a crash/restart. Unlike
+   * `release_channel`, this leaves the durable queue untouched.
+   */
+  deregister_channel(channel_id: string): void {
+    this.ownership.delete(channel_id);
+  }
+
+  /**
    * Enqueue an inbound Discord message for a broker-owned channel and kick a
    * delivery attempt. Fail-open: never throws — the daemon's `handle_message`
    * calls this on the hot path and must not be derailed by a broker fault.
