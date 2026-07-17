@@ -271,3 +271,246 @@ describe("assign() first-message delivery forks by transport (issue #87)", () =>
     expect(unlink).not.toHaveBeenCalledWith(pending_json_path("pool-2"));
   });
 });
+
+describe("concurrent cold-start: single session, one reply per message (#83)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    dir = join(tmpdir(), `broker-concurrent-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    (spawn as unknown as Mock).mockImplementation(() => fake_tmux_proc());
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    const { rm } = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  async function ensure_dir(): Promise<void> {
+    const { mkdir } = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    await mkdir(dir, { recursive: true });
+  }
+
+  const MSG2: PendingMessage = {
+    user: "hunter",
+    channel_id: PILOT_CHANNEL,
+    message_id: "m-2",
+    content: "second message while cold-starting",
+    ts: "2026-07-04T10:00:01.000Z",
+  };
+
+  it("buffers a concurrent inbound during in-flight assign and drains it after ownership registers, ordered", async () => {
+    await ensure_dir();
+    const config = make_config(true);
+    const pool = new TestPool(config);
+    const broker = new DiscordBroker({
+      config,
+      socket_path: join(dir, "b.sock"),
+      queue_path: join(dir, "q.json"),
+    });
+    const feed_spy = vi.spyOn(broker, "feed");
+    pool.set_broker(broker);
+
+    const state_dir = join(dir, "pool-4");
+    const { mkdir } = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    await mkdir(state_dir, { recursive: true });
+    pool.inject_bots([make_bot(4, state_dir)]);
+
+    // msg1 wins the assign lock. While it's in flight, msg2 loses the lock (assign
+    // returns null in discord.ts) and routes here. We simulate that ordering by
+    // marking the channel as assigning, buffering msg2, then running assign — which
+    // clears the buffer via drain right after registering ownership + feeding msg1.
+    (pool as unknown as { assigning_channels: Set<string> }).assigning_channels.add(PILOT_CHANNEL);
+    const taken = pool.deliver_or_buffer_broker_inbound(PILOT_CHANNEL, MSG2);
+    expect(taken).toBe(true); // buffered, caller must NOT reply "busy"
+    // Nothing fed yet — buffered pending drain.
+    expect(feed_spy).not.toHaveBeenCalled();
+    (pool as unknown as { assigning_channels: Set<string> }).assigning_channels.delete(
+      PILOT_CHANNEL,
+    );
+
+    const result = await pool.assign(
+      PILOT_CHANNEL,
+      "entity-1",
+      "planner",
+      undefined,
+      undefined,
+      undefined,
+      PENDING,
+    );
+
+    expect(result).not.toBeNull();
+    expect(pool.broker_owns(PILOT_CHANNEL)).toBe(true);
+
+    // Exactly two feeds: msg1 (first-turn driver) then the drained msg2 — one
+    // session, ordered, one reply per message. No message dropped.
+    expect(feed_spy).toHaveBeenCalledTimes(2);
+    expect(feed_spy.mock.calls[0]![0]).toMatchObject({ content: "hello broker pilot" });
+    expect(feed_spy.mock.calls[1]![0]).toMatchObject({
+      content: "second message while cold-starting",
+    });
+
+    await broker.stop().catch(() => {});
+  });
+
+  it("delivers msg#1 BEFORE a concurrent msg2 that arrives during the assign yield window (#83 ordering)", async () => {
+    // This is the real production race the #83 "ordered" invariant guards against.
+    // Inside assign(), start_tmux → register_channel flips broker_owns → true while
+    // the assign STILL holds its assigning_channels lock; there is then an
+    // `await unlink(pending_json)` YIELD before msg#1 is fed. A concurrent msg2
+    // arriving in that sub-window routes discord.ts → assign()→null (lock) →
+    // deliver_or_buffer_broker_inbound. Ownership is already true — a naive
+    // straight-through feed there lands msg2 AHEAD of msg#1 (queue order 2,1),
+    // violating ordering. The fix buffers while the assign lock is held and drains
+    // msg2 strictly after msg#1.
+    //
+    // We reproduce the yield injection deterministically by hooking the mocked
+    // unlink (which IS the post-register/pre-feed yield inside assign()): when it
+    // fires for the pending file, we fire msg2 through the real delivery path while
+    // assigning_channels still holds the lock — exactly the concurrent arrival.
+    await ensure_dir();
+    const config = make_config(true);
+    const pool = new TestPool(config);
+    const broker = new DiscordBroker({
+      config,
+      socket_path: join(dir, "b.sock"),
+      queue_path: join(dir, "q.json"),
+    });
+    const feed_spy = vi.spyOn(broker, "feed");
+    pool.set_broker(broker);
+
+    const state_dir = join(dir, "pool-4");
+    const { mkdir } = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    await mkdir(state_dir, { recursive: true });
+    pool.inject_bots([make_bot(4, state_dir)]);
+
+    // Hook the unlink yield: when assign() unlinks pool-4's pending file (after it
+    // registered ownership, before it feeds msg#1, lock still held), inject msg2
+    // through the production concurrent-inbound path. Guard so it fires once.
+    let injected = false;
+    (unlink as unknown as Mock).mockImplementation((p: string) => {
+      if (!injected && p === pending_json_path("pool-4")) {
+        injected = true;
+        // At this exact point: broker_owns === true, assigning_channels holds the
+        // lock, msg#1 NOT yet fed. This is the window that used to reorder.
+        expect(pool.broker_owns(PILOT_CHANNEL)).toBe(true);
+        const taken = pool.deliver_or_buffer_broker_inbound(PILOT_CHANNEL, MSG2);
+        expect(taken).toBe(true);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const result = await pool.assign(
+      PILOT_CHANNEL,
+      "entity-1",
+      "planner",
+      undefined,
+      undefined,
+      undefined,
+      PENDING,
+    );
+
+    expect(result).not.toBeNull();
+    expect(pool.broker_owns(PILOT_CHANNEL)).toBe(true);
+
+    // Exactly two feeds, and ORDER is msg#1 THEN msg2 — the invariant. Before the
+    // fix, msg2 was fed straight through during the yield (call[0] === msg2),
+    // failing this ordering assertion.
+    expect(feed_spy).toHaveBeenCalledTimes(2);
+    expect(feed_spy.mock.calls[0]![0]).toMatchObject({ content: "hello broker pilot" });
+    expect(feed_spy.mock.calls[1]![0]).toMatchObject({
+      content: "second message while cold-starting",
+    });
+
+    await broker.stop().catch(() => {});
+  });
+
+  it("feeds a concurrent inbound straight to the queue once the assign lock is released and ownership stands", async () => {
+    await ensure_dir();
+    const config = make_config(true);
+    const pool = new TestPool(config);
+    const broker = new DiscordBroker({
+      config,
+      socket_path: join(dir, "b.sock"),
+      queue_path: join(dir, "q.json"),
+    });
+    pool.set_broker(broker);
+
+    const state_dir = join(dir, "pool-4");
+    const { mkdir } = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    await mkdir(state_dir, { recursive: true });
+    pool.inject_bots([make_bot(4, state_dir)]);
+
+    // The straight-through feed branch: ownership registered AND no assign in
+    // flight (assigning_channels empty). This is the steady-follow-up window —
+    // assign() already finished and released its lock, so msg#1 is provably in the
+    // queue, and a later inbound is safe to feed directly (no reorder risk). We set
+    // up exactly that: ownership registered, no assign lock held. (Contrast the
+    // ordering test above, where the assign lock IS held mid-yield and the same
+    // call buffers instead.)
+    broker.register_channel(PILOT_CHANNEL, {
+      bot_id: 4,
+      state_dir,
+      chunk_config: {},
+    });
+    expect(pool.broker_owns(PILOT_CHANNEL)).toBe(true);
+    // No assign in flight — the discriminator that permits straight-through.
+    expect(
+      (pool as unknown as { assigning_channels: Set<string> }).assigning_channels.has(
+        PILOT_CHANNEL,
+      ),
+    ).toBe(false);
+
+    const feed_spy = vi.spyOn(broker, "feed");
+    const taken = pool.deliver_or_buffer_broker_inbound(PILOT_CHANNEL, MSG2);
+
+    expect(taken).toBe(true);
+    // Fed straight through — ownership stands and no assign is racing, so the
+    // message lands on the live session as an ordered follow-up rather than being
+    // dropped as "busy".
+    expect(feed_spy).toHaveBeenCalledTimes(1);
+    expect(feed_spy.mock.calls[0]![0]).toMatchObject({ content: MSG2.content });
+
+    await broker.stop().catch(() => {});
+  });
+
+  it("returns false for a plugin channel — caller takes the unchanged 'busy' path", async () => {
+    await ensure_dir();
+    const config = make_config(true); // broker ON, but PLUGIN_CHANNEL not a pilot
+    const pool = new TestPool(config);
+    const broker = new DiscordBroker({
+      config,
+      socket_path: join(dir, "b.sock"),
+      queue_path: join(dir, "q.json"),
+    });
+    pool.set_broker(broker);
+
+    const taken = pool.deliver_or_buffer_broker_inbound(PLUGIN_CHANNEL, {
+      ...MSG2,
+      channel_id: PLUGIN_CHANNEL,
+    });
+
+    expect(taken).toBe(false);
+
+    await broker.stop().catch(() => {});
+  });
+
+  it("returns false when no cold-start is underway (genuinely exhausted pool)", async () => {
+    await ensure_dir();
+    const config = make_config(true);
+    const pool = new TestPool(config);
+    const broker = new DiscordBroker({
+      config,
+      socket_path: join(dir, "b.sock"),
+      queue_path: join(dir, "q.json"),
+    });
+    pool.set_broker(broker);
+
+    // No ownership, no in-flight assign → nothing to attach the message to.
+    const taken = pool.deliver_or_buffer_broker_inbound(PILOT_CHANNEL, MSG2);
+
+    expect(taken).toBe(false);
+
+    await broker.stop().catch(() => {});
+  });
+});

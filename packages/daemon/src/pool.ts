@@ -505,6 +505,18 @@ export class BotPool extends EventEmitter {
   private health_timer: ReturnType<typeof setInterval> | null = null;
   /** In-flight lock: channels currently being assigned. Prevents check-then-act races. */
   private assigning_channels = new Set<string>();
+  /**
+   * Broker cold-start inbound buffer (#83/#89). When a broker channel is dark
+   * and two inbound arrive in rapid succession, the first wins the
+   * `assigning_channels` lock and cold-recreates the session; the second loses
+   * the lock (assign returns null) while broker ownership isn't registered yet,
+   * so feeding it directly would drop it (`feed` no-ops with no owner). Instead
+   * the loser buffers its message here; the winning `assign()` drains the buffer
+   * into the broker queue right after it registers ownership + feeds message #1.
+   * Result: one session, one ordered reply per message — never a duplicate
+   * dispatch. Keyed by channel_id. Only ever populated for `uses_broker` channels.
+   */
+  private broker_coldstart_buffer = new Map<string, PendingMessage[]>();
   /** In-flight lock: channels currently being released. Prevents double-release races. */
   private releasing_channels = new Set<string>();
   /** In-flight lock: tmux sessions with a pending file delivery in progress.
@@ -599,15 +611,111 @@ export class BotPool extends EventEmitter {
   }
 
   /**
-   * Enqueue the triggering (first) message of a freshly-assigned broker session
-   * into the broker queue so the shim delivers it as a `notifications/claude/
-   * channel` inbound once connected — driving the session's first turn (#87).
+   * Drop broker ownership for a channel WITHOUT clearing its queued backlog
+   * (#89). Used by the lazy release-to-dark path so the channel goes dark
+   * (`broker_owns` → false → cold-recreate on next inbound) while any unacked
+   * inbound stays in the durable queue for at-least-once redelivery. No-op when
+   * the broker is unset. See DiscordBroker.deregister_channel.
+   */
+  private deregister_broker_channel(channel_id: string): void {
+    this.broker?.deregister_channel(channel_id);
+  }
+
+  /**
+   * Deliver a broker inbound that arrived while a cold-start `assign()` for the
+   * same channel is already in flight (#83/#89). This is the concurrent-cold-
+   * start path: the caller (discord.ts) reached here because `assign()` returned
+   * null for a broker channel. We disambiguate:
    *
-   * This is the broker analogue of the plugin path's SessionStart-hook injection:
-   * on the broker transport the hook's additionalContext alone does not drive a
-   * turn, so message #1 must ride the same queue → shim → channel-inbound path as
-   * steady-state messages. Called from assign() only for channels the broker
-   * actually owns; the pending-file hook is skipped for those to avoid
+   *   - Assign still in flight (`assigning_channels`) → buffer the message; the
+   *     winning assign drains the buffer into the queue right after it feeds
+   *     message #1, preserving strict arrival order (msg#1 before this one).
+   *   - Not assigning, but ownership already registered → the winning assign
+   *     finished and released its lock, so message #1 is already in the queue;
+   *     feed this straight to the queue (steady-state delivery).
+   *   - Neither → there is no cold-start underway (e.g. the pool was genuinely
+   *     exhausted); return false so the caller can surface "busy". No message is
+   *     enqueued, so redelivery isn't relied on for a message that has no owner.
+   *
+   * Order matters: `assigning_channels` is checked BEFORE `broker_owns` because
+   * ownership flips true partway through assign() (inside start_tmux →
+   * register_channel) while the assign still holds its in-flight lock — and there
+   * is an `await` between that registration and the message-#1 feed. A concurrent
+   * inbound landing in that sub-window sees `broker_owns` true but msg#1 NOT yet
+   * queued; a straight-through feed there would land it AHEAD of msg#1 → #83
+   * ordering inversion. Gating on the assign lock (held for the whole
+   * register→feed→drain span) forces such inbound into the buffer, which assign()
+   * drains strictly after msg#1. `broker_owns` is only trusted as a
+   * straight-through signal once the assign lock is gone, i.e. msg#1 is fed.
+   *
+   * Returns true if the message was delivered or buffered (caller must NOT also
+   * reply "busy"), false if it couldn't be placed. Self-gates on `uses_broker`
+   * so it is safe to call for ANY channel — a plugin channel always returns
+   * false and takes the unchanged "busy" path, keeping flag-OFF byte-identical.
+   */
+  deliver_or_buffer_broker_inbound(channel_id: string, pending: PendingMessage): boolean {
+    // Plugin channels (and flag-OFF) never touch the broker buffer — return
+    // false immediately so the caller's existing "busy" path is byte-identical.
+    if (!this.uses_broker(channel_id)) return false;
+    // Assign in flight → buffer regardless of ownership state. See docstring:
+    // ownership can be true mid-assign before msg#1 is fed, so we must NOT feed
+    // straight through here or we'd reorder ahead of msg#1.
+    if (this.assigning_channels.has(channel_id)) {
+      const buf = this.broker_coldstart_buffer.get(channel_id) ?? [];
+      buf.push(pending);
+      this.broker_coldstart_buffer.set(channel_id, buf);
+      console.log(
+        `[pool] Buffered concurrent broker inbound for ${channel_id} during cold-start ` +
+          `(${String(buf.length)} queued)`,
+      );
+      return true;
+    }
+    // No assign in flight but ownership registered → assign finished and msg#1 is
+    // already queued; safe to feed straight through as an ordered follow-up.
+    if (this.broker_owns(channel_id)) {
+      this.feed_broker_pending(channel_id, pending);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Drain any messages buffered by `deliver_or_buffer_broker_inbound` for a
+   * channel into the broker queue, in arrival order (#83). Called by `assign()`
+   * immediately after it registers broker ownership and feeds message #1, so the
+   * concurrent inbound that lost the assign lock still lands as ordered
+   * follow-up turns on the single cold-recreated session. No-op when the buffer
+   * is empty. Safe to call for any channel.
+   */
+  private drain_broker_coldstart_buffer(channel_id: string): void {
+    const buffered = this.broker_coldstart_buffer.get(channel_id);
+    if (!buffered || buffered.length === 0) return;
+    this.broker_coldstart_buffer.delete(channel_id);
+    for (const pending of buffered) {
+      this.feed_broker_pending(channel_id, pending);
+    }
+    console.log(
+      `[pool] Drained ${String(buffered.length)} buffered broker inbound(s) for ${channel_id} into the queue after cold-start`,
+    );
+  }
+
+  /**
+   * Enqueue a PendingMessage into the broker queue so the shim delivers it as a
+   * `notifications/claude/channel` inbound once connected, driving a session turn.
+   *
+   * This is the single broker-side delivery for a PendingMessage, used on every
+   * path where the driver is a PendingMessage rather than a live discord.js
+   * Message:
+   *   - the triggering (first) message of a freshly-assigned session (#87), and
+   *   - concurrent inbound that raced a cold-start and were buffered/drained as
+   *     ordered follow-up turns (#83).
+   * There is nothing first-turn-specific here — it is the queue analogue of the
+   * steady-state feed_broker_inbound(), which takes a live Message instead.
+   *
+   * On the broker transport the SessionStart hook's additionalContext alone does
+   * not drive a turn, so message #1 must ride the same queue → shim →
+   * channel-inbound path as steady-state messages. Called only for channels the
+   * broker actually owns; the pending-file hook is skipped for those to avoid
    * double-delivery.
    *
    * The InboundMeta is built from the PendingMessage the same way the
@@ -617,7 +725,7 @@ export class BotPool extends EventEmitter {
    * threading), so it's left empty, matching the resume-nudge daemon-authored
    * shape. Fail-open: broker.feed() swallows its own errors.
    */
-  feed_broker_first_message(channel_id: string, pending: PendingMessage): void {
+  feed_broker_pending(channel_id: string, pending: PendingMessage): void {
     this.broker?.feed({
       channel_id,
       content: pending.content,
@@ -635,8 +743,26 @@ export class BotPool extends EventEmitter {
    * Whether a channel uses the broker transport. True only when the broker flag
    * is enabled AND the channel is in the pilot allowlist. This is the single
    * source of truth for the plugin-vs-broker fork at bring-up.
+   *
+   * This is the CANONICAL gate for the lazy/message-driven broker lifecycle
+   * (#89): every new branch that decides "skip proactive-resume", "release to
+   * dark instead of respawn", or "cold-recreate on next inbound" gates on this.
+   * It is config-driven (flag + allowlist), so it is stable across a daemon
+   * restart — unlike `broker_owns()`, which reflects the in-memory ownership Map
+   * that is empty until a session re-registers inside `assign()`. The
+   * restart-time paths (`resume_parked_bots`, `reconcile_assigned_health`) run
+   * BEFORE any re-registration, so gating them on `broker_owns` would be a silent
+   * no-op. Because it returns false when the flag is OFF, every #89 branch is a
+   * no-op with `broker.enabled: false` → flag-OFF behavior is byte-identical to
+   * the plugin path.
+   *
+   * `broker_owns()` remains the correct gate ONLY on paths where a session is
+   * actually live and registered (steady-state inbound feed, #87 first-message).
+   *
+   * Protected (not private) so the health/restart branches can gate on it and
+   * lifecycle tests can drive it directly.
    */
-  private uses_broker(channel_id: string): boolean {
+  protected uses_broker(channel_id: string): boolean {
     if (!this.broker) return false;
     const broker_cfg = this.config.discord?.broker;
     if (!broker_cfg?.enabled) return false;
@@ -1155,6 +1281,24 @@ export class BotPool extends EventEmitter {
       );
       if (!bot) continue;
 
+      // Broker channels are lazy and message-driven (#89): a broker session
+      // exists iff an inbound message is driving it. Proactive-resume would
+      // spawn an idle session with no turn-driver — the exact illegal state
+      // that produced the 07-05 crash loop. Skip resume entirely; the channel
+      // stays dark until the next human inbound cold-recreates it (carrying the
+      // message as the driver, with --resume for continuity via the stash below).
+      // We still kill any surviving tmux (its MCP connection died with the old
+      // daemon) and stash the session_id so the cold-recreate resumes context.
+      // Plugin channels fall through to the unchanged proactive-resume below.
+      if (this.uses_broker(candidate.channel_id)) {
+        console.log(
+          `[pool] Skipping proactive-resume for broker channel ${candidate.channel_id} ` +
+            `(pool-${String(bot.id)}) — lazy/message-driven; will cold-recreate on next inbound`,
+        );
+        await this.release_broker_to_dark(bot, candidate.session_id ?? null);
+        continue;
+      }
+
       const had_live_tmux = bot.state === "assigned";
 
       try {
@@ -1318,6 +1462,24 @@ export class BotPool extends EventEmitter {
       const entity_id = bot.entity_id;
       const channel_id = bot.channel_id;
       const archetype = bot.archetype;
+
+      // Broker channels are lazy/message-driven (#89): a half-spawned broker bot
+      // (assigned but dead tmux — the #66 case where an unconfirmed session
+      // wasn't a resume candidate) must be released to dark, not respawned into
+      // an idle session. This is the restart-time twin of the health-monitor
+      // branch in check_assigned_health. resume_parked_bots already released
+      // broker RESUME candidates to dark; this catches the ones that weren't
+      // candidates. Cold-recreate happens on the next inbound (with --resume via
+      // the stash). Plugin channels fall through to the unchanged respawn path.
+      if (channel_id && this.uses_broker(channel_id)) {
+        console.warn(
+          `[pool] pool-${String(bot.id)} came back assigned with a dead broker tmux ` +
+            `(channel: ${channel_id}) — releasing to dark, no respawn (lazy/message-driven)`,
+        );
+        await this.release_broker_to_dark(bot, bot.session_id);
+        continue;
+      }
+
       console.warn(
         `[pool] pool-${String(bot.id)} came back assigned with a dead tmux session ` +
           `(channel: ${channel_id ?? "none"}, session: ${bot.session_id?.slice(0, 8) ?? "none"}) — respawning`,
@@ -1634,7 +1796,12 @@ export class BotPool extends EventEmitter {
           // Best-effort: a missing file (write above failed) just means the hook
           // was already going to no-op; the queue enqueue below is the delivery.
         });
-        this.feed_broker_first_message(channel_id, pending_message);
+        this.feed_broker_pending(channel_id, pending_message);
+        // #83: now that ownership is registered, drain any inbound that raced in
+        // during this cold-start (lost the assigning_channels lock) so they land
+        // as ordered follow-up turns on this single session — no duplicate
+        // dispatch, no dropped message.
+        this.drain_broker_coldstart_buffer(channel_id);
       }
 
       // Update bot state
@@ -1695,6 +1862,20 @@ export class BotPool extends EventEmitter {
       };
     } finally {
       this.assigning_channels.delete(channel_id);
+      // If the buffer still holds entries here, this cold-start assign() never
+      // reached broker registration (it failed or returned early before the
+      // drain above) — so message #1 also failed and the human sees the same
+      // "busy"/no-session outcome for the whole burst. Discard the stragglers
+      // rather than leave them stranded with no owner; the human's retry drives
+      // a fresh cold-start. The happy path already drained + deleted this key.
+      const stranded = this.broker_coldstart_buffer.get(channel_id);
+      if (stranded && stranded.length > 0) {
+        this.broker_coldstart_buffer.delete(channel_id);
+        console.warn(
+          `[pool] Discarding ${String(stranded.length)} buffered broker inbound(s) for ` +
+            `${channel_id} — cold-start assign did not register a session (burst will retry)`,
+        );
+      }
     }
   }
 
@@ -1930,6 +2111,84 @@ export class BotPool extends EventEmitter {
     await this.release(channel_id);
   }
 
+  /**
+   * Release a broker bot to a dark (free, no live session) state without
+   * respawning it (#89). This is the terminal behavior for broker channels on
+   * the two non-message-driven session-creation paths — proactive-resume and
+   * watchdog-respawn — that previously spawned idle sessions. It models
+   * `handle_crash_loop`'s "stash history + release, no respawn" but is scoped to
+   * broker channels and, critically, preserves the broker queue backlog.
+   *
+   * What it does:
+   *   - Stashes `session_id` into session_history so the next inbound cold-
+   *     recreates with `--resume` (continuity — lazy ≠ amnesiac). Only a
+   *     confirmed session is stashed to avoid planting a phantom UUID that would
+   *     make `assign()` --resume a non-existent JSONL (issue #256 discipline).
+   *   - Kills tmux, clears access.json, frees the bot.
+   *   - Drops broker OWNERSHIP only (`deregister_channel`) — it does NOT clear
+   *     the durable queue, so any unacked inbound stays for at-least-once
+   *     redelivery to the cold-recreated session (no message loss on crash).
+   *   - Fires session-end extraction + emits `bot:released`.
+   *
+   * `session_id` is passed explicitly because the caller sometimes has a more
+   * authoritative id than what's on the bot (the resume candidate's persisted
+   * session_id vs. a parked bot's live field). Pass null to stash nothing.
+   *
+   * Caller must have already confirmed `uses_broker(bot.channel_id)`.
+   */
+  private async release_broker_to_dark(bot: PoolBot, session_id: string | null): Promise<void> {
+    const channel_id = bot.channel_id;
+    const entity_id = bot.entity_id;
+
+    // Stash for --resume continuity. Mirror the crash-loop/restart discipline:
+    // only stash a *confirmed* session (JSONL known on disk) so the cold-recreate
+    // doesn't --resume a phantom UUID and burn crash-loop retries (#256).
+    if (session_id && bot.session_confirmed && channel_id && entity_id) {
+      const key = `${entity_id}:${channel_id}`;
+      this.session_history.set(key, session_id);
+      this.session_history_ts.set(key, Date.now());
+      console.log(
+        `[pool] Stashed broker session history for ${key}: ${session_id.slice(0, 8)} (released to dark — cold-recreate on next inbound)`,
+      );
+    }
+
+    // Fire memory extraction before we null the bot's metadata (fire-and-forget;
+    // the gate snapshots synchronously). No-op if there's nothing to summarize.
+    void this.extract_on_session_end(bot);
+
+    // Cancel any in-flight confirmation watcher — the process it observed is dead.
+    this.cancel_session_watcher(bot.id);
+
+    // Kill any surviving tmux (its MCP connection died with the old daemon) and
+    // drop the orphaned pending file so stale content can't leak into a future
+    // assignment.
+    this.kill_tmux(bot.tmux_session);
+    void unlink(pending_file_path(bot.tmux_session)).catch(() => {});
+
+    bot.state = "free";
+    bot.channel_id = null;
+    bot.entity_id = null;
+    bot.archetype = null;
+    bot.channel_type = null;
+    bot.session_id = null;
+    bot.session_confirmed = false;
+    bot.model = null;
+    bot.effort = null;
+    bot.last_active = null;
+    bot.assigned_at = null;
+
+    // Clear access.json so no plugin listener lingers, and drop broker OWNERSHIP
+    // only (queue backlog preserved for redelivery). Swallow a write failure so a
+    // release never throws on the restart/health hot path — the important state
+    // transition (free) already landed in memory.
+    await this.write_access_json(bot.state_dir, null).catch(() => {});
+    if (channel_id) this.deregister_broker_channel(channel_id);
+
+    await this.persist();
+
+    this.emit("bot:released", { bot_id: bot.id });
+  }
+
   /** Get all bots currently assigned to a channel (state === "assigned").
    * Returns read-only snapshots — callers must not mutate the returned objects. */
   get_assigned_bots(): readonly PoolBot[] {
@@ -2163,6 +2422,23 @@ export class BotPool extends EventEmitter {
           // delivering inbound Discord messages. Probe for a live-but-deaf bot
           // that received a message it never processed (issue #73).
           await this.check_plugin_liveness(bot);
+          continue;
+        }
+
+        // Broker channels are lazy/message-driven (#89): a dead broker session
+        // must be released to dark, NOT respawned into an idle session. Respawn
+        // has no message to drive the first turn, so it dies and respawns again
+        // — the 07-05 crash loop. Release-to-dark short-circuits BEFORE
+        // record_crash so the crash-loop counter never even ticks: the loop
+        // cannot start. The next inbound cold-recreates the session (with
+        // --resume via the stash inside release_broker_to_dark). Plugin channels
+        // fall through to the unchanged record_crash → restart path below.
+        if (bot.channel_id && this.uses_broker(bot.channel_id)) {
+          console.warn(
+            `[pool] pool-${String(bot.id)} broker tmux died — releasing to dark ` +
+              `(channel: ${bot.channel_id}); cold-recreate on next inbound, no respawn`,
+          );
+          await this.release_broker_to_dark(bot, bot.session_id);
           continue;
         }
 
