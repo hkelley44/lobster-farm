@@ -1335,6 +1335,17 @@ export class BotPool extends EventEmitter {
           }
         }
 
+        // Resolve per-entity 1Password token (if present in the daemon env) so
+        // the resumed session's `op` points at the entity's own vault.
+        // Additive: when absent, the tmux-global platform token is inherited.
+        const resume_op_token = this.resolve_entity_op_token(candidate.entity_id);
+        if (resume_op_token) {
+          extra_env.OP_SERVICE_ACCOUNT_TOKEN = resume_op_token;
+        }
+        console.log(
+          `[pool] Resuming pool-${String(bot.id)} entity op token: ${resume_op_token ? "present" : "absent"} (entity: ${candidate.entity_id})`,
+        );
+
         // Resolve per-entity CLAUDE_CONFIG_DIR (if configured) so this session
         // uses the entity's own Claude Max subscription.
         const resume_claude_config = this.resolve_claude_config_dir(candidate.entity_id);
@@ -1721,6 +1732,17 @@ export class BotPool extends EventEmitter {
           // Non-fatal: session starts without GH_TOKEN
         }
       }
+
+      // Resolve per-entity 1Password token (if present in the daemon env) so
+      // this session's `op` transparently points at the entity's own vault.
+      // Additive: when absent, the tmux-global platform token is inherited.
+      const entity_op_token = this.resolve_entity_op_token(entity_id);
+      if (entity_op_token) {
+        extra_env.OP_SERVICE_ACCOUNT_TOKEN = entity_op_token;
+      }
+      console.log(
+        `[pool] Assigning pool-${String(bot.id)} entity op token: ${entity_op_token ? "present" : "absent"} (entity: ${entity_id})`,
+      );
 
       // Resolve per-entity CLAUDE_CONFIG_DIR (if configured) so this session
       // uses the entity's own Claude Max subscription.
@@ -2736,6 +2758,17 @@ export class BotPool extends EventEmitter {
         }
       }
 
+      // Resolve per-entity 1Password token (if present in the daemon env) so the
+      // restarted session's `op` points at the entity's own vault.
+      // Additive: when absent, the tmux-global platform token is inherited.
+      const crash_op_token = this.resolve_entity_op_token(entity_id);
+      if (crash_op_token) {
+        extra_env.OP_SERVICE_ACCOUNT_TOKEN = crash_op_token;
+      }
+      console.log(
+        `[pool] Restarting pool-${String(bot.id)} entity op token: ${crash_op_token ? "present" : "absent"} (entity: ${entity_id})`,
+      );
+
       // Resolve per-entity CLAUDE_CONFIG_DIR (if configured) so the restarted
       // session uses the entity's own Claude Max subscription.
       const crash_claude_config = this.resolve_claude_config_dir(entity_id);
@@ -3617,6 +3650,24 @@ export class BotPool extends EventEmitter {
     const entity_config = this.registry.get(entity_id);
     if (!entity_config) return null;
     return entity_config.entity.secrets.github_token_ref ?? null;
+  }
+
+  /** Resolve the per-entity 1Password service-account token from the daemon env.
+   *
+   * The daemon runs under `op run` (start-daemon.sh), so its process env already
+   * holds every per-entity token as OP_SERVICE_ACCOUNT_TOKEN_{ENTITY}. Mapping
+   * rule: uppercase the entity id and replace hyphens with underscores
+   * (e.g. `land-acquisition` → `OP_SERVICE_ACCOUNT_TOKEN_LAND_ACQUISITION`).
+   *
+   * This is a plain synchronous lookup — the value is already a literal in the
+   * env, so there is NO `op read` (no reference to resolve, and a subprocess
+   * would risk logging the value). Returns the token or null when unset/empty.
+   *
+   * SECURITY: never log the return value. Callers log only presence/absence. */
+  private resolve_entity_op_token(entity_id: string): string | null {
+    const env_var = `OP_SERVICE_ACCOUNT_TOKEN_${entity_id.toUpperCase().replaceAll("-", "_")}`;
+    const value = process.env[env_var];
+    return value ? value : null;
   }
 
   /** Look up the subscription.claude_config_dir for an entity from the registry.
