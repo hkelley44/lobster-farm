@@ -646,7 +646,7 @@ export class BotPool extends EventEmitter {
     // false immediately so the caller's existing "busy" path is byte-identical.
     if (!this.uses_broker(channel_id)) return false;
     if (this.broker_owns(channel_id)) {
-      this.feed_broker_first_message(channel_id, pending);
+      this.feed_broker_pending(channel_id, pending);
       return true;
     }
     if (this.assigning_channels.has(channel_id)) {
@@ -675,7 +675,7 @@ export class BotPool extends EventEmitter {
     if (!buffered || buffered.length === 0) return;
     this.broker_coldstart_buffer.delete(channel_id);
     for (const pending of buffered) {
-      this.feed_broker_first_message(channel_id, pending);
+      this.feed_broker_pending(channel_id, pending);
     }
     console.log(
       `[pool] Drained ${String(buffered.length)} buffered broker inbound(s) for ${channel_id} into the queue after cold-start`,
@@ -683,15 +683,22 @@ export class BotPool extends EventEmitter {
   }
 
   /**
-   * Enqueue the triggering (first) message of a freshly-assigned broker session
-   * into the broker queue so the shim delivers it as a `notifications/claude/
-   * channel` inbound once connected — driving the session's first turn (#87).
+   * Enqueue a PendingMessage into the broker queue so the shim delivers it as a
+   * `notifications/claude/channel` inbound once connected, driving a session turn.
    *
-   * This is the broker analogue of the plugin path's SessionStart-hook injection:
-   * on the broker transport the hook's additionalContext alone does not drive a
-   * turn, so message #1 must ride the same queue → shim → channel-inbound path as
-   * steady-state messages. Called from assign() only for channels the broker
-   * actually owns; the pending-file hook is skipped for those to avoid
+   * This is the single broker-side delivery for a PendingMessage, used on every
+   * path where the driver is a PendingMessage rather than a live discord.js
+   * Message:
+   *   - the triggering (first) message of a freshly-assigned session (#87), and
+   *   - concurrent inbound that raced a cold-start and were buffered/drained as
+   *     ordered follow-up turns (#83).
+   * There is nothing first-turn-specific here — it is the queue analogue of the
+   * steady-state feed_broker_inbound(), which takes a live Message instead.
+   *
+   * On the broker transport the SessionStart hook's additionalContext alone does
+   * not drive a turn, so message #1 must ride the same queue → shim →
+   * channel-inbound path as steady-state messages. Called only for channels the
+   * broker actually owns; the pending-file hook is skipped for those to avoid
    * double-delivery.
    *
    * The InboundMeta is built from the PendingMessage the same way the
@@ -701,7 +708,7 @@ export class BotPool extends EventEmitter {
    * threading), so it's left empty, matching the resume-nudge daemon-authored
    * shape. Fail-open: broker.feed() swallows its own errors.
    */
-  feed_broker_first_message(channel_id: string, pending: PendingMessage): void {
+  feed_broker_pending(channel_id: string, pending: PendingMessage): void {
     this.broker?.feed({
       channel_id,
       content: pending.content,
@@ -1772,7 +1779,7 @@ export class BotPool extends EventEmitter {
           // Best-effort: a missing file (write above failed) just means the hook
           // was already going to no-op; the queue enqueue below is the delivery.
         });
-        this.feed_broker_first_message(channel_id, pending_message);
+        this.feed_broker_pending(channel_id, pending_message);
         // #83: now that ownership is registered, drain any inbound that raced in
         // during this cold-start (lost the assigning_channels lock) so they land
         // as ordered follow-up turns on this single session — no duplicate

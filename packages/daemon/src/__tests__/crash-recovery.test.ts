@@ -1013,38 +1013,50 @@ describe("crash recovery (issue #157)", () => {
       );
     });
 
-    it("old crash-loop scenario terminates: broker bot never records a crash, zero respawns", async () => {
+    it("old crash-loop scenario terminates: each respawned broker bot re-releases, zero respawns, zero crashes", async () => {
       const { pool: bpool } = make_broker_pool();
       const local_start = vi.spyOn(
         bpool as unknown as Record<string, unknown>,
         "start_tmux" as never,
       );
-      const bot = make_bot({
-        id: 4,
-        state: "assigned",
-        channel_id: BROKER_CHANNEL,
-        entity_id: "test-entity",
-        archetype: "planner",
-        session_id: "sess-broker-loop",
-        session_confirmed: true,
-      });
-      bpool.inject_bots([bot]);
 
-      // Drive the health tick repeatedly — this is the 07-05 sequence (dead tmux,
-      // health tick, respawn-into-idle, repeat). Under the fix each tick releases
-      // to dark; the bot is free after the first, so subsequent ticks are no-ops.
-      await bpool.run_health_check();
-      // Re-arm the same scenario (as if a respawn had re-created the assigned bot)
-      // and confirm the crash counter stays empty — the loop cannot start.
-      await bpool.run_health_check();
-      await bpool.run_health_check();
+      // Reproduce the 07-05 loop, not just its first turn. The old watchdog killed
+      // the dead broker tmux and RESPAWNED it into another assigned-but-idle bot,
+      // whose tmux was again dead, which the next health tick respawned again — an
+      // endless crash loop. To prove the fix breaks that loop we must simulate the
+      // respawn: before every tick we re-inject a fresh assigned broker bot on the
+      // SAME channel (what the old respawn would have produced) and assert this
+      // tick releases IT to dark too — never respawns, never records a crash. If
+      // any tick respawned, `start_tmux` would fire; if any tick took the plugin
+      // crash path, `record_crash` would tick. Neither may happen on any iteration.
+      const bot_ids = [40, 41, 42];
+      for (const id of bot_ids) {
+        // Simulate the respawn that the old watchdog would have created.
+        const respawned = make_bot({
+          id,
+          state: "assigned",
+          channel_id: BROKER_CHANNEL,
+          entity_id: "test-entity",
+          archetype: "planner",
+          session_id: `sess-broker-loop-${String(id)}`,
+          session_confirmed: true,
+        });
+        bpool.inject_bots([respawned]);
 
-      // Zero respawns across every tick.
+        await bpool.run_health_check();
+
+        // This respawned bot was released to dark, not respawned into idle again.
+        const [after] = bpool.get_bots();
+        expect(after.id).toBe(id);
+        expect(after.state).toBe("free");
+        expect(after.channel_id).toBeNull();
+        // Its crash counter never ticked — the broker release short-circuits
+        // BEFORE record_crash, so the loop's restart-counter never starts.
+        expect(bpool.get_crash_history().get(id) ?? []).toHaveLength(0);
+      }
+
+      // Across the whole simulated loop: not a single respawn.
       expect(local_start).not.toHaveBeenCalled();
-      // The crash-loop counter never even ticked — release-to-dark short-circuits
-      // BEFORE record_crash.
-      expect(bpool.get_crash_history().get(4) ?? []).toHaveLength(0);
-      expect(bpool.get_bots()[0].state).toBe("free");
     });
 
     it("restart-time reconcile releases a half-spawned broker bot to dark, no respawn", async () => {

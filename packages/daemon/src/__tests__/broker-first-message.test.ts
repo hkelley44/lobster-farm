@@ -353,7 +353,7 @@ describe("concurrent cold-start: single session, one reply per message (#83)", (
     await broker.stop().catch(() => {});
   });
 
-  it("feeds a concurrent inbound straight to the queue once ownership is registered", async () => {
+  it("feeds a concurrent inbound straight to the queue in the ownership-registered-but-not-yet-assigned window", async () => {
     await ensure_dir();
     const config = make_config(true);
     const pool = new TestPool(config);
@@ -369,23 +369,36 @@ describe("concurrent cold-start: single session, one reply per message (#83)", (
     await mkdir(state_dir, { recursive: true });
     pool.inject_bots([make_bot(4, state_dir)]);
 
-    // Cold-start completes first (ownership registered).
-    await pool.assign(
-      PILOT_CHANNEL,
-      "entity-1",
-      "planner",
-      undefined,
-      undefined,
-      undefined,
-      PENDING,
-    );
+    // Reproduce the NARROW race window this branch actually serves in production,
+    // not "assign fully done". Inside assign(), prepare_broker_session registers
+    // ownership (broker_owns → true) BEFORE bot.state is flipped to "assigned".
+    // During that sub-window a second inbound in discord.ts sees get_assignment()
+    // === undefined (state not yet "assigned"), so it takes the auto-assign branch;
+    // that assign() returns null because the channel is already in
+    // assigning_channels, and the caller falls through to
+    // deliver_or_buffer_broker_inbound. broker_owns is already true, so the message
+    // is fed straight to the queue. If we let assign() fully complete instead,
+    // get_assignment() would succeed and discord.ts would route through the
+    // steady-state feed_broker_inbound() branch — this method would never be
+    // reached that way. So we set up the exact window: ownership registered, bot
+    // still free.
+    broker.register_channel(PILOT_CHANNEL, {
+      bot_id: 4,
+      state_dir,
+      chunk_config: {},
+    });
     expect(pool.broker_owns(PILOT_CHANNEL)).toBe(true);
+    // The bot is NOT yet "assigned" — get_assignment() (the discord.ts gate) is empty.
+    expect(pool.get_assignment(PILOT_CHANNEL)).toBeUndefined();
 
     const feed_spy = vi.spyOn(broker, "feed");
     const taken = pool.deliver_or_buffer_broker_inbound(PILOT_CHANNEL, MSG2);
 
     expect(taken).toBe(true);
-    // Fed straight through — no buffering needed, one session already live.
+    // Fed straight through — ownership is registered, so no buffering: the message
+    // lands on the single cold-recreating session rather than being dropped as
+    // "busy". (This asserts delivery in this window, not global order relative to
+    // message #1 — see #83 ordering note in the buffer/drain test above.)
     expect(feed_spy).toHaveBeenCalledTimes(1);
     expect(feed_spy.mock.calls[0]![0]).toMatchObject({ content: MSG2.content });
 
