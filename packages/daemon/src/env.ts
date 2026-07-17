@@ -15,6 +15,10 @@ const REQUIRED_BINARIES = ["node", "claude", "git", "gh", "tmux", "bun"] as cons
 const RECOMMENDED_BINARIES = ["op"] as const;
 
 // Env vars that must be available in tmux sessions spawned by the pool.
+// OP_SERVICE_ACCOUNT_TOKEN here is the PLATFORM token, propagated as the tmux
+// GLOBAL fallback. Per-entity tokens override it per-session in pool.ts
+// (resolve_entity_op_token) — see issue #93. Entities without a dedicated token
+// inherit this global, preserving prior behavior exactly.
 const TMUX_PROPAGATED_VARS = ["PATH", "HOME", "BUN_INSTALL", "OP_SERVICE_ACCOUNT_TOKEN"] as const;
 
 /**
