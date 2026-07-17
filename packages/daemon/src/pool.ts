@@ -2112,6 +2112,61 @@ export class BotPool extends EventEmitter {
   }
 
   /**
+   * Stash a session_id into session_history for a future `--resume`, gated on
+   * the single precondition shared by both terminal release paths
+   * (`handle_crash_loop` and `release_broker_to_dark`): the session is
+   * `session_confirmed` AND its JSONL still exists on disk *right now*.
+   *
+   * Why the disk pre-flight and not `session_confirmed` alone: `session_confirmed`
+   * proves the JSONL existed at *confirmation* time, which can be minutes or
+   * hours before a terminal path fires. Between confirmation and release the
+   * JSONL can vanish (crash corruption, `~/.claude/projects` cleanup, manual
+   * deletion). Stashing a session whose JSONL is gone plants a phantom UUID: the
+   * next cold-recreate `--resume`s a non-existent transcript and burns crash-loop
+   * retries (issue #256). Confirmation is the *floor*; the live disk check is the
+   * gate. `handle_crash_loop` always did this; `release_broker_to_dark` did not,
+   * which is the gap #92 closes — the two paths now share this one helper so
+   * their stash precondition can't drift again.
+   *
+   * Logs the outcome (stashed / skipped-unconfirmed / skipped-JSONL-missing) and
+   * returns true iff it stashed.
+   *
+   * @param label short context string threaded into the log lines (e.g.
+   *   "crash-loop", "broker release-to-dark") so logs stay path-specific.
+   */
+  protected async stash_session_history(
+    session_id: string | null,
+    session_confirmed: boolean,
+    channel_id: string | null,
+    entity_id: string | null,
+    label: string,
+  ): Promise<boolean> {
+    if (!session_id || !channel_id || !entity_id) return false;
+
+    if (!session_confirmed) {
+      console.warn(`[pool] Not stashing unconfirmed ${label} session ${session_id.slice(0, 8)}`);
+      return false;
+    }
+
+    // Confirmed once, but re-verify the JSONL is still on disk — a session that
+    // was confirmed earlier can have its transcript deleted before we release.
+    if (!(await this.check_session_jsonl_exists_anywhere(session_id))) {
+      console.warn(
+        `[pool] Not stashing ${label} session ${session_id.slice(0, 8)} — JSONL missing`,
+      );
+      return false;
+    }
+
+    const key = `${entity_id}:${channel_id}`;
+    this.session_history.set(key, session_id);
+    this.session_history_ts.set(key, Date.now());
+    console.log(
+      `[pool] Stashed ${label} session history for ${key}: ${session_id.slice(0, 8)} (cold-recreate on next inbound)`,
+    );
+    return true;
+  }
+
+  /**
    * Release a broker bot to a dark (free, no live session) state without
    * respawning it (#89). This is the terminal behavior for broker channels on
    * the two non-message-driven session-creation paths — proactive-resume and
@@ -2121,9 +2176,9 @@ export class BotPool extends EventEmitter {
    *
    * What it does:
    *   - Stashes `session_id` into session_history so the next inbound cold-
-   *     recreates with `--resume` (continuity — lazy ≠ amnesiac). Only a
-   *     confirmed session is stashed to avoid planting a phantom UUID that would
-   *     make `assign()` --resume a non-existent JSONL (issue #256 discipline).
+   *     recreates with `--resume` (continuity — lazy ≠ amnesiac). The stash goes
+   *     through `stash_session_history`, the SAME confirmed-AND-JSONL-on-disk
+   *     gate `handle_crash_loop` uses — no phantom UUID can be planted (#256/#92).
    *   - Kills tmux, clears access.json, frees the bot.
    *   - Drops broker OWNERSHIP only (`deregister_channel`) — it does NOT clear
    *     the durable queue, so any unacked inbound stays for at-least-once
@@ -2140,17 +2195,16 @@ export class BotPool extends EventEmitter {
     const channel_id = bot.channel_id;
     const entity_id = bot.entity_id;
 
-    // Stash for --resume continuity. Mirror the crash-loop/restart discipline:
-    // only stash a *confirmed* session (JSONL known on disk) so the cold-recreate
-    // doesn't --resume a phantom UUID and burn crash-loop retries (#256).
-    if (session_id && bot.session_confirmed && channel_id && entity_id) {
-      const key = `${entity_id}:${channel_id}`;
-      this.session_history.set(key, session_id);
-      this.session_history_ts.set(key, Date.now());
-      console.log(
-        `[pool] Stashed broker session history for ${key}: ${session_id.slice(0, 8)} (released to dark — cold-recreate on next inbound)`,
-      );
-    }
+    // Stash for --resume continuity via the shared confirmed-AND-JSONL-on-disk
+    // gate (#92) — identical to handle_crash_loop, so a stash can never silently
+    // no-op differently between the two terminal paths.
+    await this.stash_session_history(
+      session_id,
+      bot.session_confirmed,
+      channel_id,
+      entity_id,
+      "broker release-to-dark",
+    );
 
     // Fire memory extraction before we null the bot's metadata (fire-and-forget;
     // the gate snapshots synchronously). No-op if there's nothing to summarize.
@@ -2871,26 +2925,18 @@ export class BotPool extends EventEmitter {
     const entity_config = entity_id ? this.registry?.get(entity_id) : undefined;
 
     // Stash session history before release so the channel can resume later.
-    // A crash-looping session is almost certainly broken — only stash if the
-    // JSONL still exists on disk. Planting a phantom UUID here is how the
-    // original bug self-perpetuated: the next assignment would pull the dead
-    // UUID out of history and re-enter the crash loop (issue #256).
-    if (bot.session_id && bot.session_confirmed && channel_id && entity_id) {
-      const exists = await this.check_session_jsonl_exists_anywhere(bot.session_id);
-      if (exists) {
-        const key = `${entity_id}:${channel_id}`;
-        this.session_history.set(key, bot.session_id);
-        this.session_history_ts.set(key, Date.now());
-      } else {
-        console.warn(
-          `[pool] Not stashing crash-loop session ${bot.session_id.slice(0, 8)} — JSONL missing`,
-        );
-      }
-    } else if (bot.session_id && !bot.session_confirmed) {
-      console.warn(
-        `[pool] Not stashing unconfirmed crash-loop session ${bot.session_id.slice(0, 8)}`,
-      );
-    }
+    // A crash-looping session is almost certainly broken — the shared gate only
+    // stashes if the session is confirmed AND its JSONL still exists on disk.
+    // Planting a phantom UUID here is how the original bug self-perpetuated: the
+    // next assignment would pull the dead UUID out of history and re-enter the
+    // crash loop (issue #256). Same gate as release_broker_to_dark (#92).
+    await this.stash_session_history(
+      bot.session_id,
+      bot.session_confirmed,
+      channel_id,
+      entity_id,
+      "crash-loop",
+    );
 
     // Release the bot — this kills tmux, frees the bot, clears access.json
     if (channel_id) {

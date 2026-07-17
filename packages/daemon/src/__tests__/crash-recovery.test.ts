@@ -1106,6 +1106,124 @@ describe("crash recovery (issue #157)", () => {
       expect(bpool.get_session_history().has(`test-entity:${BROKER_CHANNEL}`)).toBe(false);
     });
 
+    // ── #92: release_broker_to_dark and handle_crash_loop share one stash gate ──
+    //
+    // The AC edge case: a broker bot released-to-dark with a confirmed session
+    // must still yield a resumable resume_session_id — UNLESS the JSONL is gone
+    // at release time, in which case stashing it would plant a phantom UUID that
+    // silently drops --resume continuity on the next cold-recreate. Both terminal
+    // paths now route the stash through the SAME confirmed-AND-JSONL-on-disk gate
+    // (stash_session_history), so they can't drift.
+
+    it("confirmed session with JSONL on disk yields a resumable resume_session_id (#92)", async () => {
+      const { pool: bpool } = make_broker_pool();
+      // BotPoolTestBase stubs check_session_jsonl_exists_anywhere → true, i.e. the
+      // confirmed session's transcript is still present on disk at release time.
+      const bot = make_bot({
+        id: 3,
+        state: "assigned",
+        channel_id: BROKER_CHANNEL,
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-broker-confirmed",
+        session_confirmed: true,
+      });
+      bpool.inject_bots([bot]);
+
+      await bpool.run_health_check();
+
+      expect(bpool.get_bots()[0].state).toBe("free");
+      // Continuity preserved: the id the cold-recreate will --resume from.
+      expect(bpool.get_session_history().get(`test-entity:${BROKER_CHANNEL}`)).toBe(
+        "sess-broker-confirmed",
+      );
+    });
+
+    it("confirmed session whose JSONL vanished before release is NOT stashed — no phantom --resume (#92)", async () => {
+      const { pool: bpool } = make_broker_pool();
+      // Simulate the gap the disk pre-flight closes: the session was confirmed
+      // earlier (session_confirmed = true) but its transcript was deleted between
+      // confirmation and release (crash corruption / ~/.claude cleanup). Without
+      // the disk re-check, release_broker_to_dark would stash a dead UUID and the
+      // next cold-recreate would --resume a non-existent JSONL (#256/#92).
+      vi.spyOn(
+        bpool as unknown as Record<string, unknown>,
+        "check_session_jsonl_exists_anywhere" as never,
+      ).mockResolvedValue(false as never);
+
+      const bot = make_bot({
+        id: 3,
+        state: "assigned",
+        channel_id: BROKER_CHANNEL,
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-jsonl-gone",
+        session_confirmed: true, // confirmed once — but the file is gone now
+      });
+      bpool.inject_bots([bot]);
+
+      await bpool.run_health_check();
+
+      expect(bpool.get_bots()[0].state).toBe("free");
+      // Not stashed: the cold-recreate spawns fresh rather than --resume-ing a
+      // phantom. session_confirmed alone would (wrongly) have stashed it — this is
+      // exactly the silent continuity-drop #92 guards against.
+      expect(bpool.get_session_history().has(`test-entity:${BROKER_CHANNEL}`)).toBe(false);
+    });
+
+    it("release_broker_to_dark and handle_crash_loop stash on the SAME gate (#92)", async () => {
+      // Both terminal paths must decline to stash a confirmed-but-JSONL-missing
+      // session identically. Drive each with a vanished JSONL and assert neither
+      // stashes — proving the shared gate, not two divergent inline checks.
+
+      // Path A: watchdog release-to-dark with JSONL gone.
+      const { pool: pool_a } = make_broker_pool();
+      vi.spyOn(
+        pool_a as unknown as Record<string, unknown>,
+        "check_session_jsonl_exists_anywhere" as never,
+      ).mockResolvedValue(false as never);
+      pool_a.inject_bots([
+        make_bot({
+          id: 3,
+          state: "assigned",
+          channel_id: BROKER_CHANNEL,
+          entity_id: "test-entity",
+          archetype: "planner",
+          session_id: "sess-a",
+          session_confirmed: true,
+        }),
+      ]);
+      await pool_a.run_health_check();
+
+      // Path B: crash-loop release with JSONL gone (plugin channel, so it takes
+      // the record_crash → handle_crash_loop path, not release_broker_to_dark).
+      const { pool: pool_b } = make_broker_pool();
+      vi.spyOn(
+        pool_b as unknown as Record<string, unknown>,
+        "check_session_jsonl_exists_anywhere" as never,
+      ).mockResolvedValue(false as never);
+      const PLUGIN_CHANNEL = "ch-not-in-allowlist";
+      pool_b.inject_bots([
+        make_bot({
+          id: 4,
+          state: "assigned",
+          channel_id: PLUGIN_CHANNEL,
+          entity_id: "test-entity",
+          archetype: "planner",
+          session_id: "sess-b",
+          session_confirmed: true,
+        }),
+      ]);
+      // 3 prior crashes in the last hour → this tick's crash trips the loop.
+      const now = Date.now();
+      pool_b.get_crash_history().set(4, [now - 45 * 60_000, now - 20 * 60_000, now - 5 * 60_000]);
+      await pool_b.run_health_check();
+
+      // Neither path stashed the vanished session.
+      expect(pool_a.get_session_history().has(`test-entity:${BROKER_CHANNEL}`)).toBe(false);
+      expect(pool_b.get_session_history().has(`test-entity:${PLUGIN_CHANNEL}`)).toBe(false);
+    });
+
     it("PLUGIN channel is unaffected — still respawns on dead tmux (flag-scoped)", async () => {
       // Same broker-enabled config, but this channel is NOT in the pilot allowlist
       // → uses_broker() is false → unchanged plugin respawn path.
