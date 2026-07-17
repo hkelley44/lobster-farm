@@ -627,14 +627,26 @@ export class BotPool extends EventEmitter {
    * start path: the caller (discord.ts) reached here because `assign()` returned
    * null for a broker channel. We disambiguate:
    *
-   *   - Ownership already registered → the winning assign finished registering;
-   *     feed the message straight to the queue (steady-state delivery).
    *   - Assign still in flight (`assigning_channels`) → buffer the message; the
-   *     winning assign drains the buffer into the queue right after it registers
-   *     ownership, preserving order.
+   *     winning assign drains the buffer into the queue right after it feeds
+   *     message #1, preserving strict arrival order (msg#1 before this one).
+   *   - Not assigning, but ownership already registered → the winning assign
+   *     finished and released its lock, so message #1 is already in the queue;
+   *     feed this straight to the queue (steady-state delivery).
    *   - Neither → there is no cold-start underway (e.g. the pool was genuinely
    *     exhausted); return false so the caller can surface "busy". No message is
    *     enqueued, so redelivery isn't relied on for a message that has no owner.
+   *
+   * Order matters: `assigning_channels` is checked BEFORE `broker_owns` because
+   * ownership flips true partway through assign() (inside start_tmux →
+   * register_channel) while the assign still holds its in-flight lock — and there
+   * is an `await` between that registration and the message-#1 feed. A concurrent
+   * inbound landing in that sub-window sees `broker_owns` true but msg#1 NOT yet
+   * queued; a straight-through feed there would land it AHEAD of msg#1 → #83
+   * ordering inversion. Gating on the assign lock (held for the whole
+   * register→feed→drain span) forces such inbound into the buffer, which assign()
+   * drains strictly after msg#1. `broker_owns` is only trusted as a
+   * straight-through signal once the assign lock is gone, i.e. msg#1 is fed.
    *
    * Returns true if the message was delivered or buffered (caller must NOT also
    * reply "busy"), false if it couldn't be placed. Self-gates on `uses_broker`
@@ -645,10 +657,9 @@ export class BotPool extends EventEmitter {
     // Plugin channels (and flag-OFF) never touch the broker buffer — return
     // false immediately so the caller's existing "busy" path is byte-identical.
     if (!this.uses_broker(channel_id)) return false;
-    if (this.broker_owns(channel_id)) {
-      this.feed_broker_pending(channel_id, pending);
-      return true;
-    }
+    // Assign in flight → buffer regardless of ownership state. See docstring:
+    // ownership can be true mid-assign before msg#1 is fed, so we must NOT feed
+    // straight through here or we'd reorder ahead of msg#1.
     if (this.assigning_channels.has(channel_id)) {
       const buf = this.broker_coldstart_buffer.get(channel_id) ?? [];
       buf.push(pending);
@@ -657,6 +668,12 @@ export class BotPool extends EventEmitter {
         `[pool] Buffered concurrent broker inbound for ${channel_id} during cold-start ` +
           `(${String(buf.length)} queued)`,
       );
+      return true;
+    }
+    // No assign in flight but ownership registered → assign finished and msg#1 is
+    // already queued; safe to feed straight through as an ordered follow-up.
+    if (this.broker_owns(channel_id)) {
+      this.feed_broker_pending(channel_id, pending);
       return true;
     }
     return false;
