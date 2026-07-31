@@ -23,5 +23,6 @@ The `lf` command-line tool for managing the LobsterFarm daemon and entities. Bui
 
 ### lib/
 
-- `launchd.ts` -- macOS launchd integration. Generates plist XML, loads/unloads the service via `launchctl`, and checks service status.
+- `launchd.ts` -- macOS launchd integration. Generates the wrapper script (`op inject` + `exec node`, never `op run -- node`, so node is never orphaned holding the port -- issue #97), plist XML, loads/unloads the service via `launchctl`, and reads job state (`get_launchd_job_state`).
+- `daemon-health.ts` -- Reconciles the PID file against launchd's view (issue #97). `parse_launchd_print` extracts state/pid/runs/last-exit; `classify_daemon_health` labels the daemon `healthy` / `crash_looping` / `split_brain` / `stopped` / `not_managed` so `lf status` and `lf start` surface crash loops instead of reporting a false "running". Pure and unit-tested.
 - `process.ts` -- Process utilities: PID file reading, process liveness check (signal 0), and shell command execution via the user's login shell.

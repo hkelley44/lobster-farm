@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { LAUNCHD_LABEL } from "@lobster-farm/shared";
+import { type LaunchdJobState, UNLOADED_JOB, parse_launchd_print } from "./daemon-health.js";
 
 // Binaries the daemon ecosystem needs available in PATH.
 const DETECTED_BINARIES = ["bun", "node", "claude", "git", "gh", "tmux", "op"] as const;
@@ -110,8 +111,16 @@ ${env_section}`;
  * and exec's the daemon.
  *
  * If ~/.lobsterfarm/.env.op exists and `op` is on PATH, secrets are resolved
- * via `op run --env-file` at startup — this injects GitHub App, Sentry, and
- * any other 1Password-backed env vars into the daemon process.
+ * via `op inject` and exported into the environment *before* the wrapper
+ * `exec`s node. node then replaces the wrapper as the launchd-tracked leaf.
+ *
+ * We deliberately do NOT use `op run -- node` (#97): `op run` does not `exec`
+ * its child — it spawns node as a subprocess and supervises it. If `op run`
+ * dies while node lives (token refresh, transient error), node is reparented
+ * to PID 1 and keeps holding the daemon port (7749) with no supervisor.
+ * launchd then respawns the wrapper, and every fresh node throws EADDRINUSE.
+ * `exec`ing node directly guarantees node is the process launchd tracks, so it
+ * can never be orphaned behind a dead supervisor.
  *
  * @param node_path   Absolute path to the node binary.
  * @param daemon_path Absolute path to the daemon entry point (index.js).
@@ -120,7 +129,7 @@ export function generate_wrapper_sh(node_path: string, daemon_path: string): str
   const home = homedir();
   return `#!/bin/zsh
 # LobsterFarm daemon wrapper — managed by \`lf start\`, do not edit.
-# Sources env.sh for PATH and secrets, then exec's the daemon.
+# Sources env.sh for PATH, injects 1Password secrets, then exec's the daemon.
 
 ENV_FILE="${home}/.lobsterfarm/env.sh"
 
@@ -132,14 +141,30 @@ fi
 
 source "$ENV_FILE"
 
-# Resolve 1Password secrets (.env.op) if available — injects GitHub App, Sentry, etc.
+# Resolve 1Password secrets (.env.op) into the environment if available, then
+# exec node directly. We use \`op inject\` (not \`op run -- node\`) so node
+# becomes the launchd-tracked leaf and can never be orphaned behind a dead
+# \`op run\` supervisor while still holding port 7749 (#97).
 ENV_OP="${home}/.lobsterfarm/.env.op"
 if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
-  exec op run --env-file "$ENV_OP" -- "${node_path}" --max-old-space-size=8192 "${daemon_path}"
+  # \`op inject\` substitutes op:// references in the env-file and prints
+  # KEY=value lines (dotenv format, unquoted values). Parse line by line and
+  # export literally — no \`eval\`, so secret values with shell metacharacters
+  # are handled safely. IFS='=' splits on the first '=' only; the remainder
+  # (including any further '=') stays in the value.
+  if resolved_secrets="$(op inject -i "$ENV_OP" 2>/dev/null)"; then
+    while IFS='=' read -r key value; do
+      [[ -z "$key" || "$key" == '#'* ]] && continue
+      export "$key=$value"
+    done <<< "$resolved_secrets"
+  else
+    echo "[start-daemon] WARNING: op inject failed — continuing without 1Password secrets" >&2
+  fi
 else
   echo "[start-daemon] WARNING: .env.op or op CLI not found — secrets from 1Password will not be injected" >&2
-  exec "${node_path}" --max-old-space-size=8192 "${daemon_path}"
 fi
+
+exec "${node_path}" --max-old-space-size=8192 "${daemon_path}"
 `;
 }
 
@@ -215,4 +240,20 @@ export async function is_service_loaded(): Promise<boolean> {
     `launchctl print gui/${uid}/${LAUNCHD_LABEL} 2>/dev/null`,
   );
   return exitCode === 0;
+}
+
+/**
+ * Query launchd for the daemon job's live state (state, pid, runs, last exit
+ * code). Returns UNLOADED_JOB when launchd doesn't manage the job.
+ *
+ * This is the observability signal the PID file cannot give us (#97): it is the
+ * only way to see a crash loop (`runs` climbing with a nonzero `last exit
+ * code`) or a split-brain (launchd's pid disagreeing with the PID file).
+ */
+export async function get_launchd_job_state(): Promise<LaunchdJobState> {
+  const { exec_command } = await import("./process.js");
+  const uid = process.getuid?.() ?? 501;
+  const { stdout, exitCode } = await exec_command(`launchctl print gui/${uid}/${LAUNCHD_LABEL}`);
+  if (exitCode !== 0) return UNLOADED_JOB;
+  return parse_launchd_print(stdout);
 }

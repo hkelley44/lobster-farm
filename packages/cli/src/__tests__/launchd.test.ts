@@ -143,19 +143,53 @@ describe("generate_wrapper_sh", () => {
       "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js",
     );
 
-    // Both the op-run path and the fallback should include the correct node/daemon paths
+    // node is exec'd directly with the daemon entry point.
     expect(result).toContain(
-      '"/opt/homebrew/bin/node" --max-old-space-size=8192 "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js"',
+      'exec "/opt/homebrew/bin/node" --max-old-space-size=8192 "/Users/farm/.lobsterfarm/src/packages/daemon/dist/index.js"',
     );
   });
 
-  it("uses op run to inject secrets from .env.op when available", () => {
+  it("uses op inject (not op run) to load secrets from .env.op", () => {
     const result = generate_wrapper_sh("/opt/homebrew/bin/node", "/path/to/daemon/index.js");
 
-    expect(result).toContain("op run --env-file");
+    // Secrets are resolved via `op inject` and exported into the env.
+    expect(result).toContain("op inject -i");
     expect(result).toContain(".env.op");
-    // Should have a fallback when op or .env.op is not available
+    // Should warn when op/.env.op are unavailable or injection fails.
     expect(result).toContain("WARNING");
+  });
+
+  // Non-comment executable lines of the wrapper — the comments deliberately
+  // discuss the `op run` / `eval` anti-patterns, so the invariant checks below
+  // must look only at what the shell actually runs.
+  const executable_lines = (script: string): string[] =>
+    script.split("\n").filter((l) => {
+      const t = l.trimStart();
+      return t.length > 0 && !t.startsWith("#");
+    });
+
+  it("never wraps node as an `op run` child (no-orphan invariant, #97)", () => {
+    const result = generate_wrapper_sh("/opt/homebrew/bin/node", "/path/to/daemon/index.js");
+
+    // `op run -- node` is exactly the pattern that orphaned node behind a dead
+    // supervisor while it kept holding :7749. No executable line may invoke it.
+    for (const line of executable_lines(result)) {
+      expect(line).not.toContain("op run");
+    }
+    // node must be the exec'd leaf — exactly one exec, and it's node.
+    const exec_lines = executable_lines(result).filter((l) => l.trimStart().startsWith("exec "));
+    expect(exec_lines).toHaveLength(1);
+    expect(exec_lines[0]).toContain('"/opt/homebrew/bin/node"');
+  });
+
+  it("exports injected secrets without eval (safe for shell metacharacters)", () => {
+    const result = generate_wrapper_sh("/opt/homebrew/bin/node", "/path/to/daemon/index.js");
+
+    // Line-by-line literal export, and no `eval` of resolved secret values.
+    expect(result).toContain('export "$key=$value"');
+    for (const line of executable_lines(result)) {
+      expect(line).not.toMatch(/\beval\b/);
+    }
   });
 
   it("references env.sh in the standard location", () => {

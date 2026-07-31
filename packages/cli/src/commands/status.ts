@@ -1,5 +1,7 @@
 import { DAEMON_PORT, pid_file_path } from "@lobster-farm/shared";
 import { Command } from "commander";
+import { classify_daemon_health } from "../lib/daemon-health.js";
+import { get_launchd_job_state } from "../lib/launchd.js";
 import { is_process_running, read_pid_file } from "../lib/process.js";
 
 /** Shape returned by the daemon's GET /status endpoint. */
@@ -55,6 +57,21 @@ export const status_command = new Command("status")
     // Check PID file
     const pid = await read_pid_file(pid_file_path());
     const running = pid !== null && is_process_running(pid);
+
+    // Reconcile the PID file against launchd's own view. The PID file alone
+    // can't distinguish "healthy" from "crash-looping" or "orphaned" (#97) —
+    // launchd knows the real state (runs count, last exit code, tracked pid).
+    const launchd = await get_launchd_job_state();
+    const health = classify_daemon_health(pid, running, launchd);
+
+    if (health.warn) {
+      console.log(`⚠ ${health.summary}`);
+      if (launchd.loaded) {
+        console.log(
+          `  launchd: state=${launchd.state ?? "?"}, runs=${launchd.runs ?? "?"}, last exit=${launchd.last_exit_code ?? "n/a"}, pid=${launchd.pid ?? "none"}`,
+        );
+      }
+    }
 
     if (!running) {
       console.log("LobsterFarm daemon: not running");
