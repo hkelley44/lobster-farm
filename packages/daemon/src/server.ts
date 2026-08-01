@@ -35,6 +35,7 @@ import {
 } from "./sentry-triage.js";
 import * as sentry from "./sentry.js";
 import type { ClaudeSessionManager } from "./session.js";
+import { classify_listen_error, read_incumbent_pid } from "./singleton.js";
 import { type WebhookContext, handle_github_webhook } from "./webhook-handler.js";
 
 interface ServerContext {
@@ -1189,6 +1190,7 @@ export function start_server(
   alert_router: AlertRouter | null = null,
   review_leases: ReviewLeaseStore | null = null,
   port: number = DAEMON_PORT,
+  existing_server: Server | null = null,
 ): Server {
   const ctx: ServerContext = {
     registry,
@@ -1204,10 +1206,27 @@ export function start_server(
     review_leases,
   };
 
-  const server = createServer((req, res) => {
+  const on_request = (req: IncomingMessage, res: ServerResponse) => {
     route_request(req, res, ctx);
-  });
+  };
 
+  // The singleton guard (#97) may have already bound the port via
+  // acquire_port(); if so we just attach the request handler to that listener.
+  if (existing_server) {
+    existing_server.on("request", on_request);
+    console.log(`LobsterFarm daemon listening on http://localhost:${String(port)}`);
+    return existing_server;
+  }
+
+  // Self-managed path (tests, or callers that don't pre-bind). Handle
+  // EADDRINUSE here too so a conflict is a clean stand-aside, never an uncaught
+  // exception that KeepAlive blind-loops on.
+  const server = createServer(on_request);
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    const verdict = classify_listen_error(err, port, read_incumbent_pid());
+    console.error(`[singleton] ${verdict.message}`);
+    process.exit(verdict.exit_code);
+  });
   server.listen(port, () => {
     console.log(`LobsterFarm daemon listening on http://localhost:${String(port)}`);
   });

@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { LAUNCHD_LABEL } from "@lobster-farm/shared";
+import { type LaunchdJobState, UNLOADED_JOB, parse_launchd_print } from "./daemon-health.js";
 
 // Binaries the daemon ecosystem needs available in PATH.
 const DETECTED_BINARIES = ["bun", "node", "claude", "git", "gh", "tmux", "op"] as const;
@@ -110,17 +111,48 @@ ${env_section}`;
  * and exec's the daemon.
  *
  * If ~/.lobsterfarm/.env.op exists and `op` is on PATH, secrets are resolved
- * via `op run --env-file` at startup — this injects GitHub App, Sentry, and
- * any other 1Password-backed env vars into the daemon process.
+ * via `op inject` and exported into the environment *before* the wrapper
+ * `exec`s node. node then replaces the wrapper as the launchd-tracked leaf.
+ *
+ * We deliberately do NOT use `op run -- node` (#97): `op run` does not `exec`
+ * its child — it spawns node as a subprocess and supervises it. If `op run`
+ * dies while node lives (token refresh, transient error), node is reparented
+ * to PID 1 and keeps holding the daemon port (7749) with no supervisor.
+ * launchd then respawns the wrapper, and every fresh node throws EADDRINUSE.
+ * `exec`ing node directly guarantees node is the process launchd tracks, so it
+ * can never be orphaned behind a dead supervisor.
+ *
+ * ## Secret-file contract (what `op run --env-file` used to do for us)
+ *
+ * Dropping `op run` means we own dotenv parsing. The emitted parser handles
+ * unquoted single-line values, single/double-quoted values (surrounding quotes
+ * stripped), and **quoted multi-line values** — which is how a PEM private key
+ * must be written in `.env.op`:
+ *
+ *     GITHUB_APP_PRIVATE_KEY="op://lobsterfarm/github-app/private-key"
+ *
+ * `op inject` is a literal template substitution, so it preserves those quotes
+ * and drops the (multi-line) secret between them. The quotes are what make a
+ * continuation line distinguishable from a new `KEY=value` assignment.
+ *
+ * An **unquoted** multi-line value is genuinely ambiguous — a PEM body line can
+ * itself look like an assignment (`AbCdEf==`). Rather than silently exporting a
+ * truncated key (the #98 review finding), the parser drops the partial value and
+ * warns. Warnings name the key only, never the value: this output goes to
+ * daemon.log.
  *
  * @param node_path   Absolute path to the node binary.
  * @param daemon_path Absolute path to the daemon entry point (index.js).
+ * @param home        Root for env.sh / .env.op lookups. Overridable for tests.
  */
-export function generate_wrapper_sh(node_path: string, daemon_path: string): string {
-  const home = homedir();
+export function generate_wrapper_sh(
+  node_path: string,
+  daemon_path: string,
+  home: string = homedir(),
+): string {
   return `#!/bin/zsh
 # LobsterFarm daemon wrapper — managed by \`lf start\`, do not edit.
-# Sources env.sh for PATH and secrets, then exec's the daemon.
+# Sources env.sh for PATH, injects 1Password secrets, then exec's the daemon.
 
 ENV_FILE="${home}/.lobsterfarm/env.sh"
 
@@ -132,14 +164,151 @@ fi
 
 source "$ENV_FILE"
 
-# Resolve 1Password secrets (.env.op) if available — injects GitHub App, Sentry, etc.
+# Resolve 1Password secrets (.env.op) into the environment if available, then
+# exec node directly. We use \`op inject\` (not \`op run -- node\`) so node
+# becomes the launchd-tracked leaf and can never be orphaned behind a dead
+# \`op run\` supervisor while still holding port 7749 (#97).
+#
+# \`op inject\` substitutes op:// references in the env-file and prints the
+# resolved dotenv text. We parse it and export literally — no \`eval\`, so
+# secret values containing shell metacharacters are safe.
+#
+# MULTI-LINE SECRETS MUST BE QUOTED IN .env.op:
+#   GITHUB_APP_PRIVATE_KEY="op://lobsterfarm/github-app/private-key"
+# \`op inject\` preserves the surrounding quotes, which makes a multi-line value
+# unambiguous on sight.
+#
+# Quoting alone is not enough to stay safe when someone forgets it, because a
+# PEM body line can itself look like an assignment (\`AbCdEf==\` parses as
+# key \`AbCdEf\`). So we do not guess from line shape alone: we first read the
+# KEY names that .env.op *declares*, before injection. The template holds
+# op:// references, never secret values, so reading it is safe and its keys are
+# safe to name in warnings. \`op inject\` only substitutes values — it never adds
+# or renames keys — so any line whose key was not declared is a continuation
+# line, however much it looks like an assignment.
 ENV_OP="${home}/.lobsterfarm/.env.op"
 if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
-  exec op run --env-file "$ENV_OP" -- "${node_path}" --max-old-space-size=8192 "${daemon_path}"
+  # Colon-delimited set of declared key names, e.g. ":FOO:BAR:".
+  op_declared=":"
+  op_undeclarable=0
+  # \`|| [[ -n "$op_line" ]]\` so a .env.op without a trailing newline does not
+  # silently lose its last declaration — read returns non-zero on EOF even when
+  # it produced a partial line, and a missing key here drops a real secret.
+  while IFS= read -r op_line || [[ -n "$op_line" ]]; do
+    op_line="\${op_line%$'\\r'}"
+    [[ "$op_line" =~ '^[[:space:]]*(#|$)' ]] && continue
+    if [[ "$op_line" =~ '^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=' ]]; then
+      op_declared="$op_declared\${match[2]}:"
+    else
+      # A line we cannot read as a declaration means our key set is incomplete,
+      # which would silently reclassify real assignments as continuation lines.
+      op_undeclarable=1
+    fi
+  done < "$ENV_OP"
+
+  if (( op_undeclarable )); then
+    echo "[start-daemon] WARNING: .env.op has line(s) that are not KEY=value declarations — secrets on those lines will not be injected. Expected form: KEY=op://vault/item/field" >&2
+  fi
+
+  if [[ "$op_declared" == ":" ]]; then
+    echo "[start-daemon] WARNING: .env.op declares no KEY=value entries — skipping secret injection" >&2
+  elif resolved_secrets="$(op inject -i "$ENV_OP" 2>/dev/null)"; then
+    op_key=""
+    op_value=""
+    op_quote=""
+    op_candidate=""
+    op_malformed=0
+
+    # Export the buffered assignment. Only *unquoted* values are ever buffered:
+    # they are the ambiguous ones, and deferring their export is what lets a
+    # following continuation line cancel a truncated value instead of shipping
+    # it. Quoted values are unambiguous and export the moment they close.
+    op_flush() {
+      [[ -n "$op_key" ]] && export "$op_key=$op_value"
+      op_key=""
+      op_value=""
+    }
+
+    while IFS= read -r op_line || [[ -n "$op_line" ]]; do
+      # Tolerate a CRLF-saved .env.op — otherwise a trailing \\r is silently
+      # baked into every value, or breaks a closing-quote match.
+      op_line="\${op_line%$'\\r'}"
+
+      # Inside a quoted multi-line value: accumulate until the closing quote.
+      if [[ -n "$op_quote" ]]; then
+        if [[ "$op_line" == *"$op_quote" ]]; then
+          op_line="\${op_line%$op_quote}"
+          op_value+=$'\\n'"$op_line"
+          op_quote=""
+          op_flush
+        else
+          op_value+=$'\\n'"$op_line"
+        fi
+        continue
+      fi
+
+      # Blank lines and comments neither open nor close an assignment.
+      [[ "$op_line" =~ '^[[:space:]]*(#|$)' ]] && continue
+
+      # A new assignment closes the previous one — but only if .env.op actually
+      # declared this key. That is what stops a PEM body line like \`AbCdEf==\`
+      # from masquerading as an assignment and flushing a truncated secret.
+      op_candidate=""
+      if [[ "$op_line" =~ '^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=' ]]; then
+        op_candidate="\${match[2]}"
+      fi
+      if [[ -n "$op_candidate" && "$op_declared" == *":$op_candidate:"* ]]; then
+        op_flush
+        op_key="$op_candidate"
+        op_value="\${op_line#*=}"
+        if [[ "$op_value" == '"'* || "$op_value" == "'"* ]]; then
+          op_quote="\${op_value:0:1}"
+          op_value="\${op_value:1}"
+          # Closes on the same line? Unambiguous — strip the quote and export.
+          if [[ -n "$op_value" && "$op_value" == *"$op_quote" ]]; then
+            op_value="\${op_value%$op_quote}"
+            op_quote=""
+            op_flush
+          fi
+        fi
+        # Unquoted values stay buffered until the next key, or EOF.
+        continue
+      fi
+
+      # Anything else is an unquoted continuation line, so the buffered value is
+      # a truncated secret. Drop it — a half PEM fails deep inside GitHub App
+      # auth, while an absent one fails loudly here. Never echo the line itself.
+      if [[ -n "$op_key" ]]; then
+        echo "[start-daemon] WARNING: unparseable line in resolved .env.op after key '$op_key' — value dropped" >&2
+      elif (( ! op_malformed )); then
+        echo "[start-daemon] WARNING: unparseable line in resolved .env.op — skipped" >&2
+      fi
+      op_malformed=1
+      op_key=""
+      op_value=""
+    done <<< "$resolved_secrets"
+
+    if [[ -n "$op_quote" ]]; then
+      echo "[start-daemon] WARNING: unterminated quote for key '$op_key' in resolved .env.op — value NOT exported" >&2
+      op_malformed=1
+    else
+      op_flush
+    fi
+
+    if (( op_malformed )); then
+      echo "[start-daemon] WARNING: multi-line secrets must be quoted in .env.op, e.g. KEY=\\"op://vault/item/field\\"" >&2
+    fi
+
+    unset resolved_secrets op_line op_key op_value op_quote op_candidate op_declared op_malformed
+    unset -f op_flush
+  else
+    echo "[start-daemon] WARNING: op inject failed — continuing without 1Password secrets" >&2
+  fi
 else
   echo "[start-daemon] WARNING: .env.op or op CLI not found — secrets from 1Password will not be injected" >&2
-  exec "${node_path}" --max-old-space-size=8192 "${daemon_path}"
 fi
+
+exec "${node_path}" --max-old-space-size=8192 "${daemon_path}"
 `;
 }
 
@@ -215,4 +384,20 @@ export async function is_service_loaded(): Promise<boolean> {
     `launchctl print gui/${uid}/${LAUNCHD_LABEL} 2>/dev/null`,
   );
   return exitCode === 0;
+}
+
+/**
+ * Query launchd for the daemon job's live state (state, pid, runs, last exit
+ * code). Returns UNLOADED_JOB when launchd doesn't manage the job.
+ *
+ * This is the observability signal the PID file cannot give us (#97): it is the
+ * only way to see a crash loop (`runs` climbing with a nonzero `last exit
+ * code`) or a split-brain (launchd's pid disagreeing with the PID file).
+ */
+export async function get_launchd_job_state(): Promise<LaunchdJobState> {
+  const { exec_command } = await import("./process.js");
+  const uid = process.getuid?.() ?? 501;
+  const { stdout, exitCode } = await exec_command(`launchctl print gui/${uid}/${LAUNCHD_LABEL}`);
+  if (exitCode !== 0) return UNLOADED_JOB;
+  return parse_launchd_print(stdout);
 }

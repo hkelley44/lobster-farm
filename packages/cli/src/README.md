@@ -23,5 +23,33 @@ The `lf` command-line tool for managing the LobsterFarm daemon and entities. Bui
 
 ### lib/
 
-- `launchd.ts` -- macOS launchd integration. Generates plist XML, loads/unloads the service via `launchctl`, and checks service status.
+- `launchd.ts` -- macOS launchd integration. Generates the wrapper script (`op inject` + `exec node`, never `op run -- node`, so node is never orphaned holding the port -- issue #97), plist XML, loads/unloads the service via `launchctl`, and reads job state (`get_launchd_job_state`).
+- `daemon-health.ts` -- Reconciles the PID file against launchd's view (issue #97). `parse_launchd_print` extracts state/pid/runs/last-exit; `classify_daemon_health` labels the daemon `healthy` / `crash_looping` / `split_brain` / `stopped` / `not_managed` so `lf status` and `lf start` surface crash loops instead of reporting a false "running". Pure and unit-tested.
 - `process.ts` -- Process utilities: PID file reading, process liveness check (signal 0), and shell command execution via the user's login shell.
+
+## `.env.op` format (daemon secrets)
+
+The daemon wrapper resolves `~/.lobsterfarm/.env.op` with `op inject` and parses the result itself, because it can no longer delegate to `op run --env-file` (that is what orphaned node on :7749 -- issue #97). The parser accepts standard dotenv, with one rule that `op run` did not impose:
+
+**Multi-line secrets must be quoted.**
+
+```sh
+# Single-line values -- quotes optional, stripped if present
+DISCORD_TOKEN=op://lobsterfarm/discord-daemon/token
+SENTRY_DSN="op://command-center/sentry/dsn"
+
+# Multi-line values (PEM keys) -- quotes REQUIRED
+GITHUB_APP_PRIVATE_KEY="op://lobsterfarm/github-app/private-key"
+```
+
+`op inject` is a literal template substitution: it preserves the surrounding quotes and drops the multi-line secret between them, which makes the value unambiguous on sight.
+
+Quoting alone is not enough to be *safe*, though, because a PEM body line can itself look like an assignment (`AbCdEf==` parses as key `AbCdEf`). So the wrapper does not decide "is this a new key?" from line shape. It first reads the key names `.env.op` **declares**, before injection -- the template holds `op://` references, never values, so reading it is safe and its keys are safe to name in warnings. `op inject` only substitutes values; it never adds or renames keys. Any line whose key was not declared is therefore a continuation line, however much it looks like an assignment.
+
+If a multi-line value is left unquoted, the wrapper **drops it and warns** to `daemon.log` rather than exporting a truncated key. That is deliberate: a half PEM fails deep inside GitHub App auth at request time, while an absent one fails visibly at startup. Warnings name the key only, never the value.
+
+`export KEY=op://...` is accepted as well as bare `KEY=op://...`.
+
+Also handled: CRLF-saved templates (a trailing `\r` is stripped rather than baked into every value); a template with no trailing newline (the last declaration is still read -- losing it would silently drop that secret *and* the one before it); a line that isn't a `KEY=value` declaration (warned, rather than quietly shrinking the key set); and a `.env.op` that declares no keys at all (injection is skipped with a warning instead of treating every line as garbage).
+
+All of this is covered end-to-end in `__tests__/launchd.test.ts` -- real `zsh`, a stub `op`, and a stub node that dumps the environment it was exec'd with, including the identifier-shaped-PEM-body case.

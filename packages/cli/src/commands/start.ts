@@ -6,10 +6,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { LAUNCHD_LABEL, daemon_log_path, expand_home, pid_file_path } from "@lobster-farm/shared";
 import { Command } from "commander";
+import { classify_daemon_health } from "../lib/daemon-health.js";
 import {
   generate_env_sh,
   generate_plist,
   generate_wrapper_sh,
+  get_launchd_job_state,
   is_service_loaded,
   load_service,
   plist_path,
@@ -131,6 +133,21 @@ export const start_command = new Command("start")
     const loaded = await is_service_loaded();
 
     if (running && !opts.upgrade) {
+      // Don't trust the PID file alone. In #97 it pointed at an orphaned node
+      // while launchd crash-looped underneath, and 'lf start' happily said
+      // "already running" 14,882 times. Cross-check launchd before no-op'ing.
+      const launchd = await get_launchd_job_state();
+      const health = classify_daemon_health(pid, running, launchd);
+      if (health.warn) {
+        console.log(`⚠ ${health.summary}`);
+        if (launchd.loaded) {
+          console.log(
+            `  launchd: state=${launchd.state ?? "?"}, runs=${launchd.runs ?? "?"}, last exit=${launchd.last_exit_code ?? "n/a"}, pid=${launchd.pid ?? "none"}`,
+          );
+        }
+        console.log("Run 'lf start --upgrade' to regenerate the wrapper and reconcile.");
+        return;
+      }
       console.log(`LobsterFarm daemon is already running (PID ${pid}).`);
       console.log("Use 'lf start --upgrade' to regenerate wrapper scripts and restart.");
       return;

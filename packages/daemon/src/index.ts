@@ -1,4 +1,5 @@
 import type { Server } from "node:http";
+import { DAEMON_PORT, daemon_log_path } from "@lobster-farm/shared";
 import { set_discord_bot, set_pool } from "./actions.js";
 import { AlertRouter } from "./alert-router.js";
 import { DiscordBroker } from "./broker/index.js";
@@ -7,6 +8,7 @@ import { load_config } from "./config.js";
 import { DiscordBot, resolve_bot_token } from "./discord.js";
 import { check_required_binaries, propagate_tmux_env } from "./env.js";
 import { init_github_app_from_env } from "./github-app.js";
+import { rotate_log_if_needed } from "./log-rotation.js";
 import { prune_daily_logs } from "./memory-pruning.js";
 import { append_session_log } from "./persistence.js";
 import { remove_pid, write_pid } from "./pid.js";
@@ -20,13 +22,26 @@ import * as sentry from "./sentry.js";
 import { start_server } from "./server.js";
 import { ClaudeSessionManager } from "./session.js";
 import type { ActiveSession, SessionResult } from "./session.js";
+import { acquire_port } from "./singleton.js";
 import { sweep_stale_worktrees } from "./worktree-cleanup.js";
 
 async function main(): Promise<void> {
+  // Rotate the launchd stdout/stderr log first, before we write anything, so a
+  // bloated log (61 MB in #97 — launchd never rotates StandardOutPath) is
+  // capped on every spawn. Best-effort; never blocks startup.
+  rotate_log_if_needed(daemon_log_path());
+
   console.log("Starting LobsterFarm daemon...");
 
   // Verify environment before any initialization
   check_required_binaries();
+
+  // Singleton guard (#97): bind the port up-front, before Discord/pool/commander
+  // come up. If another daemon already holds :7749 (e.g. an orphaned node from a
+  // dead `op run`), acquire_port() logs a single clear line and exits cleanly —
+  // instead of spinning up every subsystem, hammering the Discord gateway, and
+  // only then throwing an uncaught EADDRINUSE that KeepAlive blind-loops on.
+  const bound_server = await acquire_port(DAEMON_PORT);
 
   // Load global config
   const config = await load_config();
@@ -322,7 +337,8 @@ async function main(): Promise<void> {
   // handler. Instantiated once here so they contend on the same leases.
   const review_leases = new ReviewLeaseStore(config.pr_cron?.review_lease_ttl_ms);
 
-  // Start HTTP server
+  // Start HTTP server — reuse the socket acquire_port() already bound so there
+  // is no second listen() and no bind race with the singleton guard.
   const server = start_server(
     registry,
     config,
@@ -335,6 +351,8 @@ async function main(): Promise<void> {
     pr_watches,
     alert_router,
     review_leases,
+    DAEMON_PORT,
+    bound_server,
   );
 
   // Start PR review cron (safety net — 30 min when webhooks are active, 5 min otherwise)
