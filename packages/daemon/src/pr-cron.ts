@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
@@ -67,31 +68,68 @@ async function try_cleanup_worktree(
 }
 
 /**
+ * CI / coverage / deploy-preview bot accounts whose comments are never review
+ * feedback. GitHub Apps post under a `[bot]`-suffixed login; this denylist adds
+ * common integrations that can also comment without the suffix. Entries are
+ * lowercase — `is_bot_login` compares case-insensitively.
+ */
+const BOT_LOGIN_DENYLIST: readonly string[] = [
+  "vercel",
+  "github-actions",
+  "codecov",
+  "dependabot",
+  "sentry-io",
+];
+
+/**
+ * Is this login an automated (bot) account? True for a `[bot]`-suffixed GitHub
+ * App login or a known integration on the denylist. A bot comment is never
+ * reviewer feedback (#102 Gap 2), so callers drop it before the freshness check.
+ */
+export function is_bot_login(login: string): boolean {
+  const lower = login.toLowerCase();
+  return lower.endsWith("[bot]") || BOT_LOGIN_DENYLIST.includes(lower);
+}
+
+/**
  * Is this comment genuine reviewer feedback (vs author chatter / bots)? (#102)
  *
  * Rules, in order:
- *   - Authored by the PR author → only counts if it's a `**Verdict:` findings
- *     comment. In single-dev repos the reviewer posts verdicts under the author's
- *     own login (self-approval is blocked), so we can't drop everything by that
- *     login — but a plain reply must never count as review feedback.
- *   - Otherwise, if we know the reviewer identity → count only comments from that
- *     identity (or any `**Verdict:` comment). This drops CI bots and third parties.
- *   - Reviewer identity unknown (resolution failed) → count any non-author comment
- *     as a best-effort fallback (still excludes the author's chatter).
+ *   - A `**Verdict:` findings comment is always reviewer feedback, whatever login
+ *     posted it — this covers the single-dev repo where the reviewer posts
+ *     verdicts under the author's own login (self-approval is blocked).
+ *   - The PR author's own non-verdict chatter never counts as review feedback.
+ *   - The resolved reviewer identity counts — checked BEFORE the bot filter,
+ *     because the reviewer may itself be a GitHub App with a `[bot]`-suffixed
+ *     login (`get_authenticated_login`).
+ *   - Bots (CI, coverage, deploy previews) are dropped UNCONDITIONALLY, even in
+ *     the degraded (reviewer identity unresolved) mode. The old fallback counted
+ *     any non-author comment there, which re-admitted bot comments as "feedback"
+ *     and suppressed the post-push re-review — the #98/#99 freshness hole Gap 2
+ *     exists to close.
+ *   - Reviewer identity unknown → best-effort: any remaining non-author, non-bot
+ *     comment counts (still excludes the author's chatter).
  */
 export function is_reviewer_feedback_comment(
   comment: { author: { login: string }; body?: string },
   reviewer_login: string | null,
   pr_author_login?: string,
 ): boolean {
+  const login = comment.author.login;
   const is_verdict = comment.body?.trimStart().startsWith("**Verdict:") === true;
-  if (pr_author_login != null && comment.author.login === pr_author_login) {
-    return is_verdict;
-  }
-  if (reviewer_login != null) {
-    return comment.author.login === reviewer_login || is_verdict;
-  }
-  return true;
+
+  // A genuine verdict is reviewer feedback regardless of who posted it.
+  if (is_verdict) return true;
+  // The PR author's own non-verdict comments are chatter, not feedback.
+  if (pr_author_login != null && login === pr_author_login) return false;
+  // The reviewer identity counts — even if that identity is a GitHub App, so
+  // this must come before the bot filter below.
+  if (reviewer_login != null && login === reviewer_login) return true;
+  // A bot is never reviewer feedback — in any mode (see #102 Gap 2).
+  if (is_bot_login(login)) return false;
+  // Reviewer identity known → only that identity counts (handled above).
+  // Unknown → best-effort: any remaining non-author, non-bot comment counts.
+  return reviewer_login == null;
 }
 
 // ── Types ──
@@ -516,6 +554,14 @@ export class PRReviewCron {
   ): Promise<void> {
     const key = `${entity_id}:${String(pr.number)}`;
 
+    // Unique id for THIS review's lease (#102). Stamped on the lease at acquire
+    // and re-checked by the merge gate at completion, so the merge can prove it
+    // belongs to this review — and so the merge-retry pass (which carries its
+    // own id) can never idempotently piggyback on this still-live lease during
+    // the delete-vs-release window. Generated up front because the lease is
+    // acquired before the reviewer session exists.
+    const review_session_id = randomUUID();
+
     // Per-PR review mutex (#60). Acquire BEFORE marking the review active so a
     // webhook or Tidus spawn racing in the same window backs off cleanly. The
     // lease is keyed on owner/repo, shared across all three spawn paths. On
@@ -523,7 +569,9 @@ export class PRReviewCron {
     // next cron cycle re-checks. Null store / unresolvable slug = fail-open.
     const owner_repo = this.review_leases ? this.owner_repo_for(repo_path, entity_config) : null;
     if (this.review_leases && owner_repo) {
-      const acquired = this.review_leases.acquire(owner_repo, pr.number, "daemon-cron");
+      const acquired = this.review_leases.acquire(owner_repo, pr.number, "daemon-cron", {
+        session_id: review_session_id,
+      });
       if (!acquired.ok) {
         console.log(
           `[pr-cron] Review lease for PR #${String(pr.number)} held by ${acquired.current_lease.holder} ` +
@@ -632,7 +680,13 @@ export class PRReviewCron {
         // no lease held — an incomplete concurrent review could win the race
         // and merge a PR out from under a still-working reviewer (PR #98).
         // Release only AFTER outcome routing + any merge attempt has settled.
-        void this.persist_review_completion(entity_id, pr, repo_path, entity_config)
+        void this.persist_review_completion(
+          entity_id,
+          pr,
+          repo_path,
+          entity_config,
+          review_session_id,
+        )
           .catch((err) => {
             console.error(
               `[pr-cron] Failed to persist review for PR #${String(pr.number)}: ${String(err)}`,
@@ -682,6 +736,7 @@ export class PRReviewCron {
     pr: OpenPR,
     repo_path: string,
     entity_config: EntityConfig,
+    review_session_id?: string,
   ): Promise<void> {
     const key = `${entity_id}:${String(pr.number)}`;
 
@@ -708,7 +763,15 @@ export class PRReviewCron {
       console.log(
         `[pr-cron] Dismissed outcome for PR #${String(pr.number)} — not persisting, will re-review next cycle`,
       );
-      await this.handle_review_completion(entity_id, repo_path, pr, outcome, gh_token, source);
+      await this.handle_review_completion(
+        entity_id,
+        repo_path,
+        pr,
+        outcome,
+        gh_token,
+        source,
+        review_session_id,
+      );
       return;
     }
 
@@ -726,7 +789,15 @@ export class PRReviewCron {
     );
 
     // Route the outcome (alerts, fix spawning, etc.)
-    await this.handle_review_completion(entity_id, repo_path, pr, outcome, gh_token, source);
+    await this.handle_review_completion(
+      entity_id,
+      repo_path,
+      pr,
+      outcome,
+      gh_token,
+      source,
+      review_session_id,
+    );
   }
 
   /** After a reviewer session completes, detect the outcome and route accordingly. */
@@ -737,6 +808,7 @@ export class PRReviewCron {
     review_outcome?: ReviewOutcome,
     gh_token?: string,
     verdict_source?: ReviewOutcomeSource,
+    review_session_id?: string,
   ): Promise<void> {
     // Determine if internal (our agents) or truly external
     const entity_config = this.registry.get(entity_id);
@@ -844,10 +916,19 @@ export class PRReviewCron {
         } else if (ci.failures.length > 0) {
           // Spawn builder to fix CI failures (#196)
           await this.spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, entity_config);
-        } else if (!assert_can_merge(this.review_leases, owner_repo, pr.number, "daemon-cron")) {
+        } else if (
+          !assert_can_merge(
+            this.review_leases,
+            owner_repo,
+            pr.number,
+            "daemon-cron",
+            review_session_id,
+          )
+        ) {
           // Merge gate (#102): our review lease is no longer the live holder for
-          // this PR — another review is in flight (or the lease expired). Do NOT
-          // merge; leave the PR open with an amber alert for the next cycle.
+          // this PR — another review is in flight, the lease expired, or a
+          // different session now owns it. Do NOT merge; leave the PR open with
+          // an amber alert for the next cycle.
           console.warn(
             `[pr-cron] Merge gate blocked PR #${String(pr.number)} — daemon-cron does not hold the review lease`,
           );
@@ -1050,9 +1131,32 @@ export class PRReviewCron {
       // CI passed — attempt merge. Merge gate (#102): acquire the review lease
       // as daemon-cron first. If another holder (webhook / Tidus) is mid-review,
       // the acquire conflicts, so skip the merge this cycle rather than race it.
+      //
+      // But first check whether ANY live lease already exists (#102 review
+      // follow-up). `acquire` is idempotent for the same holder, so a live
+      // `daemon-cron` lease would be re-"acquired" as a success — and there is a
+      // window where exactly that is true: `on_complete` deletes the
+      // `active_reviews` entry synchronously but releases the `daemon-cron` lease
+      // only in the post-merge `.finally()`, so its merge is still in flight
+      // while `active_reviews.has(key)` is already false. A blind acquire here
+      // would fire a SECOND concurrent merge and then release the lease out from
+      // under the still-running one (spurious amber alert + premature release).
+      // A live lease — same holder or not — means someone already owns this
+      // merge, so defer. We only proceed when we can grant a genuinely fresh one.
       if (this.review_leases && owner_repo) {
+        const existing = this.review_leases.get(owner_repo, pr.number);
+        if (existing) {
+          console.log(
+            `[pr-cron] Merge retry for PR #${String(pr.number)} deferred — review lease held by ` +
+              `${existing.holder} (expires ${existing.expires_at})`,
+          );
+          continue;
+        }
         const acquired = this.review_leases.acquire(owner_repo, pr.number, "daemon-cron");
         if (!acquired.ok) {
+          // Defense in depth: in single-threaded JS no lease can appear between
+          // the get() and acquire() above (no await between them), but keep the
+          // conflict branch so a future refactor can't silently race.
           console.log(
             `[pr-cron] Merge retry for PR #${String(pr.number)} deferred — review lease held by ` +
               `${acquired.current_lease.holder} (expires ${acquired.current_lease.expires_at})`,

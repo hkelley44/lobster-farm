@@ -253,6 +253,12 @@ Reviewer agents (and Tidus, on the autonomous path) must **not** run
 `gh pr merge`, `git rebase`, or `git push` on the PR — approve and stop. The
 autonomous loop completes when the daemon reports the merge.
 
+> **Manual reviews on main-only repos merge on the next cron tick, not instantly (#102).**
+> A `tidus-manual` review has no daemon `on_complete` hook, so once you post the
+> Approved verdict and the manual lease releases, the merge is performed by the
+> daemon's `retry_approved_unmerged` pass on its next cycle (≤ one cron interval).
+> A short "approved but not yet merged" gap here is expected — it is **not** a hang.
+
 ## Agent Behavior During Build
 
 This applies to the fix step above:

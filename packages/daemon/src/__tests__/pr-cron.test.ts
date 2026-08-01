@@ -3,7 +3,7 @@ import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DiscordBot } from "../discord.js";
 import type { ProcessedPR } from "../persistence.js";
-import { PRReviewCron } from "../pr-cron.js";
+import { PRReviewCron, is_bot_login, is_reviewer_feedback_comment } from "../pr-cron.js";
 
 // ── Helpers ──
 
@@ -394,6 +394,75 @@ describe("PRReviewCron.should_skip_pr", () => {
 
     const skip = await cron.test_should_skip_pr(42, "reviewer-bot");
     expect(skip).toBe(false);
+  });
+});
+
+// ── #102 Gap 2: is_reviewer_feedback_comment / is_bot_login (direct unit) ──
+
+describe("is_bot_login", () => {
+  it("matches any [bot]-suffixed GitHub App login (case-insensitive)", () => {
+    expect(is_bot_login("github-actions[bot]")).toBe(true);
+    expect(is_bot_login("some-app[BOT]")).toBe(true);
+    expect(is_bot_login("renovate[bot]")).toBe(true);
+  });
+
+  it("matches denylisted integrations that comment without the [bot] suffix", () => {
+    expect(is_bot_login("vercel")).toBe(true);
+    expect(is_bot_login("Codecov")).toBe(true);
+    expect(is_bot_login("sentry-io")).toBe(true);
+  });
+
+  it("does not match ordinary human logins", () => {
+    expect(is_bot_login("reviewer-bot")).toBe(false); // human whose name contains "bot"
+    expect(is_bot_login("pr-author")).toBe(false);
+    expect(is_bot_login("hkelley44")).toBe(false);
+  });
+});
+
+describe("is_reviewer_feedback_comment", () => {
+  const bot = (login: string, body?: string) => ({ author: { login }, ...(body ? { body } : {}) });
+
+  it("drops a bot comment even in degraded (reviewer_login === null) mode", () => {
+    // The #98/#99 hole: with the reviewer identity unresolved, the old fallback
+    // counted ANY non-author comment — so a CI/deploy bot comment suppressed the
+    // post-push re-review. It must now be dropped unconditionally.
+    expect(is_reviewer_feedback_comment(bot("vercel[bot]"), null, "pr-author")).toBe(false);
+    expect(is_reviewer_feedback_comment(bot("codecov"), null, "pr-author")).toBe(false);
+  });
+
+  it("drops a bot comment when the reviewer identity IS resolved too", () => {
+    expect(
+      is_reviewer_feedback_comment(bot("github-actions[bot]"), "reviewer-bot", "pr-author"),
+    ).toBe(false);
+  });
+
+  it("still counts the reviewer identity even when it is a GitHub App ([bot] login)", () => {
+    // resolve_reviewer_login can return an app identity like `lobsterfarm[bot]`.
+    // The reviewer-identity match must win over the bot filter.
+    expect(
+      is_reviewer_feedback_comment(bot("lobsterfarm[bot]"), "lobsterfarm[bot]", "pr-author"),
+    ).toBe(true);
+  });
+
+  it("counts a genuine **Verdict: comment regardless of login", () => {
+    expect(
+      is_reviewer_feedback_comment(
+        bot("reviewer-bot", "**Verdict: Approved**"),
+        null,
+        "reviewer-bot",
+      ),
+    ).toBe(true);
+  });
+
+  it("still counts a human reviewer's comment in degraded mode (non-author, non-bot)", () => {
+    // Fallback best-effort: unknown reviewer identity, a human's comment counts.
+    expect(is_reviewer_feedback_comment(bot("some-human"), null, "pr-author")).toBe(true);
+  });
+
+  it("never counts the PR author's non-verdict chatter", () => {
+    expect(
+      is_reviewer_feedback_comment(bot("pr-author", "thanks!"), "reviewer-bot", "pr-author"),
+    ).toBe(false);
   });
 });
 

@@ -111,13 +111,21 @@ class TestCron extends PRReviewCron {
     ).alert_router.post_alert.mock.calls.map((c) => c[0] as { title: string; body: string });
   }
 
-  run_handle_completion(): Promise<void> {
+  run_handle_completion(review_session_id?: string): Promise<void> {
     const fn = (
       this as unknown as {
-        handle_review_completion: (e: string, p: string, pr: typeof PR, o: string) => Promise<void>;
+        handle_review_completion: (
+          e: string,
+          p: string,
+          pr: typeof PR,
+          o: string,
+          t?: string,
+          v?: string,
+          sid?: string,
+        ) => Promise<void>;
       }
     ).handle_review_completion.bind(this);
-    return fn(ENTITY_ID, REPO_PATH, PR, "approved");
+    return fn(ENTITY_ID, REPO_PATH, PR, "approved", undefined, undefined, review_session_id);
   }
 
   run_retry(processed_approved: boolean): Promise<void> {
@@ -226,5 +234,50 @@ describe("PR cron merge gate (#102)", () => {
     expect(attempt_auto_merge).toHaveBeenCalledTimes(1);
     // The retry-scoped lease is released after the merge — no lingering hold.
     expect(leases.get(OWNER_REPO, PR.number)).toBeNull();
+  });
+
+  it("retry pass does NOT double-merge while a daemon-cron on_complete merge is in flight", async () => {
+    // #102 review follow-up: on_complete deletes the active_reviews entry
+    // synchronously but holds the daemon-cron lease until its post-merge
+    // .finally(). If a retry tick fires in that window, a blind idempotent
+    // acquire of the same-holder lease would fire a SECOND concurrent merge and
+    // then release the lease out from under the still-running one. The retry
+    // must defer when ANY live lease exists — even its own holder's.
+    const leases = new ReviewLeaseStore();
+    leases.acquire(OWNER_REPO, PR.number, "daemon-cron"); // simulates in-flight on_complete
+
+    const cron = new TestCron(leases);
+    await cron.run_retry(true);
+
+    expect(attempt_auto_merge).not.toHaveBeenCalled();
+    // The in-flight merge's lease is left intact — retry didn't steal or release it.
+    expect(leases.get(OWNER_REPO, PR.number)?.holder).toBe("daemon-cron");
+  });
+
+  // ── #102 review follow-up: the gate checks the session id, not just the holder ──
+
+  it("blocks the merge when the live lease is the SAME holder but a DIFFERENT session", async () => {
+    // A daemon-cron lease exists, but it belongs to a different review session
+    // than the one now completing. The gate must prove ownership by session id,
+    // not merely by holder — otherwise a stale/other daemon-cron lease would let
+    // this completion merge a PR it doesn't actually own.
+    const leases = new ReviewLeaseStore();
+    leases.acquire(OWNER_REPO, PR.number, "daemon-cron", { session_id: "review-OTHER" });
+
+    const cron = new TestCron(leases);
+    await cron.run_handle_completion("review-MINE");
+
+    expect(attempt_auto_merge).not.toHaveBeenCalled();
+    expect(cron.alerts.some((a) => a.title.includes("Merge gate blocked"))).toBe(true);
+  });
+
+  it("merges when the live lease matches BOTH the holder and the review's session", async () => {
+    const leases = new ReviewLeaseStore();
+    leases.acquire(OWNER_REPO, PR.number, "daemon-cron", { session_id: "review-MINE" });
+
+    const cron = new TestCron(leases);
+    await cron.run_handle_completion("review-MINE");
+
+    expect(attempt_auto_merge).toHaveBeenCalledTimes(1);
   });
 });

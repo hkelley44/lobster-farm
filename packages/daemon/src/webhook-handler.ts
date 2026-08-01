@@ -10,6 +10,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { promisify } from "node:util";
 import type { ArchetypeRole } from "@lobster-farm/shared";
@@ -586,8 +587,15 @@ async function spawn_review(
   // acquire and Tidus's HTTP acquire. If another holder already owns it, skip the
   // spawn — the existing reviewer covers this PR. Null store (legacy/test) =
   // fail-open: behave exactly as before the mutex existed.
+  // Unique id for THIS review's lease (#102), stamped at acquire and re-checked
+  // by the merge gate at completion so a merge can prove it belongs to this
+  // review — consistent with the cron path's session-id tightening.
+  const review_session_id = randomUUID();
+
   if (ctx.review_leases) {
-    const acquired = ctx.review_leases.acquire(repo_full_name, pr.number, "daemon-webhook");
+    const acquired = ctx.review_leases.acquire(repo_full_name, pr.number, "daemon-webhook", {
+      session_id: review_session_id,
+    });
     if (!acquired.ok) {
       console.log(
         `[webhook] Review lease for PR #${String(pr.number)} held by ${acquired.current_lease.holder} ` +
@@ -667,7 +675,15 @@ async function spawn_review(
       ctx.session_manager.removeListener("session:completed", on_complete);
       ctx.session_manager.removeListener("session:failed", on_fail);
 
-      void handle_review_completion(entity_id, repo_path, repo_full_name, pr, ctx, installation_id)
+      void handle_review_completion(
+        entity_id,
+        repo_path,
+        repo_full_name,
+        pr,
+        ctx,
+        installation_id,
+        review_session_id,
+      )
         .catch((err) => {
           console.error(`[webhook] Post-review error: ${String(err)}`);
           sentry.captureException(err, {
@@ -733,6 +749,7 @@ async function handle_review_completion(
   pr: WebhookPR,
   ctx: WebhookContext,
   installation_id?: string,
+  review_session_id?: string,
 ): Promise<void> {
   // Resolve a token so detect_review_outcome and check_pr_merged can
   // authenticate against the correct GitHub account (cross-account repos).
@@ -780,6 +797,7 @@ async function handle_review_completion(
       gh_token,
       ctx,
       installation_id,
+      review_session_id,
     );
     return;
   }
@@ -829,7 +847,15 @@ async function handle_review_completion(
 
           // Merge gate (#102): even on the CI-pending bypass, only merge if we
           // still hold the review lease. Another live review blocks this merge.
-          if (!assert_can_merge(ctx.review_leases, repo_full_name, pr.number, "daemon-webhook")) {
+          if (
+            !assert_can_merge(
+              ctx.review_leases,
+              repo_full_name,
+              pr.number,
+              "daemon-webhook",
+              review_session_id,
+            )
+          ) {
             console.warn(
               `[webhook] Merge gate blocked PR #${String(pr.number)} (CI-pending bypass) — lease not held by daemon-webhook`,
             );
@@ -880,7 +906,13 @@ async function handle_review_completion(
         // Spawn builder to fix CI failures (#196)
         await spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, ctx, installation_id);
       } else if (
-        !assert_can_merge(ctx.review_leases, repo_full_name, pr.number, "daemon-webhook")
+        !assert_can_merge(
+          ctx.review_leases,
+          repo_full_name,
+          pr.number,
+          "daemon-webhook",
+          review_session_id,
+        )
       ) {
         // Merge gate (#102): the daemon-webhook lease is no longer the live
         // holder — another review is in flight. Do not merge; leave the PR open.
@@ -993,6 +1025,7 @@ export async function handle_v2_review_completion(
   gh_token: string | undefined,
   ctx: WebhookContext,
   installation_id?: string,
+  review_session_id?: string,
 ): Promise<void> {
   if (outcome === "changes_requested") {
     // Fetch current head SHA + the review body so the next pass can echo
@@ -1062,7 +1095,15 @@ export async function handle_v2_review_completion(
     // Merge gate (#102): the v2 lifecycle's run_merge_gate re-verifies CI and
     // mergeability, but it does NOT know about the review lease. Guard it with
     // the lease so an approved merge can't fire while another review is live.
-    if (!assert_can_merge(ctx.review_leases, repo_full_name, pr.number, "daemon-webhook")) {
+    if (
+      !assert_can_merge(
+        ctx.review_leases,
+        repo_full_name,
+        pr.number,
+        "daemon-webhook",
+        review_session_id,
+      )
+    ) {
       console.warn(
         `[webhook:v2] Merge gate blocked PR #${String(pr.number)} — daemon-webhook does not hold the review lease`,
       );

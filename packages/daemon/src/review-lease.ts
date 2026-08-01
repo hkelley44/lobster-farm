@@ -95,9 +95,16 @@ export class ReviewLeaseStore {
    * Acquire the lease for a PR.
    *
    * - No live lease → grant a fresh one to `holder`.
-   * - Live lease held by the SAME holder → idempotent: return the existing
-   *   lease unchanged. We deliberately do NOT extend `expires_at` — re-acquiring
-   *   must not let a holder hold the lease forever by re-asking.
+   * - Live lease held by the SAME holder AND the same (or an absent) session id
+   *   → idempotent: return the existing lease unchanged. We deliberately do NOT
+   *   extend `expires_at` — re-acquiring must not let a holder hold the lease
+   *   forever by re-asking.
+   * - Live lease held by the same holder but a DIFFERENT session id → conflict.
+   *   A differing session id means a genuinely different operation is contending
+   *   for the PR (e.g. the merge-retry pass vs. the in-flight review that spawned
+   *   the lease). Without this, `acquire` was idempotent per-holder and a retry
+   *   could silently piggyback on a review's still-live lease and double-merge
+   *   in the delete-vs-release window (#102).
    * - Live lease held by a DIFFERENT holder → conflict; return that lease.
    */
   acquire(
@@ -111,8 +118,19 @@ export class ReviewLeaseStore {
     const existing = this.live_lease(key, now);
 
     if (existing) {
-      // Same holder re-acquiring → idempotent, return as-is (no extension).
       if (existing.holder === holder) {
+        // Same holder, but a distinct session id → different logical operation.
+        // Only conflict when BOTH sides carry a session id (legacy callers that
+        // pass none keep the old idempotent behavior).
+        const req_sid = opts.session_id;
+        if (
+          req_sid !== undefined &&
+          existing.session_id !== undefined &&
+          req_sid !== existing.session_id
+        ) {
+          return { ok: false, current_lease: existing };
+        }
+        // Same holder re-acquiring → idempotent, return as-is (no extension).
         return { ok: true, lease: existing };
       }
       // Different holder still holds it → conflict.
