@@ -505,6 +505,29 @@ function target_from_interaction(
 
 // ── Discord Bot ──
 
+// ── GLOBAL category ──
+
+/** Name used when scaffolding the category that holds the global channels. */
+export const GLOBAL_CATEGORY_NAME = "GLOBAL";
+
+/**
+ * Match the GLOBAL category by name, case-insensitively.
+ *
+ * Discord renders category names uppercase in the client, so a category created
+ * by hand as "Global" looks identical to a scaffolded "GLOBAL" in the UI while
+ * comparing unequal over the API. The live guild's category is stored as
+ * "Global", which meant every `=== "GLOBAL"` lookup returned null and silently
+ * disabled #command-center detection for 14 days (#99).
+ *
+ * The damage was not just a missing typing indicator: `mark_inbound()` is the
+ * only signal feeding the commander's plugin-liveness probe (#77/#78), and it
+ * lives behind that lookup. A deaf commander is precisely what the probe exists
+ * to catch, and this mismatch made it unable to catch it.
+ */
+export function is_global_category_name(name: string): boolean {
+  return name.trim().toLowerCase() === GLOBAL_CATEGORY_NAME.toLowerCase();
+}
+
 // ── Avatar cache paths ──
 
 const AVATAR_EXTENSIONS = [".jpg", ".png", ".webp"];
@@ -639,9 +662,18 @@ export class DiscordBot extends EventEmitter {
 
         // Eagerly resolve #command-center channel ID so handle_message()
         // can detect user messages there and show typing + status embeds.
+        //
+        // Failing to resolve is not cosmetic: mark_inbound() lives behind this
+        // lookup, and it is the only signal feeding the commander's deaf-probe.
+        // Silence here bought 14 days of an unnoticed dead channel (#99), so
+        // an unresolved command-center is now loud.
         void this.find_command_center_channel().then((id) => {
           if (id) {
             console.log(`[discord] Command center channel resolved: ${id}`);
+          } else {
+            console.warn(
+              `[discord] WARNING: #command-center not found under a "${GLOBAL_CATEGORY_NAME}" category — the commander will receive no typing indicator, no status embed, and its plugin-liveness probe cannot detect a deaf session. Check that the category exists and holds a #command-center channel.`,
+            );
           }
         });
 
@@ -722,7 +754,7 @@ export class DiscordBot extends EventEmitter {
     if (!guild) return null;
 
     const category = guild.channels.cache.find(
-      (c) => c.name === "GLOBAL" && c.type === DiscordChannelType.GuildCategory,
+      (c) => is_global_category_name(c.name) && c.type === DiscordChannelType.GuildCategory,
     );
     if (!category) return null;
 
@@ -740,7 +772,7 @@ export class DiscordBot extends EventEmitter {
     if (!guild) return null;
 
     const category = guild.channels.cache.find(
-      (c) => c.name === "GLOBAL" && c.type === DiscordChannelType.GuildCategory,
+      (c) => is_global_category_name(c.name) && c.type === DiscordChannelType.GuildCategory,
     );
     if (!category) return null;
 
@@ -1812,12 +1844,12 @@ export class DiscordBot extends EventEmitter {
     try {
       // Find or create GLOBAL category
       let category = guild.channels.cache.find(
-        (c) => c.name === "GLOBAL" && c.type === DiscordChannelType.GuildCategory,
+        (c) => is_global_category_name(c.name) && c.type === DiscordChannelType.GuildCategory,
       ) as CategoryChannel | undefined;
 
       if (!category) {
         category = await guild.channels.create({
-          name: "GLOBAL",
+          name: GLOBAL_CATEGORY_NAME,
           type: DiscordChannelType.GuildCategory,
           reason: "LobsterFarm global channels",
         });
@@ -2379,7 +2411,7 @@ export class DiscordBot extends EventEmitter {
     try {
       await guild.channels.fetch();
       const global_category = guild.channels.cache.find(
-        (c) => c.name === "GLOBAL" && c.type === DiscordChannelType.GuildCategory,
+        (c) => is_global_category_name(c.name) && c.type === DiscordChannelType.GuildCategory,
       ) as CategoryChannel | undefined;
 
       if (global_category) {
