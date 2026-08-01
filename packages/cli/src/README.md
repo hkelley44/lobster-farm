@@ -42,6 +42,12 @@ SENTRY_DSN="op://command-center/sentry/dsn"
 GITHUB_APP_PRIVATE_KEY="op://lobsterfarm/github-app/private-key"
 ```
 
-`op inject` is a literal template substitution: it preserves the surrounding quotes and drops the multi-line secret between them. Those quotes are the only thing that distinguishes a continuation line from a new `KEY=value` assignment -- a PEM body line can itself look like an assignment (`AbCdEf==`).
+`op inject` is a literal template substitution: it preserves the surrounding quotes and drops the multi-line secret between them, which makes the value unambiguous on sight.
 
-If a multi-line value is left unquoted, the wrapper **drops it and warns** to `daemon.log` rather than exporting a truncated key. That is deliberate: a half PEM fails deep inside GitHub App auth at request time, while an absent one fails visibly at startup. Warnings name the key only, never the value. Round-tripping is covered end-to-end in `__tests__/launchd.test.ts` (real `zsh`, stub `op`, multi-line PEM).
+Quoting alone is not enough to be *safe*, though, because a PEM body line can itself look like an assignment (`AbCdEf==` parses as key `AbCdEf`). So the wrapper does not decide "is this a new key?" from line shape. It first reads the key names `.env.op` **declares**, before injection -- the template holds `op://` references, never values, so reading it is safe and its keys are safe to name in warnings. `op inject` only substitutes values; it never adds or renames keys. Any line whose key was not declared is therefore a continuation line, however much it looks like an assignment.
+
+If a multi-line value is left unquoted, the wrapper **drops it and warns** to `daemon.log` rather than exporting a truncated key. That is deliberate: a half PEM fails deep inside GitHub App auth at request time, while an absent one fails visibly at startup. Warnings name the key only, never the value.
+
+Also handled: CRLF-saved templates (a trailing `\r` is stripped rather than baked into every value), and a `.env.op` that declares no keys at all (injection is skipped with a warning instead of treating every line as garbage).
+
+All of this is covered end-to-end in `__tests__/launchd.test.ts` -- real `zsh`, a stub `op`, and a stub node that dumps the environment it was exec'd with, including the identifier-shaped-PEM-body case.

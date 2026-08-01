@@ -255,8 +255,13 @@ interface WrapperRun {
 /**
  * Run the generated wrapper against a canned `op inject` output.
  * Returns the environment the exec'd leaf actually received.
+ *
+ * `declared` is the key set `.env.op` declares. The wrapper reads it before
+ * injection and uses it to tell an assignment from a continuation line, so it
+ * is load-bearing, not scaffolding — tests that vary it are testing real
+ * behaviour. Defaults to every key the stub node reports.
  */
-function run_wrapper(injected: string): WrapperRun {
+function run_wrapper(injected: string, declared: readonly string[] = REPORTED_KEYS): WrapperRun {
   const root = mkdtempSync(join(tmpdir(), "lf-wrapper-"));
   temp_roots.push(root);
 
@@ -288,8 +293,12 @@ function run_wrapper(injected: string): WrapperRun {
 
   // env.sh only has to put the stub `op` on PATH.
   writeFileSync(join(lf, "env.sh"), `export PATH=${JSON.stringify(bin)}:$PATH\n`);
-  // Presence is all that matters — the stub `op` never reads it.
-  writeFileSync(join(lf, ".env.op"), "GITHUB_APP_PRIVATE_KEY=op://vault/item/field\n");
+  // The real template: op:// references, never values. The wrapper parses this
+  // for its declared-key set. The stub `op` ignores it and prints `injected`.
+  writeFileSync(
+    join(lf, ".env.op"),
+    `${declared.map((k) => `${k}=op://vault/item/${k.toLowerCase()}`).join("\n")}\n`,
+  );
 
   const wrapper = join(root, "start-daemon.sh");
   writeFileSync(wrapper, generate_wrapper_sh(node_stub, join(root, "index.js"), root));
@@ -397,6 +406,95 @@ describe.skipIf(!zsh_available)("generate_wrapper_sh secret injection (zsh)", ()
     const { status } = run_wrapper("DISCORD_TOKEN=plain-token-value\n");
 
     expect(status).toBe(0);
+  });
+
+  // PR #98 review round 2. The earlier parser decided "is this a new key?" from
+  // line shape alone, so a PEM body line that happens to be identifier-shaped
+  // (`AbCdEf==` → key `AbCdEf`) was accepted as an assignment and flushed the
+  // buffered value — exporting a TRUNCATED GITHUB_APP_PRIVATE_KEY, the exact
+  // failure the drop-and-warn path exists to prevent. The original PEM fixture
+  // missed it only because its `=` line also contained `+` and `/`, which fail
+  // the identifier regex. These pin the shapes that actually bite.
+  describe("identifier-shaped PEM body lines (review round 2)", () => {
+    it("does not export a truncated key when the PEM body looks like an assignment", () => {
+      const unquoted = [
+        "GITHUB_APP_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----",
+        "AbCdEf==", // <- identifier-shaped: the whole bug
+        "-----END RSA PRIVATE KEY-----",
+        "DISCORD_TOKEN=still-fine",
+        "",
+      ].join("\n");
+
+      const { env, stderr } = run_wrapper(unquoted);
+
+      expect(env.GITHUB_APP_PRIVATE_KEY).toBe("");
+      // And it must not invent a key from the base64 line either.
+      expect(stderr).toContain("GITHUB_APP_PRIVATE_KEY");
+      expect(stderr).not.toContain("AbCdEf");
+      expect(env.DISCORD_TOKEN).toBe("still-fine");
+    });
+
+    it("treats an undeclared identifier-shaped line as a continuation, not a key", () => {
+      // `SPECIAL` is declared; `NOT_DECLARED` is not. Only the declared one may
+      // open an assignment — this is the property that removes the ambiguity.
+      const injected = ["SPECIAL=first", "NOT_DECLARED=second", ""].join("\n");
+
+      const { env, stderr } = run_wrapper(injected, ["SPECIAL"]);
+
+      expect(env.SPECIAL).toBe("");
+      expect(stderr).toContain("SPECIAL");
+    });
+
+    it("still exports a declared key whose value contains = padding", () => {
+      // The guard must not over-correct: a legitimate single-line base64-ish
+      // value is still a value.
+      const { env, stderr } = run_wrapper("DISCORD_TOKEN=AbCdEf==\n");
+
+      expect(env.DISCORD_TOKEN).toBe("AbCdEf==");
+      expect(stderr).not.toContain("WARNING");
+    });
+
+    it("round-trips a quoted PEM whose body is identifier-shaped", () => {
+      const pem = [
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "AbCdEf==",
+        "-----END RSA PRIVATE KEY-----",
+      ].join("\n");
+      const { env, stderr } = run_wrapper(
+        [`GITHUB_APP_PRIVATE_KEY="${pem}"`, "TRAILING=after", ""].join("\n"),
+      );
+
+      expect(env.GITHUB_APP_PRIVATE_KEY).toBe(pem);
+      expect(env.TRAILING).toBe("after");
+      expect(stderr).not.toContain("WARNING");
+    });
+  });
+
+  it("tolerates a CRLF-saved .env.op without baking \\r into values", () => {
+    const pem = ["-----BEGIN RSA PRIVATE KEY-----", "MIIEow", "-----END RSA PRIVATE KEY-----"].join(
+      "\r\n",
+    );
+    const injected = [
+      "DISCORD_TOKEN=plain-token-value",
+      `GITHUB_APP_PRIVATE_KEY="${pem}"`,
+      "",
+    ].join("\r\n");
+
+    const { env, stderr } = run_wrapper(injected);
+
+    // A trailing \r used to ride silently into every value.
+    expect(env.DISCORD_TOKEN).toBe("plain-token-value");
+    expect(env.GITHUB_APP_PRIVATE_KEY).not.toContain("\r");
+    expect(env.GITHUB_APP_PRIVATE_KEY).toContain("BEGIN RSA PRIVATE KEY");
+    expect(env.GITHUB_APP_PRIVATE_KEY).toContain("END RSA PRIVATE KEY");
+    expect(stderr).not.toContain("WARNING");
+  });
+
+  it("skips injection with a warning when .env.op declares no keys", () => {
+    const { env, stderr } = run_wrapper("DISCORD_TOKEN=ignored\n", []);
+
+    expect(env.DISCORD_TOKEN).toBe("");
+    expect(stderr).toContain("declares no KEY=value entries");
   });
 });
 

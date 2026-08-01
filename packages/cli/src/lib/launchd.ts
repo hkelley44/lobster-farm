@@ -175,16 +175,35 @@ source "$ENV_FILE"
 #
 # MULTI-LINE SECRETS MUST BE QUOTED IN .env.op:
 #   GITHUB_APP_PRIVATE_KEY="op://lobsterfarm/github-app/private-key"
-# \`op inject\` preserves the surrounding quotes, and the quotes are what let the
-# parser tell a continuation line from a new KEY=value assignment. An unquoted
-# multi-line value is ambiguous (a PEM body line can look like an assignment) —
-# we drop it and warn rather than export a truncated secret.
+# \`op inject\` preserves the surrounding quotes, which makes a multi-line value
+# unambiguous on sight.
+#
+# Quoting alone is not enough to stay safe when someone forgets it, because a
+# PEM body line can itself look like an assignment (\`AbCdEf==\` parses as
+# key \`AbCdEf\`). So we do not guess from line shape alone: we first read the
+# KEY names that .env.op *declares*, before injection. The template holds
+# op:// references, never secret values, so reading it is safe and its keys are
+# safe to name in warnings. \`op inject\` only substitutes values — it never adds
+# or renames keys — so any line whose key was not declared is a continuation
+# line, however much it looks like an assignment.
 ENV_OP="${home}/.lobsterfarm/.env.op"
 if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
-  if resolved_secrets="$(op inject -i "$ENV_OP" 2>/dev/null)"; then
+  # Colon-delimited set of declared key names, e.g. ":FOO:BAR:".
+  op_declared=":"
+  while IFS= read -r op_line; do
+    op_line="\${op_line%$'\\r'}"
+    if [[ "$op_line" =~ '^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=' ]]; then
+      op_declared="$op_declared\${match[1]}:"
+    fi
+  done < "$ENV_OP"
+
+  if [[ "$op_declared" == ":" ]]; then
+    echo "[start-daemon] WARNING: .env.op declares no KEY=value entries — skipping secret injection" >&2
+  elif resolved_secrets="$(op inject -i "$ENV_OP" 2>/dev/null)"; then
     op_key=""
     op_value=""
     op_quote=""
+    op_candidate=""
     op_malformed=0
 
     # Export the buffered assignment. Only *unquoted* values are ever buffered:
@@ -198,6 +217,10 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
     }
 
     while IFS= read -r op_line; do
+      # Tolerate a CRLF-saved .env.op — otherwise a trailing \\r is silently
+      # baked into every value, or breaks a closing-quote match.
+      op_line="\${op_line%$'\\r'}"
+
       # Inside a quoted multi-line value: accumulate until the closing quote.
       if [[ -n "$op_quote" ]]; then
         if [[ "$op_line" == *"$op_quote" ]]; then
@@ -214,10 +237,16 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
       # Blank lines and comments neither open nor close an assignment.
       [[ "$op_line" =~ '^[[:space:]]*(#|$)' ]] && continue
 
-      # A new KEY=value assignment closes the previous one.
-      if [[ "$op_line" == *=* ]] && [[ "\${op_line%%=*}" =~ '^[A-Za-z_][A-Za-z0-9_]*$' ]]; then
+      # A new assignment closes the previous one — but only if .env.op actually
+      # declared this key. That is what stops a PEM body line like \`AbCdEf==\`
+      # from masquerading as an assignment and flushing a truncated secret.
+      op_candidate=""
+      if [[ "$op_line" =~ '^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=' ]]; then
+        op_candidate="\${match[1]}"
+      fi
+      if [[ -n "$op_candidate" && "$op_declared" == *":$op_candidate:"* ]]; then
         op_flush
-        op_key="\${op_line%%=*}"
+        op_key="$op_candidate"
         op_value="\${op_line#*=}"
         if [[ "$op_value" == '"'* || "$op_value" == "'"* ]]; then
           op_quote="\${op_value:0:1}"
@@ -257,7 +286,7 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
       echo "[start-daemon] WARNING: multi-line secrets must be quoted in .env.op, e.g. KEY=\\"op://vault/item/field\\"" >&2
     fi
 
-    unset resolved_secrets op_line op_key op_value op_quote op_malformed
+    unset resolved_secrets op_line op_key op_value op_quote op_candidate op_declared op_malformed
     unset -f op_flush
   else
     echo "[start-daemon] WARNING: op inject failed — continuing without 1Password secrets" >&2
