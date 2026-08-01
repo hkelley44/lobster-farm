@@ -597,8 +597,15 @@ async function spawn_review(
       session_id: review_session_id,
     });
     if (!acquired.ok) {
+      // Distinguish the two conflict kinds for on-call debugging of a stuck PR:
+      // a different holder owns it, vs. we (daemon-webhook) already hold it under
+      // a different, still-live review session (the delete-vs-release window).
+      const reason =
+        acquired.current_lease.holder === "daemon-webhook"
+          ? "we already hold it under a different, still-live review session"
+          : `another holder ${acquired.current_lease.holder} owns it`;
       console.log(
-        `[webhook] Review lease for PR #${String(pr.number)} held by ${acquired.current_lease.holder} ` +
+        `[webhook] Review lease for PR #${String(pr.number)} — ${reason} ` +
           `(expires ${acquired.current_lease.expires_at}) — skipping webhook spawn`,
       );
       return;

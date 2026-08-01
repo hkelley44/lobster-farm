@@ -573,8 +573,15 @@ export class PRReviewCron {
         session_id: review_session_id,
       });
       if (!acquired.ok) {
+        // Distinguish the two conflict kinds for on-call debugging of a stuck PR:
+        // a different holder owns it, vs. we (daemon-cron) already hold it under a
+        // different, still-live review session (the delete-vs-release window).
+        const reason =
+          acquired.current_lease.holder === "daemon-cron"
+            ? "we already hold it under a different, still-live review session"
+            : `another holder ${acquired.current_lease.holder} owns it`;
         console.log(
-          `[pr-cron] Review lease for PR #${String(pr.number)} held by ${acquired.current_lease.holder} ` +
+          `[pr-cron] Review lease for PR #${String(pr.number)} — ${reason} ` +
             `(expires ${acquired.current_lease.expires_at}) — skipping cron spawn this tick`,
         );
         return;
