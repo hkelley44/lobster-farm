@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_LEASE_TTL_MS, ReviewLeaseStore, is_lease_holder } from "../review-lease.js";
+import {
+  DEFAULT_LEASE_TTL_MS,
+  ReviewLeaseStore,
+  assert_can_merge,
+  is_lease_holder,
+} from "../review-lease.js";
 
 const OWNER_REPO = "hkelley44/lobster-farm";
 const PR = 60;
@@ -49,6 +54,41 @@ describe("ReviewLeaseStore — state machine", () => {
     if (second.ok) {
       expect(second.lease.expires_at).toBe(original_expiry);
       expect(second.lease.acquired_at).toBe(first.ok ? first.lease.acquired_at : "");
+    }
+  });
+
+  it("conflicts when the SAME holder re-acquires under a DIFFERENT session (#102)", () => {
+    // This pins the novel acquire() branch that stops a *new* review session
+    // from idempotently piggybacking on an *old* same-holder lease that's still
+    // alive in the on_complete→release window (the delete-vs-release race).
+    // Pre-delta, same-holder re-acquire was unconditionally idempotent — this
+    // second acquire would have returned ok:true and let two sessions run.
+    const first = store.acquire(OWNER_REPO, PR, "daemon-cron", { session_id: "sess-A" });
+    expect(first.ok).toBe(true);
+    const original = first.ok ? first.lease : null;
+
+    // Same holder, DIFFERENT session, lease still live → must conflict.
+    const second = store.acquire(OWNER_REPO, PR, "daemon-cron", { session_id: "sess-B" });
+    expect(second.ok).toBe(false);
+    if (!second.ok) {
+      // The conflict surfaces the live lease, unchanged: still session A, same
+      // owner + expiry (a rejected acquire must not mutate or extend the hold).
+      expect(second.current_lease.session_id).toBe("sess-A");
+      expect(second.current_lease.owner_repo).toBe(OWNER_REPO);
+      expect(second.current_lease.expires_at).toBe(original?.expires_at);
+    }
+
+    // The live lease is untouched by the rejected acquire.
+    expect(store.get(OWNER_REPO, PR)?.session_id).toBe("sess-A");
+
+    // Re-acquiring under the SAME session stays idempotent — returns the original
+    // lease with owner/expiry unchanged (session identity, not re-asking, gates).
+    const third = store.acquire(OWNER_REPO, PR, "daemon-cron", { session_id: "sess-A" });
+    expect(third.ok).toBe(true);
+    if (third.ok) {
+      expect(third.lease.session_id).toBe("sess-A");
+      expect(third.lease.expires_at).toBe(original?.expires_at);
+      expect(third.lease.acquired_at).toBe(original?.acquired_at);
     }
   });
 
@@ -154,5 +194,62 @@ describe("is_lease_holder", () => {
     expect(is_lease_holder("")).toBe(false);
     expect(is_lease_holder(null)).toBe(false);
     expect(is_lease_holder(42)).toBe(false);
+  });
+});
+
+describe("ReviewLeaseStore.holds (#102)", () => {
+  it("is true only when the live lease is held by the given holder", () => {
+    const store = new ReviewLeaseStore();
+    expect(store.holds(OWNER_REPO, PR, "daemon-cron")).toBe(false); // no lease
+    store.acquire(OWNER_REPO, PR, "daemon-cron");
+    expect(store.holds(OWNER_REPO, PR, "daemon-cron")).toBe(true);
+    expect(store.holds(OWNER_REPO, PR, "daemon-webhook")).toBe(false); // different holder
+  });
+
+  it("becomes false once the lease expires", () => {
+    vi.useFakeTimers();
+    const store = new ReviewLeaseStore(1000);
+    store.acquire(OWNER_REPO, PR, "daemon-cron");
+    expect(store.holds(OWNER_REPO, PR, "daemon-cron")).toBe(true);
+    vi.advanceTimersByTime(1001);
+    expect(store.holds(OWNER_REPO, PR, "daemon-cron")).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it("enforces session_id only when both the lease and the caller provide one", () => {
+    const store = new ReviewLeaseStore();
+    store.acquire(OWNER_REPO, PR, "daemon-cron", { session_id: "sess-A" });
+    expect(store.holds(OWNER_REPO, PR, "daemon-cron", "sess-A")).toBe(true);
+    expect(store.holds(OWNER_REPO, PR, "daemon-cron", "sess-B")).toBe(false);
+    // No session id supplied by the caller → holder identity alone gates.
+    expect(store.holds(OWNER_REPO, PR, "daemon-cron")).toBe(true);
+  });
+});
+
+describe("assert_can_merge (#102)", () => {
+  it("blocks the merge when a DIFFERENT holder's lease is live", () => {
+    const store = new ReviewLeaseStore();
+    store.acquire(OWNER_REPO, PR, "tidus-manual");
+    expect(assert_can_merge(store, OWNER_REPO, PR, "daemon-cron")).toBe(false);
+  });
+
+  it("blocks the merge when NO lease is held by the caller", () => {
+    const store = new ReviewLeaseStore();
+    expect(assert_can_merge(store, OWNER_REPO, PR, "daemon-cron")).toBe(false);
+  });
+
+  it("allows the merge when the caller holds the live lease", () => {
+    const store = new ReviewLeaseStore();
+    store.acquire(OWNER_REPO, PR, "daemon-cron");
+    expect(assert_can_merge(store, OWNER_REPO, PR, "daemon-cron")).toBe(true);
+  });
+
+  it("fails open when there is no store (legacy/test wiring)", () => {
+    expect(assert_can_merge(null, OWNER_REPO, PR, "daemon-cron")).toBe(true);
+  });
+
+  it("fails open when the owner/repo slug is unresolved", () => {
+    const store = new ReviewLeaseStore();
+    expect(assert_can_merge(store, null, PR, "daemon-cron")).toBe(true);
   });
 });

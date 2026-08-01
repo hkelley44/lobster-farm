@@ -165,6 +165,13 @@ The Reviewer:
 
 ### 4. Merge — terminal step (branch-aware)
 
+**Who merges (#102):** on the **autonomous** main-only path (4b), the **daemon**
+performs the merge — a single lease-gated chokepoint. Reviewer agents no longer
+run `gh pr merge` themselves. The **staging gate** (4a) is the one exception: it
+is a Hunter-gated manual promotion with no daemon equivalent, so Tidus still runs
+those merge/promote commands by hand — but only after Hunter's explicit ✅, and
+only for repos that have an `origin/staging` branch.
+
 The terminal step depends on whether the repo has a staging branch. Detect with:
 
 ```bash
@@ -222,17 +229,35 @@ After the promotion:
 - Notify #work-log: "Feature <title> shipped to main."
 - The GitHub issue auto-closes via the PR's `Closes #<issue>` line (which followed the PR through both merges).
 
-#### 4b. Repo has only `origin/main` — autonomous merge
+#### 4b. Repo has only `origin/main` — daemon-owned autonomous merge
 
-1. **Check for conflicts** — `gh pr view {number} --json mergeable`
-2. **If clean** — squash merge: `gh pr merge {number} --squash --delete-branch`
-3. **If conflicts:**
-   - Attempt a clean rebase: `git rebase main` on the PR branch
-   - If the rebase is straightforward (no manual resolution needed), push and merge
-   - If the rebase requires decisions (conflicting changes in the same area), escalate to #alerts with the conflict details and wait for guidance
-4. **Post-merge** — notify #work-log
+**The daemon performs this merge, not the reviewer agent (#102).** Merges are
+centralized in the daemon as the single, lease-gated chokepoint — the fix for
+the #98 race, where a reviewer agent ran `gh pr merge` itself, outside the
+review lease, and an incomplete concurrent review lost the race. The reviewer's
+job ends at the **Approved** verdict.
 
-The autonomous loop completes here for main-only repos. No further steps required.
+What the daemon does once the verdict is Approved (cron or webhook path):
+
+1. **Merge gate** — `assert_can_merge` confirms the daemon still holds the live
+   review lease for this PR. If another review is in flight (or the lease
+   lapsed), the merge is deferred with an amber alert and retried next cycle.
+   This is what makes "no auto-merge while another review is in flight" a hard,
+   code-enforced guarantee rather than a courtesy.
+2. **Re-check CI** on the exact reviewed SHA, and **rebase** the branch if it's
+   behind main (clean rebase only; a real conflict escalates to #alerts).
+3. **Squash-merge** — `gh pr merge {number} --squash --delete-branch`.
+4. **Post-merge** — close linked issues, clean up the worktree, notify.
+
+Reviewer agents (and Tidus, on the autonomous path) must **not** run
+`gh pr merge`, `git rebase`, or `git push` on the PR — approve and stop. The
+autonomous loop completes when the daemon reports the merge.
+
+> **Manual reviews on main-only repos merge on the next cron tick, not instantly (#102).**
+> A `tidus-manual` review has no daemon `on_complete` hook, so once you post the
+> Approved verdict and the manual lease releases, the merge is performed by the
+> daemon's `retry_approved_unmerged` pass on its next cycle (≤ one cron interval).
+> A short "approved but not yet merged" gap here is expected — it is **not** a hang.
 
 ## Agent Behavior During Build
 
@@ -251,7 +276,8 @@ This isn't about asking permission for every line of code. It's about being a co
 - Trigger review-merge SOP for new/updated PRs
 - Spawn reviewer and builder agents
 - Track which PRs are being processed
-- Handle merge mechanics (squash, rebase)
+- Hold the per-PR review lease **through** the merge, and gate every merge on it (`assert_can_merge`) — no auto-merge fires while another review is in flight (#102)
+- **Perform the merge** on the autonomous path (squash, rebase, re-check CI) — the single lease-gated chokepoint. Agents do not self-merge here (#102)
 
 **Agents (intelligent):**
 - Review code against standards

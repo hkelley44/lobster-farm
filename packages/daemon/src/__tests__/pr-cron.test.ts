@@ -3,7 +3,7 @@ import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DiscordBot } from "../discord.js";
 import type { ProcessedPR } from "../persistence.js";
-import { PRReviewCron } from "../pr-cron.js";
+import { PRReviewCron, is_bot_login, is_reviewer_feedback_comment } from "../pr-cron.js";
 
 // ── Helpers ──
 
@@ -24,14 +24,14 @@ const T = {
 /** Shape matching the private PRFeedbackData interface. */
 interface FeedbackData {
   reviews: Array<{ submittedAt: string; author: { login: string }; state: string }>;
-  comments: Array<{ createdAt: string; author: { login: string } }>;
+  comments: Array<{ createdAt: string; author: { login: string }; body?: string }>;
   commits: Array<{ committedDate: string }>;
 }
 
 /** Build a PRFeedbackData object for test scenarios. */
 function make_pr_data(opts: {
   reviews?: Array<{ submittedAt: string; login?: string; state?: string }>;
-  comments?: Array<{ createdAt: string; login?: string }>;
+  comments?: Array<{ createdAt: string; login?: string; body?: string }>;
   commits?: Array<{ committedDate: string }>;
 }): FeedbackData {
   return {
@@ -43,6 +43,7 @@ function make_pr_data(opts: {
     comments: (opts.comments ?? []).map((c) => ({
       createdAt: c.createdAt,
       author: { login: c.login ?? "reviewer-bot" },
+      ...(c.body != null ? { body: c.body } : {}),
     })),
     commits: (opts.commits ?? []).map((c) => ({
       committedDate: c.committedDate,
@@ -89,10 +90,14 @@ class TestPRReviewCron extends PRReviewCron {
    * Expose the private should_skip_pr for direct testing.
    * Uses bracket notation to call the private method.
    */
-  async test_should_skip_pr(pr_number: number): Promise<boolean> {
-    type SkipFn = (repo_path: string, pr_number: number) => Promise<boolean>;
+  async test_should_skip_pr(pr_number: number, pr_author_login?: string): Promise<boolean> {
+    type SkipFn = (
+      repo_path: string,
+      pr_number: number,
+      pr_author_login?: string,
+    ) => Promise<boolean>;
     const fn = (this as unknown as { should_skip_pr: SkipFn }).should_skip_pr.bind(this);
-    return fn("/test/repo", pr_number);
+    return fn("/test/repo", pr_number, pr_author_login);
   }
 }
 
@@ -301,6 +306,163 @@ describe("PRReviewCron.should_skip_pr", () => {
         (m) => typeof m === "string" && m.includes("PR #42") && m.includes("already reviewed"),
       ),
     ).toBe(true);
+  });
+
+  // ── #102 Gap 2: author comments must not suppress re-review ──
+
+  it("does NOT skip when the PR author comments after the last commit (no reviewer feedback)", async () => {
+    // Regression for #98: a builder pushes a fix (T.commit_new), then the PR
+    // author posts a comment even later. Before #102 that comment's createdAt
+    // made latest_feedback newer than the commit and suppressed re-review. Now
+    // the author's own comment is excluded, so the post-push re-review proceeds.
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [{ createdAt: "2026-03-27T12:00:00Z", login: "pr-author" }],
+        commits: [{ committedDate: T.commit_new }], // 11:00, before the author comment
+      }),
+    );
+
+    const skip = await cron.test_should_skip_pr(42, "pr-author");
+    expect(skip).toBe(false);
+  });
+
+  it("still skips when a genuine reviewer comment lands after the last commit", async () => {
+    // A real reviewer (distinct login) commenting after the commit is genuine
+    // feedback — the PR is up to date, so skip.
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [{ createdAt: "2026-03-27T12:00:00Z", login: "reviewer-bot" }],
+        commits: [{ committedDate: T.commit_new }],
+      }),
+    );
+
+    const skip = await cron.test_should_skip_pr(42, "pr-author");
+    expect(skip).toBe(true);
+  });
+
+  it("ignores CI-bot / third-party comments after the last commit", async () => {
+    // A CI bot comment is neither reviewer feedback nor an author reply — it
+    // must not, by itself, suppress a re-review.
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [{ createdAt: "2026-03-27T12:00:00Z", login: "github-actions[bot]" }],
+        commits: [{ committedDate: T.commit_new }],
+      }),
+    );
+
+    const skip = await cron.test_should_skip_pr(42, "pr-author");
+    expect(skip).toBe(false);
+  });
+
+  it("counts an author's **Verdict: findings comment (single-dev reviewer == author)", async () => {
+    // In single-dev repos the reviewer posts verdicts under the author's own
+    // login (self-approve is blocked). A `**Verdict:` comment IS review
+    // feedback and must still suppress re-review when no new commits followed.
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [
+          { createdAt: T.review, login: "reviewer-bot", body: "**Verdict: Approved**\nLGTM" },
+        ],
+        commits: [{ committedDate: T.commit_old }],
+      }),
+    );
+
+    // Author login equals the reviewer login here (single-dev).
+    const skip = await cron.test_should_skip_pr(42, "reviewer-bot");
+    expect(skip).toBe(true);
+  });
+
+  it("does NOT let a plain author reply (no verdict) count in single-dev repos", async () => {
+    // Same login for author and reviewer, but this comment is chatter — it must
+    // not suppress the post-push re-review.
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [{ createdAt: "2026-03-27T12:00:00Z", login: "reviewer-bot", body: "thanks!" }],
+        commits: [{ committedDate: T.commit_new }],
+      }),
+    );
+
+    const skip = await cron.test_should_skip_pr(42, "reviewer-bot");
+    expect(skip).toBe(false);
+  });
+});
+
+// ── #102 Gap 2: is_reviewer_feedback_comment / is_bot_login (direct unit) ──
+
+describe("is_bot_login", () => {
+  it("matches any [bot]-suffixed GitHub App login (case-insensitive)", () => {
+    expect(is_bot_login("github-actions[bot]")).toBe(true);
+    expect(is_bot_login("some-app[BOT]")).toBe(true);
+    expect(is_bot_login("renovate[bot]")).toBe(true);
+  });
+
+  it("matches denylisted integrations that comment without the [bot] suffix", () => {
+    expect(is_bot_login("vercel")).toBe(true);
+    expect(is_bot_login("Codecov")).toBe(true);
+    expect(is_bot_login("sentry-io")).toBe(true);
+  });
+
+  it("does not match ordinary human logins", () => {
+    expect(is_bot_login("reviewer-bot")).toBe(false); // human whose name contains "bot"
+    expect(is_bot_login("pr-author")).toBe(false);
+    expect(is_bot_login("hkelley44")).toBe(false);
+  });
+});
+
+describe("is_reviewer_feedback_comment", () => {
+  const bot = (login: string, body?: string) => ({ author: { login }, ...(body ? { body } : {}) });
+
+  it("drops a bot comment even in degraded (reviewer_login === null) mode", () => {
+    // The #98/#99 hole: with the reviewer identity unresolved, the old fallback
+    // counted ANY non-author comment — so a CI/deploy bot comment suppressed the
+    // post-push re-review. It must now be dropped unconditionally.
+    expect(is_reviewer_feedback_comment(bot("vercel[bot]"), null, "pr-author")).toBe(false);
+    expect(is_reviewer_feedback_comment(bot("codecov"), null, "pr-author")).toBe(false);
+  });
+
+  it("drops a bot comment when the reviewer identity IS resolved too", () => {
+    expect(
+      is_reviewer_feedback_comment(bot("github-actions[bot]"), "reviewer-bot", "pr-author"),
+    ).toBe(false);
+  });
+
+  it("still counts the reviewer identity even when it is a GitHub App ([bot] login)", () => {
+    // resolve_reviewer_login can return an app identity like `lobsterfarm[bot]`.
+    // The reviewer-identity match must win over the bot filter.
+    expect(
+      is_reviewer_feedback_comment(bot("lobsterfarm[bot]"), "lobsterfarm[bot]", "pr-author"),
+    ).toBe(true);
+  });
+
+  it("counts a genuine **Verdict: comment regardless of login", () => {
+    expect(
+      is_reviewer_feedback_comment(
+        bot("reviewer-bot", "**Verdict: Approved**"),
+        null,
+        "reviewer-bot",
+      ),
+    ).toBe(true);
+  });
+
+  it("still counts a human reviewer's comment in degraded mode (non-author, non-bot)", () => {
+    // Fallback best-effort: unknown reviewer identity, a human's comment counts.
+    expect(is_reviewer_feedback_comment(bot("some-human"), null, "pr-author")).toBe(true);
+  });
+
+  it("never counts the PR author's non-verdict chatter", () => {
+    expect(
+      is_reviewer_feedback_comment(bot("pr-author", "thanks!"), "reviewer-bot", "pr-author"),
+    ).toBe(false);
   });
 });
 

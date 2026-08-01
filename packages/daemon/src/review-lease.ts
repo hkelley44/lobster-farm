@@ -18,6 +18,15 @@
  *   - Lazy expiry. We evict expired leases on every acquire/get rather than
  *     running a background sweeper — there is no work to do between calls.
  *   - Single-writer. One daemon per machine, so no cross-process coordination.
+ *
+ * The lease gates the MERGE, not just the spawn (#102). Before #102 the store
+ * was only consulted when a reviewer was about to be spawned — the actual
+ * `gh pr merge` ran with no lease held, so an incomplete review could win a
+ * race and auto-merge a PR (observed on PR #98). Every merge call site now
+ * passes through `assert_can_merge`, which merges only when the live lease for
+ * that PR is held by the caller. Because there is exactly one lease per PR,
+ * "a different holder's lease is live" and "no lease is held by me" both block
+ * the merge — precisely "no auto-merge while another review is in flight."
  */
 
 /** Who holds a review lease. The webhook spawn path is in-scope per #60. */
@@ -86,9 +95,16 @@ export class ReviewLeaseStore {
    * Acquire the lease for a PR.
    *
    * - No live lease → grant a fresh one to `holder`.
-   * - Live lease held by the SAME holder → idempotent: return the existing
-   *   lease unchanged. We deliberately do NOT extend `expires_at` — re-acquiring
-   *   must not let a holder hold the lease forever by re-asking.
+   * - Live lease held by the SAME holder AND the same (or an absent) session id
+   *   → idempotent: return the existing lease unchanged. We deliberately do NOT
+   *   extend `expires_at` — re-acquiring must not let a holder hold the lease
+   *   forever by re-asking.
+   * - Live lease held by the same holder but a DIFFERENT session id → conflict.
+   *   A differing session id means a genuinely different operation is contending
+   *   for the PR (e.g. the merge-retry pass vs. the in-flight review that spawned
+   *   the lease). Without this, `acquire` was idempotent per-holder and a retry
+   *   could silently piggyback on a review's still-live lease and double-merge
+   *   in the delete-vs-release window (#102).
    * - Live lease held by a DIFFERENT holder → conflict; return that lease.
    */
   acquire(
@@ -102,8 +118,19 @@ export class ReviewLeaseStore {
     const existing = this.live_lease(key, now);
 
     if (existing) {
-      // Same holder re-acquiring → idempotent, return as-is (no extension).
       if (existing.holder === holder) {
+        // Same holder, but a distinct session id → different logical operation.
+        // Only conflict when BOTH sides carry a session id (legacy callers that
+        // pass none keep the old idempotent behavior).
+        const req_sid = opts.session_id;
+        if (
+          req_sid !== undefined &&
+          existing.session_id !== undefined &&
+          req_sid !== existing.session_id
+        ) {
+          return { ok: false, current_lease: existing };
+        }
+        // Same holder re-acquiring → idempotent, return as-is (no extension).
         return { ok: true, lease: existing };
       }
       // Different holder still holds it → conflict.
@@ -144,4 +171,47 @@ export class ReviewLeaseStore {
   get(owner_repo: string, pr_number: number): ReviewLease | null {
     return this.live_lease(ReviewLeaseStore.key(owner_repo, pr_number), Date.now());
   }
+
+  /**
+   * Does `holder` currently hold the live lease for this PR? (#102)
+   *
+   * This is the predicate the merge gate is built on. Returns true only when a
+   * live (non-expired) lease exists AND it belongs to `holder`. A lease held by
+   * a different holder, or no lease at all, both return false — which is exactly
+   * the "another review is in flight, or nobody owns this merge" block.
+   *
+   * When `session_id` is supplied AND the live lease carries a `session_id`,
+   * they must also match — this lets a caller prove the merge belongs to the
+   * specific review session that approved the PR, not merely the same origin.
+   * If either side omits the session id we fall back to holder-only matching
+   * (holder identity is the mandatory gate; session id is an optional
+   * tightening).
+   */
+  holds(owner_repo: string, pr_number: number, holder: LeaseHolder, session_id?: string): boolean {
+    const lease = this.get(owner_repo, pr_number);
+    if (!lease || lease.holder !== holder) return false;
+    if (session_id && lease.session_id && lease.session_id !== session_id) return false;
+    return true;
+  }
+}
+
+/**
+ * The single merge gate (#102). Returns true when it is safe for `holder` to
+ * merge PR `pr_number`, false when the merge must be aborted (another review's
+ * lease is live, or no lease is held by this caller).
+ *
+ * Fail-open by design, matching the spawn-time mutex it hardens: when there is
+ * no store (legacy / test wiring passes `null`) or the owner/repo slug could
+ * not be resolved, the gate returns true so behavior is unchanged from before
+ * the gate existed. A degraded lease store must never permanently wedge merges.
+ */
+export function assert_can_merge(
+  store: ReviewLeaseStore | null,
+  owner_repo: string | null,
+  pr_number: number,
+  holder: LeaseHolder,
+  session_id?: string,
+): boolean {
+  if (!store || !owner_repo) return true; // fail-open — see #102 / #60 "Out of scope"
+  return store.holds(owner_repo, pr_number, holder, session_id);
 }

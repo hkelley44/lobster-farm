@@ -14,6 +14,29 @@ function state_dir(config: LobsterFarmConfig): string {
   return join(lobsterfarm_dir(config.paths), STATE_DIR);
 }
 
+/**
+ * Belt-and-suspenders guard against tests leaking into live state (#102 Gap 3).
+ *
+ * Under `NODE_ENV === "test"`, refuse to write when the resolved state root is
+ * the real `~/.lobsterfarm` — i.e. a test built a config without overriding
+ * `paths.lobsterfarm_dir`. Throwing loudly here beats silently corrupting the
+ * developer's live daemon state (the `lobster-farm:6010` leak was exactly this:
+ * `pr-cron-lease.test.ts` used a fixture PR with no `paths` override, so
+ * `save_pr_reviews` wrote straight to `~/.lobsterfarm/state/pr-reviews.json`).
+ *
+ * No-op outside tests — production always writes to the configured root.
+ */
+function assert_writable_state_root(path: string, config: LobsterFarmConfig): void {
+  if (process.env.NODE_ENV !== "test") return;
+  const configured_root = lobsterfarm_dir(config.paths);
+  const real_root = lobsterfarm_dir(); // default "~/.lobsterfarm", expanded
+  if (configured_root === real_root) {
+    throw new Error(
+      `[persistence] Refusing to write ${path} under the real state root (${real_root}) during tests. Point config.paths.lobsterfarm_dir at a tmp dir (see #102 Gap 3).`,
+    );
+  }
+}
+
 function pr_reviews_path(config: LobsterFarmConfig): string {
   return join(state_dir(config), PR_REVIEWS_FILE);
 }
@@ -81,23 +104,116 @@ export async function save_pr_reviews(
   config: LobsterFarmConfig,
 ): Promise<void> {
   const path = pr_reviews_path(config);
+  assert_writable_state_root(path, config);
   const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
   await mkdir(dirname(path), { recursive: true });
   await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
   await rename(tmp_path, path);
 }
 
-/** Load PR review state from disk. Returns empty object if file doesn't exist. */
-export async function load_pr_reviews(config: LobsterFarmConfig): Promise<PRReviewState> {
+/**
+ * Validate/repair a raw pr-reviews object (#102 Gap 3). Drops any entry whose:
+ *   - key is not `${entity_id}:${pr_number}` shaped, or
+ *   - embedded `pr_number` does not equal the key's numeric suffix, or
+ *   - embedded `entity_id` does not equal the key's prefix, or
+ *   - `entity_id` is not a registered entity (only when `known_entity_ids` is
+ *     supplied — the caller must have a registry to enable this check).
+ *
+ * This makes the store self-healing against leaks like the `lobster-farm:6010`
+ * bogus key a test fixture wrote into live state. Returns the cleaned map and
+ * the list of dropped keys so the caller can log + rewrite.
+ */
+export function sanitize_pr_reviews(
+  data: Record<string, unknown>,
+  known_entity_ids?: ReadonlySet<string>,
+): {
+  clean: PRReviewState;
+  dropped: string[];
+} {
+  const clean: PRReviewState = {};
+  const dropped: string[] = [];
+
+  for (const [key, value] of Object.entries(data)) {
+    // Key must be exactly "<entity_id>:<pr_number>" with a numeric suffix.
+    const sep = key.lastIndexOf(":");
+    const key_entity = sep > 0 ? key.slice(0, sep) : "";
+    const key_num_str = sep > 0 ? key.slice(sep + 1) : "";
+    const key_num = Number(key_num_str);
+
+    const shape_ok =
+      key_entity.length > 0 &&
+      key_num_str.length > 0 &&
+      Number.isInteger(key_num) &&
+      typeof value === "object" &&
+      value !== null;
+
+    if (!shape_ok) {
+      dropped.push(key);
+      continue;
+    }
+
+    const entry = value as Partial<ProcessedPR>;
+    if (entry.pr_number !== key_num || entry.entity_id !== key_entity) {
+      dropped.push(key);
+      continue;
+    }
+
+    // Unknown-entity check — only when the caller passed a registry snapshot.
+    if (known_entity_ids && !known_entity_ids.has(key_entity)) {
+      dropped.push(key);
+      continue;
+    }
+
+    clean[key] = entry as ProcessedPR;
+  }
+
+  return { clean, dropped };
+}
+
+/**
+ * Load PR review state from disk. Returns empty object if file doesn't exist.
+ *
+ * Sanitizes on load (#102 Gap 3): malformed / mismatched / unknown-entity
+ * entries are dropped, each logged by key, and the cleaned file is rewritten so
+ * the corruption doesn't linger. This is what heals leaks such as the bogus
+ * `lobster-farm:6010` key. Pass `known_entity_ids` (from the registry) to also
+ * drop entries for entities that no longer exist.
+ */
+export async function load_pr_reviews(
+  config: LobsterFarmConfig,
+  known_entity_ids?: ReadonlySet<string>,
+): Promise<PRReviewState> {
   const path = pr_reviews_path(config);
+  let content: string;
   try {
-    const content = await readFile(path, "utf-8");
-    const data: unknown = JSON.parse(content);
-    if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
-    return data as PRReviewState;
+    content = await readFile(path, "utf-8");
   } catch {
     return {};
   }
+
+  let data: unknown;
+  try {
+    data = JSON.parse(content);
+  } catch {
+    return {};
+  }
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
+
+  const { clean, dropped } = sanitize_pr_reviews(data as Record<string, unknown>, known_entity_ids);
+  if (dropped.length > 0) {
+    console.warn(
+      `[persistence] pr-reviews.json: dropped ${String(dropped.length)} malformed/mismatched ` +
+        `entr${dropped.length === 1 ? "y" : "ies"}: ${dropped.join(", ")} — rewriting clean`,
+    );
+    try {
+      await save_pr_reviews(clean, config);
+    } catch (err) {
+      // A failed rewrite must not break loading — the in-memory state is already
+      // clean; we just couldn't persist the repair this cycle.
+      console.warn(`[persistence] Failed to rewrite cleaned pr-reviews.json: ${String(err)}`);
+    }
+  }
+  return clean;
 }
 
 // ── Pool State ──
@@ -151,6 +267,7 @@ export async function save_pool_state(
   avatar_state?: Record<string, PersistedBotAvatarState>,
 ): Promise<void> {
   const path = pool_state_path(config);
+  assert_writable_state_root(path, config);
   const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
   await mkdir(dirname(path), { recursive: true });
   const state: PersistedPoolState = {
@@ -320,6 +437,7 @@ export async function save_pr_watches(
   config: LobsterFarmConfig,
 ): Promise<void> {
   const path = pr_watches_path(config);
+  assert_writable_state_root(path, config);
   const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
   await mkdir(dirname(path), { recursive: true });
   await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
@@ -362,6 +480,7 @@ export async function save_deploy_triage(
   config: LobsterFarmConfig,
 ): Promise<void> {
   const path = deploy_triage_path(config);
+  assert_writable_state_root(path, config);
   const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
   await mkdir(dirname(path), { recursive: true });
   await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
