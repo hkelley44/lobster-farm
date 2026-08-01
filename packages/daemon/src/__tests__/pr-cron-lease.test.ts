@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
-import type { EntityConfig } from "@lobster-farm/shared";
+import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PRReviewCron } from "../pr-cron.js";
 import { ReviewLeaseStore } from "../review-lease.js";
@@ -17,6 +20,16 @@ vi.mock("../issue-utils.js", async () => {
   };
 });
 
+// Keep review-outcome detection off the gh CLI so the completion handler can run
+// deterministically (#102). Approved+external+unmerged routes to an alert with
+// no merge, exercising the lease release-after-routing ordering.
+vi.mock("../actions.js", () => ({
+  detect_review_outcome: vi.fn().mockResolvedValue("approved"),
+  detect_review_outcome_with_source: vi
+    .fn()
+    .mockResolvedValue({ outcome: "approved", source: "review" }),
+}));
+
 vi.mock("../sentry.js", () => ({
   captureException: vi.fn(),
   captureMessage: vi.fn(),
@@ -24,6 +37,18 @@ vi.mock("../sentry.js", () => ({
   cronCheckInStart: vi.fn(() => "checkin-id"),
   cronCheckInFinish: vi.fn(),
 }));
+
+// Sandbox state writes to a per-suite tmp dir so `save_pr_reviews` (reachable via
+// persist_review_completion) never touches the real ~/.lobsterfarm/state — the
+// exact leak that put a bogus `lobster-farm:6010` key into live state (#102 Gap 3).
+let STATE_ROOT: string;
+
+function make_sandboxed_config(): LobsterFarmConfig {
+  return LobsterFarmConfigSchema.parse({
+    user: { name: "Test" },
+    paths: { lobsterfarm_dir: STATE_ROOT },
+  });
+}
 
 const REPO_PATH = "/tmp/test-repo";
 const REPO_URL = "https://github.com/test-org/lobster-farm.git";
@@ -66,7 +91,7 @@ class TestCron extends PRReviewCron {
     super(
       { get: () => make_entity(), get_active: () => [make_entity()] } as never,
       session_manager as never,
-      LobsterFarmConfigSchema.parse({ user: { name: "Test" } }),
+      make_sandboxed_config(),
       null,
       null,
       null,
@@ -93,12 +118,14 @@ describe("PRReviewCron review mutex (#60)", () => {
   let log_spy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
+    STATE_ROOT = mkdtempSync(join(tmpdir(), "lf-pr-cron-lease-"));
     log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
   });
 
   afterEach(() => {
     log_spy.mockRestore();
     vi.restoreAllMocks();
+    rmSync(STATE_ROOT, { recursive: true, force: true });
   });
 
   it("cron acquires the lease before spawning — a later tidus acquire collides (409 path)", async () => {
@@ -170,7 +197,12 @@ describe("PRReviewCron review mutex (#60)", () => {
     expect(leases.get(OWNER_REPO, OPEN_PR.number)?.holder).toBe("daemon-webhook");
   });
 
-  it("releases the lease when the reviewer session completes", async () => {
+  it("holds the lease THROUGH the merge, releasing only after outcome routing (#102)", async () => {
+    // Before #102 the completion handler released the lease *before*
+    // persist_review_completion (which routes the outcome and runs the merge),
+    // so the auto-merge executed with no lease held — an incomplete concurrent
+    // review could win the race. The lease must now stay live until the merge
+    // attempt has settled.
     const leases = new ReviewLeaseStore();
     const cron = new TestCron(leases);
 
@@ -185,11 +217,17 @@ describe("PRReviewCron review mutex (#60)", () => {
     await cron.run_review_pr();
     expect(leases.get(OWNER_REPO, OPEN_PR.number)?.holder).toBe("daemon-cron");
 
-    // Fire the completion handler — lease must be released.
+    // Fire the completion handler. The lease must STILL be live synchronously
+    // afterward — the release now lives in a `.finally` that runs only after
+    // outcome routing + any merge attempt completes.
     const completed = on_calls.find(([e]) => e === "session:completed")?.[1];
     expect(completed).toBeDefined();
     completed!({ session_id: "sess-cron-1", exit_code: 0 });
+    expect(leases.get(OWNER_REPO, OPEN_PR.number)?.holder).toBe("daemon-cron");
 
-    expect(leases.get(OWNER_REPO, OPEN_PR.number)).toBeNull();
+    // Once persist_review_completion settles, the lease is released.
+    await vi.waitFor(() => {
+      expect(leases.get(OWNER_REPO, OPEN_PR.number)).toBeNull();
+    });
   });
 });

@@ -74,6 +74,7 @@ vi.mock("../actions.js", () => ({
 }));
 import { record_v2_review_feedback } from "../check-suite-handler.js";
 import { run_merge_gate } from "../merge-gate.js";
+import { ReviewLeaseStore } from "../review-lease.js";
 import { fetch_pr_mergeability } from "../review-utils.js";
 import type { WebhookContext, WebhookPR } from "../webhook-handler.js";
 import { handle_v2_review_completion } from "../webhook-handler.js";
@@ -587,5 +588,95 @@ describe("handle_v2_review_completion — dismissed", () => {
     expect((ctx.session_manager as any).spawn).not.toHaveBeenCalled();
     expect(run_merge_gate).not.toHaveBeenCalled();
     expect(cleanup_after_merge).not.toHaveBeenCalled();
+  });
+});
+
+describe("handle_v2_review_completion — merge gate lease (#102)", () => {
+  it("does NOT run the merge-gate while another review lease is active", async () => {
+    // Regression for the #98 race on the webhook arm: a different origin holds
+    // the lease for this PR. An approved outcome must not merge.
+    const leases = new ReviewLeaseStore();
+    leases.acquire(REPO_FULL_NAME, 42, "daemon-cron");
+
+    const pr = make_pr();
+    const ctx = make_ctx({ review_leases: leases });
+
+    await handle_v2_review_completion(
+      ENTITY_ID,
+      REPO_PATH,
+      REPO_FULL_NAME,
+      pr,
+      "approved",
+      "ghs",
+      ctx,
+    );
+
+    expect(run_merge_gate).not.toHaveBeenCalled();
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({ title: expect.stringContaining("Merge gate blocked") }),
+    );
+    // The other holder's lease is untouched.
+    expect(leases.get(REPO_FULL_NAME, 42)?.holder).toBe("daemon-cron");
+  });
+
+  it("does NOT run the merge-gate when no lease is held", async () => {
+    const leases = new ReviewLeaseStore(); // present but empty
+
+    const pr = make_pr();
+    const ctx = make_ctx({ review_leases: leases });
+
+    await handle_v2_review_completion(
+      ENTITY_ID,
+      REPO_PATH,
+      REPO_FULL_NAME,
+      pr,
+      "approved",
+      "ghs",
+      ctx,
+    );
+
+    expect(run_merge_gate).not.toHaveBeenCalled();
+    expect((ctx.alert_router as any).post_alert).toHaveBeenCalledWith(
+      expect.objectContaining({ title: expect.stringContaining("Merge gate blocked") }),
+    );
+  });
+
+  it("runs the merge-gate when the webhook holds the live lease", async () => {
+    vi.mocked(run_merge_gate).mockResolvedValueOnce({ kind: "merged", method: "direct" });
+    const leases = new ReviewLeaseStore();
+    leases.acquire(REPO_FULL_NAME, 42, "daemon-webhook");
+
+    const pr = make_pr();
+    const ctx = make_ctx({ review_leases: leases });
+
+    await handle_v2_review_completion(
+      ENTITY_ID,
+      REPO_PATH,
+      REPO_FULL_NAME,
+      pr,
+      "approved",
+      "ghs",
+      ctx,
+    );
+
+    expect(run_merge_gate).toHaveBeenCalledTimes(1);
+  });
+
+  it("fail-open: with no lease store the merge-gate runs unchanged (legacy/test)", async () => {
+    vi.mocked(run_merge_gate).mockResolvedValueOnce({ kind: "merged", method: "direct" });
+    const pr = make_pr();
+    const ctx = make_ctx(); // review_leases undefined
+
+    await handle_v2_review_completion(
+      ENTITY_ID,
+      REPO_PATH,
+      REPO_FULL_NAME,
+      pr,
+      "approved",
+      "ghs",
+      ctx,
+    );
+
+    expect(run_merge_gate).toHaveBeenCalledTimes(1);
   });
 });

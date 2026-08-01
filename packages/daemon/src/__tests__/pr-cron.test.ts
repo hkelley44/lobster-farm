@@ -24,14 +24,14 @@ const T = {
 /** Shape matching the private PRFeedbackData interface. */
 interface FeedbackData {
   reviews: Array<{ submittedAt: string; author: { login: string }; state: string }>;
-  comments: Array<{ createdAt: string; author: { login: string } }>;
+  comments: Array<{ createdAt: string; author: { login: string }; body?: string }>;
   commits: Array<{ committedDate: string }>;
 }
 
 /** Build a PRFeedbackData object for test scenarios. */
 function make_pr_data(opts: {
   reviews?: Array<{ submittedAt: string; login?: string; state?: string }>;
-  comments?: Array<{ createdAt: string; login?: string }>;
+  comments?: Array<{ createdAt: string; login?: string; body?: string }>;
   commits?: Array<{ committedDate: string }>;
 }): FeedbackData {
   return {
@@ -43,6 +43,7 @@ function make_pr_data(opts: {
     comments: (opts.comments ?? []).map((c) => ({
       createdAt: c.createdAt,
       author: { login: c.login ?? "reviewer-bot" },
+      ...(c.body != null ? { body: c.body } : {}),
     })),
     commits: (opts.commits ?? []).map((c) => ({
       committedDate: c.committedDate,
@@ -89,10 +90,14 @@ class TestPRReviewCron extends PRReviewCron {
    * Expose the private should_skip_pr for direct testing.
    * Uses bracket notation to call the private method.
    */
-  async test_should_skip_pr(pr_number: number): Promise<boolean> {
-    type SkipFn = (repo_path: string, pr_number: number) => Promise<boolean>;
+  async test_should_skip_pr(pr_number: number, pr_author_login?: string): Promise<boolean> {
+    type SkipFn = (
+      repo_path: string,
+      pr_number: number,
+      pr_author_login?: string,
+    ) => Promise<boolean>;
     const fn = (this as unknown as { should_skip_pr: SkipFn }).should_skip_pr.bind(this);
-    return fn("/test/repo", pr_number);
+    return fn("/test/repo", pr_number, pr_author_login);
   }
 }
 
@@ -301,6 +306,94 @@ describe("PRReviewCron.should_skip_pr", () => {
         (m) => typeof m === "string" && m.includes("PR #42") && m.includes("already reviewed"),
       ),
     ).toBe(true);
+  });
+
+  // ── #102 Gap 2: author comments must not suppress re-review ──
+
+  it("does NOT skip when the PR author comments after the last commit (no reviewer feedback)", async () => {
+    // Regression for #98: a builder pushes a fix (T.commit_new), then the PR
+    // author posts a comment even later. Before #102 that comment's createdAt
+    // made latest_feedback newer than the commit and suppressed re-review. Now
+    // the author's own comment is excluded, so the post-push re-review proceeds.
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [{ createdAt: "2026-03-27T12:00:00Z", login: "pr-author" }],
+        commits: [{ committedDate: T.commit_new }], // 11:00, before the author comment
+      }),
+    );
+
+    const skip = await cron.test_should_skip_pr(42, "pr-author");
+    expect(skip).toBe(false);
+  });
+
+  it("still skips when a genuine reviewer comment lands after the last commit", async () => {
+    // A real reviewer (distinct login) commenting after the commit is genuine
+    // feedback — the PR is up to date, so skip.
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [{ createdAt: "2026-03-27T12:00:00Z", login: "reviewer-bot" }],
+        commits: [{ committedDate: T.commit_new }],
+      }),
+    );
+
+    const skip = await cron.test_should_skip_pr(42, "pr-author");
+    expect(skip).toBe(true);
+  });
+
+  it("ignores CI-bot / third-party comments after the last commit", async () => {
+    // A CI bot comment is neither reviewer feedback nor an author reply — it
+    // must not, by itself, suppress a re-review.
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [{ createdAt: "2026-03-27T12:00:00Z", login: "github-actions[bot]" }],
+        commits: [{ committedDate: T.commit_new }],
+      }),
+    );
+
+    const skip = await cron.test_should_skip_pr(42, "pr-author");
+    expect(skip).toBe(false);
+  });
+
+  it("counts an author's **Verdict: findings comment (single-dev reviewer == author)", async () => {
+    // In single-dev repos the reviewer posts verdicts under the author's own
+    // login (self-approve is blocked). A `**Verdict:` comment IS review
+    // feedback and must still suppress re-review when no new commits followed.
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [
+          { createdAt: T.review, login: "reviewer-bot", body: "**Verdict: Approved**\nLGTM" },
+        ],
+        commits: [{ committedDate: T.commit_old }],
+      }),
+    );
+
+    // Author login equals the reviewer login here (single-dev).
+    const skip = await cron.test_should_skip_pr(42, "reviewer-bot");
+    expect(skip).toBe(true);
+  });
+
+  it("does NOT let a plain author reply (no verdict) count in single-dev repos", async () => {
+    // Same login for author and reviewer, but this comment is chatter — it must
+    // not suppress the post-push re-review.
+    cron.set_feedback(
+      42,
+      make_pr_data({
+        reviews: [],
+        comments: [{ createdAt: "2026-03-27T12:00:00Z", login: "reviewer-bot", body: "thanks!" }],
+        commits: [{ committedDate: T.commit_new }],
+      }),
+    );
+
+    const skip = await cron.test_should_skip_pr(42, "reviewer-bot");
+    expect(skip).toBe(false);
   });
 });
 

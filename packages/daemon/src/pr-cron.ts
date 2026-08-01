@@ -23,7 +23,7 @@ import { load_pr_reviews, save_pr_reviews } from "./persistence.js";
 import type { PRReviewState } from "./persistence.js";
 import type { PRWatchStore } from "./pr-watches.js";
 import type { EntityRegistry } from "./registry.js";
-import type { ReviewLeaseStore } from "./review-lease.js";
+import { type ReviewLeaseStore, assert_can_merge } from "./review-lease.js";
 import {
   MAX_CI_FIX_ATTEMPTS,
   attempt_auto_merge,
@@ -66,6 +66,34 @@ async function try_cleanup_worktree(
   }
 }
 
+/**
+ * Is this comment genuine reviewer feedback (vs author chatter / bots)? (#102)
+ *
+ * Rules, in order:
+ *   - Authored by the PR author → only counts if it's a `**Verdict:` findings
+ *     comment. In single-dev repos the reviewer posts verdicts under the author's
+ *     own login (self-approval is blocked), so we can't drop everything by that
+ *     login — but a plain reply must never count as review feedback.
+ *   - Otherwise, if we know the reviewer identity → count only comments from that
+ *     identity (or any `**Verdict:` comment). This drops CI bots and third parties.
+ *   - Reviewer identity unknown (resolution failed) → count any non-author comment
+ *     as a best-effort fallback (still excludes the author's chatter).
+ */
+export function is_reviewer_feedback_comment(
+  comment: { author: { login: string }; body?: string },
+  reviewer_login: string | null,
+  pr_author_login?: string,
+): boolean {
+  const is_verdict = comment.body?.trimStart().startsWith("**Verdict:") === true;
+  if (pr_author_login != null && comment.author.login === pr_author_login) {
+    return is_verdict;
+  }
+  if (reviewer_login != null) {
+    return comment.author.login === reviewer_login || is_verdict;
+  }
+  return true;
+}
+
 // ── Types ──
 
 interface OpenPR {
@@ -98,6 +126,10 @@ interface GHReview {
 interface GHComment {
   createdAt: string;
   author: { login: string };
+  /** Present on `gh pr view --json comments`. Used to recognize the reviewer's
+   * `**Verdict:` findings comments in single-dev repos, where the reviewer and
+   * the PR author share a login (#102). */
+  body?: string;
 }
 
 interface GHCommit {
@@ -154,8 +186,13 @@ export class PRReviewCron {
     this.gh_bin = resolve_binary("gh");
     console.log(`[pr-cron] Resolved gh binary: ${this.gh_bin}`);
 
-    // Load persisted review state so we don't re-review after restart
-    this.processed = await load_pr_reviews(this.config);
+    // Load persisted review state so we don't re-review after restart. Pass the
+    // registered entity IDs so load can drop orphaned / bogus entries (#102 Gap 3)
+    // — e.g. a leaked `lobster-farm:6010`-style key for a PR that never existed.
+    const known_entity_ids = this.registry.get_all
+      ? new Set(this.registry.get_all().map((e) => e.entity.id))
+      : undefined;
+    this.processed = await load_pr_reviews(this.config, known_entity_ids);
     const count = Object.keys(this.processed).length;
     if (count > 0) {
       console.log(`[pr-cron] Loaded ${String(count)} processed PR reviews from disk`);
@@ -313,8 +350,10 @@ export class PRReviewCron {
 
       console.log(`[pr-cron] Found open PR #${String(pr.number)} in ${entity_id}: "${pr.title}"`);
 
-      // Check if PR needs (re-)review by comparing commit vs feedback timestamps
-      const skip = await this.should_skip_pr(repo_path, pr.number);
+      // Check if PR needs (re-)review by comparing commit vs feedback timestamps.
+      // Pass the PR author so their own comments never count as review feedback
+      // (an author reply after a push must not suppress re-review — #102 Gap 2).
+      const skip = await this.should_skip_pr(repo_path, pr.number, pr.author.login);
       if (skip) {
         continue;
       }
@@ -328,36 +367,54 @@ export class PRReviewCron {
   }
 
   /**
-   * Decide whether to skip a PR based on commit vs review/comment timestamps.
+   * Decide whether to skip a PR based on commit vs REVIEWER feedback timestamps.
    *
-   * - No feedback at all: don't skip (never reviewed)
-   * - Latest commit is newer than latest feedback + buffer: don't skip (needs re-review)
-   * - Latest feedback is at or after latest commit: skip (already reviewed)
+   * - No reviewer feedback at all: don't skip (never reviewed)
+   * - Latest commit is newer than latest reviewer feedback + buffer: don't skip
+   * - Latest reviewer feedback is at or after latest commit: skip (already reviewed)
+   *
+   * "Freshness" must reflect actual review feedback, not chatter (#102 Gap 2).
+   * Before #102 every comment counted, so a PR author's own comment after a push
+   * (e.g. replying to the review) had a `createdAt` newer than the last commit and
+   * suppressed the legitimate post-push re-review — the exact hole that let a stale
+   * approval win the #98 race. We now count only genuine reviewer feedback: formal
+   * `PullRequestReview` submissions, plus comments from the reviewer identity
+   * (`get_authenticated_login`) — and `**Verdict:` findings comments in single-dev
+   * repos where the reviewer and PR author share a login. Author replies,
+   * third-party comments, and CI bots are ignored for freshness.
    */
-  private async should_skip_pr(repo_path: string, pr_number: number): Promise<boolean> {
+  private async should_skip_pr(
+    repo_path: string,
+    pr_number: number,
+    pr_author_login?: string,
+  ): Promise<boolean> {
     const data = await this.fetch_pr_feedback(repo_path, pr_number);
     if (!data) {
       // Can't fetch PR data — don't skip, let the reviewer attempt proceed
       return false;
     }
 
-    // Extract feedback timestamps from reviews and comments.
-    // Note: we don't filter by author here. If CI bots start posting comments,
-    // add author filtering (e.g., skip authors with [bot] suffix or known CI logins).
+    // Resolve the reviewer identity so we can distinguish real review feedback
+    // from the author's own comments. Null (unresolvable) → degrade to "any
+    // non-author comment counts" so we still exclude the author's chatter.
+    const reviewer_login = await this.resolve_reviewer_login(repo_path);
+
     const feedback_timestamps: number[] = [];
 
+    // Formal reviews are review feedback by definition — always count them.
     for (const review of data.reviews) {
       if (review.submittedAt) {
         feedback_timestamps.push(new Date(review.submittedAt).getTime());
       }
     }
+    // Comments only count when they represent actual reviewer feedback.
     for (const comment of data.comments) {
-      if (comment.createdAt) {
-        feedback_timestamps.push(new Date(comment.createdAt).getTime());
-      }
+      if (!comment.createdAt) continue;
+      if (!is_reviewer_feedback_comment(comment, reviewer_login, pr_author_login)) continue;
+      feedback_timestamps.push(new Date(comment.createdAt).getTime());
     }
 
-    // No feedback at all — never reviewed
+    // No reviewer feedback at all — never reviewed
     if (feedback_timestamps.length === 0) {
       return false;
     }
@@ -402,6 +459,18 @@ export class PRReviewCron {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Resolve the reviewer identity — the daemon's authenticated `gh api user`
+   * login, the same login the Reviewer posts verdict comments as (#102 Gap 2).
+   * Returns null when it can't be resolved; callers degrade gracefully.
+   *
+   * Visibility is `protected` so test subclasses can inject a deterministic
+   * login without stubbing the gh CLI (mirrors `count_review_cycles`).
+   */
+  protected async resolve_reviewer_login(repo_path: string): Promise<string | null> {
+    return get_authenticated_login(repo_path, process.env, this.gh_bin);
   }
 
   /**
@@ -500,21 +569,18 @@ export class PRReviewCron {
       "Run /ultrareview to do a comprehensive code review, then post using the",
       `commands from your initial instructions with PR #${String(pr.number)}.`,
       "",
-      "Before merging, check CI status:",
+      "Before deciding your verdict, check CI status:",
       `  gh pr checks ${String(pr.number)} --required`,
-      "If any required checks are failing or pending, do NOT merge.",
-      "Instead, note the failing checks in your review and request changes.",
-      "If no CI workflows are configured for this repo, proceed with merge normally.",
+      "If any required checks are failing, note them in your review. Pending CI is",
+      "not a reason to request changes — review on code merits (see your CI Awareness",
+      "instructions). If no CI workflows are configured for this repo, ignore CI.",
       "",
-      "After posting your review:",
-      "- If you approved, merge the PR:",
-      `  gh pr merge ${String(pr.number)} --squash --delete-branch`,
-      "- If the merge command fails (branch behind main):",
-      `  1. Try: git fetch origin && git checkout ${pr.headRefName} && git rebase origin/main`,
-      `  2. If rebase is clean (no conflicts): git push --force-with-lease origin ${pr.headRefName}`,
-      `  3. Then retry: gh pr merge ${String(pr.number)} --squash --delete-branch`,
-      "  4. If rebase has conflicts: git rebase --abort — do NOT force push conflict markers",
-      "- If you requested changes, do NOT merge.",
+      "Do NOT merge the PR yourself. The daemon owns the merge (#102): once you post",
+      "an Approved verdict, the daemon performs the single, lease-gated merge — it",
+      "re-checks CI and mergeability first, and rebases if the branch is behind. Your",
+      "job ends at the verdict. If you approved, simply post the verdict and stop; if",
+      "you requested changes, post the verdict and stop. Do not run `gh pr merge`,",
+      "`git rebase`, or `git push` — that is the daemon's responsibility now.",
     ];
 
     if (issue_context) {
@@ -557,12 +623,17 @@ export class PRReviewCron {
         this.session_manager.removeListener("session:failed", on_fail);
 
         this.active_reviews.delete(key);
-        release_lease(); // free the PR for legitimate re-review (#60)
         console.log(`[pr-cron] Review completed for PR #${String(pr.number)} in ${entity_id}`);
 
-        // Persist completion so we don't re-review after restart
-        void this.persist_review_completion(entity_id, pr, repo_path, entity_config).catch(
-          (err) => {
+        // Hold the review lease THROUGH the merge (#102). The merge happens
+        // inside persist_review_completion → handle_review_completion →
+        // attempt_auto_merge, which is gated by assert_can_merge("daemon-cron").
+        // Releasing here (as we did before #102) meant the auto-merge ran with
+        // no lease held — an incomplete concurrent review could win the race
+        // and merge a PR out from under a still-working reviewer (PR #98).
+        // Release only AFTER outcome routing + any merge attempt has settled.
+        void this.persist_review_completion(entity_id, pr, repo_path, entity_config)
+          .catch((err) => {
             console.error(
               `[pr-cron] Failed to persist review for PR #${String(pr.number)}: ${String(err)}`,
             );
@@ -570,8 +641,10 @@ export class PRReviewCron {
               tags: { module: "pr-cron", entity: entity_id },
               contexts: { pr: { number: pr.number, title: pr.title } },
             });
-          },
-        );
+          })
+          .finally(() => {
+            release_lease(); // free the PR for legitimate re-review (#60), post-merge
+          });
       };
 
       const on_fail = (session_id: string, error: string) => {
@@ -670,6 +743,14 @@ export class PRReviewCron {
     const github_user = entity_config?.entity.accounts?.github?.user;
     const is_internal = github_user != null && pr.author.login === github_user;
 
+    // Owner/repo slug for the merge gate (#102). Null when the store is absent
+    // or the slug can't be resolved → assert_can_merge fails open (behaves as
+    // before the gate existed). This handler always runs on the cron path, so
+    // the expected lease holder is "daemon-cron", acquired in review_pr and
+    // still held here (release moved into on_complete's finally).
+    const owner_repo =
+      this.review_leases && entity_config ? this.owner_repo_for(repo_path, entity_config) : null;
+
     let review_state: ReviewOutcome;
     if (review_outcome) {
       review_state = review_outcome;
@@ -763,6 +844,20 @@ export class PRReviewCron {
         } else if (ci.failures.length > 0) {
           // Spawn builder to fix CI failures (#196)
           await this.spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, entity_config);
+        } else if (!assert_can_merge(this.review_leases, owner_repo, pr.number, "daemon-cron")) {
+          // Merge gate (#102): our review lease is no longer the live holder for
+          // this PR — another review is in flight (or the lease expired). Do NOT
+          // merge; leave the PR open with an amber alert for the next cycle.
+          console.warn(
+            `[pr-cron] Merge gate blocked PR #${String(pr.number)} — daemon-cron does not hold the review lease`,
+          );
+          await this.alert_router?.post_alert({
+            entity_id,
+            tier: "action_required",
+            title: `\u26a0\ufe0f Merge gate blocked — PR #${String(pr.number)}`,
+            body: `${pr.title} — approved but another review holds the lease; merge deferred to next cycle.`,
+            embed_color: ALERT_COLOR_AMBER,
+          });
         } else {
           // All checks passed (or none configured) — attempt auto-merge with rebase (#166)
           const result = await attempt_auto_merge(
@@ -853,6 +948,13 @@ export class PRReviewCron {
   ): Promise<void> {
     const gh_token = await this.resolve_entity_token(entity_config);
     const github_user = entity_config.entity.accounts?.github?.user;
+
+    // Owner/repo slug for the merge gate (#102). This retry pass runs with NO
+    // reviewer session active, so no lease is naturally held. We acquire the
+    // lease as "daemon-cron" right before each merge and release it after — so
+    // a merge here can never fire while a webhook or Tidus review holds the
+    // lease. Null slug/store → assert_can_merge fails open.
+    const owner_repo = this.review_leases ? this.owner_repo_for(repo_path, entity_config) : null;
 
     for (const pr of prs) {
       const key = `${entity_id}:${String(pr.number)}`;
@@ -945,48 +1047,78 @@ export class PRReviewCron {
         continue;
       }
 
-      // CI passed — attempt merge
-      console.log(`[pr-cron] CI passed for approved PR #${String(pr.number)} — retrying merge`);
+      // CI passed — attempt merge. Merge gate (#102): acquire the review lease
+      // as daemon-cron first. If another holder (webhook / Tidus) is mid-review,
+      // the acquire conflicts, so skip the merge this cycle rather than race it.
+      if (this.review_leases && owner_repo) {
+        const acquired = this.review_leases.acquire(owner_repo, pr.number, "daemon-cron");
+        if (!acquired.ok) {
+          console.log(
+            `[pr-cron] Merge retry for PR #${String(pr.number)} deferred — review lease held by ` +
+              `${acquired.current_lease.holder} (expires ${acquired.current_lease.expires_at})`,
+          );
+          continue;
+        }
+      }
 
-      const result = await attempt_auto_merge(
-        pr.number,
-        pr.headRefName,
-        repo_path,
-        this.gh_bin,
-        gh_token,
-      );
+      try {
+        // Defensive: we hold the lease now, so this is trivially true — but it
+        // keeps a uniform gate in front of every merge call site (#102).
+        if (!assert_can_merge(this.review_leases, owner_repo, pr.number, "daemon-cron")) {
+          console.warn(
+            `[pr-cron] Merge gate blocked retry for PR #${String(pr.number)} — lease not held`,
+          );
+          continue;
+        }
 
-      if (result.merged) {
-        // Update processed state to reflect the merge
-        this.processed[key] = {
-          entity_id,
-          pr_number: pr.number,
-          reviewed_at: new Date().toISOString(),
-          outcome: "approved",
-        };
-        await save_pr_reviews(this.processed, this.config);
+        console.log(`[pr-cron] CI passed for approved PR #${String(pr.number)} — retrying merge`);
 
-        await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
-        await this.alert_router?.post_alert({
-          entity_id,
-          tier: "routine",
-          title: `PR #${String(pr.number)} merged`,
-          body: `${pr.title} — CI passed, auto-merged (${result.method})`,
-        });
+        const result = await attempt_auto_merge(
+          pr.number,
+          pr.headRefName,
+          repo_path,
+          this.gh_bin,
+          gh_token,
+        );
 
-        // Clean up local worktrees for the merged branch
-        await try_cleanup_worktree(repo_path, pr.headRefName, pr.number, {
-          alert_router: this.alert_router,
-          entity_id,
-        });
-      } else {
-        await this.alert_router?.post_alert({
-          entity_id,
-          tier: "action_required",
-          title: `\u26a0\ufe0f Merge failed — PR #${String(pr.number)}`,
-          body: `${pr.title} — approved, CI passed, but merge failed. ${result.error ?? "Manual intervention needed."}`,
-          embed_color: ALERT_COLOR_AMBER,
-        });
+        if (result.merged) {
+          // Update processed state to reflect the merge
+          this.processed[key] = {
+            entity_id,
+            pr_number: pr.number,
+            reviewed_at: new Date().toISOString(),
+            outcome: "approved",
+          };
+          await save_pr_reviews(this.processed, this.config);
+
+          await this.close_issues_for_merged_pr(entity_id, repo_path, pr, entity_config);
+          await this.alert_router?.post_alert({
+            entity_id,
+            tier: "routine",
+            title: `PR #${String(pr.number)} merged`,
+            body: `${pr.title} — CI passed, auto-merged (${result.method})`,
+          });
+
+          // Clean up local worktrees for the merged branch
+          await try_cleanup_worktree(repo_path, pr.headRefName, pr.number, {
+            alert_router: this.alert_router,
+            entity_id,
+          });
+        } else {
+          await this.alert_router?.post_alert({
+            entity_id,
+            tier: "action_required",
+            title: `\u26a0\ufe0f Merge failed — PR #${String(pr.number)}`,
+            body: `${pr.title} — approved, CI passed, but merge failed. ${result.error ?? "Manual intervention needed."}`,
+            embed_color: ALERT_COLOR_AMBER,
+          });
+        }
+      } finally {
+        // Release the merge lease we acquired for this retry (#102). No-op when
+        // there's no store or slug.
+        if (this.review_leases && owner_repo) {
+          this.review_leases.release(owner_repo, pr.number, "daemon-cron");
+        }
       }
     }
   }

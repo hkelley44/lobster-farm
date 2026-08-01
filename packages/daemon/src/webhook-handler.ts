@@ -44,7 +44,7 @@ import type { BotPool } from "./pool.js";
 import type { PRWatchStore } from "./pr-watches.js";
 import type { EntityRegistry } from "./registry.js";
 import { find_entity_for_repo as find_entity_for_repo_full } from "./repo-utils.js";
-import type { ReviewLeaseStore } from "./review-lease.js";
+import { type ReviewLeaseStore, assert_can_merge } from "./review-lease.js";
 import {
   MAX_CI_FIX_ATTEMPTS,
   MAX_DEPLOY_FIX_ATTEMPTS,
@@ -827,6 +827,22 @@ async function handle_review_completion(
             `[webhook] CI checks pending for PR #${String(pr.number)} but pr-cron is disabled — attempting merge`,
           );
 
+          // Merge gate (#102): even on the CI-pending bypass, only merge if we
+          // still hold the review lease. Another live review blocks this merge.
+          if (!assert_can_merge(ctx.review_leases, repo_full_name, pr.number, "daemon-webhook")) {
+            console.warn(
+              `[webhook] Merge gate blocked PR #${String(pr.number)} (CI-pending bypass) — lease not held by daemon-webhook`,
+            );
+            await ctx.alert_router?.post_alert({
+              entity_id,
+              tier: "action_required",
+              title: `\u26a0\ufe0f Merge gate blocked — PR #${String(pr.number)}`,
+              body: `${pr.title} — approved but another review holds the lease; merge deferred.`,
+              embed_color: ALERT_COLOR_AMBER,
+            });
+            return;
+          }
+
           const result = await attempt_auto_merge(
             pr.number,
             pr.head.ref,
@@ -863,6 +879,21 @@ async function handle_review_completion(
       } else if (ci.failures.length > 0) {
         // Spawn builder to fix CI failures (#196)
         await spawn_ci_fixer(entity_id, repo_path, pr, ci.failures, ctx, installation_id);
+      } else if (
+        !assert_can_merge(ctx.review_leases, repo_full_name, pr.number, "daemon-webhook")
+      ) {
+        // Merge gate (#102): the daemon-webhook lease is no longer the live
+        // holder — another review is in flight. Do not merge; leave the PR open.
+        console.warn(
+          `[webhook] Merge gate blocked PR #${String(pr.number)} — daemon-webhook does not hold the review lease`,
+        );
+        await ctx.alert_router?.post_alert({
+          entity_id,
+          tier: "action_required",
+          title: `\u26a0\ufe0f Merge gate blocked — PR #${String(pr.number)}`,
+          body: `${pr.title} — approved but another review holds the lease; merge deferred.`,
+          embed_color: ALERT_COLOR_AMBER,
+        });
       } else {
         // All checks passed (or none configured) — proceed with merge
         const result = await attempt_auto_merge(
@@ -1023,6 +1054,23 @@ export async function handle_v2_review_completion(
         tier: "action_required",
         title: `\u26a0\ufe0f No GH token — PR #${String(pr.number)}`,
         body: `${pr.title} — approved but no GH token available for merge-gate. Manual intervention needed.`,
+        embed_color: ALERT_COLOR_AMBER,
+      });
+      return;
+    }
+
+    // Merge gate (#102): the v2 lifecycle's run_merge_gate re-verifies CI and
+    // mergeability, but it does NOT know about the review lease. Guard it with
+    // the lease so an approved merge can't fire while another review is live.
+    if (!assert_can_merge(ctx.review_leases, repo_full_name, pr.number, "daemon-webhook")) {
+      console.warn(
+        `[webhook:v2] Merge gate blocked PR #${String(pr.number)} — daemon-webhook does not hold the review lease`,
+      );
+      await ctx.alert_router?.post_alert({
+        entity_id,
+        tier: "action_required",
+        title: `\u26a0\ufe0f Merge gate blocked — PR #${String(pr.number)}`,
+        body: `${pr.title} — approved but another review holds the lease; merge deferred.`,
         embed_color: ALERT_COLOR_AMBER,
       });
       return;
