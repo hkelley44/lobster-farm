@@ -122,11 +122,34 @@ ${env_section}`;
  * `exec`ing node directly guarantees node is the process launchd tracks, so it
  * can never be orphaned behind a dead supervisor.
  *
+ * ## Secret-file contract (what `op run --env-file` used to do for us)
+ *
+ * Dropping `op run` means we own dotenv parsing. The emitted parser handles
+ * unquoted single-line values, single/double-quoted values (surrounding quotes
+ * stripped), and **quoted multi-line values** — which is how a PEM private key
+ * must be written in `.env.op`:
+ *
+ *     GITHUB_APP_PRIVATE_KEY="op://lobsterfarm/github-app/private-key"
+ *
+ * `op inject` is a literal template substitution, so it preserves those quotes
+ * and drops the (multi-line) secret between them. The quotes are what make a
+ * continuation line distinguishable from a new `KEY=value` assignment.
+ *
+ * An **unquoted** multi-line value is genuinely ambiguous — a PEM body line can
+ * itself look like an assignment (`AbCdEf==`). Rather than silently exporting a
+ * truncated key (the #98 review finding), the parser drops the partial value and
+ * warns. Warnings name the key only, never the value: this output goes to
+ * daemon.log.
+ *
  * @param node_path   Absolute path to the node binary.
  * @param daemon_path Absolute path to the daemon entry point (index.js).
+ * @param home        Root for env.sh / .env.op lookups. Overridable for tests.
  */
-export function generate_wrapper_sh(node_path: string, daemon_path: string): string {
-  const home = homedir();
+export function generate_wrapper_sh(
+  node_path: string,
+  daemon_path: string,
+  home: string = homedir(),
+): string {
   return `#!/bin/zsh
 # LobsterFarm daemon wrapper — managed by \`lf start\`, do not edit.
 # Sources env.sh for PATH, injects 1Password secrets, then exec's the daemon.
@@ -145,18 +168,97 @@ source "$ENV_FILE"
 # exec node directly. We use \`op inject\` (not \`op run -- node\`) so node
 # becomes the launchd-tracked leaf and can never be orphaned behind a dead
 # \`op run\` supervisor while still holding port 7749 (#97).
+#
+# \`op inject\` substitutes op:// references in the env-file and prints the
+# resolved dotenv text. We parse it and export literally — no \`eval\`, so
+# secret values containing shell metacharacters are safe.
+#
+# MULTI-LINE SECRETS MUST BE QUOTED IN .env.op:
+#   GITHUB_APP_PRIVATE_KEY="op://lobsterfarm/github-app/private-key"
+# \`op inject\` preserves the surrounding quotes, and the quotes are what let the
+# parser tell a continuation line from a new KEY=value assignment. An unquoted
+# multi-line value is ambiguous (a PEM body line can look like an assignment) —
+# we drop it and warn rather than export a truncated secret.
 ENV_OP="${home}/.lobsterfarm/.env.op"
 if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
-  # \`op inject\` substitutes op:// references in the env-file and prints
-  # KEY=value lines (dotenv format, unquoted values). Parse line by line and
-  # export literally — no \`eval\`, so secret values with shell metacharacters
-  # are handled safely. IFS='=' splits on the first '=' only; the remainder
-  # (including any further '=') stays in the value.
   if resolved_secrets="$(op inject -i "$ENV_OP" 2>/dev/null)"; then
-    while IFS='=' read -r key value; do
-      [[ -z "$key" || "$key" == '#'* ]] && continue
-      export "$key=$value"
+    op_key=""
+    op_value=""
+    op_quote=""
+    op_malformed=0
+
+    # Export the buffered assignment. Only *unquoted* values are ever buffered:
+    # they are the ambiguous ones, and deferring their export is what lets a
+    # following continuation line cancel a truncated value instead of shipping
+    # it. Quoted values are unambiguous and export the moment they close.
+    op_flush() {
+      [[ -n "$op_key" ]] && export "$op_key=$op_value"
+      op_key=""
+      op_value=""
+    }
+
+    while IFS= read -r op_line; do
+      # Inside a quoted multi-line value: accumulate until the closing quote.
+      if [[ -n "$op_quote" ]]; then
+        if [[ "$op_line" == *"$op_quote" ]]; then
+          op_line="\${op_line%$op_quote}"
+          op_value+=$'\\n'"$op_line"
+          op_quote=""
+          op_flush
+        else
+          op_value+=$'\\n'"$op_line"
+        fi
+        continue
+      fi
+
+      # Blank lines and comments neither open nor close an assignment.
+      [[ "$op_line" =~ '^[[:space:]]*(#|$)' ]] && continue
+
+      # A new KEY=value assignment closes the previous one.
+      if [[ "$op_line" == *=* ]] && [[ "\${op_line%%=*}" =~ '^[A-Za-z_][A-Za-z0-9_]*$' ]]; then
+        op_flush
+        op_key="\${op_line%%=*}"
+        op_value="\${op_line#*=}"
+        if [[ "$op_value" == '"'* || "$op_value" == "'"* ]]; then
+          op_quote="\${op_value:0:1}"
+          op_value="\${op_value:1}"
+          # Closes on the same line? Unambiguous — strip the quote and export.
+          if [[ -n "$op_value" && "$op_value" == *"$op_quote" ]]; then
+            op_value="\${op_value%$op_quote}"
+            op_quote=""
+            op_flush
+          fi
+        fi
+        # Unquoted values stay buffered until the next key, or EOF.
+        continue
+      fi
+
+      # Anything else is an unquoted continuation line, so the buffered value is
+      # a truncated secret. Drop it — a half PEM fails deep inside GitHub App
+      # auth, while an absent one fails loudly here. Never echo the line itself.
+      if [[ -n "$op_key" ]]; then
+        echo "[start-daemon] WARNING: unparseable line in resolved .env.op after key '$op_key' — value dropped" >&2
+      elif (( ! op_malformed )); then
+        echo "[start-daemon] WARNING: unparseable line in resolved .env.op — skipped" >&2
+      fi
+      op_malformed=1
+      op_key=""
+      op_value=""
     done <<< "$resolved_secrets"
+
+    if [[ -n "$op_quote" ]]; then
+      echo "[start-daemon] WARNING: unterminated quote for key '$op_key' in resolved .env.op — value NOT exported" >&2
+      op_malformed=1
+    else
+      op_flush
+    fi
+
+    if (( op_malformed )); then
+      echo "[start-daemon] WARNING: multi-line secrets must be quoted in .env.op, e.g. KEY=\\"op://vault/item/field\\"" >&2
+    fi
+
+    unset resolved_secrets op_line op_key op_value op_quote op_malformed
+    unset -f op_flush
   else
     echo "[start-daemon] WARNING: op inject failed — continuing without 1Password secrets" >&2
   fi

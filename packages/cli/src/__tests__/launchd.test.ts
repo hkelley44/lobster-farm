@@ -1,4 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
 import { generate_env_sh, generate_plist, generate_wrapper_sh } from "../lib/launchd.js";
 
 // --- generate_env_sh ---
@@ -185,17 +189,214 @@ describe("generate_wrapper_sh", () => {
   it("exports injected secrets without eval (safe for shell metacharacters)", () => {
     const result = generate_wrapper_sh("/opt/homebrew/bin/node", "/path/to/daemon/index.js");
 
-    // Line-by-line literal export, and no `eval` of resolved secret values.
-    expect(result).toContain('export "$key=$value"');
+    // Literal export of the buffered assignment, and no `eval` of secret values.
+    expect(result).toContain('export "$op_key=$op_value"');
     for (const line of executable_lines(result)) {
       expect(line).not.toMatch(/\beval\b/);
     }
+  });
+
+  it("documents the multi-line quoting contract in the wrapper itself", () => {
+    const result = generate_wrapper_sh("/opt/homebrew/bin/node", "/path/to/daemon/index.js");
+
+    // Whoever debugs a secret-injection failure reads the wrapper, not this repo.
+    expect(result).toMatch(/MULTI-LINE SECRETS MUST BE QUOTED/);
+    expect(result).toContain("multi-line secrets must be quoted in .env.op");
   });
 
   it("references env.sh in the standard location", () => {
     const result = generate_wrapper_sh("/opt/homebrew/bin/node", "/path/to/daemon/index.js");
 
     expect(result).toContain(".lobsterfarm/env.sh");
+  });
+});
+
+// --- generate_wrapper_sh: functional secret-injection behaviour ---
+//
+// These run the generated wrapper under a real zsh with a stub `op` (prints a
+// canned `op inject` result) and a stub "node" (dumps the environment it was
+// exec'd with). That end-to-end path is the only way to prove the dotenv parser
+// actually round-trips a multi-line PEM — the #98 review finding.
+
+const ZSH = "/bin/zsh";
+const zsh_available = (() => {
+  try {
+    execFileSync(ZSH, ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+const temp_roots: string[] = [];
+
+afterAll(() => {
+  for (const dir of temp_roots) rmSync(dir, { recursive: true, force: true });
+});
+
+/** Vars the stub "node" reports back, base64-encoded so newlines survive. */
+const REPORTED_KEYS = [
+  "DISCORD_TOKEN",
+  "QUOTED_DOUBLE",
+  "QUOTED_SINGLE",
+  "EMPTY_QUOTED",
+  "WITH_EQUALS",
+  "SPECIAL",
+  "GITHUB_APP_PRIVATE_KEY",
+  "TRAILING",
+] as const;
+
+interface WrapperRun {
+  env: Record<string, string>;
+  stderr: string;
+  status: number | null;
+}
+
+/**
+ * Run the generated wrapper against a canned `op inject` output.
+ * Returns the environment the exec'd leaf actually received.
+ */
+function run_wrapper(injected: string): WrapperRun {
+  const root = mkdtempSync(join(tmpdir(), "lf-wrapper-"));
+  temp_roots.push(root);
+
+  const bin = join(root, "bin");
+  const lf = join(root, ".lobsterfarm");
+  mkdirSync(bin);
+  mkdirSync(lf);
+
+  // Stub `op`: ignores its args and prints the canned injection result.
+  const injected_path = join(root, "injected.txt");
+  writeFileSync(injected_path, injected);
+  const op_stub = join(bin, "op");
+  writeFileSync(op_stub, `#!/bin/zsh\ncat ${JSON.stringify(injected_path)}\n`);
+  chmodSync(op_stub, 0o755);
+
+  // Stub "node": reports the vars it was exec'd with, base64 so newlines survive.
+  const node_stub = join(bin, "fake-node");
+  writeFileSync(
+    node_stub,
+    [
+      "#!/bin/zsh",
+      `for k in ${REPORTED_KEYS.join(" ")}; do`,
+      `  printf '%s %s\\n' "$k" "$(printf '%s' "\${(P)k}" | base64 | tr -d '\\n')"`,
+      "done",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(node_stub, 0o755);
+
+  // env.sh only has to put the stub `op` on PATH.
+  writeFileSync(join(lf, "env.sh"), `export PATH=${JSON.stringify(bin)}:$PATH\n`);
+  // Presence is all that matters — the stub `op` never reads it.
+  writeFileSync(join(lf, ".env.op"), "GITHUB_APP_PRIVATE_KEY=op://vault/item/field\n");
+
+  const wrapper = join(root, "start-daemon.sh");
+  writeFileSync(wrapper, generate_wrapper_sh(node_stub, join(root, "index.js"), root));
+  chmodSync(wrapper, 0o755);
+
+  const proc = spawnSync(ZSH, [wrapper], { encoding: "utf-8" });
+  const env: Record<string, string> = {};
+  for (const line of (proc.stdout ?? "").split("\n")) {
+    const [key, b64] = line.split(" ");
+    if (key) env[key] = Buffer.from(b64 ?? "", "base64").toString("utf-8");
+  }
+  return { env, stderr: proc.stderr ?? "", status: proc.status };
+}
+
+const PEM = [
+  "-----BEGIN RSA PRIVATE KEY-----",
+  "MIIEowIBAAKCAQEAtest+line/with=padding",
+  "AbCdEf==",
+  "-----END RSA PRIVATE KEY-----",
+].join("\n");
+
+describe.skipIf(!zsh_available)("generate_wrapper_sh secret injection (zsh)", () => {
+  const well_formed = [
+    "# a comment line",
+    "",
+    "DISCORD_TOKEN=plain-token-value",
+    'QUOTED_DOUBLE="double quoted"',
+    "QUOTED_SINGLE='single quoted'",
+    'EMPTY_QUOTED=""',
+    "WITH_EQUALS=a=b=c",
+    // Would execute under `eval`, and would be mangled by naive quote handling.
+    'SPECIAL=$(echo pwned)`whoami`"stray',
+    `GITHUB_APP_PRIVATE_KEY="${PEM}"`,
+    "TRAILING=after-the-pem",
+    "",
+  ].join("\n");
+
+  it("round-trips a quoted multi-line PEM byte-for-byte (#98 review finding)", () => {
+    const { env, stderr } = run_wrapper(well_formed);
+
+    expect(env.GITHUB_APP_PRIVATE_KEY).toBe(PEM);
+    // And it must not swallow the assignment that follows the PEM.
+    expect(env.TRAILING).toBe("after-the-pem");
+    expect(stderr).not.toContain("WARNING");
+  });
+
+  it("strips surrounding quotes and preserves values verbatim", () => {
+    const { env } = run_wrapper(well_formed);
+
+    expect(env.DISCORD_TOKEN).toBe("plain-token-value");
+    expect(env.QUOTED_DOUBLE).toBe("double quoted");
+    expect(env.QUOTED_SINGLE).toBe("single quoted");
+    expect(env.EMPTY_QUOTED).toBe("");
+    // Only the first `=` separates key from value.
+    expect(env.WITH_EQUALS).toBe("a=b=c");
+  });
+
+  it("never expands or executes shell metacharacters in a secret value", () => {
+    const { env } = run_wrapper(well_formed);
+
+    expect(env.SPECIAL).toBe('$(echo pwned)`whoami`"stray');
+    expect(env.SPECIAL).not.toContain("pwned\n");
+  });
+
+  it("drops (not truncates) an unquoted multi-line value and warns", () => {
+    // The exact shape `op inject` emits when .env.op forgets the quotes.
+    const unquoted = ["DISCORD_TOKEN=still-fine", `GITHUB_APP_PRIVATE_KEY=${PEM}`, ""].join("\n");
+
+    const { env, stderr } = run_wrapper(unquoted);
+
+    // A truncated PEM is worse than an absent one: it fails deep inside GitHub
+    // App auth instead of at startup. Absent + loud is the contract.
+    expect(env.GITHUB_APP_PRIVATE_KEY).toBe("");
+    expect(stderr).toContain("WARNING");
+    expect(stderr).toContain("multi-line secrets must be quoted in .env.op");
+    // Unrelated keys still load.
+    expect(env.DISCORD_TOKEN).toBe("still-fine");
+  });
+
+  it("warns on an unterminated quote without exporting a partial value", () => {
+    const truncated = [
+      'GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----',
+      "MIIEow",
+      "",
+    ].join("\n");
+
+    const { env, stderr } = run_wrapper(truncated);
+
+    expect(env.GITHUB_APP_PRIVATE_KEY).toBe("");
+    expect(stderr).toContain("unterminated quote");
+  });
+
+  it("never echoes secret material in its warnings", () => {
+    const unquoted = [`GITHUB_APP_PRIVATE_KEY=${PEM}`, ""].join("\n");
+
+    const { stderr } = run_wrapper(unquoted);
+
+    // daemon.log is world-readable-ish and long-lived — key names only.
+    expect(stderr).toContain("GITHUB_APP_PRIVATE_KEY");
+    expect(stderr).not.toContain("MIIEow");
+    expect(stderr).not.toContain("BEGIN RSA PRIVATE KEY");
+  });
+
+  it("still exec's node as the leaf after injection", () => {
+    const { status } = run_wrapper("DISCORD_TOKEN=plain-token-value\n");
+
+    expect(status).toBe(0);
   });
 });
 
