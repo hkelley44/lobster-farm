@@ -261,7 +261,11 @@ interface WrapperRun {
  * is load-bearing, not scaffolding — tests that vary it are testing real
  * behaviour. Defaults to every key the stub node reports.
  */
-function run_wrapper(injected: string, declared: readonly string[] = REPORTED_KEYS): WrapperRun {
+function run_wrapper(
+  injected: string,
+  declared: readonly string[] = REPORTED_KEYS,
+  template?: string,
+): WrapperRun {
   const root = mkdtempSync(join(tmpdir(), "lf-wrapper-"));
   temp_roots.push(root);
 
@@ -297,7 +301,7 @@ function run_wrapper(injected: string, declared: readonly string[] = REPORTED_KE
   // for its declared-key set. The stub `op` ignores it and prints `injected`.
   writeFileSync(
     join(lf, ".env.op"),
-    `${declared.map((k) => `${k}=op://vault/item/${k.toLowerCase()}`).join("\n")}\n`,
+    template ?? `${declared.map((k) => `${k}=op://vault/item/${k.toLowerCase()}`).join("\n")}\n`,
   );
 
   const wrapper = join(root, "start-daemon.sh");
@@ -491,10 +495,74 @@ describe.skipIf(!zsh_available)("generate_wrapper_sh secret injection (zsh)", ()
   });
 
   it("skips injection with a warning when .env.op declares no keys", () => {
-    const { env, stderr } = run_wrapper("DISCORD_TOKEN=ignored\n", []);
+    const { env, stderr } = run_wrapper("DISCORD_TOKEN=ignored\n", [], "# only a comment\n");
 
     expect(env.DISCORD_TOKEN).toBe("");
     expect(stderr).toContain("declares no KEY=value entries");
+  });
+
+  // Review round 3. The declared-key scan reads .env.op with `read`, which
+  // returns non-zero at EOF even when it produced a partial final line. Without
+  // the `|| [[ -n "$op_line" ]]` guard a template saved without a trailing
+  // newline silently loses its LAST declaration — and because an undeclared key
+  // is treated as a continuation line, that also drops the secret before it.
+  describe(".env.op without a trailing newline", () => {
+    it("still declares the final key", () => {
+      const keys = ["DISCORD_TOKEN", "SPECIAL", "TRAILING"];
+      const template = keys.map((k) => `${k}=op://vault/item/${k.toLowerCase()}`).join("\n"); // no \n
+
+      const { env, stderr } = run_wrapper(
+        ["DISCORD_TOKEN=one", "SPECIAL=two", "TRAILING=three", ""].join("\n"),
+        keys,
+        template,
+      );
+
+      expect(env.TRAILING).toBe("three");
+      // The cascade: losing the last declaration also ate the one before it.
+      expect(env.SPECIAL).toBe("two");
+      expect(env.DISCORD_TOKEN).toBe("one");
+      expect(stderr).not.toContain("WARNING");
+    });
+
+    it("does not misattribute a warning to an innocent key", () => {
+      // The pre-fix failure blamed SPECIAL, which was fine, and advised quoting
+      // multi-line secrets when nothing here is multi-line.
+      const keys = ["DISCORD_TOKEN", "SPECIAL", "TRAILING"];
+      const template = keys.map((k) => `${k}=op://vault/item/${k.toLowerCase()}`).join("\n");
+
+      const { stderr } = run_wrapper(
+        ["DISCORD_TOKEN=one", "SPECIAL=two", "TRAILING=three", ""].join("\n"),
+        keys,
+        template,
+      );
+
+      expect(stderr).not.toContain("SPECIAL");
+      expect(stderr).not.toContain("multi-line");
+    });
+  });
+
+  it("honours `export KEY=` declarations in the template", () => {
+    const { env, stderr } = run_wrapper(
+      ["export DISCORD_TOKEN=exported-value", ""].join("\n"),
+      ["DISCORD_TOKEN"],
+      "export DISCORD_TOKEN=op://vault/item/discord_token\n",
+    );
+
+    expect(env.DISCORD_TOKEN).toBe("exported-value");
+    expect(stderr).not.toContain("WARNING");
+  });
+
+  it("warns when a template line is not a KEY=value declaration", () => {
+    // Silently disabling injection for an unreadable line is how a secret goes
+    // missing with no explanation.
+    const { env, stderr } = run_wrapper(
+      ["DISCORD_TOKEN=fine", ""].join("\n"),
+      ["DISCORD_TOKEN"],
+      "DISCORD_TOKEN=op://vault/item/discord_token\nthis is not a declaration\n",
+    );
+
+    expect(env.DISCORD_TOKEN).toBe("fine");
+    expect(stderr).toContain("not KEY=value declarations");
   });
 });
 

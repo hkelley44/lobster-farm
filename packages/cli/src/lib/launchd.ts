@@ -190,12 +190,25 @@ ENV_OP="${home}/.lobsterfarm/.env.op"
 if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
   # Colon-delimited set of declared key names, e.g. ":FOO:BAR:".
   op_declared=":"
-  while IFS= read -r op_line; do
+  op_undeclarable=0
+  # \`|| [[ -n "$op_line" ]]\` so a .env.op without a trailing newline does not
+  # silently lose its last declaration — read returns non-zero on EOF even when
+  # it produced a partial line, and a missing key here drops a real secret.
+  while IFS= read -r op_line || [[ -n "$op_line" ]]; do
     op_line="\${op_line%$'\\r'}"
-    if [[ "$op_line" =~ '^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=' ]]; then
-      op_declared="$op_declared\${match[1]}:"
+    [[ "$op_line" =~ '^[[:space:]]*(#|$)' ]] && continue
+    if [[ "$op_line" =~ '^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=' ]]; then
+      op_declared="$op_declared\${match[2]}:"
+    else
+      # A line we cannot read as a declaration means our key set is incomplete,
+      # which would silently reclassify real assignments as continuation lines.
+      op_undeclarable=1
     fi
   done < "$ENV_OP"
+
+  if (( op_undeclarable )); then
+    echo "[start-daemon] WARNING: .env.op has line(s) that are not KEY=value declarations — secrets on those lines will not be injected. Expected form: KEY=op://vault/item/field" >&2
+  fi
 
   if [[ "$op_declared" == ":" ]]; then
     echo "[start-daemon] WARNING: .env.op declares no KEY=value entries — skipping secret injection" >&2
@@ -216,7 +229,7 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
       op_value=""
     }
 
-    while IFS= read -r op_line; do
+    while IFS= read -r op_line || [[ -n "$op_line" ]]; do
       # Tolerate a CRLF-saved .env.op — otherwise a trailing \\r is silently
       # baked into every value, or breaks a closing-quote match.
       op_line="\${op_line%$'\\r'}"
@@ -241,8 +254,8 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
       # declared this key. That is what stops a PEM body line like \`AbCdEf==\`
       # from masquerading as an assignment and flushing a truncated secret.
       op_candidate=""
-      if [[ "$op_line" =~ '^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=' ]]; then
-        op_candidate="\${match[1]}"
+      if [[ "$op_line" =~ '^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=' ]]; then
+        op_candidate="\${match[2]}"
       fi
       if [[ -n "$op_candidate" && "$op_declared" == *":$op_candidate:"* ]]; then
         op_flush

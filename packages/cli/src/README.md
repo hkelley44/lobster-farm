@@ -48,6 +48,8 @@ Quoting alone is not enough to be *safe*, though, because a PEM body line can it
 
 If a multi-line value is left unquoted, the wrapper **drops it and warns** to `daemon.log` rather than exporting a truncated key. That is deliberate: a half PEM fails deep inside GitHub App auth at request time, while an absent one fails visibly at startup. Warnings name the key only, never the value.
 
-Also handled: CRLF-saved templates (a trailing `\r` is stripped rather than baked into every value), and a `.env.op` that declares no keys at all (injection is skipped with a warning instead of treating every line as garbage).
+`export KEY=op://...` is accepted as well as bare `KEY=op://...`.
+
+Also handled: CRLF-saved templates (a trailing `\r` is stripped rather than baked into every value); a template with no trailing newline (the last declaration is still read -- losing it would silently drop that secret *and* the one before it); a line that isn't a `KEY=value` declaration (warned, rather than quietly shrinking the key set); and a `.env.op` that declares no keys at all (injection is skipped with a warning instead of treating every line as garbage).
 
 All of this is covered end-to-end in `__tests__/launchd.test.ts` -- real `zsh`, a stub `op`, and a stub node that dumps the environment it was exec'd with, including the identifier-shaped-PEM-body case.
