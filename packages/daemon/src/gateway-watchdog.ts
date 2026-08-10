@@ -61,6 +61,13 @@ export interface GatewayWatchdogOptions {
   missed_intervals?: number;
   /** How often the liveness check runs. Default 30s. */
   check_interval_ms?: number;
+  /** Hard deadline on one `recycle()` attempt (destroy + login). A login
+   * handshake can HANG (network partition, DNS stall) rather than reject —
+   * without a deadline the `recycling` guard would stay latched and the
+   * watchdog would go permanently silent, the exact wedge it exists to
+   * prevent. On timeout the attempt is abandoned and the watchdog re-arms for
+   * another full threshold. Default 60s. */
+  recycle_timeout_ms?: number;
   /** Injectable clock for tests. Default Date.now. */
   now?: () => number;
 }
@@ -71,16 +78,27 @@ export class GatewayWatchdog {
   private readonly alert?: (message: string) => Promise<void>;
   private readonly threshold_ms: number;
   private readonly check_interval_ms: number;
+  private readonly recycle_timeout_ms: number;
   private readonly now: () => number;
 
   private timer: ReturnType<typeof setInterval> | null = null;
-  /** Floor for the silence window: set at start() and after every recycle, so
-   * a fresh login gets a full threshold of grace before its first ack, and a
-   * recycle can't immediately re-trigger. */
+  /** Floor for the silence window: set at start(), after every recycle, and on
+   * a connecting→not-connecting transition, so (a) a fresh login gets a full
+   * threshold of grace before its first ack, (b) a recycle can't immediately
+   * re-trigger, and (c) a just-completed resume isn't punished for its stale
+   * pre-disruption ack timestamp. */
   private baseline_ms = 0;
   /** Re-entrancy guard: a recycle (destroy + login) spans multiple check
-   * intervals; overlapping ticks must not stack recycles. */
+   * intervals; overlapping ticks must not stack recycles. Cleared even when
+   * the recycle HANGS — see recycle_timeout_ms. */
   private recycling = false;
+  /** True while the last-observed snapshot had a shard in a connecting state.
+   * Lets tick() detect the connecting→not-connecting edge: at that moment
+   * `shard.lastPingTimestamp` still holds the last PRE-disruption ack (the
+   * first post-resume heartbeat is up to ~41s away), so without a baseline
+   * reset a long-but-successful resume would be recycled the instant it
+   * completed — the opposite of "transient resume never recycles". */
+  private was_connecting = false;
 
   constructor(opts: GatewayWatchdogOptions) {
     this.probe = opts.probe;
@@ -90,6 +108,7 @@ export class GatewayWatchdog {
     const missed = opts.missed_intervals ?? 3;
     this.threshold_ms = heartbeat * missed;
     this.check_interval_ms = opts.check_interval_ms ?? 30_000;
+    this.recycle_timeout_ms = opts.recycle_timeout_ms ?? 60_000;
     this.now = opts.now ?? Date.now;
   }
 
@@ -137,6 +156,21 @@ export class GatewayWatchdog {
       // discord.js auto-reconnect is in flight — its recovery owns the
       // gateway right now. Transient disconnect/resume cycles land here and
       // must NOT trigger a recycle.
+      this.was_connecting = true;
+      return;
+    }
+
+    if (this.was_connecting) {
+      // connecting→not-connecting edge: discord.js just finished a connect or
+      // resume. The ack timestamp is still the last PRE-disruption one (next
+      // heartbeat lands within ~1 interval), so grant the same grace a fresh
+      // login gets — otherwise a legitimately-recovered connection would be
+      // recycled on the first tick after a long outage.
+      this.was_connecting = false;
+      this.baseline_ms = this.now();
+      console.log(
+        "[gateway-watchdog] shard left connecting state — resume/reconnect complete; re-arming with a fresh grace window",
+      );
       return;
     }
 
@@ -172,14 +206,40 @@ export class GatewayWatchdog {
       });
       console.error(`[gateway-watchdog] gateway presumed dead — recycling client: ${reason}`);
 
+      // Bound the attempt with a hard deadline: destroy+login can HANG (never
+      // settle) under a network partition rather than reject, and an unguarded
+      // await here would latch `recycling` forever — permanently silencing the
+      // watchdog. On timeout the in-flight attempt is abandoned; that is safe
+      // because the NEXT attempt's recycle destroys the abandoned client
+      // before building a fresh one (see DiscordBot.recycle_client), and if
+      // the abandoned login eventually completes on its own, the client it
+      // logged in is the live `this.client` — also fine.
       let recycled = false;
-      try {
-        await this.recycle(reason);
+      const attempt = this.recycle(reason).then(
+        () => "ok" as const,
+        (err: unknown) => ({ err }),
+      );
+      const deadline = new Promise<"timeout">((resolve) => {
+        const t = setTimeout(() => resolve("timeout"), this.recycle_timeout_ms);
+        t.unref?.();
+      });
+      const outcome = await Promise.race([attempt, deadline]);
+      if (outcome === "ok") {
         recycled = true;
         console.log("[gateway-watchdog] client recycled — gateway re-login complete");
-      } catch (err) {
-        console.error(`[gateway-watchdog] recycle FAILED: ${String(err)}`);
-        sentry.captureException(err, { tags: { module: "gateway-watchdog", phase: "recycle" } });
+      } else if (outcome === "timeout") {
+        console.error(
+          `[gateway-watchdog] recycle TIMED OUT after ${String(this.recycle_timeout_ms)}ms — abandoning attempt, will retry after the next silence threshold`,
+        );
+        sentry.captureException(
+          new Error(`gateway recycle timed out after ${String(this.recycle_timeout_ms)}ms`),
+          { tags: { module: "gateway-watchdog", phase: "recycle-timeout" } },
+        );
+      } else {
+        console.error(`[gateway-watchdog] recycle FAILED: ${String(outcome.err)}`);
+        sentry.captureException(outcome.err, {
+          tags: { module: "gateway-watchdog", phase: "recycle" },
+        });
       }
 
       // Best-effort Discord alert AFTER the recycle attempt — on success the
@@ -194,10 +254,13 @@ export class GatewayWatchdog {
         // Expected when Discord itself is down — Sentry already has the event.
       }
     } finally {
-      // Re-arm with a full grace window whether the recycle succeeded or not:
-      // success needs time for the first ack; failure retries after another
-      // full threshold instead of hot-looping destroy/login.
+      // Re-arm with a full grace window whether the recycle succeeded, failed,
+      // or timed out: success needs time for the first ack; failure/timeout
+      // retries after another full threshold instead of hot-looping
+      // destroy/login. The connecting-edge tracker resets too — the recycle
+      // replaced the client, so any pre-recycle state is stale.
       this.baseline_ms = this.now();
+      this.was_connecting = false;
       this.recycling = false;
     }
   }

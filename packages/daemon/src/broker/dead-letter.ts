@@ -24,19 +24,26 @@
 import type { AlertPayload } from "../alert-router.js";
 import type { QueueEntry } from "./queue.js";
 
-/** The subset of BotPool.heal_dead_letter's result this module consumes. */
+/** The subset of BotPool.heal_dead_letter's result this module consumes.
+ * Every outcome carries the channel's owning `entity_id` (data-derived by the
+ * pool: healed → the released bot's own entity; otherwise → bot-on-channel or
+ * registry channel-list lookup) so the alert routes to the RIGHT entity's
+ * #alerts channel — a hardcoded entity would silently drop the alert for any
+ * non-platform pilot channel (review finding #1 on PR #109). */
 export type DeadLetterHealResult =
-  | { outcome: "healed"; bot_id: number; session_id: string | null }
-  | { outcome: "cooldown"; last_heal_ms: number }
-  | { outcome: "no_session" };
+  | { outcome: "healed"; bot_id: number; session_id: string | null; entity_id: string | null }
+  | { outcome: "cooldown"; last_heal_ms: number; entity_id: string | null }
+  | { outcome: "no_session"; entity_id: string | null };
 
 export interface DeadLetterDeps {
   /** BotPool.heal_dead_letter — releases the owning bot to dark (cool-down guarded). */
   heal: (channel_id: string) => Promise<DeadLetterHealResult>;
   /** AlertRouter.post_alert (or a stand-in). Must not throw into the caller. */
   post_alert: (payload: AlertPayload) => Promise<unknown>;
-  /** Entity whose #alerts channel receives the alert. */
-  entity_id?: string;
+  /** Fallback entity when the heal couldn't resolve one (channel unknown to
+   * pool AND registry). Defaults to the platform entity "lobster-farm" — an
+   * alert must land SOMEWHERE, and the operator owns that channel. */
+  fallback_entity_id?: string;
 }
 
 /**
@@ -53,7 +60,8 @@ export async function handle_dead_letter(entry: QueueEntry, deps: DeadLetterDeps
     `> ${entry.content.slice(0, 500)}`;
 
   const heal = await deps.heal(entry.channel_id);
-  const entity_id = deps.entity_id ?? "lobster-farm";
+  // Data-derived entity first; platform entity only as the alert-of-last-resort.
+  const entity_id = heal.entity_id ?? deps.fallback_entity_id ?? "lobster-farm";
 
   switch (heal.outcome) {
     case "healed":

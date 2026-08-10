@@ -166,7 +166,13 @@ describe("dead-letter session heal (#107)", () => {
 
     const result = await pool.heal_dead_letter(BROKER_CHANNEL);
 
-    expect(result).toEqual({ outcome: "healed", bot_id: 3, session_id: "sess-deaf-1" });
+    // entity_id snapshotted BEFORE release nulls the bot — routes the alert.
+    expect(result).toEqual({
+      outcome: "healed",
+      bot_id: 3,
+      session_id: "sess-deaf-1",
+      entity_id: "test-entity",
+    });
     // Bot released to dark.
     expect(pool.get_bots()[0]!.state).toBe("free");
     expect(pool.get_bots()[0]!.channel_id).toBeNull();
@@ -194,7 +200,8 @@ describe("dead-letter session heal (#107)", () => {
     // is failing too. No second heal.
     pool.inject_bots([assigned_broker_bot(4)]);
     const repeat = await pool.heal_dead_letter(BROKER_CHANNEL, t0 + 60_000);
-    expect(repeat).toEqual({ outcome: "cooldown", last_heal_ms: t0 });
+    // entity resolved from the (untouched) assigned bot on the channel.
+    expect(repeat).toEqual({ outcome: "cooldown", last_heal_ms: t0, entity_id: "test-entity" });
     // The newly-injected bot was NOT touched — no automatic action on cooldown.
     expect(pool.get_bots()[0]!.state).toBe("assigned");
   });
@@ -216,8 +223,31 @@ describe("dead-letter session heal (#107)", () => {
     pool.inject_bots([make_bot({ id: 3 })]); // free bot
 
     const result = await pool.heal_dead_letter(BROKER_CHANNEL);
-    expect(result).toEqual({ outcome: "no_session" });
+    // Free bot, no registry → nothing claims the channel: entity unresolved
+    // (the alert composer falls back to the platform entity).
+    expect(result).toEqual({ outcome: "no_session", entity_id: null });
     expect(pool.get_bots()[0]!.state).toBe("free");
+  });
+
+  it("no_session with a registry: entity resolved from the entity's channel list", async () => {
+    const { pool } = make_pool_with_broker();
+    pool.inject_bots([make_bot({ id: 3 })]); // free bot — no bot claims the channel
+    (pool as unknown as { registry: unknown }).registry = {
+      get_all: () => [
+        {
+          entity: { id: "healthydogs", channels: { list: [{ type: "general", id: "ch-other" }] } },
+        },
+        {
+          entity: {
+            id: "test-entity",
+            channels: { list: [{ type: "work_room", id: BROKER_CHANNEL }] },
+          },
+        },
+      ],
+    };
+
+    const result = await pool.heal_dead_letter(BROKER_CHANNEL);
+    expect(result).toEqual({ outcome: "no_session", entity_id: "test-entity" });
   });
 
   it("never heals a non-broker channel (belt-and-suspenders against stale entries)", async () => {
@@ -233,7 +263,7 @@ describe("dead-letter session heal (#107)", () => {
     pool.inject_bots([plugin_bot]);
 
     const result = await pool.heal_dead_letter("ch-plugin");
-    expect(result).toEqual({ outcome: "no_session" });
+    expect(result).toEqual({ outcome: "no_session", entity_id: "test-entity" });
     expect(pool.get_bots()[0]!.state).toBe("assigned"); // untouched
   });
 
@@ -241,9 +271,12 @@ describe("dead-letter session heal (#107)", () => {
 
   it("healed: one action_required alert naming the healed session, the drop, and NO re-enqueue", async () => {
     const alerts: AlertPayload[] = [];
-    const heal = vi
-      .fn()
-      .mockResolvedValue({ outcome: "healed", bot_id: 3, session_id: "deafbeef-1234-5678" });
+    const heal = vi.fn().mockResolvedValue({
+      outcome: "healed",
+      bot_id: 3,
+      session_id: "deafbeef-1234-5678",
+      entity_id: "healthydogs",
+    });
 
     await handle_dead_letter(make_entry(), {
       heal,
@@ -255,6 +288,9 @@ describe("dead-letter session heal (#107)", () => {
     expect(heal).toHaveBeenCalledWith(BROKER_CHANNEL);
     expect(alerts).toHaveLength(1);
     const alert = alerts[0]!;
+    // Routed to the healed bot's OWN entity — never a hardcoded one, or the
+    // alert silently misses #alerts for any non-platform pilot channel.
+    expect(alert.entity_id).toBe("healthydogs");
     expect(alert.tier).toBe("action_required");
     // The dropped message is quoted (the entry is its only copy) …
     expect(alert.body).toContain("please deploy the thing");
@@ -269,13 +305,18 @@ describe("dead-letter session heal (#107)", () => {
   it("cooldown: escalates at failure severity (incident_open) and says no action was taken", async () => {
     const alerts: AlertPayload[] = [];
     await handle_dead_letter(make_entry(), {
-      heal: vi.fn().mockResolvedValue({ outcome: "cooldown", last_heal_ms: 1_754_700_000_000 }),
+      heal: vi.fn().mockResolvedValue({
+        outcome: "cooldown",
+        last_heal_ms: 1_754_700_000_000,
+        entity_id: "healthydogs",
+      }),
       post_alert: async (p) => {
         alerts.push(p);
       },
     });
 
     expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.entity_id).toBe("healthydogs");
     expect(alerts[0]!.tier).toBe("incident_open");
     expect(alerts[0]!.body).toContain("no automatic action");
     expect(alerts[0]!.body).toContain("please deploy the thing");
@@ -284,15 +325,27 @@ describe("dead-letter session heal (#107)", () => {
   it("no_session: plain dead-letter alert, notes the channel was already dark", async () => {
     const alerts: AlertPayload[] = [];
     await handle_dead_letter(make_entry(), {
-      heal: vi.fn().mockResolvedValue({ outcome: "no_session" }),
+      heal: vi.fn().mockResolvedValue({ outcome: "no_session", entity_id: "healthydogs" }),
       post_alert: async (p) => {
         alerts.push(p);
       },
     });
 
     expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.entity_id).toBe("healthydogs");
     expect(alerts[0]!.tier).toBe("action_required");
     expect(alerts[0]!.body).toContain("already dark");
+  });
+
+  it("unresolvable entity: falls back to the platform entity so the alert still lands somewhere", async () => {
+    const alerts: AlertPayload[] = [];
+    await handle_dead_letter(make_entry(), {
+      heal: vi.fn().mockResolvedValue({ outcome: "no_session", entity_id: null }),
+      post_alert: async (p) => {
+        alerts.push(p);
+      },
+    });
+    expect(alerts[0]!.entity_id).toBe("lobster-farm");
   });
 
   it("end-to-end with a real pool: heal ordering preserves the alert's quoted content", async () => {
@@ -308,8 +361,9 @@ describe("dead-letter session heal (#107)", () => {
     });
 
     // The heal actually ran (bot dark) AND the alert still carries the content
-    // that only existed on the entry.
+    // that only existed on the entry, routed to the healed bot's entity.
     expect(pool.get_bots()[0]!.state).toBe("free");
+    expect(alerts[0]!.entity_id).toBe("test-entity");
     expect(alerts[0]!.body).toContain("the only copy of this message");
     expect(alerts[0]!.title).toContain("auto-healed");
   });

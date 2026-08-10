@@ -2648,37 +2648,66 @@ export class BotPool extends EventEmitter {
     channel_id: string,
     now_ms = Date.now(),
   ): Promise<
-    | { outcome: "healed"; bot_id: number; session_id: string | null }
-    | { outcome: "cooldown"; last_heal_ms: number }
-    | { outcome: "no_session" }
+    | { outcome: "healed"; bot_id: number; session_id: string | null; entity_id: string | null }
+    | { outcome: "cooldown"; last_heal_ms: number; entity_id: string | null }
+    | { outcome: "no_session"; entity_id: string | null }
   > {
     // Belt-and-suspenders: dead-letters only fire for broker channels, but a
     // stale entry must never heal (i.e. release) a plugin-channel bot.
-    if (!this.uses_broker(channel_id)) return { outcome: "no_session" };
+    if (!this.uses_broker(channel_id)) {
+      return { outcome: "no_session", entity_id: this.entity_for_channel(channel_id) };
+    }
 
     const last_heal = this.dead_letter_heal_at.get(channel_id);
     if (last_heal !== undefined && now_ms - last_heal < BotPool.DEAD_LETTER_HEAL_COOLDOWN_MS) {
       console.error(
         `[pool] [dead-letter-heal] channel ${channel_id} dead-lettered again within the ${String(Math.round(BotPool.DEAD_LETTER_HEAL_COOLDOWN_MS / 60_000))}min cool-down — heal suppressed (heal-loop guard), leaving dark`,
       );
-      return { outcome: "cooldown", last_heal_ms: last_heal };
+      return {
+        outcome: "cooldown",
+        last_heal_ms: last_heal,
+        entity_id: this.entity_for_channel(channel_id),
+      };
     }
 
     const bot = this.bots.find((b) => b.state === "assigned" && b.channel_id === channel_id);
     if (!bot) {
       // Channel already dark (e.g. age-based sweep dead-lettered while no
       // session was assigned) — nothing to heal; next inbound cold-recreates.
-      return { outcome: "no_session" };
+      return { outcome: "no_session", entity_id: this.entity_for_channel(channel_id) };
     }
 
+    // Snapshot BEFORE release_broker_to_dark nulls the bot's fields — the
+    // caller routes the dead-letter alert to this entity's #alerts channel.
     const session_id = bot.session_id;
     const bot_id = bot.id;
+    const entity_id = bot.entity_id;
     console.warn(
       `[pool] [dead-letter-heal] pool-${String(bot_id)} on ${channel_id} never acked a broker inbound through the full redelivery horizon — releasing to dark so the next message cold-recreates the session with a fresh shim`,
     );
     this.dead_letter_heal_at.set(channel_id, now_ms);
     await this.release_broker_to_dark(bot, session_id, "dead-letter heal — session stopped acking");
-    return { outcome: "healed", bot_id, session_id };
+    return { outcome: "healed", bot_id, session_id, entity_id };
+  }
+
+  /**
+   * Resolve which entity a channel belongs to, for alert routing (#107 review
+   * fix): a bot bound to the channel first (any non-free state — a parked
+   * bot's metadata is still authoritative), then the entity registry's channel
+   * lists. Returns null when nothing claims the channel — the caller picks its
+   * own fallback.
+   */
+  entity_for_channel(channel_id: string): string | null {
+    const bot = this.bots.find((b) => b.channel_id === channel_id && b.entity_id);
+    if (bot?.entity_id) return bot.entity_id;
+    if (this.registry) {
+      for (const entity of this.registry.get_all()) {
+        if (entity.entity.channels?.list?.some((c) => c.id === channel_id)) {
+          return entity.entity.id;
+        }
+      }
+    }
+    return null;
   }
 
   /** Get all bots currently assigned to a channel (state === "assigned").

@@ -207,6 +207,92 @@ describe("gateway watchdog (#107)", () => {
     expect(recycle).toHaveBeenCalledTimes(2);
   });
 
+  it("a HANGING recycle (login never settles) does not wedge the watchdog: times out, re-arms, retries", async () => {
+    let now = 1_000_000;
+    let snapshot: GatewaySnapshot = { last_heartbeat_ack_ms: now, connecting: false };
+    // A login stalled by a network partition: the promise NEVER settles —
+    // neither resolves nor rejects. Pre-fix, `recycling` stayed latched and
+    // every future tick short-circuited forever.
+    const recycle = vi.fn(() => new Promise<void>(() => {}));
+    const watchdog = new GatewayWatchdog({
+      probe: () => snapshot,
+      recycle,
+      recycle_timeout_ms: 10, // real ms — the deadline uses the wall clock
+      now: () => now,
+    });
+    watchdog.start();
+
+    now += THRESHOLD_MS + 1;
+    await watchdog.tick(); // resolves via the timeout, NOT the hung login
+    expect(recycle).toHaveBeenCalledTimes(1);
+    expect(sentry.captureException).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining("timed out") }),
+      expect.objectContaining({ tags: expect.objectContaining({ phase: "recycle-timeout" }) }),
+    );
+
+    // Not wedged: after another full threshold of silence a fresh attempt fires.
+    snapshot = { last_heartbeat_ack_ms: null, connecting: false };
+    await watchdog.tick(); // within grace — quiet
+    expect(recycle).toHaveBeenCalledTimes(1);
+    now += THRESHOLD_MS + 1;
+    await watchdog.tick();
+    expect(recycle).toHaveBeenCalledTimes(2);
+  });
+
+  it("long-but-successful resume with a stale pre-disruption ack is NOT recycled (connecting→not-connecting grace)", async () => {
+    const { watchdog, clock, set_snapshot, recycle } = make_harness();
+    watchdog.start();
+
+    // Healthy, then a real outage: shard reconnecting well past the threshold.
+    const pre_outage_ack = clock.now();
+    set_snapshot({ last_heartbeat_ack_ms: pre_outage_ack, connecting: false });
+    await watchdog.tick();
+    clock.advance(THRESHOLD_MS * 3);
+    set_snapshot({ last_heartbeat_ack_ms: pre_outage_ack, connecting: true });
+    await watchdog.tick();
+    expect(recycle).not.toHaveBeenCalled();
+
+    // Resume SUCCEEDS. At this exact moment lastPingTimestamp still holds the
+    // pre-disruption ack — the first post-resume heartbeat is up to ~41s away.
+    // discord.js just proved the connection healthy; recycling it here would
+    // work against the watchdog's own goal.
+    set_snapshot({ last_heartbeat_ack_ms: pre_outage_ack, connecting: false });
+    await watchdog.tick();
+    expect(recycle).not.toHaveBeenCalled();
+
+    // The post-resume heartbeat lands inside the grace window → healthy again.
+    clock.advance(HEARTBEAT_MS);
+    set_snapshot({ last_heartbeat_ack_ms: clock.now(), connecting: false });
+    await watchdog.tick();
+    clock.advance(THRESHOLD_MS * 2);
+    set_snapshot({ last_heartbeat_ack_ms: clock.now() - 5_000, connecting: false });
+    await watchdog.tick();
+    expect(recycle).not.toHaveBeenCalled();
+  });
+
+  it("resume that completes but never heartbeats again DOES recycle — after a full fresh threshold", async () => {
+    const { watchdog, clock, set_snapshot, recycle } = make_harness();
+    watchdog.start();
+
+    const pre_outage_ack = clock.now();
+    clock.advance(THRESHOLD_MS * 2);
+    set_snapshot({ last_heartbeat_ack_ms: pre_outage_ack, connecting: true });
+    await watchdog.tick();
+
+    // "Resume" completes but the connection is actually dead: no ack ever lands.
+    set_snapshot({ last_heartbeat_ack_ms: pre_outage_ack, connecting: false });
+    await watchdog.tick(); // edge: grace granted, no recycle
+    expect(recycle).not.toHaveBeenCalled();
+
+    clock.advance(THRESHOLD_MS - 1);
+    await watchdog.tick();
+    expect(recycle).not.toHaveBeenCalled();
+
+    clock.advance(2);
+    await watchdog.tick();
+    expect(recycle).toHaveBeenCalledTimes(1);
+  });
+
   it("force_recycle (invalidated session) bypasses the silence threshold", async () => {
     const { watchdog, clock, set_snapshot, recycle, call_order } = make_harness();
     watchdog.start();
