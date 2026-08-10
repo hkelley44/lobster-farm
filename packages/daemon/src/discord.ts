@@ -36,14 +36,16 @@ import {
   RESTJSONErrorCodes,
   type Role,
   SlashCommandBuilder,
+  Status,
   type TextChannel,
   type Webhook,
 } from "discord.js";
 import type { InboundMeta } from "./broker/protocol.js";
 import type { CommanderProcess } from "./commander-process.js";
 import { PAT_TMUX_SESSION } from "./commander-process.js";
+import { type GatewaySnapshot, GatewayWatchdog } from "./gateway-watchdog.js";
 import { is_tmux_session_idle } from "./pool.js";
-import type { BotPool, PoolBot } from "./pool.js";
+import type { BotPool, PendingMessage, PoolBot } from "./pool.js";
 import type { TaskQueue } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
 import type { RoutedMessage } from "./router.js";
@@ -605,6 +607,19 @@ function avatar_cache_path(config: LobsterFarmConfig): string {
   return join(lobsterfarm_dir(config.paths), "state", "avatar-urls.json");
 }
 
+/** Shard statuses meaning "discord.js's own connect/resume machinery is in
+ * flight" — the gateway watchdog must not recycle while any of these hold
+ * (#107). Everything else (Ready with stale heartbeats, Idle, Disconnected
+ * with no reconnect running) counts toward sustained-death silence. */
+const GATEWAY_CONNECTING_STATUSES: ReadonlySet<Status> = new Set([
+  Status.Connecting,
+  Status.Reconnecting,
+  Status.Identifying,
+  Status.Resuming,
+  Status.Nearly,
+  Status.WaitingForGuilds,
+]);
+
 export class DiscordBot extends EventEmitter {
   private client: Client;
   private channel_map = new Map<string, ChannelEntry>();
@@ -628,13 +643,24 @@ export class DiscordBot extends EventEmitter {
   >();
   /** Cached #command-center channel ID (resolved lazily from the GLOBAL category). */
   private command_center_channel_id: string | null = null;
+  /** Bot token, held in memory for the watchdog's recycle re-login (#107). */
+  private _token: string | null = null;
+  /** Gateway watchdog (#107) — heartbeat-recency liveness + recycle-on-death. */
+  private watchdog: GatewayWatchdog | null = null;
 
   constructor(
     private config: LobsterFarmConfig,
     private registry: EntityRegistry,
   ) {
     super();
-    this.client = new Client({
+    this.client = this.create_client();
+  }
+
+  /** Build a gateway client with the daemon's intents. Used by the constructor
+   * and by the watchdog's recycle path (#107) — a destroyed v14 client cannot
+   * be re-logged-in, so a recycle needs a fresh instance. */
+  private create_client(): Client {
+    return new Client({
       intents: [
         GatewayIntentBits.Guilds,
         // Privileged intent — requires "Server Members Intent" enabled in
@@ -650,7 +676,38 @@ export class DiscordBot extends EventEmitter {
   /** Connect to Discord. */
   async connect(token: string): Promise<void> {
     this.build_channel_map();
+    // Held in memory only, for the gateway watchdog's recycle re-login (#107).
+    this._token = token;
 
+    await this.open_gateway(token);
+
+    sentry.addBreadcrumb({
+      category: "daemon.lifecycle",
+      message: "Discord connected",
+      data: { tag: this.client.user?.tag },
+    });
+
+    // Gateway watchdog (#107): heartbeat-recency liveness for the daemon's
+    // single gateway. NOT broker-flag-gated — today's gateway (slash commands,
+    // alert routing) has the same silent-death exposure. Pure detection/heal:
+    // zero behavior change while healthy.
+    this.watchdog = new GatewayWatchdog({
+      probe: () => this.gateway_snapshot(),
+      recycle: (reason) => this.recycle_client(reason),
+      alert: async (message) => {
+        const status_channel = await this.find_system_status_channel();
+        if (status_channel) await this.send(status_channel, message);
+      },
+    });
+    this.watchdog.start();
+  }
+
+  /**
+   * Attach gateway handlers to the CURRENT `this.client` and log in. Shared by
+   * `connect()` and the watchdog's `recycle_client()` — the recycle builds a
+   * fresh client, so handlers must be re-attached each time.
+   */
+  private async open_gateway(token: string): Promise<void> {
     const ready = new Promise<void>((resolve) => {
       this.client.once("ready", () => {
         const tag = this.client.user?.tag ?? "unknown";
@@ -696,13 +753,94 @@ export class DiscordBot extends EventEmitter {
       }
     });
 
+    // ── Gateway lifecycle visibility (#107) ──
+    // Structured logging for the shard lifecycle the daemon previously flew
+    // blind on. Log-only (discord.js's auto-reconnect still owns transient
+    // recovery) — except `invalidated`, after which discord.js will NEVER
+    // reconnect on its own, so the watchdog recycles immediately.
+    this.client.on("shardDisconnect", (event, shard_id) => {
+      console.warn(
+        `[discord] [gateway] shard ${String(shard_id)} disconnected (code ${String(event.code)}) — discord.js will attempt reconnect`,
+      );
+    });
+    this.client.on("shardReconnecting", (shard_id) => {
+      console.warn(`[discord] [gateway] shard ${String(shard_id)} reconnecting`);
+    });
+    this.client.on("shardResume", (shard_id, replayed) => {
+      console.log(
+        `[discord] [gateway] shard ${String(shard_id)} resumed (${String(replayed)} events replayed)`,
+      );
+    });
+    this.client.on("shardReady", (shard_id) => {
+      console.log(`[discord] [gateway] shard ${String(shard_id)} ready`);
+    });
+    this.client.on("shardError", (err, shard_id) => {
+      // discord.js handles the reconnect; we just refuse to be blind about it.
+      console.error(`[discord] [gateway] shard ${String(shard_id)} error: ${String(err)}`);
+    });
+    this.client.on("invalidated", () => {
+      console.error(
+        "[discord] [gateway] session INVALIDATED — discord.js will not reconnect; recycling client",
+      );
+      void this.watchdog?.force_recycle(
+        "gateway session invalidated (terminal, no auto-reconnect)",
+      );
+    });
+
     await this.client.login(token);
     await ready;
+  }
+
+  /**
+   * Gateway health snapshot for the watchdog (#107). Heartbeat-ack recency is
+   * the liveness signal: discord.js v14 (verified on 14.25.1) stamps
+   * `shard.lastPingTimestamp` from @discordjs/ws `HeartbeatComplete` on every
+   * acked heartbeat (-1 before the first ack). `connecting` reflects any shard
+   * mid-connect/identify/resume, i.e. discord.js's own recovery in flight.
+   */
+  private gateway_snapshot(): GatewaySnapshot {
+    let last_ack: number | null = null;
+    let connecting = false;
+    for (const shard of this.client.ws.shards.values()) {
+      if (shard.lastPingTimestamp > 0) {
+        last_ack = Math.max(last_ack ?? 0, shard.lastPingTimestamp);
+      }
+      if (GATEWAY_CONNECTING_STATUSES.has(shard.status)) connecting = true;
+    }
+    return { last_heartbeat_ack_ms: last_ack, connecting };
+  }
+
+  /**
+   * Destroy the (presumed-dead) client and bring up a fresh one on the same
+   * token (#107). Only the watchdog calls this, and only on sustained gateway
+   * death — never while healthy. State carried on `this` (channel map, pool,
+   * avatar cache, …) survives untouched; everything client-bound (handlers,
+   * ready work: slash-command registration, command-center resolution) is
+   * re-established by `open_gateway()`.
+   */
+  private async recycle_client(reason: string): Promise<void> {
+    if (!this._token) throw new Error("cannot recycle gateway client — no token stored");
+    console.warn(`[discord] [gateway] recycling client: ${reason}`);
+
+    // Typing loops hold interval handles against the dead client's channels.
+    await this.stop_all_typing_loops();
+    this.connected = false;
+
+    try {
+      await this.client.destroy();
+    } catch (err) {
+      // A dead client can fail to destroy cleanly — the fresh login below is
+      // what matters.
+      console.warn(`[discord] [gateway] destroy() of dead client failed: ${String(err)}`);
+    }
+
+    this.client = this.create_client();
+    await this.open_gateway(this._token);
 
     sentry.addBreadcrumb({
       category: "daemon.lifecycle",
-      message: "Discord connected",
-      data: { tag: this.client.user?.tag },
+      message: "Discord client recycled by gateway watchdog",
+      data: { reason },
     });
   }
 
@@ -731,6 +869,9 @@ export class DiscordBot extends EventEmitter {
 
   /** Disconnect from Discord. */
   async disconnect(): Promise<void> {
+    // Stop the watchdog unconditionally — a recycle-in-flight can have
+    // this.connected temporarily false while the timer is still armed.
+    this.watchdog?.stop();
     if (this.connected) {
       console.log("[discord] Disconnecting...");
       await this.stop_all_typing_loops();
@@ -3217,9 +3358,33 @@ export class DiscordBot extends EventEmitter {
       return;
     }
 
-    // Release current bot, assign new one
+    // Release current bot, assign new one.
+    //
+    // Broker channels (#107): a broker session exists iff an inbound message
+    // drives it (#89), and assign()'s choke-point guard refuses driverless
+    // calls. The swap is a genuine user action, so synthesize the driver from
+    // it — the new archetype comes up with a driven first turn (preserving the
+    // immediate-greeting UX). Plugin channels pass no pending_message, exactly
+    // as today (byte-identical with the flag off).
     await this._pool.release(channel_id);
-    const result = await this._pool.assign(channel_id, entry.entity_id, archetype);
+    const swap_driver: PendingMessage | undefined = this._pool.channel_uses_broker(channel_id)
+      ? {
+          user: target.author_name,
+          channel_id,
+          message_id: "",
+          content: `${target.author_name} swapped you in as the ${archetype} archetype via /swap. Introduce yourself briefly and pick up the conversation.`,
+          ts: new Date().toISOString(),
+        }
+      : undefined;
+    const result = await this._pool.assign(
+      channel_id,
+      entry.entity_id,
+      archetype,
+      undefined, // resume_session_id — pool auto-resumes from history
+      undefined, // channel_type — unchanged from today's call
+      undefined, // working_dir
+      swap_driver,
+    );
 
     if (result) {
       const agent_display =
@@ -3322,6 +3487,12 @@ export class DiscordBot extends EventEmitter {
 
     // Assign a pool bot (planner by default). If the /room command carried
     // initial context, inject it via the SessionStart hook (issue #290).
+    //
+    // Broker channels with NO context (#107): assign()'s choke-point guard
+    // refuses driverless calls, and room creation is a genuine user action —
+    // synthesize the driver from the creation event so the session comes up
+    // with a driven first turn. Plugin channels without context still pass
+    // undefined, byte-identical to today.
     const pending_message = context
       ? {
           user: target.author_name,
@@ -3330,7 +3501,15 @@ export class DiscordBot extends EventEmitter {
           content: context,
           ts: new Date().toISOString(),
         }
-      : undefined;
+      : this._pool.channel_uses_broker(channel_id)
+        ? {
+            user: target.author_name,
+            channel_id,
+            message_id: "",
+            content: `Room #${name} created by ${target.author_name} via /room (purpose: on-demand work room for ${routed.entity_id}; no initial context given). Introduce yourself and ask what this room is for.`,
+            ts: new Date().toISOString(),
+          }
+        : undefined;
     const assignment = await this._pool.assign(
       channel_id,
       routed.entity_id,
@@ -3534,14 +3713,30 @@ export class DiscordBot extends EventEmitter {
     await this.persist_entity_config(entity_config);
     this.build_channel_map();
 
-    // Assign pool bot with resumed session_id
+    // Assign pool bot with resumed session_id.
+    //
+    // Broker channels (#107): the resume is a genuine user action — synthesize
+    // the driver from it so the cold-recreated session runs a driven first turn
+    // (assign()'s choke-point guard refuses driverless broker calls). Plugin
+    // channels pass no pending_message, byte-identical to today.
     const resume_session_id = archive.session_id ?? undefined;
+    const resume_driver: PendingMessage | undefined = this._pool.channel_uses_broker(channel_id)
+      ? {
+          user: target.author_name,
+          channel_id,
+          message_id: "",
+          content: `Session ${search_name} resumed by ${target.author_name} via /resume. Review where you left off and continue.`,
+          ts: new Date().toISOString(),
+        }
+      : undefined;
     const assignment = await this._pool.assign(
       channel_id,
       routed.entity_id,
       (archive.archetype || "planner") as ArchetypeRole,
       resume_session_id,
       "work_room",
+      undefined, // working_dir
+      resume_driver,
     );
 
     // Consume the archive file now that the room is live again.
