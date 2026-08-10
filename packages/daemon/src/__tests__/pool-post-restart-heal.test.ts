@@ -182,6 +182,19 @@ describe("post-restart pool auto-heal (#106)", () => {
     await pool.resume_parked_bots();
   }
 
+  /**
+   * Age the resumed bots past the liveness warm-up window (#106 review).
+   * `heal_post_restart` refuses to judge a session younger than
+   * LIVENESS_WARMUP_MS (boot-noise readings are untrustworthy); real runs
+   * satisfy this because the heal fires minutes after resume. Tests call the
+   * heal immediately, so they backdate `assigned_at` to simulate that gap.
+   */
+  function age_bots(ms = 10 * 60 * 1000): void {
+    for (const bot of pool.get_bots()) {
+      if (bot.assigned_at) bot.assigned_at = new Date(bot.assigned_at.getTime() - ms);
+    }
+  }
+
   beforeEach(() => {
     vi.clearAllMocks();
     temp_dir = join(tmpdir(), `pool-post-restart-heal-${Date.now()}`);
@@ -241,6 +254,7 @@ describe("post-restart pool auto-heal (#106)", () => {
 
   it("recycles a resumed session with zero turn evidence and alerts what was healed", async () => {
     await resume_bots([{ id: 3, channel_id: "ch-general", session_id: "sess-aaa" }]);
+    age_bots(); // past the liveness warm-up — readings are trustworthy now
     // Idle pane, no stop-hook stamp, no JSONL activity → the deaf signature.
     pool.set_bot_idle_state(3, true);
     pool.set_jsonl_activity("sess-aaa", false);
@@ -273,6 +287,7 @@ describe("post-restart pool auto-heal (#106)", () => {
   it("leaves a quiet-but-healthy session alone when the stop hook stamped its nudge turn", async () => {
     await resume_bots([{ id: 3, channel_id: "ch-general", session_id: "sess-aaa" }]);
 
+    age_bots();
     // The session processed its resume nudge (Stop hook fired), then went
     // legitimately idle in a quiet room. A quiet channel is not a deaf channel.
     pool.mark_processed("sess-aaa");
@@ -290,6 +305,7 @@ describe("post-restart pool auto-heal (#106)", () => {
 
   it("treats JSONL activity since resume as healthy even without a stop-hook stamp", async () => {
     await resume_bots([{ id: 3, channel_id: "ch-general", session_id: "sess-aaa" }]);
+    age_bots();
     pool.set_bot_idle_state(3, true);
     // The transcript moved since the resume — a turn ran (or is running),
     // regardless of what the pane heuristic thinks.
@@ -303,6 +319,7 @@ describe("post-restart pool auto-heal (#106)", () => {
 
   it("treats a visibly-working pane as healthy (long first turn in flight)", async () => {
     await resume_bots([{ id: 3, channel_id: "ch-general", session_id: "sess-aaa" }]);
+    age_bots();
     pool.set_bot_idle_state(3, false);
     pool.set_jsonl_activity("sess-aaa", false);
 
@@ -332,6 +349,7 @@ describe("post-restart pool auto-heal (#106)", () => {
       { id: 4, channel_id: "ch-homepage", session_id: "sess-bbb" },
     ]);
 
+    age_bots();
     // Bot 3 processed its nudge; bot 4 is the incident signature.
     pool.mark_processed("sess-aaa");
     pool.set_bot_idle_state(3, true);
@@ -360,6 +378,38 @@ describe("post-restart pool auto-heal (#106)", () => {
     expect(heal_alert).not.toContain("ch-general");
   });
 
+  it("refuses to judge a session still inside the liveness warm-up window (#106 review)", async () => {
+    await resume_bots([{ id: 3, channel_id: "ch-general", session_id: "sess-aaa" }]);
+    // NOT aged: assigned_at ≈ now, so boot-noise readings are untrustworthy.
+    // Deaf-looking evidence must NOT trigger a recycle yet.
+    pool.set_bot_idle_state(3, true);
+    pool.set_jsonl_activity("sess-aaa", false);
+
+    await pool.run_heal();
+
+    // No recycle, no alert — and the armed marker survives so the steady-state
+    // probe judges the session once it clears warm-up.
+    expect(start_tmux_spy).toHaveBeenCalledTimes(1); // resume spawn only
+    expect(notify_mock).not.toHaveBeenCalled();
+    const bot = pool.get_bots()[0]!;
+    expect(bot.state).toBe("assigned");
+    expect(bot.last_inbound_at).not.toBeNull();
+  });
+
+  it("stops recycling when a drain starts (shutdown safety)", async () => {
+    await resume_bots([{ id: 3, channel_id: "ch-general", session_id: "sess-aaa" }]);
+    age_bots();
+    pool.set_bot_idle_state(3, true);
+    pool.set_jsonl_activity("sess-aaa", false);
+
+    (pool as unknown as { _draining: boolean })._draining = true;
+    await pool.run_heal();
+
+    // Draining daemon must not release/reassign anything.
+    expect(start_tmux_spy).toHaveBeenCalledTimes(1); // resume spawn only
+    expect(notify_mock).not.toHaveBeenCalled();
+  });
+
   it("schedule_post_restart_heal is a no-op when nothing is on probation", async () => {
     vi.useFakeTimers();
     try {
@@ -374,6 +424,7 @@ describe("post-restart pool auto-heal (#106)", () => {
 
   it("schedule_post_restart_heal runs the pass after the delay", async () => {
     await resume_bots([{ id: 3, channel_id: "ch-general", session_id: "sess-aaa" }]);
+    age_bots();
     pool.set_bot_idle_state(3, true);
     pool.set_jsonl_activity("sess-aaa", false);
 

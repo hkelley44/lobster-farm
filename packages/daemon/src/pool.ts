@@ -17,6 +17,7 @@ import { resolve_effort, resolve_model_id } from "./models.js";
 import { load_pool_state, save_pool_state } from "./persistence.js";
 import type { PersistedBotAvatarState, PersistedPoolBot } from "./persistence.js";
 import {
+  LIVENESS_WARMUP_MS,
   PLUGIN_DEAF_THRESHOLD_MS,
   evaluate_plugin_liveness,
   is_tmux_session_idle,
@@ -494,7 +495,7 @@ export const AVATAR_COOLDOWN_MS = 30 * 60 * 1000;
 /** Re-exported from the shared probe module so existing pool importers keep
  * working. The decision logic lives in `plugin-liveness.ts` and is shared with
  * the commander probe (#77). */
-export { PLUGIN_DEAF_THRESHOLD_MS };
+export { LIVENESS_WARMUP_MS, PLUGIN_DEAF_THRESHOLD_MS };
 
 /** Sliding window for the deaf auto-recycle loop guard (#106). Recycles per
  * channel are counted inside this window; see `deaf_recycle_history`. */
@@ -1657,6 +1658,10 @@ export class BotPool extends EventEmitter {
     const dark: string[] = [];
 
     for (const [bot_id, probation] of entries) {
+      // Re-check drain state each iteration — recycle_deaf_bot awaits, so a
+      // shutdown can start mid-pass and releasing/reassigning must stop with it.
+      if (this._draining) break;
+
       const bot = this.bots.find((b) => b.id === bot_id);
       // Assignment moved on (released, reassigned, evicted, new session) —
       // whatever path did that owns the outcome; nothing to heal here.
@@ -1666,6 +1671,14 @@ export class BotPool extends EventEmitter {
         bot.channel_id !== probation.channel_id ||
         bot.session_id !== probation.session_id
       ) {
+        continue;
+      }
+
+      // Still inside the liveness warm-up window (heal delay shorter than
+      // warm-up, or assigned_at refreshed) — no reading is trustworthy yet.
+      // Leave the armed marker in place; the steady-state probe judges the
+      // session once it clears warm-up.
+      if (bot.assigned_at && Date.now() - bot.assigned_at.getTime() < LIVENESS_WARMUP_MS) {
         continue;
       }
 
@@ -2855,6 +2868,18 @@ export class BotPool extends EventEmitter {
 
     const inbound = bot.last_inbound_at;
     if (!inbound) return; // nothing delivered — skip the tmux pane read entirely
+
+    // Warm-up gate (#106 review blocker): take NO reading — healthy or deaf —
+    // until the session has been up long enough for its pane to settle. The
+    // spawn-time arming sites (resume nudge, recycle recovery message) set
+    // `last_inbound_at` at T≈0, and a health tick landing mid-boot could
+    // otherwise mis-read startup output as "working", stamp
+    // `last_processing_at`, and clear the armed marker — silencing both this
+    // probe AND the post-restart heal for a genuinely-deaf session. The grace
+    // window already spans the same interval, so gating costs no detection
+    // latency. Bots with no assigned_at (pathological) fall through to the
+    // original behavior.
+    if (bot.assigned_at && Date.now() - bot.assigned_at.getTime() < LIVENESS_WARMUP_MS) return;
 
     const verdict = evaluate_plugin_liveness(
       {

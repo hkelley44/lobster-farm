@@ -470,6 +470,80 @@ describe("check_plugin_liveness (issue #73)", () => {
     expect(deaf_alert).toBe(true);
   });
 
+  it("warm-up gate: takes NO reading on a freshly-spawned bot, even when boot noise reads as working (#106 review)", async () => {
+    const start_tmux = vi
+      .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
+      .mockResolvedValue(undefined as never);
+
+    // Spawn-armed marker (resume nudge / recycle recovery message) at T≈0 with
+    // a pane that would read as "working" (startup banner mis-read). Without
+    // the gate this produced healthy_working: last_processing_at falsely
+    // stamped, marker cleared, BOTH deaf detectors silenced forever.
+    const bot = make_assigned_bot(3, {
+      assigned_at: new Date(), // just spawned — inside the warm-up window
+      last_inbound_at: new Date(),
+      last_processing_at: null,
+    });
+    pool.inject_bots([bot]);
+    pool.set_tmux_alive("pool-3", true);
+    pool.set_bot_idle_state(3, false); // "working" per the pane heuristic
+
+    await pool.run_probe(bot);
+
+    // No reading taken: marker preserved, no processing stamp, no recovery.
+    expect(bot.last_inbound_at).not.toBeNull();
+    expect(bot.last_processing_at).toBeNull();
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(notify_mock).not.toHaveBeenCalled();
+  });
+
+  it("warm-up gate: readings resume once the session has settled past the window", async () => {
+    const start_tmux = vi
+      .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
+      .mockResolvedValue(undefined as never);
+
+    // Same conditions, but the session is old — the gate no longer applies and
+    // a genuinely-working pane clears the marker as before.
+    const bot = make_assigned_bot(3, {
+      assigned_at: new Date(Date.now() - 10 * 60 * 1000),
+      last_inbound_at: new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000),
+      last_processing_at: null,
+    });
+    pool.inject_bots([bot]);
+    pool.set_tmux_alive("pool-3", true);
+    pool.set_bot_idle_state(3, false); // working
+
+    await pool.run_probe(bot);
+
+    expect(bot.last_inbound_at).toBeNull();
+    expect(bot.last_processing_at).not.toBeNull();
+    expect(start_tmux).not.toHaveBeenCalled();
+  });
+
+  it("warm-up gate: a spawn-armed session still idle after the window IS judged deaf and recycled", async () => {
+    const start_tmux = vi
+      .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
+      .mockResolvedValue(undefined as never);
+
+    // Armed at spawn, warm-up elapsed, still idle with zero processing — the
+    // gate delays the verdict but must not swallow it.
+    const spawn_time = new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000);
+    const bot = make_assigned_bot(3, {
+      assigned_at: spawn_time,
+      last_inbound_at: spawn_time,
+      last_processing_at: null,
+    });
+    pool.inject_bots([bot]);
+    pool.set_tmux_alive("pool-3", true);
+    pool.set_bot_idle_state(3, true);
+
+    await pool.run_probe(bot);
+
+    expect(start_tmux).toHaveBeenCalledTimes(1);
+    const messages = notify_mock.mock.calls.map((c) => String(c[1]));
+    expect(messages.some((m) => m.includes("went DEAF"))).toBe(true);
+  });
+
   it("skips a bot already mid-recovery (in-flight lock)", async () => {
     const start_tmux = vi
       .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
