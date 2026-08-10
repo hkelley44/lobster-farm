@@ -247,7 +247,7 @@ describe("check_plugin_liveness (issue #73)", () => {
     expect(bot.last_inbound_at).toBeNull();
   });
 
-  it("detects deafness and recovers: alerts #alerts and respawns the session", async () => {
+  it("detects deafness and recycles release-to-fresh: alert, release, fresh assign resuming the session (#106)", async () => {
     const start_tmux = vi
       .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
       .mockResolvedValue(undefined as never);
@@ -264,28 +264,36 @@ describe("check_plugin_liveness (issue #73)", () => {
 
     await pool.run_probe(bot);
 
-    // Recovered via the restart path (resumes the confirmed session).
+    // Recycled: the same release + assign an operator does by hand. One spawn.
     expect(start_tmux).toHaveBeenCalledTimes(1);
-    // Bot stays assigned on the same channel after a successful restart.
-    expect(bot.state).toBe("assigned");
-    expect(bot.channel_id).toBe("chan-foods");
-    // The inbound marker is consumed so we don't re-trigger on the same silence.
-    expect(bot.last_inbound_at).toBeNull();
+    const spawn_args = start_tmux.mock.calls[0] as unknown[];
+    // The stash → assign flow resumes the confirmed session for continuity...
+    expect(spawn_args[4]).toBe("sess-live");
+    expect(spawn_args[5]).toBe(true);
+    // ...and injects a recovery message so the fresh session runs a first turn
+    // and catches up on whatever the deaf plugin dropped.
+    expect((spawn_args[6] as Record<string, string>).LF_PENDING_FILE).toBeDefined();
+
+    // The channel ends up with an assigned bot again.
+    const assigned = pool
+      .get_bots()
+      .find((b) => b.channel_id === "chan-foods" && b.state === "assigned");
+    expect(assigned).toBeDefined();
+    // The recovery injection arms the probe on the fresh bot: if the new
+    // session never processes it either, deafness is re-detected and the loop
+    // guard eventually stops the churn.
+    expect(assigned!.last_inbound_at).not.toBeNull();
+    expect(assigned!.last_processing_at).toBeNull();
 
     // A "went DEAF" alert fired; the un-recoverable alert did NOT.
-    const deaf_alert = notify_mock.mock.calls.some(
-      (call) => typeof call[1] === "string" && call[1].includes("went DEAF"),
-    );
-    const dark_alert = notify_mock.mock.calls.some(
-      (call) => typeof call[1] === "string" && call[1].includes("could not be restarted"),
-    );
-    expect(deaf_alert).toBe(true);
-    expect(dark_alert).toBe(false);
+    const messages = notify_mock.mock.calls.map((c) => String(c[1]));
+    expect(messages.some((m) => m.includes("went DEAF"))).toBe(true);
+    expect(messages.some((m) => m.includes("could not be reassigned"))).toBe(false);
   });
 
-  it("alerts that the channel is dark when recovery fails to respawn", async () => {
-    // Make the respawn fail — restart_crashed_session frees the bot, then the
-    // probe surfaces the dark channel.
+  it("alerts that the channel is dark when the recycle's reassign fails", async () => {
+    // Make the fresh spawn fail — assign() throws, the recycle reports "dark",
+    // and the probe surfaces the unattended channel.
     vi.spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never).mockRejectedValue(
       new Error("tmux spawn failed") as never,
     );
@@ -300,12 +308,93 @@ describe("check_plugin_liveness (issue #73)", () => {
 
     await pool.run_probe(bot);
 
-    // Bot freed by the restart-failure path...
+    // Bot was released and the reassign never landed...
     expect(bot.state).toBe("free");
     // ...and both the initial deaf alert and the un-recoverable alert fired.
     const messages = notify_mock.mock.calls.map((c) => String(c[1]));
     expect(messages.some((m) => m.includes("went DEAF"))).toBe(true);
-    expect(messages.some((m) => m.includes("could not be restarted"))).toBe(true);
+    expect(messages.some((m) => m.includes("could not be reassigned"))).toBe(true);
+  });
+
+  it("loop guard: repeated deafness within the window releases WITHOUT reassign and alerts at failure severity", async () => {
+    const start_tmux = vi
+      .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
+      .mockResolvedValue(undefined as never);
+
+    // Two auto-recycles already happened on this channel inside the window —
+    // a third deaf verdict means recycling is not curing the root cause.
+    (pool as unknown as { deaf_recycle_history: Map<string, number[]> }).deaf_recycle_history.set(
+      "chan-foods",
+      [Date.now() - 10 * 60 * 1000, Date.now() - 5 * 60 * 1000],
+    );
+
+    const bot = make_assigned_bot(3, {
+      last_inbound_at: new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000),
+      last_processing_at: null,
+    });
+    pool.inject_bots([bot]);
+    pool.set_tmux_alive("pool-3", true);
+    pool.set_bot_idle_state(3, true);
+
+    await pool.run_probe(bot);
+
+    // No reassign — released and left dark for a human.
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(bot.state).toBe("free");
+    const messages = notify_mock.mock.calls.map((c) => String(c[1]));
+    expect(messages.some((m) => m.includes("keeps going DEAF"))).toBe(true);
+  });
+
+  it("loop guard: recycle timestamps outside the window are forgotten", async () => {
+    const start_tmux = vi
+      .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
+      .mockResolvedValue(undefined as never);
+
+    // Old recycles (>1h) don't count against the budget.
+    (pool as unknown as { deaf_recycle_history: Map<string, number[]> }).deaf_recycle_history.set(
+      "chan-foods",
+      [Date.now() - 2 * 60 * 60 * 1000, Date.now() - 3 * 60 * 60 * 1000],
+    );
+
+    const bot = make_assigned_bot(3, {
+      last_inbound_at: new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000),
+      last_processing_at: null,
+    });
+    pool.inject_bots([bot]);
+    pool.set_tmux_alive("pool-3", true);
+    pool.set_bot_idle_state(3, true);
+
+    await pool.run_probe(bot);
+
+    // Normal recycle proceeds.
+    expect(start_tmux).toHaveBeenCalledTimes(1);
+    const assigned = pool
+      .get_bots()
+      .find((b) => b.channel_id === "chan-foods" && b.state === "assigned");
+    expect(assigned).toBeDefined();
+  });
+
+  it("mark_processed stamps last_processing_at for the matching assigned session only (#106)", () => {
+    const bot = make_assigned_bot(3, { session_id: "sess-live", last_processing_at: null });
+    const other = make_bot({
+      id: 4,
+      state: "assigned",
+      channel_id: "chan-other",
+      entity_id: "healthydogs",
+      archetype: "planner",
+      session_id: "sess-other",
+      last_processing_at: null,
+    });
+    pool.inject_bots([bot, other]);
+
+    pool.mark_processed("sess-live");
+
+    expect(bot.last_processing_at).not.toBeNull();
+    expect(other.last_processing_at).toBeNull();
+
+    // Unknown session id is a no-op.
+    pool.mark_processed("sess-unknown");
+    expect(other.last_processing_at).toBeNull();
   });
 
   it("skips the DEAF-restart path for a broker-transport session (broker redelivery is the liveness mechanism)", async () => {
@@ -348,9 +437,15 @@ describe("check_plugin_liveness (issue #73)", () => {
 
     // A broker exists but does NOT own this channel → plugin transport → the
     // probe behaves exactly as before. This pins that the exemption is scoped to
-    // broker-owned channels only, not "any broker present".
-    (pool as unknown as { broker: { owns(id: string): boolean } | null }).broker = {
+    // broker-owned channels only, not "any broker present". release_channel is
+    // the no-op the recycle's release() path calls on non-broker channels.
+    (
+      pool as unknown as {
+        broker: { owns(id: string): boolean; release_channel(id: string): void } | null;
+      }
+    ).broker = {
       owns: () => false,
+      release_channel: () => {},
     };
 
     const bot = make_assigned_bot(3, {
@@ -363,9 +458,12 @@ describe("check_plugin_liveness (issue #73)", () => {
 
     await pool.run_probe(bot);
 
-    // The plugin session IS deaf and IS restarted — unchanged behavior.
+    // The plugin session IS deaf and IS recycled — the exemption didn't apply.
     expect(start_tmux).toHaveBeenCalledTimes(1);
-    expect(bot.last_inbound_at).toBeNull();
+    const assigned = pool
+      .get_bots()
+      .find((b) => b.channel_id === "chan-foods" && b.state === "assigned");
+    expect(assigned).toBeDefined();
     const deaf_alert = notify_mock.mock.calls.some(
       (call) => typeof call[1] === "string" && call[1].includes("went DEAF"),
     );

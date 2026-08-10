@@ -91,6 +91,10 @@ const handle_status: RouteHandler = (_req, res, ctx) => {
   const queue_stats = ctx.queue.get_stats();
   json_response(res, 200, {
     running: true,
+    // Daemon process pid (#106): lets the redeploy script verify a restart
+    // actually produced a NEW process (pid change + running:true) instead of
+    // trusting that `launchctl kickstart` did its job.
+    pid: process.pid,
     uptime_seconds,
     entities: {
       total: ctx.registry.count(),
@@ -453,6 +457,13 @@ const handle_stop_hook: RouteHandler = async (req, res, ctx) => {
     json_response(res, 200, { ok: true });
     return;
   }
+
+  // Every session's Stop hook fires here once per completed assistant turn —
+  // a deterministic "this session ran a turn" signal. Stamp it so the
+  // plugin-liveness probe and the post-restart heal (#106) never judge a
+  // session deaf because its turn happened to fit between two 30s pane
+  // samples. Cheap in-memory lookup; no-op for non-pool sessions.
+  ctx.pool?.mark_processed(session_id);
 
   try {
     const result = await evaluate_stop(

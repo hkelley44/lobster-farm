@@ -284,6 +284,13 @@ async function main(): Promise<void> {
     // anything still assigned with no live tmux is a half-spawn that would
     // silently drop every message to its channel.
     await pool.reconcile_assigned_health();
+
+    // One-shot post-restart auto-heal (#106): a few minutes from now, recycle
+    // any resumed session that shows zero evidence of having run its resume-
+    // nudge turn — the "alive in tmux but receiving nothing" state that left
+    // rooms silently deaf for days after the 08-01 restart. No-op when every
+    // resumed session comes up healthy.
+    pool.schedule_post_restart_heal();
   }
 
   // Initialize Commander (persistent Claude Code session with Discord channel)

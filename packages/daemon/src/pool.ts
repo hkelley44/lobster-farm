@@ -24,6 +24,7 @@ import {
 import { scan_and_recover } from "./rate-limit-recovery.js";
 import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
+import { find_session_file } from "./session-context.js";
 import { sq } from "./shell.js";
 
 // ── Types ──
@@ -495,6 +496,25 @@ export const AVATAR_COOLDOWN_MS = 30 * 60 * 1000;
  * the commander probe (#77). */
 export { PLUGIN_DEAF_THRESHOLD_MS };
 
+/** Sliding window for the deaf auto-recycle loop guard (#106). Recycles per
+ * channel are counted inside this window; see `deaf_recycle_history`. */
+export const DEAF_RECYCLE_WINDOW_MS = 60 * 60 * 1000;
+
+/** Max automatic deaf recycles per channel inside DEAF_RECYCLE_WINDOW_MS
+ * before the heal gives up (release without reassign + failure alert). Two
+ * chances: the first recycle cures a one-off dead listener; a second covers a
+ * transient (e.g. Discord-side) failure of the first; a third deaf verdict in
+ * the same hour means recycling is not the fix and a human needs to look. */
+export const MAX_DEAF_RECYCLES_PER_WINDOW = 2;
+
+/** Delay before the one-shot post-restart heal pass (#106). Long enough for a
+ * fleet of resumed sessions to boot and run their resume-nudge turn even on a
+ * loaded machine (Claude startup + MCP init + a multi-step nudge turn), short
+ * enough that a deaf room is healed within minutes of the restart instead of
+ * days. The steady-state probe (90s threshold) usually fires first; this pass
+ * is the deterministic backstop that doesn't depend on pane heuristics. */
+export const POST_RESTART_HEAL_DELAY_MS = 3 * 60 * 1000;
+
 // ── Pool Manager ──
 
 export class BotPool extends EventEmitter {
@@ -559,6 +579,28 @@ export class BotPool extends EventEmitter {
    * takes longer than the 30s health-check interval — this prevents a second
    * pass from firing a duplicate recovery on a bot that's already mid-restart. */
   private recovering_plugin = new Set<number>();
+  /** Auto-recycle timestamps per channel (#106). The deaf heal is a full
+   * release + fresh assign; if the same channel keeps going deaf, recycling is
+   * not curing the root cause and repeating it just churns sessions (the 08-01
+   * incident showed restart churn itself producing deaf plugins). After
+   * MAX_DEAF_RECYCLES_PER_WINDOW recycles inside DEAF_RECYCLE_WINDOW_MS the
+   * next deaf verdict releases WITHOUT reassign and alerts at failure severity.
+   * In-memory only — a daemon restart resets the budget, which is fine: the
+   * restart also replaces every plugin connection. */
+  private deaf_recycle_history = new Map<string, number[]>();
+  /** Post-restart probation (#106): bots proactively resumed by
+   * resume_parked_bots() whose resume nudge was successfully injected. Each
+   * entry records the assignment snapshot + a baseline timestamp; the one-shot
+   * heal pass (heal_post_restart) recycles any entry whose session shows zero
+   * evidence of having run a turn since the baseline — the "alive but not
+   * receiving injected channel messages" signature of the 08-01→08-04 incident.
+   * bot_id → snapshot. In-memory only. */
+  private post_restart_probation = new Map<
+    number,
+    { channel_id: string; entity_id: string; session_id: string; baseline: number }
+  >();
+  /** One-shot timer for the post-restart heal pass. */
+  private post_restart_heal_timer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -1361,6 +1403,7 @@ export class BotPool extends EventEmitter {
         // during Claude init as additionalContext — replacing the legacy
         // bridge_resume_nudge() tmux send-keys path that raced against
         // MCP plugin readiness. See issue #290.
+        let nudge_written = false;
         try {
           const nudge_path = await write_pending_message(bot.tmux_session, {
             user: "lobsterfarm-daemon",
@@ -1371,6 +1414,7 @@ export class BotPool extends EventEmitter {
             ts: new Date().toISOString(),
           });
           extra_env.LF_PENDING_FILE = nudge_path;
+          nudge_written = true;
         } catch (err) {
           console.warn(
             `[pool] Failed to write resume nudge for pool-${String(bot.id)}: ${String(err)}`,
@@ -1400,6 +1444,28 @@ export class BotPool extends EventEmitter {
         bot.session_confirmed = true;
         bot.last_active = new Date();
         bot.assigned_at = new Date(); // Reset uptime — new process
+
+        // Post-restart deaf detection (#106). The resume nudge is a genuinely
+        // injected message: a healthy resumed session runs a turn on it within
+        // seconds of boot, while a session whose plugin/injection path did not
+        // re-establish sits at the prompt forever — the exact 08-01→08-04
+        // "alive but receiving nothing" signature. Two independent detectors:
+        //   - `last_inbound_at` feeds the steady-state probe (90s threshold,
+        //     30s ticks) for fast detection;
+        //   - the probation entry feeds the one-shot `heal_post_restart` pass,
+        //     whose JSONL-mtime check doesn't depend on pane heuristics.
+        // Only armed when the nudge actually got written — with no injected
+        // message, an idle session is legitimate, not deaf.
+        if (nudge_written) {
+          bot.last_inbound_at = new Date();
+          bot.last_processing_at = null;
+          this.post_restart_probation.set(bot.id, {
+            channel_id: candidate.channel_id,
+            entity_id: candidate.entity_id,
+            session_id: candidate.session_id!,
+            baseline: Date.now(),
+          });
+        }
 
         resumed++;
         console.log(
@@ -1520,6 +1586,161 @@ export class BotPool extends EventEmitter {
           );
         }
       }
+    }
+  }
+
+  /**
+   * Schedule the one-shot post-restart heal pass (#106).
+   *
+   * Call AFTER `resume_parked_bots()` + `reconcile_assigned_health()` — by then
+   * every proactively-resumed bot with an injected resume nudge is on
+   * probation. The pass runs once, POST_RESTART_HEAL_DELAY_MS later, and
+   * recycles any probation session that shows zero evidence of having run a
+   * turn since resume. No-op when nothing is on probation.
+   */
+  schedule_post_restart_heal(delay_ms: number = POST_RESTART_HEAL_DELAY_MS): void {
+    if (this.post_restart_probation.size === 0) return;
+    if (this.post_restart_heal_timer) return; // already scheduled
+
+    console.log(
+      `[pool] Post-restart heal pass scheduled in ${String(Math.round(delay_ms / 1000))}s ` +
+        `for ${String(this.post_restart_probation.size)} resumed session(s)`,
+    );
+    this.post_restart_heal_timer = setTimeout(() => {
+      this.post_restart_heal_timer = null;
+      void this.heal_post_restart();
+    }, delay_ms);
+    // Don't hold the event loop open for the heal — daemon shutdown also
+    // clears it explicitly.
+    this.post_restart_heal_timer.unref?.();
+  }
+
+  /**
+   * One-shot post-restart heal (#106): recycle resumed sessions that never
+   * re-established message delivery.
+   *
+   * The 08-01→08-04 incident: a daemon restart proactively resumed sessions
+   * that came back alive in tmux but receiving nothing — empty prompts,
+   * `no transcript` — and the rooms stayed silently dark for days until an
+   * operator manually recycled each bot. This pass makes that state
+   * self-healing: every resumed-with-nudge session must show SOME evidence of
+   * having run a turn since resume, or it gets the same release-to-fresh
+   * recycle the operator performed by hand, with one aggregate alert listing
+   * everything healed.
+   *
+   * Healthy evidence (any one suffices — all three are cheap and none can
+   * false-negative a genuinely deaf session):
+   *   1. `last_processing_at` ≥ baseline — the Stop hook stamped a completed
+   *      turn (deterministic, closes the pane-sampling race).
+   *   2. The session JSONL was modified since baseline — a turn ran or is
+   *      mid-flight, independent of pane heuristics.
+   *   3. The pane is non-idle right now — visibly working.
+   *
+   * A quiet-but-healthy room passes trivially: the resume nudge itself drives
+   * a turn, so "no human spoke since the restart" still produces evidence 1+2.
+   * Probation is only armed when the nudge was actually injected, so a session
+   * with nothing to respond to is never judged deaf. Sessions whose tmux died
+   * are left to the crash-restart machinery, and entries whose assignment
+   * changed (released/reassigned/evicted meanwhile) are skipped — some other
+   * path already handled them.
+   *
+   * Protected so tests can invoke it directly without the timer.
+   */
+  protected async heal_post_restart(): Promise<void> {
+    if (this._draining) return;
+
+    const entries = [...this.post_restart_probation.entries()];
+    this.post_restart_probation.clear();
+    if (entries.length === 0) return;
+
+    const healed: string[] = [];
+    const dark: string[] = [];
+
+    for (const [bot_id, probation] of entries) {
+      const bot = this.bots.find((b) => b.id === bot_id);
+      // Assignment moved on (released, reassigned, evicted, new session) —
+      // whatever path did that owns the outcome; nothing to heal here.
+      if (
+        !bot ||
+        bot.state !== "assigned" ||
+        bot.channel_id !== probation.channel_id ||
+        bot.session_id !== probation.session_id
+      ) {
+        continue;
+      }
+
+      // Evidence the session ran (or is running) a turn since resume → healthy.
+      if (bot.last_processing_at && bot.last_processing_at.getTime() >= probation.baseline) {
+        bot.last_inbound_at = null;
+        continue;
+      }
+      if (await this.session_jsonl_modified_since(probation.session_id, probation.baseline)) {
+        bot.last_inbound_at = null;
+        continue;
+      }
+      if (!this.is_bot_idle(bot)) {
+        continue; // visibly working right now — the probe will finish the bookkeeping
+      }
+      // Dead tmux is a crash, not deafness — the health monitor owns restarts.
+      if (!this.is_tmux_alive(bot.tmux_session)) {
+        continue;
+      }
+
+      const label = `${probation.entity_id}/${this.channel_label(probation.entity_id, probation.channel_id)}`;
+      console.error(
+        `[pool] pool-${String(bot_id)} never processed its resume nudge after the daemon restart (session ${probation.session_id.slice(0, 8)}, channel ${probation.channel_id}) — plugin connection did not re-establish; auto-recycling`,
+      );
+
+      const outcome = await this.recycle_deaf_bot(bot, "post-restart heal");
+      if (outcome === "recycled") {
+        healed.push(label);
+      } else if (outcome === "dark" || outcome === "loop_guard_released") {
+        dark.push(label);
+      }
+    }
+
+    if (healed.length === 0 && dark.length === 0) return;
+
+    const lines: string[] = [];
+    if (healed.length > 0) {
+      lines.push(
+        `🩹 Post-restart auto-heal: ${String(healed.length)} session(s) never re-established Discord message delivery after the daemon restart and were auto-recycled: ${healed.join(", ")}. Fresh sessions are up; conversation history resumed where available.`,
+      );
+    }
+    if (dark.length > 0) {
+      lines.push(
+        `🔴 Post-restart auto-heal could NOT revive: ${dark.join(", ")}. These channels are unattended — recycle manually and check daemon logs.`,
+      );
+    }
+    try {
+      // Aggregate alert can span entities — route to the platform alerts
+      // channel (no entity_config) where operators watch restarts.
+      await notify("alerts", lines.join("\n"));
+    } catch (notify_err) {
+      console.warn(`[pool] Failed to post post-restart heal alert: ${String(notify_err)}`);
+    }
+  }
+
+  /**
+   * Whether a session's JSONL transcript was modified at/after `since_ms`.
+   * Deterministic "the session ran a turn" evidence for the post-restart heal —
+   * Claude Code appends to the JSONL as a turn executes, so a resumed session
+   * that processed its nudge always moves the mtime forward. Fail-closed to
+   * `false` (no evidence) when the file is missing/unreadable; the other
+   * evidence checks still get their chance before a recycle. Protected so
+   * tests can override without touching the real filesystem.
+   */
+  protected async session_jsonl_modified_since(
+    session_id: string,
+    since_ms: number,
+  ): Promise<boolean> {
+    try {
+      const file = await find_session_file(session_id);
+      if (!file) return false;
+      const s = await stat(file);
+      return s.mtimeMs >= since_ms;
+    } catch {
+      return false;
     }
   }
 
@@ -2378,6 +2599,26 @@ export class BotPool extends EventEmitter {
   }
 
   /**
+   * Record that a session just completed an assistant turn (#106).
+   *
+   * Called from the daemon's `/hooks/stop` endpoint — every Claude session's
+   * Stop hook POSTs its session_id there once per turn. This is a
+   * *deterministic* "the session ran a turn" signal, unlike the tmux pane
+   * sampling the probe otherwise relies on: a bot that receives an inbound and
+   * answers it entirely between two 30s health ticks would look
+   * idle-with-no-processing to the sampler and be judged deaf. Stamping
+   * `last_processing_at` on turn completion closes that false-positive window
+   * for both the steady-state probe and the post-restart heal.
+   */
+  mark_processed(session_id: string): void {
+    if (!session_id) return;
+    const bot = this.bots.find((b) => b.session_id === session_id && b.state === "assigned");
+    if (bot) {
+      bot.last_processing_at = new Date();
+    }
+  }
+
+  /**
    * Start the tmux session health monitor.
    * Checks every 30 seconds for assigned bots whose tmux sessions have died.
    * When a dead session is found, attempts to restart it automatically.
@@ -2658,71 +2899,197 @@ export class BotPool extends EventEmitter {
   /**
    * Recover a bot whose MCP plugin has gone deaf to inbound Discord messages.
    *
-   * Unlike a tmux crash, the process is *alive* — but its plugin channel
-   * listener is dead, so a fresh session is the only fix. We kill the live tmux
-   * (otherwise `start_tmux` collides on the session name), then route through
-   * the same `restart_crashed_session` path crash recovery uses: it resumes the
-   * confirmed session (preserving conversation context) with a brand-new plugin
-   * connection, or spawns fresh, and posts its own success alert. On failure it
-   * frees the bot, which we detect and surface to #alerts so the channel never
-   * goes silently dark.
+   * Probe-path entry point: posts the operator alerts (naming the channel) and
+   * delegates the mechanics to `recycle_deaf_bot`. Recovery is a full
+   * release-to-fresh recycle (#106) — the same `release` + `assign` an operator
+   * performs by hand — NOT the old in-place `restart_crashed_session` respawn:
+   * the 08-01→08-04 incident showed restart churn itself producing sessions
+   * that came back alive-but-deaf, while a clean release + fresh assignment
+   * reliably restored delivery.
    */
   private async recover_deaf_bot(bot: PoolBot): Promise<void> {
     if (this.recovering_plugin.has(bot.id)) return;
+
+    const bot_id = bot.id;
+    const entity_id = bot.entity_id;
+    const channel_id = bot.channel_id;
+    const archetype = bot.archetype;
+    const entity_config = entity_id ? this.registry?.get(entity_id) : undefined;
+    const label = this.channel_label(entity_id, channel_id);
+
+    try {
+      await notify(
+        "alerts",
+        `🔴 Pool bot ${String(bot_id)} (${archetype ?? "unknown"}) went DEAF to inbound Discord for ${entity_id ?? "unknown"}/${label} — alive in tmux but no longer receiving channel messages. Auto-recycling: releasing the bot and assigning a fresh session (conversation resumes from history where possible).`,
+        entity_config,
+      );
+    } catch (notify_err) {
+      console.warn(
+        `[pool] Failed to alert #alerts for deaf pool-${String(bot_id)}: ${String(notify_err)}`,
+      );
+    }
+
+    const outcome = await this.recycle_deaf_bot(bot, "deaf-recycle");
+
+    if (outcome === "loop_guard_released") {
+      try {
+        await notify(
+          "alerts",
+          `🔴 ${entity_id ?? "unknown"}/${label} keeps going DEAF — auto-recycled ${String(MAX_DEAF_RECYCLES_PER_WINDOW)}x in the last hour without curing delivery. Bot released WITHOUT reassign; the channel is dark until manually recycled (POST /pool/assign). Investigate the Discord plugin/bot token.`,
+          entity_config,
+        );
+      } catch (notify_err) {
+        console.warn(
+          `[pool] Failed to alert #alerts for deaf loop-guard on ${label}: ${String(notify_err)}`,
+        );
+      }
+    } else if (outcome === "dark") {
+      console.error(
+        `[pool] pool-${String(bot_id)} could not be reassigned after plugin deafness — channel ${label} is dark`,
+      );
+      try {
+        await notify(
+          "alerts",
+          `🔴 Pool bot ${String(bot_id)} (${archetype ?? "unknown"}) could not be reassigned after going deaf for ${entity_id ?? "unknown"}/${label}. Channel is unattended — check daemon logs.`,
+          entity_config,
+        );
+      } catch (notify_err) {
+        console.warn(
+          `[pool] Failed to alert #alerts for un-recoverable deaf pool-${String(bot_id)}: ${String(notify_err)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Release-to-fresh recycle for a deaf plugin session (#106) — shared by the
+   * steady-state probe (`recover_deaf_bot`) and the post-restart heal pass
+   * (`heal_post_restart`). Alert side-effects stay with the callers (mirroring
+   * the plugin-liveness module's caller-owns-side-effects split); this owns the
+   * mechanics:
+   *
+   *   1. Loop guard: give up (release, no reassign) after
+   *      MAX_DEAF_RECYCLES_PER_WINDOW recycles per channel per window.
+   *   2. Stash the session via the #92-gated helper so the fresh assignment
+   *      `--resume`s the conversation when the JSONL is intact.
+   *   3. `release()` + `assign()` — exactly the operator's manual recycle —
+   *      with an injected recovery message that (a) drives the fresh session's
+   *      first turn on the plugin path and (b) tells the agent to catch up on
+   *      the channel messages the deaf plugin dropped.
+   *   4. Stamp `last_inbound_at` on the fresh bot: the recovery message was
+   *      genuinely injected, so if the new session never processes it either,
+   *      the probe re-fires and the loop guard ends the churn.
+   */
+  private async recycle_deaf_bot(
+    bot: PoolBot,
+    label: string,
+  ): Promise<"recycled" | "loop_guard_released" | "dark" | "skipped"> {
+    if (this.recovering_plugin.has(bot.id)) return "skipped";
     this.recovering_plugin.add(bot.id);
 
     const entity_id = bot.entity_id;
     const channel_id = bot.channel_id;
     const archetype = bot.archetype;
+    const channel_type = bot.channel_type;
+    const session_id = bot.session_id;
+    const session_confirmed = bot.session_confirmed;
 
-    // Consume the inbound marker up-front so a concurrent/next probe pass can't
-    // re-trigger on the same silence while we're mid-recovery.
+    // Consume the markers up-front so a concurrent/next probe pass can't
+    // re-trigger on the same silence while we're mid-recycle. Probation entry
+    // (if any) is consumed too — this recycle IS its heal.
     bot.last_inbound_at = null;
     bot.last_processing_at = null;
+    this.post_restart_probation.delete(bot.id);
 
     try {
-      await notify(
-        "alerts",
-        `\ud83d\udd34 Pool bot ${String(bot.id)} (${archetype ?? "unknown"}) went DEAF to inbound Discord for ${entity_id ?? "unknown"}/${this.channel_label(entity_id, channel_id)} — alive in tmux but the MCP plugin stopped delivering messages. Restarting the session to restore delivery.`,
-        entity_id ? this.registry?.get(entity_id) : undefined,
-      );
-    } catch (notify_err) {
-      console.warn(
-        `[pool] Failed to alert #alerts for deaf pool-${String(bot.id)}: ${String(notify_err)}`,
-      );
-    }
-
-    try {
-      // Kill the live-but-deaf tmux so restart_crashed_session can recreate it
-      // with a fresh plugin connection. The session name is reused.
-      this.kill_tmux(bot.tmux_session);
-
-      await this.restart_crashed_session(bot);
-
-      // If the bot is no longer assigned, the respawn failed and the channel is
-      // now dark — surface it so it isn't silently unattended.
-      if (bot.state !== "assigned") {
-        const label = this.channel_label(entity_id, channel_id);
+      if (!channel_id || !entity_id || !archetype) {
+        // Pathological: assigned bot with incomplete metadata. There is nothing
+        // sane to reassign; release the channel if we can name it, else leave
+        // it to the health monitor's orphan handling.
         console.error(
-          `[pool] pool-${String(bot.id)} could not be restarted after plugin deafness — channel ${label} is dark`,
+          `[pool] Cannot recycle deaf pool-${String(bot.id)} — incomplete assignment metadata ` +
+            `(channel: ${channel_id ?? "none"}, entity: ${entity_id ?? "none"})`,
         );
-        try {
-          await notify(
-            "alerts",
-            `\ud83d\udd34 Pool bot ${String(bot.id)} (${archetype ?? "unknown"}) could not be restarted after going deaf for ${entity_id ?? "unknown"}/${label}. Channel is unattended — check daemon logs.`,
-            entity_id ? this.registry?.get(entity_id) : undefined,
-          );
-        } catch (notify_err) {
-          console.warn(
-            `[pool] Failed to alert #alerts for un-recoverable deaf pool-${String(bot.id)}: ${String(notify_err)}`,
-          );
-        }
+        if (channel_id) await this.release(channel_id);
+        return "dark";
       }
+
+      // Loop guard: recycling the same channel over and over means the recycle
+      // isn't curing the root cause — stop the churn and hand it to a human.
+      const now = Date.now();
+      const recent = (this.deaf_recycle_history.get(channel_id) ?? []).filter(
+        (t) => now - t < DEAF_RECYCLE_WINDOW_MS,
+      );
+      if (recent.length >= MAX_DEAF_RECYCLES_PER_WINDOW) {
+        this.deaf_recycle_history.set(channel_id, recent);
+        console.error(
+          `[pool] Channel ${channel_id} went deaf again after ${String(recent.length)} auto-recycle(s) in the last hour — giving up (release without reassign)`,
+        );
+        await this.stash_session_history(
+          session_id,
+          session_confirmed,
+          channel_id,
+          entity_id,
+          `${label} loop-guard`,
+        );
+        await this.release(channel_id);
+        return "loop_guard_released";
+      }
+      recent.push(now);
+      this.deaf_recycle_history.set(channel_id, recent);
+
+      // Stash BEFORE release (release nulls the bot's session fields) so
+      // assign() below finds the session in history and --resumes it.
+      await this.stash_session_history(session_id, session_confirmed, channel_id, entity_id, label);
+      await this.release(channel_id);
+
+      let assignment: PoolAssignment | null = null;
+      try {
+        assignment = await this.assign(
+          channel_id,
+          entity_id,
+          archetype,
+          undefined,
+          channel_type ?? undefined,
+          undefined,
+          {
+            user: "lobsterfarm-daemon",
+            channel_id,
+            message_id: "",
+            content:
+              "Your session's Discord connection went deaf and the daemon auto-recycled it. " +
+              "Recent messages in this channel may never have reached you — fetch the " +
+              "channel's recent messages and respond to anything left unanswered.",
+            ts: new Date().toISOString(),
+          },
+        );
+      } catch (err) {
+        console.error(
+          `[pool] Deaf recycle reassign failed for channel ${channel_id}: ${String(err)}`,
+        );
+        sentry.captureException(err, {
+          tags: { module: "pool", action: "deaf_recycle" },
+          contexts: { recycle: { entity_id, channel_id, label } },
+        });
+      }
+
+      if (!assignment) return "dark";
+
+      const fresh = this.bots.find((b) => b.id === assignment.bot_id);
+      if (fresh && fresh.state === "assigned" && fresh.channel_id === channel_id) {
+        fresh.last_inbound_at = new Date();
+        fresh.last_processing_at = null;
+      }
+
+      console.log(
+        `[pool] Recycled deaf channel ${channel_id}: pool-${String(bot.id)} released, ` +
+          `pool-${String(assignment.bot_id)} assigned fresh (${label})`,
+      );
+      return "recycled";
     } finally {
       this.recovering_plugin.delete(bot.id);
     }
   }
-
   // ── Crash Recovery ──
 
   /**
@@ -3163,6 +3530,14 @@ export class BotPool extends EventEmitter {
   async shutdown(): Promise<void> {
     this.stop_health_monitor();
     this.stop_rate_limit_monitor();
+
+    // Cancel a pending post-restart heal pass — recycling mid-shutdown would
+    // fight the drain.
+    if (this.post_restart_heal_timer) {
+      clearTimeout(this.post_restart_heal_timer);
+      this.post_restart_heal_timer = null;
+    }
+    this.post_restart_probation.clear();
 
     // Cancel all in-flight session confirmation watchers — we're about to
     // kill tmux anyway, and the timers would otherwise keep the event loop
