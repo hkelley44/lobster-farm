@@ -6,6 +6,7 @@ Repo-level shell utilities. One script per concern, executable, with a header co
 
 | Script | Purpose |
 |---|---|
+| `redeploy-daemon.sh` | The single robust daemon redeploy command (#106): rebuild `dist` → `launchctl kickstart -k` → poll launchd + `/status` for a **genuine pid change + `running:true`** → report PASS/FAIL. Launchd-native, foreground, no `setsid`/`nohup` detachment (both silently fail on macOS). `--no-build` skips the rebuild. |
 | `run-tests-isolated.sh` | Wrap any command in a one-shot launchd service so it runs in a fresh macOS resource coalition, breaking inheritance from the LobsterFarm daemon's coalition (id 1153). Use `scripts/run-tests-isolated.sh pnpm -r test` from agent sessions to avoid the SIGKILL kill path documented in #28. |
 
 ## Conventions

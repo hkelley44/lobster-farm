@@ -30,15 +30,24 @@ import { execFileSync } from "node:child_process";
 
 /**
  * Check whether a tmux session is idle (showing a prompt, not actively processing).
- * Reads the last line of the tmux pane and looks for prompt or permission dialog indicators.
+ * Reads the last line of the tmux pane and looks for explicit working indicators.
  *
- * Checks three things (in order):
+ * Classification (in order):
  * 1. "esc to interrupt" → actively generating → NOT idle
  * 2. "local agent" → background subagent running → NOT idle
- * 3. "❯" or "bypass permissions" → at prompt with no active work → idle
+ * 3. Anything else → idle. This covers the explicit prompt indicators ("❯",
+ *    "bypass permissions" in the status bar) AND every unrecognized state:
+ *    startup banners, MCP-init lines, dialogs, partial redraws. "Not idle" is
+ *    reserved for explicitly-recognized working markers only — Claude Code's
+ *    status bar shows "esc to interrupt" for the whole duration of a turn, so
+ *    real work is never missing its marker, while transient boot text carries
+ *    no marker at all. Treating unknown text as "working" was how a freshly
+ *    spawned session's banner could read as `healthy_working` and falsely
+ *    clear the deaf-probe's armed inbound marker (#106 review blocker).
  *
- * Fails open (returns true) when the pane can't be read — safe default for eviction
- * and typing-loop termination.
+ * Fails open (returns true) when the pane can't be read — symmetric with the
+ * unknown-text rule, and the safe default for eviction and typing-loop
+ * termination.
  *
  * Lives here because the live pane-idle reading is the second observable the
  * plugin-liveness probe compares against `last_inbound_at`; both the pool and
@@ -60,10 +69,9 @@ export function is_tmux_session_idle(tmux_session: string): boolean {
     // The parent is at the prompt but work is still happening — NOT idle.
     if (last_line.includes("local agent")) return false;
 
-    // If no active indicators, check for idle indicators:
-    // - "❯" prompt visible (waiting for input)
-    // - "bypass permissions" in status bar without active-work indicators (idle at prompt)
-    return last_line.includes("❯") || last_line.includes("bypass permissions");
+    // No explicit working marker → idle (prompt, dialog, startup banner, or
+    // any unrecognized transient — see the classification note above).
+    return true;
   } catch {
     return true; // Can't check — assume idle (fail-open)
   }
@@ -84,6 +92,24 @@ export function is_tmux_session_idle(tmux_session: string): boolean {
  * while still catching a genuinely deaf session within ~2 health-check cycles.
  */
 export const PLUGIN_DEAF_THRESHOLD_MS = 90_000;
+
+/**
+ * How long after a session (re)spawn before ANY liveness reading is trusted
+ * (#106 review). During boot the pane cycles through banners and init lines
+ * that no heuristic can classify reliably, and a single mis-read in the
+ * "working" direction is destructive: it stamps `last_processing_at` and
+ * clears the armed `last_inbound_at`, silencing both the steady-state probe
+ * and the post-restart heal for a genuinely-deaf session. So probes take no
+ * reading — neither healthy nor deaf — until the session is this old.
+ *
+ * Equal to PLUGIN_DEAF_THRESHOLD_MS deliberately: no verdict can be *needed*
+ * earlier (the grace window already spans 0–90s after an inbound), so gating
+ * reads for the same span costs nothing while guaranteeing boot noise is
+ * never read at all. Healthy sessions are still cleared promptly after
+ * warm-up via the Stop-hook `mark_processed` stamp (`healthy_processed`),
+ * which is immune to pane noise.
+ */
+export const LIVENESS_WARMUP_MS = 90_000;
 
 /** Observable inputs the probe compares to reach a verdict. */
 export interface LivenessSignal {
