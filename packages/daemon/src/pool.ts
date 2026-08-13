@@ -813,6 +813,19 @@ export class BotPool extends EventEmitter {
   }
 
   /**
+   * Public caller-facing view of `uses_broker()` (#107). Session-creating
+   * callers (the /swap, /room, /resume command handlers and POST /pool/assign)
+   * consult this to decide whether they must synthesize a `pending_message`
+   * driver before calling `assign()` — the choke-point guard refuses driverless
+   * assigns for broker channels. Plugin channels (and flag-OFF) return false,
+   * so callers that gate on this stay byte-identical to today when the broker
+   * is disabled.
+   */
+  channel_uses_broker(channel_id: string): boolean {
+    return this.uses_broker(channel_id);
+  }
+
+  /**
    * Read the bot's access.json chunk config (the same file the official plugin
    * reads for reply chunking). Missing/corrupt → plugin runtime defaults, so
    * broker outbound segments messages identically to the plugin. Never throws.
@@ -1338,7 +1351,11 @@ export class BotPool extends EventEmitter {
           `[pool] Skipping proactive-resume for broker channel ${candidate.channel_id} ` +
             `(pool-${String(bot.id)}) — lazy/message-driven; will cold-recreate on next inbound`,
         );
-        await this.release_broker_to_dark(bot, candidate.session_id ?? null);
+        await this.release_broker_to_dark(
+          bot,
+          candidate.session_id ?? null,
+          "daemon restart — proactive-resume skipped (lazy/message-driven)",
+        );
         continue;
       }
 
@@ -1554,7 +1571,11 @@ export class BotPool extends EventEmitter {
           `[pool] pool-${String(bot.id)} came back assigned with a dead broker tmux ` +
             `(channel: ${channel_id}) — releasing to dark, no respawn (lazy/message-driven)`,
         );
-        await this.release_broker_to_dark(bot, bot.session_id);
+        await this.release_broker_to_dark(
+          bot,
+          bot.session_id,
+          "daemon restart — came back assigned with dead tmux",
+        );
         continue;
       }
 
@@ -1770,7 +1791,13 @@ export class BotPool extends EventEmitter {
    * SessionStart hook (session-start-inject.sh) reads it during Claude init
    * and injects the message as additionalContext — replacing the legacy
    * tmux send-keys bridging that raced against MCP plugin readiness
-   * (issue #290). */
+   * (issue #290).
+   *
+   * CONTRACT (#107): for a broker-owned channel (`uses_broker`) a
+   * `pending_message` driver is REQUIRED — a driverless call returns `null`
+   * without spawning (see the choke-point guard below). Callers that can hit a
+   * broker channel must synthesize a driver from the triggering user action
+   * (see `channel_uses_broker`). Plugin channels are unaffected. */
   async assign(
     channel_id: string,
     entity_id: string,
@@ -1782,6 +1809,42 @@ export class BotPool extends EventEmitter {
   ): Promise<PoolAssignment | null> {
     if (this._draining) {
       console.log("[pool] Rejecting assignment — draining");
+      return null;
+    }
+
+    // ── Broker choke-point guard (#107) ──
+    //
+    // The #89 invariant, enforced at the one place every session-creation path
+    // funnels through: for a broker-owned channel, a session may only ever be
+    // created carrying an inbound driver (`pending_message`) that the broker
+    // queue delivers as its first turn. A driverless broker session idles at
+    // the prompt, never confirms, and recreates exactly the zombie state that
+    // sank the pilot twice (07-04 and 07-05, see #87/#89). Refusing HERE —
+    // rather than caller-by-caller — kills the whole class of bug: no future
+    // caller can reintroduce it. A dark channel that lazily recreates on the
+    // next human message is strictly safer than an invariant-violating session.
+    //
+    // Gate is `uses_broker()` (config-driven, restart-stable), NOT
+    // `broker_owns()` (empty until a session registers) — the #90 gate
+    // rationale. With `broker.enabled: false` this branch is unreachable for
+    // every channel, so flag-OFF behavior stays byte-identical to the plugin
+    // path (merge gate since #86).
+    if (!pending_message && this.uses_broker(channel_id)) {
+      console.error(
+        `[pool] [broker-guard] REFUSING driverless assign() for broker channel ${channel_id} (entity: ${entity_id}, archetype: ${archetype}, resume: ${resume_session_id?.slice(0, 8) ?? "none"}, channel_type: ${channel_type ?? "none"}) — a broker session exists iff an inbound message drives it (#89); channel stays dark, next inbound cold-recreates it`,
+      );
+      sentry.captureMessage("Broker choke-point guard refused a driverless assign()", "warning", {
+        tags: { module: "pool", guard: "broker-choke-point" },
+        contexts: {
+          assign: {
+            channel_id,
+            entity_id,
+            archetype,
+            resume_session_id: resume_session_id ?? null,
+            channel_type: channel_type ?? null,
+          },
+        },
+      });
       return null;
     }
 
@@ -2451,11 +2514,25 @@ export class BotPool extends EventEmitter {
    * authoritative id than what's on the bot (the resume candidate's persisted
    * session_id vs. a parked bot's live field). Pass null to stash nothing.
    *
+   * `reason` is a short human-readable cause ("daemon restart", "session died",
+   * …) threaded into the #91 operator-visibility signal emitted below.
+   *
    * Caller must have already confirmed `uses_broker(bot.channel_id)`.
    */
-  private async release_broker_to_dark(bot: PoolBot, session_id: string | null): Promise<void> {
+  private async release_broker_to_dark(
+    bot: PoolBot,
+    session_id: string | null,
+    reason: string,
+  ): Promise<void> {
     const channel_id = bot.channel_id;
     const entity_id = bot.entity_id;
+
+    // Operator visibility (#91): exactly one info-level signal per dark
+    // transition — this method runs once per assigned→free release, never per
+    // health tick, so "once per channel" holds structurally. Deliberately NOT
+    // an `alerts`-severity event: dark-and-waiting is designed behavior, not a
+    // failure (the plugin revive-failure alerting is untouched).
+    this.emit_broker_dark_signal(bot, channel_id, entity_id, reason);
 
     // Stash for --resume continuity via the shared confirmed-AND-JSONL-on-disk
     // gate (#92) — identical to handle_crash_loop, so a stash can never silently
@@ -2503,6 +2580,134 @@ export class BotPool extends EventEmitter {
     await this.persist();
 
     this.emit("bot:released", { bot_id: bot.id });
+  }
+
+  /**
+   * The #91 "channel left dark, awaiting inbound" operator signal: one
+   * structured info log plus a low-severity #work-log note. Called exactly once
+   * per dark transition (from `release_broker_to_dark`). Never throws and never
+   * blocks the release path — the Discord note is fire-and-forget. Protected so
+   * tests can spy on it directly.
+   */
+  protected emit_broker_dark_signal(
+    bot: PoolBot,
+    channel_id: string | null,
+    entity_id: string | null,
+    reason: string,
+  ): void {
+    console.log(
+      `[pool] [broker-dark] Broker channel ${channel_id ?? "unknown"} left dark, awaiting inbound — reason: ${reason} (pool-${String(bot.id)}, session: ${bot.session_id?.slice(0, 8) ?? "none"}); next message cold-recreates the session`,
+    );
+    try {
+      void notify(
+        "work_log",
+        `🌙 Broker channel <#${channel_id ?? "?"}> left dark (${reason}) — awaiting the next message, which recreates the session with continuity. Expected behavior, nothing to do.`,
+        entity_id ? this.registry?.get(entity_id) : undefined,
+      ).catch(() => {
+        // Best-effort visibility — a failed work-log note must never break a
+        // release/restart path.
+      });
+    } catch {
+      /* same: never throw into the release path */
+    }
+  }
+
+  // ── Dead-letter session heal (#107, the broker-era #106 items 2–3) ──
+
+  /** Per-channel cool-down between automatic dead-letter heals. A repeat
+   * dead-letter inside this window means the heal itself isn't fixing the
+   * delivery path — re-healing would just loop. In-memory by design: a daemon
+   * restart already releases broker channels to dark, so losing the timestamps
+   * on restart is harmless (spec #107, Open Question 3 default: 10 minutes). */
+  static readonly DEAD_LETTER_HEAL_COOLDOWN_MS = 10 * 60 * 1000;
+
+  /** channel_id → epoch ms of the last automatic dead-letter heal. */
+  private dead_letter_heal_at = new Map<string, number>();
+
+  /**
+   * Heal the session leg of a dead-lettered broker inbound (#107 / #106 class).
+   *
+   * A dead-letter means the shim never acked across the full redelivery horizon
+   * (~2.5 min) — the owning session's delivery path is broken, and every
+   * subsequent message would dead-letter too. The heal releases the owning bot
+   * to dark via `release_broker_to_dark` (history stashed through the #92
+   * shared gate, queue preserved via `deregister_channel`) so the NEXT inbound
+   * cold-recreates the session with a fresh shim.
+   *
+   * The dead-lettered message itself is NOT re-enqueued: if the message is
+   * poison, re-feeding it defeats the loop-breaker dead-lettering exists to be.
+   * The human retries from the quoted alert.
+   *
+   * Heal-loop guard: if the same channel dead-letters again within
+   * `DEAD_LETTER_HEAL_COOLDOWN_MS` of a heal, returns `cooldown` and takes no
+   * automatic action — the caller escalates at failure severity.
+   *
+   * `now_ms` is injectable for tests.
+   */
+  async heal_dead_letter(
+    channel_id: string,
+    now_ms = Date.now(),
+  ): Promise<
+    | { outcome: "healed"; bot_id: number; session_id: string | null; entity_id: string | null }
+    | { outcome: "cooldown"; last_heal_ms: number; entity_id: string | null }
+    | { outcome: "no_session"; entity_id: string | null }
+  > {
+    // Belt-and-suspenders: dead-letters only fire for broker channels, but a
+    // stale entry must never heal (i.e. release) a plugin-channel bot.
+    if (!this.uses_broker(channel_id)) {
+      return { outcome: "no_session", entity_id: this.entity_for_channel(channel_id) };
+    }
+
+    const last_heal = this.dead_letter_heal_at.get(channel_id);
+    if (last_heal !== undefined && now_ms - last_heal < BotPool.DEAD_LETTER_HEAL_COOLDOWN_MS) {
+      console.error(
+        `[pool] [dead-letter-heal] channel ${channel_id} dead-lettered again within the ${String(Math.round(BotPool.DEAD_LETTER_HEAL_COOLDOWN_MS / 60_000))}min cool-down — heal suppressed (heal-loop guard), leaving dark`,
+      );
+      return {
+        outcome: "cooldown",
+        last_heal_ms: last_heal,
+        entity_id: this.entity_for_channel(channel_id),
+      };
+    }
+
+    const bot = this.bots.find((b) => b.state === "assigned" && b.channel_id === channel_id);
+    if (!bot) {
+      // Channel already dark (e.g. age-based sweep dead-lettered while no
+      // session was assigned) — nothing to heal; next inbound cold-recreates.
+      return { outcome: "no_session", entity_id: this.entity_for_channel(channel_id) };
+    }
+
+    // Snapshot BEFORE release_broker_to_dark nulls the bot's fields — the
+    // caller routes the dead-letter alert to this entity's #alerts channel.
+    const session_id = bot.session_id;
+    const bot_id = bot.id;
+    const entity_id = bot.entity_id;
+    console.warn(
+      `[pool] [dead-letter-heal] pool-${String(bot_id)} on ${channel_id} never acked a broker inbound through the full redelivery horizon — releasing to dark so the next message cold-recreates the session with a fresh shim`,
+    );
+    this.dead_letter_heal_at.set(channel_id, now_ms);
+    await this.release_broker_to_dark(bot, session_id, "dead-letter heal — session stopped acking");
+    return { outcome: "healed", bot_id, session_id, entity_id };
+  }
+
+  /**
+   * Resolve which entity a channel belongs to, for alert routing (#107 review
+   * fix): a bot bound to the channel first (any non-free state — a parked
+   * bot's metadata is still authoritative), then the entity registry's channel
+   * lists. Returns null when nothing claims the channel — the caller picks its
+   * own fallback.
+   */
+  entity_for_channel(channel_id: string): string | null {
+    const bot = this.bots.find((b) => b.channel_id === channel_id && b.entity_id);
+    if (bot?.entity_id) return bot.entity_id;
+    if (this.registry) {
+      for (const entity of this.registry.get_all()) {
+        if (entity.entity.channels?.list?.some((c) => c.id === channel_id)) {
+          return entity.entity.id;
+        }
+      }
+    }
+    return null;
   }
 
   /** Get all bots currently assigned to a channel (state === "assigned").
@@ -2774,7 +2979,7 @@ export class BotPool extends EventEmitter {
             `[pool] pool-${String(bot.id)} broker tmux died — releasing to dark ` +
               `(channel: ${bot.channel_id}); cold-recreate on next inbound, no respawn`,
           );
-          await this.release_broker_to_dark(bot, bot.session_id);
+          await this.release_broker_to_dark(bot, bot.session_id, "session died (health tick)");
           continue;
         }
 

@@ -15,7 +15,7 @@ import {
 } from "./discord.js";
 import type { DiscordBot } from "./discord.js";
 import type { GitHubAppAuth } from "./github-app.js";
-import type { BotPool } from "./pool.js";
+import type { BotPool, PendingMessage } from "./pool.js";
 import type { PRWatchStore } from "./pr-watches.js";
 import { QueueFullError } from "./queue.js";
 import type { TaskQueue, TaskSubmission } from "./queue.js";
@@ -640,6 +640,9 @@ const handle_pool_assign: RouteHandler = async (req, res, ctx) => {
     entity_id?: string;
     archetype?: string;
     resume_session_id?: string;
+    /** Optional inbound driver (#107). REQUIRED for broker-owned channels —
+     * a broker session exists iff an inbound message drives it (#89). */
+    pending_message?: { user?: string; content?: string; message_id?: string; ts?: string };
   };
   try {
     params = JSON.parse(body) as typeof params;
@@ -653,11 +656,48 @@ const handle_pool_assign: RouteHandler = async (req, res, ctx) => {
     return;
   }
 
+  // Validate + normalize the optional pending_message into a full PendingMessage.
+  let pending_message: PendingMessage | undefined;
+  if (params.pending_message !== undefined) {
+    const pm = params.pending_message;
+    if (typeof pm !== "object" || pm === null || typeof pm.content !== "string" || !pm.content) {
+      json_response(res, 400, {
+        error: "pending_message must be an object with a non-empty string `content`",
+      });
+      return;
+    }
+    pending_message = {
+      user: typeof pm.user === "string" && pm.user ? pm.user : "http-api",
+      channel_id: params.channel_id,
+      message_id: typeof pm.message_id === "string" ? pm.message_id : "",
+      content: pm.content,
+      ts: typeof pm.ts === "string" && pm.ts ? pm.ts : new Date().toISOString(),
+    };
+  }
+
+  // Broker choke-point, surfaced honestly at the HTTP layer (#107): a
+  // broker-owned channel may not spawn a driverless session — assign() would
+  // refuse anyway, but a 422 with an explanation beats a misleading 503.
+  // Plugin channels (and flag-OFF, where no channel uses the broker) keep
+  // today's contract exactly.
+  if (!pending_message && ctx.pool.channel_uses_broker(params.channel_id)) {
+    json_response(res, 422, {
+      error:
+        "Channel is broker-owned: a session exists iff an inbound message drives it (#89). " +
+        "Provide pending_message: { content, user? } to drive the first turn, or let the next " +
+        "human message in the channel cold-recreate the session.",
+    });
+    return;
+  }
+
   const assignment = await ctx.pool.assign(
     params.channel_id,
     params.entity_id,
     params.archetype as ArchetypeRole,
     params.resume_session_id,
+    undefined, // channel_type — unchanged from today's call
+    undefined, // working_dir
+    pending_message,
   );
 
   if (!assignment) {

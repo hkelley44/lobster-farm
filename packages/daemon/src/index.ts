@@ -2,6 +2,7 @@ import type { Server } from "node:http";
 import { DAEMON_PORT, daemon_log_path } from "@lobster-farm/shared";
 import { set_discord_bot, set_pool } from "./actions.js";
 import { AlertRouter } from "./alert-router.js";
+import { handle_dead_letter } from "./broker/dead-letter.js";
 import { DiscordBroker } from "./broker/index.js";
 import { CommanderProcess } from "./commander-process.js";
 import { load_config } from "./config.js";
@@ -184,27 +185,27 @@ async function main(): Promise<void> {
   // The dead-letter alert is routed through the tiered AlertRouter, which is
   // created further below. We capture it via a mutable ref so a message that
   // exhausts redelivery surfaces to #alerts as an action_required item.
+  //
+  // #107: a dead-letter also HEALS the session leg — the owning bot is released
+  // to dark (queue preserved) so the next inbound cold-recreates it with a
+  // fresh shim. handle_dead_letter composes the alert (content captured before
+  // the heal — the entry is the only copy) and enforces alert severity per
+  // outcome; the cool-down heal-loop guard lives in pool.heal_dead_letter.
   let broker: DiscordBroker | null = null;
   let broker_alert_router: AlertRouter | null = null;
   if (config.discord?.broker?.enabled) {
     broker = new DiscordBroker({
       config,
       on_dead_letter: (entry) => {
-        const router = broker_alert_router;
-        if (!router) return;
-        void router
-          .post_alert({
-            entity_id: "lobster-farm",
-            tier: "action_required",
-            title: "Discord broker dead-lettered a message",
-            body:
-              `A broker inbound for channel \`${entry.channel_id}\` (pool-${String(entry.bot_id)}) ` +
-              `exhausted redelivery after ${String(entry.deliveries)} attempt(s) and was dropped.\n\n` +
-              `> ${entry.content.slice(0, 500)}`,
-          })
-          .catch((err) => {
-            console.error(`[broker] dead-letter alert failed: ${String(err)}`);
-          });
+        void handle_dead_letter(entry, {
+          heal: (channel_id) => pool.heal_dead_letter(channel_id),
+          post_alert: async (payload) => {
+            const router = broker_alert_router;
+            if (router) await router.post_alert(payload);
+          },
+        }).catch((err) => {
+          console.error(`[broker] dead-letter handling failed: ${String(err)}`);
+        });
       },
     });
     try {

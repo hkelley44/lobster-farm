@@ -37,6 +37,15 @@ here runs and every session uses the official plugin exactly as before.
   injected `OutboundHandler` using the *connection's* identity (never the
   request's — a session cannot spoof another bot).
 
+- **dead-letter.ts** — `handle_dead_letter` (#107), the alert + session-heal
+  composition for a dead-lettered inbound. Captures the quoted message FIRST
+  (the entry is its only copy), then runs `pool.heal_dead_letter` (release the
+  owning bot to dark, queue preserved, 10-min per-channel cool-down), then posts
+  ONE alert per outcome: healed → `action_required` naming the recycled session;
+  repeat-within-cool-down → `incident_open`, no automatic action; already-dark →
+  plain dead-letter alert. The dead-lettered message is never re-enqueued
+  (poison-loop breaker). Extracted from index.ts wiring for testability.
+
 - **outbound.ts** — `OutboundExecutor`, raw Discord API v10 REST. Reads the
   per-bot token from `<state_dir>/.env`, produces result strings byte-identical
   to the plugin (`sent (id: X)`, `reacted`, `edited (id: X)`, the fetch line
