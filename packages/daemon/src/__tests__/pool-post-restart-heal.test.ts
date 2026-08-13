@@ -394,6 +394,11 @@ describe("post-restart pool auto-heal (#106)", () => {
     const bot = pool.get_bots()[0]!;
     expect(bot.state).toBe("assigned");
     expect(bot.last_inbound_at).not.toBeNull();
+    // Pin the real post-skip state: the pass is one-shot, so the probation
+    // entry is CONSUMED on warm-up skip (nothing re-schedules this pass) —
+    // the fallback for a genuinely-deaf session is the steady-state probe
+    // reading the still-armed marker above, not a second heal pass.
+    expect(pool.probation_size()).toBe(0);
   });
 
   it("stops recycling when a drain starts (shutdown safety)", async () => {

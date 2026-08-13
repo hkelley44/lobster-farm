@@ -1676,8 +1676,14 @@ export class BotPool extends EventEmitter {
 
       // Still inside the liveness warm-up window (heal delay shorter than
       // warm-up, or assigned_at refreshed) — no reading is trustworthy yet.
-      // Leave the armed marker in place; the steady-state probe judges the
-      // session once it clears warm-up.
+      // The probation entry is CONSUMED here (this pass is one-shot: the map
+      // was snapshotted-and-cleared above, and nothing re-schedules), so this
+      // session gets no post-restart-heal verdict or aggregate alert. That is
+      // deliberate low-risk behavior, not a gap: the bot-level
+      // `last_inbound_at` marker stays armed, and the steady-state
+      // check_plugin_liveness probe — with its own warm-up gate — still
+      // detects a genuinely-deaf session and recycles it, just via the pane
+      // path and its per-channel "went DEAF" alert instead of this pass.
       if (bot.assigned_at && Date.now() - bot.assigned_at.getTime() < LIVENESS_WARMUP_MS) {
         continue;
       }
