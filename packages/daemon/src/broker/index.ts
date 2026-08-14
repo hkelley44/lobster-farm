@@ -41,6 +41,10 @@ export interface DiscordBrokerOptions {
   socket_path?: string;
   queue_path?: string;
   fetch_impl?: typeof fetch;
+  /** Override the queue's redelivery window (ms). Tests only. */
+  redeliver_after_ms?: number;
+  /** Override the server's redelivery sweep interval (ms). Tests only. */
+  sweep_interval_ms?: number;
 }
 
 export class DiscordBroker {
@@ -63,6 +67,7 @@ export class DiscordBroker {
     this.executor = new OutboundExecutor(opts.fetch_impl);
     this.queue = new BrokerQueue({
       path: queue_path,
+      redeliver_after_ms: opts.redeliver_after_ms,
       on_dead_letter: (entry) => {
         try {
           void opts.on_dead_letter?.(entry);
@@ -74,6 +79,7 @@ export class DiscordBroker {
     this.server = new BrokerServer({
       socket_path: this._socket_path,
       queue: this.queue,
+      sweep_interval_ms: opts.sweep_interval_ms,
       outbound: (channel_id, _bot_id, tool, args) => this.execute_outbound(channel_id, tool, args),
     });
   }
@@ -163,6 +169,11 @@ export class DiscordBroker {
   /** True if the channel is broker-owned (has registered ownership). */
   owns(channel_id: string): boolean {
     return this.ownership.has(channel_id);
+  }
+
+  /** Live (non-dead) queued inbound count for a channel — diagnostics/tests. */
+  queue_depth(channel_id: string): number {
+    return this.queue.depth(channel_id);
   }
 
   // ── Internal ──

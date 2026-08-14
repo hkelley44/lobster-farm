@@ -10,6 +10,7 @@ import { DEFAULT_ARCHETYPES, entity_dir, expand_home, lobsterfarm_dir } from "@l
 import type { ChannelType } from "@lobster-farm/shared";
 import { notify } from "./actions.js";
 import type { ChannelOwnership, DiscordBroker } from "./broker/index.js";
+import { SHIM_MCP_SERVER_KEY } from "./broker/protocol.js";
 import type { InboundMeta } from "./broker/protocol.js";
 import { resolve_binary } from "./env.js";
 import { NO_SESSION, extract_session_learnings } from "./hooks.js";
@@ -893,7 +894,7 @@ export class BotPool extends EventEmitter {
       const mcp_config = {
         mcpServers: {
           ...global_servers,
-          plugin_discord_discord: {
+          [SHIM_MCP_SERVER_KEY]: {
             command: process.execPath,
             args: [shim_entry],
             env: {
@@ -4163,12 +4164,26 @@ export class BotPool extends EventEmitter {
     // modal stalls. We resolve ~ via homedir() because tmux command-string
     // parsing doesn't expand tildes.
     // Broker sessions register the LF shim via --mcp-config (keyed
-    // `plugin_discord_discord` so tool names stay byte-identical) with
+    // SHIM_MCP_SERVER_KEY so tool names stay byte-identical) with
     // --strict-mcp-config so no other MCP servers leak in. Plugin sessions use
     // the official channel plugin exactly as before.
+    //
+    // `--channels server:<key>` is REQUIRED for the broker transport: the CLI
+    // only routes a server's `notifications/claude/channel` into the session
+    // when that server is named in its --channels list. Without it the CLI
+    // receives the shim's inbound and drops it ("Channel notifications skipped:
+    // server … not in --channels list"), the shim acks the notification it
+    // successfully wrote, the queue entry is deleted, and the session idles as
+    // an unconfirmed zombie — the broker-inbound delivery bug this line fixes.
     const transport_args =
       use_broker && broker_session
-        ? ["--mcp-config", sq(broker_session.mcp_config_path), "--strict-mcp-config"]
+        ? [
+            "--mcp-config",
+            sq(broker_session.mcp_config_path),
+            "--strict-mcp-config",
+            "--channels",
+            `server:${SHIM_MCP_SERVER_KEY}`,
+          ]
         : ["--channels", "plugin:discord@claude-plugins-official"];
 
     const claude_args = [

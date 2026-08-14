@@ -21,6 +21,29 @@
 /** Path to the broker's unix domain socket, relative to the lobsterfarm dir. */
 export const BROKER_SOCKET_RELATIVE = "state/broker.sock";
 
+/**
+ * The MCP server key the shim is registered under in a broker session's
+ * `--mcp-config`. This single name is load-bearing twice:
+ *
+ *   1. Tool-name parity: the CLI prefixes tools as `mcp__<key>__<tool>`, so this
+ *      key makes the shim's tools come out as `mcp__plugin_discord_discord__reply`
+ *      etc. — byte-identical to the official plugin (reply-enforcement matches on
+ *      these names).
+ *   2. Channel routing: the CLI only routes a server's
+ *      `notifications/claude/channel` notifications into the session if that
+ *      server is named in its `--channels` list (tagged `server:<key>` for
+ *      manually-configured MCP servers). A shim session launched WITHOUT
+ *      `--channels server:<this key>` has every inbound silently skipped:
+ *      "Channel notifications skipped: server plugin_discord_discord not in
+ *      --channels list for this session" — the root cause of the #112
+ *      idle-zombie (message delivered, dropped by the CLI, acked by the shim,
+ *      permanently lost).
+ *
+ * pool.ts must use this constant for BOTH the mcp-config key and the
+ * `--channels server:…` argument so the two can never drift apart.
+ */
+export const SHIM_MCP_SERVER_KEY = "plugin_discord_discord";
+
 /** Outbound tool names the shim can forward. Byte-identical to the official
  * plugin's tool surface — the daemon executes these via per-bot REST. */
 export type BrokerToolName =
