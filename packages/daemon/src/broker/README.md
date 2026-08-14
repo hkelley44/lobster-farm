@@ -22,6 +22,12 @@ here runs and every session uses the official plugin exactly as before.
   / ack / outbound_request / outbound_response), `InboundMeta` (byte-identical to
   the plugin's `notifications/claude/channel` meta), and NDJSON framing helpers
   (`encode_envelope`, `NdjsonDecoder`). Transport-agnostic — no socket code here.
+  Also home of `SHIM_MCP_SERVER_KEY` — the MCP server key the shim is registered
+  under. The key is load-bearing twice: it makes the shim's tool names byte-
+  identical to the plugin (`mcp__plugin_discord_discord__*`), and it must appear
+  as `--channels server:<key>` on the session's `claude` invocation or the CLI
+  silently drops every `notifications/claude/channel` the shim emits (the
+  idle-zombie bug — see the constant's doc comment).
 
 - **queue.ts** — `BrokerQueue`, the durable per-channel inbound queue. Every
   inbound is persisted (atomic write-temp-then-rename, coalesced async writes)

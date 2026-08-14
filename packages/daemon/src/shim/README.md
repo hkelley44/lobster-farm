@@ -23,14 +23,24 @@ outbound  agent tool call  →  forward to daemon  →  return result verbatim
 A broker-pilot session is launched with the shim swapped in for the plugin:
 
 ```
-claude --mcp-config <broker-mcp.json> --strict-mcp-config
+claude --mcp-config <broker-mcp.json> --strict-mcp-config --channels server:plugin_discord_discord
 ```
 
 `broker-mcp.json` (written by `pool.ts` `prepare_broker_session`) declares one
-MCP server keyed **`plugin_discord_discord`** running this file. That server key
-is load-bearing: the agent-visible tool names come out as
-`mcp__plugin_discord_discord__reply` etc. — byte-identical to the fleet, so
-reply-enforcement (#80), which matches on tool *name*, keeps working unchanged.
+MCP server keyed **`plugin_discord_discord`** (`SHIM_MCP_SERVER_KEY` in
+`../broker/protocol.ts`) running this file. That server key is load-bearing
+twice:
+
+- The agent-visible tool names come out as `mcp__plugin_discord_discord__reply`
+  etc. — byte-identical to the fleet, so reply-enforcement (#80), which matches
+  on tool *name*, keeps working unchanged.
+- `--channels server:<key>` registers the server as a **channel source**. The
+  CLI only routes a server's `notifications/claude/channel` into the session if
+  that server is named in its `--channels` list; without the flag, every inbound
+  the shim emits is received and silently skipped ("Channel notifications
+  skipped: server plugin_discord_discord not in --channels list"), the shim acks
+  the write, and the message is permanently lost — the session cold-starts with
+  nothing to do and dies as a 60s idle-zombie.
 
 The plugin path uses `--channels plugin:discord@claude-plugins-official` instead.
 The two are mutually exclusive per session and chosen at bring-up.
