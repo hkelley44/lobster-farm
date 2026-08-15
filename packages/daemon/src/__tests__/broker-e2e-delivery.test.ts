@@ -1,20 +1,24 @@
 /**
  * End-to-end broker inbound delivery (the test that would have caught the
- * --channels routing bug).
+ * CLI channel-routing bugs).
  *
  * The existing broker tests stop at the queue boundary: they spy on
  * `broker.feed()` and assert the enqueue happened, mocking everything
  * downstream. That left the actual delivery contract unexercised — and the
- * contract is where the pilot died: the Claude CLI only routes a server's
- * `notifications/claude/channel` notifications into the session when that
- * server is named in its `--channels` list (tagged `server:<key>` for
- * mcp-config servers). A broker session launched without
- * `--channels server:plugin_discord_discord` had every inbound received and
- * then dropped by the CLI ("Channel notifications skipped: server
- * plugin_discord_discord not in --channels list for this session"), acked by
- * the shim (its notification write succeeded), and permanently deleted from
- * the durable queue — cold-started sessions idled as 60s zombies while the
- * queue file sat empty, looking as if nothing was ever enqueued.
+ * contract is where the pilot died, TWICE, in the same shape (message
+ * enqueued, delivered, silently discarded by the CLI, acked by the shim,
+ * permanently deleted from the durable queue; cold-started session idles as a
+ * 60s zombie while the empty queue file makes it look like nothing was ever
+ * enqueued):
+ *
+ *   #112 — the shim server wasn't named in `--channels` at all
+ *     ("Channel notifications skipped: … not in --channels list").
+ *   #114 — a `server:` entry additionally needs the CLI's dev marker, which
+ *     only `--dangerously-load-development-channels` confers
+ *     ("… not on the approved channels allowlist"); AND even with both gates
+ *     passed, a delivery during CLI boot lands before the client attaches its
+ *     channel handler and is black-holed (the handler-attach race the shim's
+ *     registration grace now avoids).
  *
  * This suite runs the real chain with NO delivery mocks:
  *
@@ -23,17 +27,17 @@
  *   → the REAL shim binary (built from src/shim/discord-shim.ts) spawned as a
  *     child process, exactly as the CLI would spawn it from broker-mcp.json
  *   → a fake Claude CLI: an MCP stdio client that replicates the real CLI's
- *     channel-routing gate — it only accepts `notifications/claude/channel`
- *     from servers tagged `server:<key>` / `plugin:<name>@<marketplace>` in
- *     the assembled command's --channels list.
+ *     channel-routing gates and handler-attach timing (see the model notes
+ *     at `parse_channel_registry` / `cli_routes_channel` below — a BEST-EFFORT
+ *     model of closed-source behavior; the live pilot is the source of truth).
  *
  * Only tmux itself is faked (a tmux server can't run in CI); the command
  * string it would have executed is captured and drives the fake CLI, so the
- * `--channels` args under test are the production ones, byte for byte.
+ * transport args under test are the production ones, byte for byte.
  *
  * Against the pre-fix code the driven-first-turn test fails exactly like the
- * live zombie: the notification arrives at the CLI gate, is dropped, the shim
- * acks, the queue drains to empty, and no first turn ever runs.
+ * live zombie: the notification is dropped (by a gate or by the pre-attach
+ * window), the shim acks, the queue drains to empty, and no first turn runs.
  */
 
 import { tmpdir } from "node:os";
@@ -111,22 +115,60 @@ function build_shim(): void {
   );
 }
 
-// ── Fake Claude CLI: the real CLI's channel-routing gate ──
+// ── Fake Claude CLI: the real CLI's channel-routing gates ──
 //
-// Replicates the CLI's tagged --channels parser and matcher (observed in
-// v2.1.220): entries must be `plugin:<name>@<marketplace>` or `server:<name>`;
-// a channel notification from MCP server <key> is routed IFF a server-kind
-// entry's name equals <key>. Untagged entries are rejected by the real CLI.
+// !! BEST-EFFORT MODEL OF CLOSED-SOURCE BEHAVIOR !!
+// This models the routing logic observed in CLI v2.1.220 (extracted from the
+// binary and confirmed against live MCP logs). The real CLI can change without
+// notice, and this model has already missed a gate once (#114 shipped because
+// the model knew gate 1 but not gate 2). Treat the LIVE broker pilot as the
+// source of truth; when the pilot and this model disagree, the model is wrong
+// and must be updated from the CLI's own logs
+// (~/Library/Caches/claude-cli-nodejs/<proj>/mcp-logs-*/…).
+//
+// Modeled behavior (all observed in v2.1.220):
+//
+//   Parsing: `--channels <entries…>` and
+//   `--dangerously-load-development-channels <entries…>` each take tagged
+//   entries — `plugin:<name>@<marketplace>` or `server:<name>`; untagged
+//   entries are rejected. The dev-flag entries are appended AFTER the
+//   --channels entries (post startup-dialog acceptance) and are stamped
+//   `dev: true`; --channels entries are not.
+//
+//   Gate 1 (#112): a notification from MCP server <key> must match an entry —
+//   first-match-wins `.find()`: server-kind entries match on the exact key.
+//   No match → "Channel notifications skipped: server <key> not in --channels
+//   list for this session".
+//
+//   Gate 2 (#114): the MATCHED entry, if server-kind, must be `dev: true` —
+//   i.e. it must have come from the dev flag. Otherwise → "Channel
+//   notifications skipped: server <key> is not on the approved channels
+//   allowlist (use --dangerously-load-development-channels for local dev)".
+//   First-match-wins makes this order-sensitive: a non-dev `--channels
+//   server:<key>` entry SHADOWS a dev entry for the same key and re-fails
+//   gate 2, which is why pool.ts must pass the server entry via the dev flag
+//   ONLY.
+//
+//   Handler-attach window (#114): the CLI attaches its channel-notification
+//   handler shortly AFTER the MCP connection completes ("Channel
+//   notifications registered" ~16ms after "Successfully connected"). A
+//   notification arriving before the attach is silently dropped — modeled
+//   here as a dead window after client.connect() during which channel
+//   notifications are discarded, exactly the boot race that black-holed
+//   msg#1 even with both gates passing.
 interface ChannelEntry {
   kind: "server" | "plugin";
   name: string;
   marketplace?: string;
+  /** True only for entries passed via --dangerously-load-development-channels. */
+  dev: boolean;
 }
 
-function parse_channels_entries(tokens: string[]): ChannelEntry[] {
+/** Parse one flag's tagged entry list from the tokenized command. */
+function parse_tagged_entries(tokens: string[], flag: string, dev: boolean): ChannelEntry[] {
   const entries: ChannelEntry[] = [];
   for (let i = 0; i < tokens.length - 1; i++) {
-    if (tokens[i] !== "--channels") continue;
+    if (tokens[i] !== flag) continue;
     for (const v of tokens[i + 1]!.split(",")) {
       if (v.startsWith("plugin:")) {
         const rest = v.slice(7);
@@ -136,20 +178,36 @@ function parse_channels_entries(tokens: string[]): ChannelEntry[] {
             kind: "plugin",
             name: rest.slice(0, at),
             marketplace: rest.slice(at + 1),
+            dev,
           });
         }
       } else if (v.startsWith("server:") && v.length > 7) {
-        entries.push({ kind: "server", name: v.slice(7) });
+        entries.push({ kind: "server", name: v.slice(7), dev });
       }
     }
   }
   return entries;
 }
 
+/** The session's channel-entry registry in CLI order: --channels entries
+ * first, dev-flag entries appended after (the CLI appends them when the
+ * startup dialog is accepted). */
+function parse_channel_registry(tokens: string[]): ChannelEntry[] {
+  return [
+    ...parse_tagged_entries(tokens, "--channels", false),
+    ...parse_tagged_entries(tokens, "--dangerously-load-development-channels", true),
+  ];
+}
+
+/** Both gates, first-match-wins — mirrors the CLI's routing decision for a
+ * notification from MCP server `server_key`. */
 function cli_routes_channel(server_key: string, entries: ChannelEntry[]): boolean {
-  // Server-kind entries match on the exact MCP server key. Plugin-kind entries
-  // match `plugin:<name>` server ids, which an mcp-config key never is.
-  return entries.some((e) => e.kind === "server" && e.name === server_key);
+  const matched = entries.find((e) =>
+    e.kind === "server" ? e.name === server_key : `plugin:${e.name}` === server_key,
+  );
+  if (!matched) return false; // gate 1: not in --channels list
+  if (matched.kind === "server" && !matched.dev) return false; // gate 2: not on approved allowlist
+  return true;
 }
 
 /** Tokenize the tmux command string, honoring sq()'s single-quoting. */
@@ -364,21 +422,33 @@ describe("broker end-to-end inbound delivery (inbound → queue → shim → ses
       const server_def = mcp_config.mcpServers[SHIM_MCP_SERVER_KEY];
       expect(server_def).toBeDefined();
 
-      // The real CLI's routing gate, driven by the real --channels args.
-      const channel_entries = parse_channels_entries(tokens);
+      // The real CLI's routing gates (1: entry match, 2: dev marker), driven by
+      // the real --channels / --dangerously-load-development-channels args.
+      const channel_entries = parse_channel_registry(tokens);
       const routed = cli_routes_channel(SHIM_MCP_SERVER_KEY, channel_entries);
 
       let driven_turn: { content: string; meta: InboundMeta } | null = null;
       let skipped = 0;
+      let dropped_pre_attach = 0;
+      // Models the CLI's handler-attach window (#114): the channel handler is
+      // attached shortly AFTER the MCP connection completes; notifications
+      // arriving before that are silently dropped. Real gap ≈ 16ms; we use
+      // 150ms so the model is meaningfully stricter than the real CLI while
+      // the shim's (test-shortened) registration grace stays well above it.
+      let handler_attached = false;
+      const HANDLER_ATTACH_DELAY_MS = 150;
 
       client = new Client({ name: "fake-claude-cli", version: "1.0.0" }, { capabilities: {} });
       client.fallbackNotificationHandler = (notification) => {
         if (notification.method === "notifications/claude/channel") {
-          if (routed) {
+          if (!handler_attached) {
+            // The boot black hole: accepted by no handler, seen by nobody.
+            dropped_pre_attach += 1;
+          } else if (routed) {
             driven_turn = notification.params as unknown as { content: string; meta: InboundMeta };
           } else {
-            // The real CLI: "Channel notifications skipped: server <key> not in
-            // --channels list for this session" — the message is dropped here.
+            // The real CLI: "Channel notifications skipped: …" (gate 1 or 2) —
+            // the message is dropped here.
             skipped += 1;
           }
         }
@@ -387,22 +457,35 @@ describe("broker end-to-end inbound delivery (inbound → queue → shim → ses
 
       // Spawn the REAL shim the way the CLI would: the mcp-config server def's
       // env (LF_BROKER_SOCKET/CHANNEL/BOT_ID) against the built shim bundle.
+      // LF_BROKER_REGISTER_GRACE_MS shortens the shim's post-initialize
+      // registration grace (prod default 3s) to keep the suite fast while
+      // preserving the invariant under test: grace > handler-attach gap.
       const transport = new StdioClientTransport({
         command: process.execPath,
         args: [SHIM_PATH],
-        env: { ...(process.env as Record<string, string>), ...server_def!.env },
+        env: {
+          ...(process.env as Record<string, string>),
+          ...server_def!.env,
+          LF_BROKER_REGISTER_GRACE_MS: "600",
+        },
         stderr: "pipe",
       });
       await client.connect(transport);
+      setTimeout(() => {
+        handler_attached = true;
+      }, HANDLER_ATTACH_DELAY_MS);
 
       // ── Assert 2: the queued message #1 drives the session's first turn.
-      // Pre-fix this times out exactly like the live zombie: the shim delivers,
-      // the CLI gate drops it (skipped > 0), the shim acks, and no turn runs.
+      // Pre-fix this times out exactly like the live zombie, for either root
+      // cause: a gate rejection (skipped > 0 — #112 gate 1 / #114 gate 2) or a
+      // premature delivery swallowed by the handler-attach window
+      // (dropped_pre_attach > 0 — #114 boot race). Either way the shim acks
+      // and no turn ever runs.
       await poll_until(
         () => driven_turn !== null,
         10_000,
         () =>
-          `driven first turn (CLI gate dropped ${String(skipped)} notification(s) — idle-zombie)`,
+          `driven first turn (CLI gates dropped ${String(skipped)}, pre-attach window swallowed ${String(dropped_pre_attach)} — idle-zombie)`,
       );
       expect(driven_turn!.content).toBe("hello broker pilot");
       expect(driven_turn!.meta).toMatchObject({
@@ -411,6 +494,7 @@ describe("broker end-to-end inbound delivery (inbound → queue → shim → ses
         user: "hunter",
       });
       expect(skipped).toBe(0);
+      expect(dropped_pre_attach).toBe(0);
 
       // ── Assert 3: the shim's ack empties the durable queue — delivered
       // exactly once, nothing stranded for redelivery.
@@ -421,7 +505,75 @@ describe("broker end-to-end inbound delivery (inbound → queue → shim → ses
     }
   }, 30_000);
 
-  it("broker transport args register the shim for channel routing (--channels server:<key>)", async () => {
+  it("malformed LF_BROKER_REGISTER_GRACE_MS falls back to the safe default (no graceless collapse)", async () => {
+    // Regression for the parse guard: an unguarded parseInt("bogus") → NaN,
+    // and setTimeout(fn, NaN) fires at ~1ms — silently reverting the shim to
+    // immediate registration and the exact pre-attach boot race the grace
+    // exists to prevent. With the guard, a bogus value falls back to the 3s
+    // production default, so delivery still lands AFTER the fake CLI's
+    // handler-attach window and the first turn runs (this test just takes ~3s
+    // instead of ~600ms).
+    const config = make_config(true);
+    const pool = new TestPool(config);
+    const broker = make_broker(config);
+    await broker.start();
+    pool.set_broker(broker);
+
+    let client: Client | null = null;
+    try {
+      await assign_pilot(pool);
+      const tokens = tokenize(latest_tmux_command());
+      const mcp_config = JSON.parse(
+        await readFile(flag_value(tokens, "--mcp-config")!, "utf-8"),
+      ) as {
+        mcpServers: Record<string, { env: Record<string, string> }>;
+      };
+      const server_def = mcp_config.mcpServers[SHIM_MCP_SERVER_KEY];
+      const routed = cli_routes_channel(SHIM_MCP_SERVER_KEY, parse_channel_registry(tokens));
+
+      let driven_turn: { content: string } | null = null;
+      let dropped_pre_attach = 0;
+      let handler_attached = false;
+
+      client = new Client({ name: "fake-claude-cli", version: "1.0.0" }, { capabilities: {} });
+      client.fallbackNotificationHandler = (notification) => {
+        if (notification.method === "notifications/claude/channel") {
+          if (!handler_attached) dropped_pre_attach += 1;
+          else if (routed) driven_turn = notification.params as unknown as { content: string };
+        }
+        return Promise.resolve();
+      };
+
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [SHIM_PATH],
+        env: {
+          ...(process.env as Record<string, string>),
+          ...server_def!.env,
+          LF_BROKER_REGISTER_GRACE_MS: "not-a-number",
+        },
+        stderr: "pipe",
+      });
+      await client.connect(transport);
+      setTimeout(() => {
+        handler_attached = true;
+      }, 150);
+
+      await poll_until(
+        () => driven_turn !== null,
+        10_000,
+        () =>
+          `driven first turn under bogus grace env (pre-attach window swallowed ${String(dropped_pre_attach)} — NaN collapsed the grace)`,
+      );
+      expect(driven_turn!.content).toBe("hello broker pilot");
+      expect(dropped_pre_attach).toBe(0);
+    } finally {
+      await client?.close().catch(() => {});
+      await broker.stop().catch(() => {});
+    }
+  }, 30_000);
+
+  it("broker transport args clear BOTH CLI gates (dev-flagged server entry, no shadowing)", async () => {
     const config = make_config(true);
     const pool = new TestPool(config);
     const broker = make_broker(config);
@@ -430,10 +582,27 @@ describe("broker end-to-end inbound delivery (inbound → queue → shim → ses
     try {
       await assign_pilot(pool);
       const tokens = tokenize(latest_tmux_command());
-      const entries = parse_channels_entries(tokens);
-      // The precise regression: without a server-kind entry naming the shim's
-      // MCP server key, the CLI skips every inbound channel notification.
+      const entries = parse_channel_registry(tokens);
+      // The precise regressions:
+      //   #112 (gate 1): no entry naming the shim's MCP server key at all →
+      //     every inbound skipped ("not in --channels list").
+      //   #114 (gate 2): entry present but via --channels (no dev marker) →
+      //     every inbound skipped ("not on the approved channels allowlist").
       expect(cli_routes_channel(SHIM_MCP_SERVER_KEY, entries)).toBe(true);
+      // Shadowing guard: the CLI matches first-wins, and --channels entries
+      // precede dev-flag entries — a duplicate non-dev `--channels server:<key>`
+      // would shadow the dev entry and re-fail gate 2. The server entry must
+      // ride the dev flag ONLY.
+      const channels_only = parse_tagged_entries(tokens, "--channels", false);
+      expect(channels_only.some((e) => e.kind === "server" && e.name === SHIM_MCP_SERVER_KEY)).toBe(
+        false,
+      );
+      const dev_only = parse_tagged_entries(
+        tokens,
+        "--dangerously-load-development-channels",
+        true,
+      );
+      expect(dev_only).toEqual([{ kind: "server", name: SHIM_MCP_SERVER_KEY, dev: true }]);
     } finally {
       await broker.stop().catch(() => {});
     }
@@ -464,6 +633,7 @@ describe("broker end-to-end inbound delivery (inbound → queue → shim → ses
       expect(flag_value(tokens, "--channels")).toBe("plugin:discord@claude-plugins-official");
       expect(tokens).not.toContain("--strict-mcp-config");
       expect(tokens).not.toContain("--mcp-config");
+      expect(tokens).not.toContain("--dangerously-load-development-channels");
     } finally {
       await broker.stop().catch(() => {});
     }
@@ -491,5 +661,6 @@ describe("broker end-to-end inbound delivery (inbound → queue → shim → ses
     expect(flag_value(tokens, "--channels")).toBe("plugin:discord@claude-plugins-official");
     expect(tokens).not.toContain("--strict-mcp-config");
     expect(tokens).not.toContain("--mcp-config");
+    expect(tokens).not.toContain("--dangerously-load-development-channels");
   });
 });
