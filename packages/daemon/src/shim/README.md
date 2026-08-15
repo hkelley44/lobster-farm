@@ -23,7 +23,7 @@ outbound  agent tool call  →  forward to daemon  →  return result verbatim
 A broker-pilot session is launched with the shim swapped in for the plugin:
 
 ```
-claude --mcp-config <broker-mcp.json> --strict-mcp-config --channels server:plugin_discord_discord
+claude --mcp-config <broker-mcp.json> --strict-mcp-config --dangerously-load-development-channels server:plugin_discord_discord
 ```
 
 `broker-mcp.json` (written by `pool.ts` `prepare_broker_session`) declares one
@@ -34,16 +34,38 @@ twice:
 - The agent-visible tool names come out as `mcp__plugin_discord_discord__reply`
   etc. — byte-identical to the fleet, so reply-enforcement (#80), which matches
   on tool *name*, keeps working unchanged.
-- `--channels server:<key>` registers the server as a **channel source**. The
-  CLI only routes a server's `notifications/claude/channel` into the session if
-  that server is named in its `--channels` list; without the flag, every inbound
-  the shim emits is received and silently skipped ("Channel notifications
-  skipped: server plugin_discord_discord not in --channels list"), the shim acks
-  the write, and the message is permanently lost — the session cold-starts with
-  nothing to do and dies as a 60s idle-zombie.
+- `--dangerously-load-development-channels server:<key>` registers the server
+  as an approved **channel source**. The CLI routes a server's
+  `notifications/claude/channel` into the session only when a channel entry
+  names the server AND carries the dev marker that flag confers. Both observed
+  failure modes end in "Channel notifications skipped: …" + the shim acking a
+  message the CLI discarded (permanent loss → 60s cold-start idle-zombie):
+  no entry at all ("not in --channels list", #112), or a plain
+  `--channels server:<key>` entry without the dev marker ("not on the approved
+  channels allowlist", #114). Entries match first-wins with `--channels`
+  entries ahead of dev entries, so the server entry must ride the dev flag
+  ONLY — a duplicate non-dev entry would shadow it.
+
+The dev flag pops a confirmation dialog at CLI startup (accept preselected);
+the daemon's start_tmux auto-keypress answers it. MCP servers don't spawn until
+the dialog is answered.
 
 The plugin path uses `--channels plugin:discord@claude-plugins-official` instead.
 The two are mutually exclusive per session and chosen at bring-up.
+
+### Registration grace (boot race)
+
+Even with the gates cleared, the CLI attaches its channel-notification handler
+shortly **after** the MCP connection completes ("Channel notifications
+registered" ≈ 16ms after "Successfully connected"). A backlog message delivered
+in that window is silently dropped — and acked, because the shim's notification
+write succeeded and MCP notifications carry no processing receipt. The shim
+therefore defers its first broker registration (which triggers backlog
+delivery) until the client's `initialized` notification plus a grace period
+(`LF_BROKER_REGISTER_GRACE_MS`, default 3s; bounded 30s fail-open if
+`initialized` never arrives). This is a heuristic against closed-source timing
+— the live pilot is the source of truth for whether it holds across CLI
+versions.
 
 Because `--strict-mcp-config` loads **only** `broker-mcp.json`, `prepare_broker_session`
 also merges in any global `mcpServers` from the resolved `.claude.json` (e.g.
@@ -58,8 +80,10 @@ session — the pilot swaps the Discord transport and nothing else. The shim's
 | `LF_BROKER_SOCKET`  | absolute path to the daemon's unix socket  |
 | `LF_BROKER_CHANNEL` | channel_id this session owns               |
 | `LF_BROKER_BOT_ID`  | owning pool bot id (selects the reply identity server-side) |
+| `LF_BROKER_REGISTER_GRACE_MS` | optional; first-registration grace after MCP `initialized` (default 3000) — see "Registration grace" above |
 
-All three are required; missing any exits non-zero before the MCP loop starts.
+The first three are required; missing any exits non-zero before the MCP loop
+starts. The grace override is a test seam — production uses the default.
 
 ## Fail-open discipline
 

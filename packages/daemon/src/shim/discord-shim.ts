@@ -12,11 +12,15 @@
  *   outbound  agent tool call → forward to daemon → return result verbatim
  *
  * Registered for a session INSTEAD of the official plugin via:
- *   claude --mcp-config <json> --strict-mcp-config
+ *   claude --mcp-config <json> --strict-mcp-config \
+ *     --dangerously-load-development-channels server:plugin_discord_discord
  * where the JSON declares an MCP server keyed `plugin_discord_discord` running
  * this file. That server key is what makes the agent-visible tool names come
  * out as `mcp__plugin_discord_discord__reply` etc. — identical to the fleet.
  * (Empirically verified; the prefix is a literal `mcp__<serverKey>__<tool>`.)
+ * The dev-channels flag is what makes the CLI route this server's channel
+ * notifications at all — see SHIM_MCP_SERVER_KEY in ../broker/protocol.ts for
+ * the two routing gates (#112/#114).
  *
  * Fail-open discipline: a socket drop reconnects with backoff; it never crashes
  * the host CLI session. An outbound with no daemon connection returns an error
@@ -26,6 +30,7 @@
  *   LF_BROKER_SOCKET   absolute path to the daemon's unix socket (required)
  *   LF_BROKER_CHANNEL  channel_id this session owns (required)
  *   LF_BROKER_BOT_ID   owning pool bot id (required)
+ *   LF_BROKER_REGISTER_GRACE_MS  optional first-registration grace, ms (default 3000)
  */
 
 import { randomUUID } from "node:crypto";
@@ -362,9 +367,47 @@ if (!SOCKET_PATH || !CHANNEL_ID || Number.isNaN(BOT_ID)) {
 }
 
 const broker = new BrokerClient(SOCKET_PATH, CHANNEL_ID, BOT_ID);
-broker.start();
+
+// ── Registration grace (#114) ──
+//
+// Do NOT connect to the broker (and thus trigger backlog delivery) until the
+// CLI is ready to receive channel notifications. Empirically (CLI v2.1.220)
+// the client attaches its `notifications/claude/channel` handler shortly
+// AFTER the MCP handshake completes ("Channel notifications registered"
+// ~16ms after "Successfully connected"). A backlog message delivered in that
+// window is silently dropped by the client's no-handler default — and we ack
+// it (our write succeeded; MCP notifications carry no processing receipt), so
+// it is permanently lost and the cold-started session idles as a zombie.
+//
+// Waiting for the client's `initialized` notification puts us past the
+// handshake; the grace period then clears the handler-attach gap with ~100x
+// margin. This is a heuristic against closed-source timing — there is no MCP
+// signal for "channel handler attached" — so the delay is env-tunable and the
+// live pilot remains the source of truth. Bounded fail-open: if `initialized`
+// never arrives (wedged client), we register after 30s anyway rather than
+// leaving the channel permanently dark.
+const REGISTER_GRACE_MS = process.env.LF_BROKER_REGISTER_GRACE_MS
+  ? Number.parseInt(process.env.LF_BROKER_REGISTER_GRACE_MS, 10)
+  : 3_000;
+
+const initialized = new Promise<void>((resolve) => {
+  mcp.oninitialized = () => resolve();
+});
 
 await mcp.connect(new StdioServerTransport());
+
+void (async () => {
+  const bound = new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, 30_000);
+    t.unref();
+  });
+  await Promise.race([initialized, bound]);
+  await new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, REGISTER_GRACE_MS);
+    t.unref();
+  });
+  broker.start();
+})();
 
 // Clean shutdown on stdin EOF (CLI closed the MCP connection).
 function shutdown(): void {

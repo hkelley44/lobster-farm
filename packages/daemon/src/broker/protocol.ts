@@ -30,17 +30,23 @@ export const BROKER_SOCKET_RELATIVE = "state/broker.sock";
  *      etc. — byte-identical to the official plugin (reply-enforcement matches on
  *      these names).
  *   2. Channel routing: the CLI only routes a server's
- *      `notifications/claude/channel` notifications into the session if that
- *      server is named in its `--channels` list (tagged `server:<key>` for
- *      manually-configured MCP servers). A shim session launched WITHOUT
- *      `--channels server:<this key>` has every inbound silently skipped:
- *      "Channel notifications skipped: server plugin_discord_discord not in
- *      --channels list for this session" — the root cause of the #112
- *      idle-zombie (message delivered, dropped by the CLI, acked by the shim,
- *      permanently lost).
+ *      `notifications/claude/channel` notifications into the session if a
+ *      channel entry names this key AND that entry carries the CLI's dev
+ *      marker — which only `--dangerously-load-development-channels
+ *      server:<this key>` confers. Two observed failure modes, both ending in
+ *      "Channel notifications skipped: …" and an idle-zombie session (message
+ *      delivered, dropped by the CLI, acked by the shim, permanently lost):
+ *        - no entry at all → "not in --channels list for this session" (#112);
+ *        - entry via plain `--channels server:<key>` (no dev marker) → "not on
+ *          the approved channels allowlist (use
+ *          --dangerously-load-development-channels for local dev)" (#114).
+ *      The CLI matches entries first-wins, and --channels entries precede
+ *      dev-flag entries — so the server entry must ride the dev flag ONLY; a
+ *      duplicate non-dev entry would shadow it and re-fail the allowlist gate.
  *
  * pool.ts must use this constant for BOTH the mcp-config key and the
- * `--channels server:…` argument so the two can never drift apart.
+ * `--dangerously-load-development-channels server:…` argument so the two can
+ * never drift apart.
  */
 export const SHIM_MCP_SERVER_KEY = "plugin_discord_discord";
 

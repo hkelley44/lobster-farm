@@ -4168,20 +4168,40 @@ export class BotPool extends EventEmitter {
     // --strict-mcp-config so no other MCP servers leak in. Plugin sessions use
     // the official channel plugin exactly as before.
     //
-    // `--channels server:<key>` is REQUIRED for the broker transport: the CLI
-    // only routes a server's `notifications/claude/channel` into the session
-    // when that server is named in its --channels list. Without it the CLI
-    // receives the shim's inbound and drops it ("Channel notifications skipped:
-    // server … not in --channels list"), the shim acks the notification it
-    // successfully wrote, the queue entry is deleted, and the session idles as
-    // an unconfirmed zombie — the broker-inbound delivery bug this line fixes.
+    // Registering the shim as a channel source must clear TWO CLI gates
+    // (verified against CLI v2.1.220's routing logic; each was found the hard
+    // way, in production, as a "Channel notifications skipped: …" zombie):
+    //
+    //   Gate 1 (#112): the server must be named in the session's channel-entry
+    //     list at all, or every `notifications/claude/channel` is skipped with
+    //     "not in --channels list for this session".
+    //   Gate 2 (#114): a `server:<key>` entry must ALSO carry the CLI's
+    //     internal dev marker, or it is skipped with "not on the approved
+    //     channels allowlist (use --dangerously-load-development-channels for
+    //     local dev)". Only entries passed via
+    //     `--dangerously-load-development-channels` get that marker.
+    //
+    // Both skips are fatal, not transient: the shim acks the notification it
+    // successfully wrote (it cannot see the CLI discarded it), the queue entry
+    // is deleted, and the cold-started session idles as an unconfirmed zombie.
+    //
+    // CRITICAL: the server entry must be passed ONLY via
+    // `--dangerously-load-development-channels`, NOT via `--channels` as well.
+    // The CLI appends dev-flag entries AFTER --channels entries and matches
+    // with first-wins find(); a duplicate non-dev `--channels server:<key>`
+    // entry would shadow the dev one and re-fail gate 2.
+    //
+    // The dev flag pops a confirmation dialog at CLI startup; the auto-accept
+    // keypress below (see the broker branch of the trust-dialog timer) answers
+    // it. The dialog is by design for foreign channel servers — the shim is
+    // our own co-shipped code, so accepting is sound.
     const transport_args =
       use_broker && broker_session
         ? [
             "--mcp-config",
             sq(broker_session.mcp_config_path),
             "--strict-mcp-config",
-            "--channels",
+            "--dangerously-load-development-channels",
             `server:${SHIM_MCP_SERVER_KEY}`,
           ]
         : ["--channels", "plugin:discord@claude-plugins-official"];
@@ -4287,6 +4307,27 @@ export class BotPool extends EventEmitter {
               /* dialog may not appear */
             }
           }, 3000);
+
+          // Broker sessions launch with --dangerously-load-development-channels
+          // (#114), which pops a confirmation dialog at CLI startup with the
+          // accept option preselected — Enter confirms. The dialog blocks the
+          // whole startup (MCP servers don't spawn until it's answered), so an
+          // unanswered dialog is a dark channel. A second keypress covers the
+          // case where the first Enter was consumed by the trust dialog; a
+          // spare Enter at an idle prompt (or during a running turn) is a
+          // no-op. Broker branch only — plugin sessions keep the single
+          // trust-dialog press, byte-identical to before.
+          if (use_broker) {
+            setTimeout(() => {
+              try {
+                execFileSync("tmux", ["send-keys", "-t", bot.tmux_session, "Enter"], {
+                  stdio: "ignore",
+                });
+              } catch {
+                /* dialog may not appear */
+              }
+            }, 6000);
+          }
 
           console.log(`[pool] pool-${String(bot.id)} running as ${agent_name} in tmux`);
           resolve();

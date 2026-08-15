@@ -25,9 +25,11 @@ here runs and every session uses the official plugin exactly as before.
   Also home of `SHIM_MCP_SERVER_KEY` — the MCP server key the shim is registered
   under. The key is load-bearing twice: it makes the shim's tool names byte-
   identical to the plugin (`mcp__plugin_discord_discord__*`), and it must appear
-  as `--channels server:<key>` on the session's `claude` invocation or the CLI
-  silently drops every `notifications/claude/channel` the shim emits (the
-  idle-zombie bug — see the constant's doc comment).
+  as `--dangerously-load-development-channels server:<key>` on the session's
+  `claude` invocation (dev flag ONLY — a plain `--channels server:<key>` entry
+  fails the CLI's approved-channels allowlist AND would shadow a dev entry,
+  #112/#114) or the CLI silently drops every `notifications/claude/channel` the
+  shim emits (the idle-zombie bugs — see the constant's doc comment).
 
 - **queue.ts** — `BrokerQueue`, the durable per-channel inbound queue. Every
   inbound is persisted (atomic write-temp-then-rename, coalesced async writes)
