@@ -505,6 +505,74 @@ describe("broker end-to-end inbound delivery (inbound → queue → shim → ses
     }
   }, 30_000);
 
+  it("malformed LF_BROKER_REGISTER_GRACE_MS falls back to the safe default (no graceless collapse)", async () => {
+    // Regression for the parse guard: an unguarded parseInt("bogus") → NaN,
+    // and setTimeout(fn, NaN) fires at ~1ms — silently reverting the shim to
+    // immediate registration and the exact pre-attach boot race the grace
+    // exists to prevent. With the guard, a bogus value falls back to the 3s
+    // production default, so delivery still lands AFTER the fake CLI's
+    // handler-attach window and the first turn runs (this test just takes ~3s
+    // instead of ~600ms).
+    const config = make_config(true);
+    const pool = new TestPool(config);
+    const broker = make_broker(config);
+    await broker.start();
+    pool.set_broker(broker);
+
+    let client: Client | null = null;
+    try {
+      await assign_pilot(pool);
+      const tokens = tokenize(latest_tmux_command());
+      const mcp_config = JSON.parse(
+        await readFile(flag_value(tokens, "--mcp-config")!, "utf-8"),
+      ) as {
+        mcpServers: Record<string, { env: Record<string, string> }>;
+      };
+      const server_def = mcp_config.mcpServers[SHIM_MCP_SERVER_KEY];
+      const routed = cli_routes_channel(SHIM_MCP_SERVER_KEY, parse_channel_registry(tokens));
+
+      let driven_turn: { content: string } | null = null;
+      let dropped_pre_attach = 0;
+      let handler_attached = false;
+
+      client = new Client({ name: "fake-claude-cli", version: "1.0.0" }, { capabilities: {} });
+      client.fallbackNotificationHandler = (notification) => {
+        if (notification.method === "notifications/claude/channel") {
+          if (!handler_attached) dropped_pre_attach += 1;
+          else if (routed) driven_turn = notification.params as unknown as { content: string };
+        }
+        return Promise.resolve();
+      };
+
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [SHIM_PATH],
+        env: {
+          ...(process.env as Record<string, string>),
+          ...server_def!.env,
+          LF_BROKER_REGISTER_GRACE_MS: "not-a-number",
+        },
+        stderr: "pipe",
+      });
+      await client.connect(transport);
+      setTimeout(() => {
+        handler_attached = true;
+      }, 150);
+
+      await poll_until(
+        () => driven_turn !== null,
+        10_000,
+        () =>
+          `driven first turn under bogus grace env (pre-attach window swallowed ${String(dropped_pre_attach)} — NaN collapsed the grace)`,
+      );
+      expect(driven_turn!.content).toBe("hello broker pilot");
+      expect(dropped_pre_attach).toBe(0);
+    } finally {
+      await client?.close().catch(() => {});
+      await broker.stop().catch(() => {});
+    }
+  }, 30_000);
+
   it("broker transport args clear BOTH CLI gates (dev-flagged server entry, no shadowing)", async () => {
     const config = make_config(true);
     const pool = new TestPool(config);

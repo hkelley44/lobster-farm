@@ -386,9 +386,14 @@ const broker = new BrokerClient(SOCKET_PATH, CHANNEL_ID, BOT_ID);
 // live pilot remains the source of truth. Bounded fail-open: if `initialized`
 // never arrives (wedged client), we register after 30s anyway rather than
 // leaving the channel permanently dark.
-const REGISTER_GRACE_MS = process.env.LF_BROKER_REGISTER_GRACE_MS
+// Guarded parse: a malformed value must fall back to the default, never to
+// NaN — setTimeout(fn, NaN) fires at ~1ms, silently collapsing the grace back
+// to the exact graceless pre-attach race it exists to prevent. Negative values
+// clamp to ~1ms the same way, so they're rejected too.
+const parsed_grace = process.env.LF_BROKER_REGISTER_GRACE_MS
   ? Number.parseInt(process.env.LF_BROKER_REGISTER_GRACE_MS, 10)
-  : 3_000;
+  : Number.NaN;
+const REGISTER_GRACE_MS = Number.isFinite(parsed_grace) && parsed_grace >= 0 ? parsed_grace : 3_000;
 
 const initialized = new Promise<void>((resolve) => {
   mcp.oninitialized = () => resolve();
