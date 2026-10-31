@@ -23,6 +23,23 @@ const exec = promisify(execFile);
 /** Timeout for git commands — generous but bounded. */
 const GIT_TIMEOUT_MS = 30_000;
 
+/**
+ * Refs whose first-parent history counts as "trunk" (issue #110).
+ *
+ * Both forms are checked and unioned: a worktree is typically created from
+ * `origin/main`, which can be ahead of the local `main` ref (or behind it, if
+ * someone committed locally). Taking the union means a branch sitting on
+ * *either* lineage is recognized as having done no work of its own.
+ */
+const TRUNK_REFS = ["refs/remotes/origin/main", "refs/heads/main"] as const;
+
+/**
+ * `rev-list` of a long trunk can exceed execFile's 1 MiB default stdout cap
+ * (~24k commits at 41 bytes/sha). Raise it so the probe doesn't fail — and
+ * therefore fall into the fail-safe "skip everything" path — on a big repo.
+ */
+const REV_LIST_MAX_BUFFER = 64 * 1024 * 1024;
+
 // ── Safety guardrail (issue #27) ──
 
 /**
@@ -629,12 +646,108 @@ async function cleanup_claude_worktrees(
   }
 }
 
+// ── Stale-classification guardrail (issue #110) ──
+
+/**
+ * The set of commits on the trunk's first-parent history, or `null` when it
+ * could not be determined. `null` is load-bearing: callers treat "unknown
+ * trunk" as "cannot prove this branch did any work" and skip removal.
+ */
+export type TrunkHistory = Set<string> | null;
+
+/**
+ * Read the trunk's first-parent history (issue #110).
+ *
+ * First-parent history is the discriminator that makes `is_unstarted_branch`
+ * work. Every commit ever *merged in* from a side branch is reachable from
+ * trunk but is NOT on trunk's first-parent chain (it hangs off a merge
+ * commit's second parent). Commits that are on the chain are trunk commits —
+ * so a branch pointing at one is a branch that has produced nothing.
+ *
+ * Refs that don't resolve are skipped individually, so a repo with no
+ * `origin` remote still gets a usable answer from `refs/heads/main`.
+ *
+ * @returns Union of the first-parent histories of every resolvable trunk ref,
+ *   or `null` if none resolved (i.e. we have no idea what trunk looks like).
+ */
+async function load_trunk_history(repo_path: string): Promise<TrunkHistory> {
+  const shas = new Set<string>();
+  let any_resolved = false;
+
+  for (const ref of TRUNK_REFS) {
+    try {
+      const { stdout } = await exec("git", ["rev-list", "--first-parent", ref], {
+        cwd: repo_path,
+        timeout: GIT_TIMEOUT_MS,
+        maxBuffer: REV_LIST_MAX_BUFFER,
+      });
+      any_resolved = true;
+      for (const line of stdout.split("\n")) {
+        const sha = line.trim();
+        if (sha) shas.add(sha);
+      }
+    } catch {
+      // Ref doesn't exist in this repo (or rev-list failed) — try the next one.
+    }
+  }
+
+  return any_resolved ? shas : null;
+}
+
+/**
+ * True when a branch has produced no commits of its own (issue #110).
+ *
+ * This is the fix for the sweep misclassifying freshly-created worktrees as
+ * stale. A brand-new worktree (`git worktree add <dir> -b <branch> origin/main`)
+ * has a branch tip that is *literally a trunk commit*: zero commits ahead, a
+ * clean working tree, and no `origin/<branch>` ref yet. That made it
+ * indistinguishable from finished work to both of `sweep_repo`'s stale tests —
+ * `git branch --merged main` lists it, and `is_remote_branch_gone` reports its
+ * never-created remote ref as "gone" — while #27/#30's safety preconditions
+ * found nothing to protect (nothing uncommitted, untracked, or unpushed,
+ * because nothing had been written yet). The worktree was deleted out from
+ * under a running agent.
+ *
+ * A branch whose tip is on trunk's first-parent history cannot be finished
+ * work: its commits, if it had any, would hang off trunk rather than sit on
+ * it. Checking the tip (rather than "zero commits ahead of main") is what
+ * keeps genuinely-merged worktrees sweepable — a branch merged into main via
+ * a merge commit is also zero-ahead, but its tip is *off* the first-parent
+ * chain, so it stays eligible.
+ *
+ * Deliberately conservative in both unknown cases — an empty `tip_sha` or an
+ * unknown trunk returns `true` (treat as unstarted → do not remove). Leaking
+ * a stale worktree costs disk; removing a live one destroys work.
+ */
+export function is_unstarted_branch(tip_sha: string, trunk: TrunkHistory): boolean {
+  if (!tip_sha) return true;
+  if (trunk === null) return true;
+  return trunk.has(tip_sha);
+}
+
+/** Resolve a branch name to its tip sha. Returns null if it doesn't resolve. */
+async function resolve_branch_tip(repo_path: string, branch: string): Promise<string | null> {
+  try {
+    const { stdout } = await exec("git", ["rev-parse", "--verify", `refs/heads/${branch}`], {
+      cwd: repo_path,
+      timeout: GIT_TIMEOUT_MS,
+    });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Periodic stale worktree sweep ──
 
 /**
  * Sweep all entity repos for stale worktrees. A worktree is stale if:
  * - Its branch has been merged into main, or
  * - Its branch's remote tracking ref no longer exists
+ *
+ * ...and, per issue #110, only if its branch has produced at least one commit
+ * of its own. See `is_unstarted_branch` — both stale tests above fire on a
+ * brand-new worktree, which is why that guardrail exists.
  *
  * Designed to run periodically (e.g., hourly) as a safety net.
  */
@@ -717,6 +830,16 @@ async function sweep_repo(repo_path: string, deps: CleanupDeps = {}): Promise<nu
     return 0;
   }
 
+  // Trunk first-parent history, for the issue #110 unstarted-branch guardrail.
+  // Loaded once per repo per sweep and shared by both removal paths below.
+  const trunk = await load_trunk_history(repo_path);
+  if (trunk === null) {
+    console.warn(
+      `[worktree-cleanup] Could not resolve trunk history in ${repo_path} — skipping sweep (issue #110 guardrail)`,
+    );
+    return 0;
+  }
+
   let cleaned = 0;
 
   for (const entry of entries) {
@@ -730,6 +853,18 @@ async function sweep_repo(repo_path: string, deps: CleanupDeps = {}): Promise<nu
 
     // Check if this is the main working tree (same path as repo_path)
     if (entry.path === repo_path) continue;
+
+    // Issue #110: a branch that has produced no commits of its own is not
+    // stale, it's unstarted — an agent is very likely working in it right now.
+    // This runs BEFORE either stale test because both of them fire on a
+    // brand-new worktree (merged-into-main via `branch --merged`, remote-gone
+    // via a never-pushed branch) and neither is evidence that work is done.
+    if (is_unstarted_branch(entry.head, trunk)) {
+      console.log(
+        `[worktree-cleanup] Keeping worktree (branch has no commits of its own): ${entry.path} [${branch}]`,
+      );
+      continue;
+    }
 
     let should_clean = false;
 
@@ -760,8 +895,15 @@ async function sweep_repo(repo_path: string, deps: CleanupDeps = {}): Promise<nu
     }
   }
 
-  // Also sweep .claude/worktrees/ for agent directories referencing merged branches
+  // Also sweep .claude/worktrees/ for agent directories referencing merged branches.
+  //
+  // Issue #110 applies here too: this path matches directories by branch slug,
+  // so a freshly-created `.claude/worktrees/<slug>` whose branch tip is still a
+  // trunk commit would be removed by name even after the loop above spared it.
+  // Same guardrail, second code path.
   for (const branch of merged_branches) {
+    const tip = await resolve_branch_tip(repo_path, branch);
+    if (tip === null || is_unstarted_branch(tip, trunk)) continue;
     await cleanup_claude_worktrees(repo_path, branch, deps);
   }
 

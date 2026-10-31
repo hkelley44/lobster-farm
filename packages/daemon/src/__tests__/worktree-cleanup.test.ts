@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup_after_merge,
   find_worktree_for_branch,
+  is_unstarted_branch,
   is_worktree_safe_to_remove,
   parse_worktree_list,
   relocate_sessions_from_path,
@@ -88,6 +89,18 @@ function setup_git_mocks(
     status_porcelain?: string;
     /** Output for `git rev-list <branch> --not --remotes`. Defaults to "" (no unpushed commits). */
     rev_list_unpushed?: string;
+    /**
+     * Commits on the trunk's first-parent history, keyed by trunk ref
+     * (issue #110). A ref absent from this map resolves to an empty history;
+     * set `trunk_unresolvable` to make every trunk ref fail instead.
+     */
+    trunk_first_parent?: Record<string, string[]>;
+    /** When true, every `rev-list --first-parent <trunk>` probe throws. */
+    trunk_unresolvable?: boolean;
+    /** Tip sha per local branch, for `rev-parse --verify refs/heads/<branch>`. */
+    branch_tips?: Record<string, string>;
+    /** Local branches whose `refs/heads/<branch>` lookup should fail. */
+    missing_local_branches?: string[];
   } = {},
 ): void {
   mock_exec_file.mockImplementation((cmd: string, args: string[], _opts: unknown) => {
@@ -124,12 +137,27 @@ function setup_git_mocks(
     }
 
     if (subcmd === "rev-parse") {
-      // args: ["rev-parse", "--verify", "refs/remotes/origin/<branch>"]
+      // args: ["rev-parse", "--verify", "<ref>"]
       const ref = args[2] ?? "";
-      const branch = ref.replace("refs/remotes/origin/", "");
-      if (opts.rev_parse_missing?.includes(branch)) {
-        throw new Error("fatal: Needed a single revision");
+
+      // Remote tracking ref — drives the "remote gone" stale test.
+      if (ref.startsWith("refs/remotes/origin/")) {
+        const branch = ref.slice("refs/remotes/origin/".length);
+        if (opts.rev_parse_missing?.includes(branch)) {
+          throw new Error("fatal: Needed a single revision");
+        }
+        return "abc123";
       }
+
+      // Local branch ref — existence probe plus tip resolution (issue #110).
+      if (ref.startsWith("refs/heads/")) {
+        const branch = ref.slice("refs/heads/".length);
+        if (opts.missing_local_branches?.includes(branch)) {
+          throw new Error("fatal: Needed a single revision");
+        }
+        return opts.branch_tips?.[branch] ?? `tip-${branch}`;
+      }
+
       return "abc123";
     }
 
@@ -139,6 +167,12 @@ function setup_git_mocks(
     }
 
     if (subcmd === "rev-list") {
+      // Issue #110 trunk probe: `rev-list --first-parent <trunk-ref>`.
+      if (args[1] === "--first-parent") {
+        if (opts.trunk_unresolvable) throw new Error("fatal: bad revision");
+        return (opts.trunk_first_parent?.[args[2] ?? ""] ?? []).join("\n");
+      }
+      // Issue #27 guardrail: `rev-list <branch> --not --remotes`.
       return opts.rev_list_unpushed ?? "";
     }
 
@@ -1022,5 +1056,228 @@ describe("remove_worktree — issue #27 guardrail", () => {
     const payload = alert_router.post_alert.mock.calls[0][0];
     expect(payload.entity_id).toBe("test-entity");
     expect(payload.title).toContain("Unpushed");
+  });
+});
+
+// ── Issue #110: freshly-created worktrees must not be classified as stale ──
+
+describe("is_unstarted_branch", () => {
+  const trunk = new Set(["trunk-tip", "trunk-older"]);
+
+  it("treats a branch sitting on the trunk's first-parent history as unstarted", () => {
+    expect(is_unstarted_branch("trunk-tip", trunk)).toBe(true);
+    expect(is_unstarted_branch("trunk-older", trunk)).toBe(true);
+  });
+
+  it("treats a branch tip off the first-parent history as having done work", () => {
+    // A branch merged into main via a merge commit lands here: reachable from
+    // main, but hanging off a merge's second parent rather than on the chain.
+    expect(is_unstarted_branch("side-branch-tip", trunk)).toBe(false);
+  });
+
+  it("fails safe when the trunk history is unknown", () => {
+    expect(is_unstarted_branch("side-branch-tip", null)).toBe(true);
+  });
+
+  it("fails safe when the worktree HEAD is unknown", () => {
+    expect(is_unstarted_branch("", trunk)).toBe(true);
+  });
+});
+
+describe("sweep_stale_worktrees — issue #110 unstarted-branch guardrail", () => {
+  const TRUNK = {
+    "refs/remotes/origin/main": ["trunk-tip", "trunk-older"],
+    "refs/heads/main": ["trunk-tip", "trunk-older"],
+  };
+
+  function registry_for(repo = "/repo") {
+    return {
+      get_active: vi.fn().mockReturnValue([
+        {
+          entity: {
+            id: "test-entity",
+            repos: [{ path: repo, url: "https://github.com/test/repo.git" }],
+          },
+        },
+      ]),
+    };
+  }
+
+  function removed_paths(): string[] {
+    return mock_exec_file.mock.calls
+      .filter(
+        (c: unknown[]) =>
+          (c[0] as string) === "git" &&
+          (c[1] as string[])[0] === "worktree" &&
+          (c[1] as string[])[1] === "remove",
+      )
+      .map((c: unknown[]) => (c[1] as string[])[2]);
+  }
+
+  it("keeps a brand-new worktree whose branch was never pushed (remote-gone path)", async () => {
+    // The incident in #110: worktree created seconds ago, branch tip is still
+    // origin/main, `origin/<branch>` has never existed so the remote reads as
+    // "gone", and nothing is uncommitted/untracked/unpushed.
+    setup_git_mocks({
+      worktree_list: make_porcelain(
+        { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
+        { path: "/repo/worktrees/fresh", branch: "refs/heads/feature/fresh", head: "trunk-tip" },
+      ),
+      merged_branches: "",
+      rev_parse_missing: ["feature/fresh"],
+      trunk_first_parent: TRUNK,
+    });
+    const alert_router = { post_alert: vi.fn() };
+
+    await sweep_stale_worktrees(registry_for() as any, { alert_router: alert_router as any });
+
+    expect(removed_paths()).toHaveLength(0);
+    // Not stale-but-unsafe — it is simply not stale, so nobody is paged.
+    expect(alert_router.post_alert).not.toHaveBeenCalled();
+  });
+
+  it("keeps a brand-new worktree listed as merged into main (merged path)", async () => {
+    setup_git_mocks({
+      worktree_list: make_porcelain(
+        { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
+        { path: "/repo/worktrees/fresh", branch: "refs/heads/feature/fresh", head: "trunk-tip" },
+      ),
+      merged_branches: "  feature/fresh\n",
+      rev_parse_missing: [], // remote ref exists — only the merged test fires
+      trunk_first_parent: TRUNK,
+    });
+
+    await sweep_stale_worktrees(registry_for() as any);
+
+    expect(removed_paths()).toHaveLength(0);
+  });
+
+  it("keeps a worktree created at an older trunk commit after main advanced", async () => {
+    // Tip equality alone would not save this one: another team's PR merged
+    // after the worktree was created, so the branch is now strictly behind
+    // origin/main while still having produced nothing.
+    setup_git_mocks({
+      worktree_list: make_porcelain(
+        { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
+        { path: "/repo/worktrees/old", branch: "refs/heads/feature/old", head: "trunk-older" },
+      ),
+      merged_branches: "  feature/old\n",
+      rev_parse_missing: ["feature/old"],
+      trunk_first_parent: TRUNK,
+    });
+
+    await sweep_stale_worktrees(registry_for() as any);
+
+    expect(removed_paths()).toHaveLength(0);
+  });
+
+  it("still sweeps a merged worktree whose branch has commits of its own", async () => {
+    setup_git_mocks({
+      worktree_list: make_porcelain(
+        { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
+        { path: "/repo/worktrees/done", branch: "refs/heads/feature/done", head: "side-tip" },
+      ),
+      merged_branches: "  feature/done\n",
+      rev_parse_missing: [],
+      trunk_first_parent: TRUNK,
+    });
+
+    await sweep_stale_worktrees(registry_for() as any);
+
+    expect(removed_paths()).toEqual(["/repo/worktrees/done"]);
+  });
+
+  it("still sweeps a remote-gone worktree whose branch has commits of its own", async () => {
+    setup_git_mocks({
+      worktree_list: make_porcelain(
+        { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
+        { path: "/repo/worktrees/orphan", branch: "refs/heads/feature/orphan", head: "side-tip" },
+      ),
+      merged_branches: "",
+      rev_parse_missing: ["feature/orphan"],
+      trunk_first_parent: TRUNK,
+    });
+
+    await sweep_stale_worktrees(registry_for() as any);
+
+    expect(removed_paths()).toEqual(["/repo/worktrees/orphan"]);
+  });
+
+  it("still enforces the #27/#30 preconditions on a worktree that IS stale", async () => {
+    // The #110 classifier fix must not become the only line of defense: a
+    // branch with its own commits is still classified stale, and the safety
+    // guardrail is still what stops the removal.
+    setup_git_mocks({
+      worktree_list: make_porcelain(
+        { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
+        { path: "/repo/worktrees/wip", branch: "refs/heads/feature/wip", head: "side-tip" },
+      ),
+      merged_branches: "",
+      rev_parse_missing: ["feature/wip"],
+      trunk_first_parent: TRUNK,
+      status_porcelain: "?? notes.md\n",
+    });
+    const alert_router = { post_alert: vi.fn() };
+
+    await sweep_stale_worktrees(registry_for() as any, { alert_router: alert_router as any });
+
+    expect(removed_paths()).toHaveLength(0);
+    expect(alert_router.post_alert).toHaveBeenCalledTimes(1);
+    expect(alert_router.post_alert.mock.calls[0][0].title).toContain("Untracked");
+  });
+
+  it("skips the whole repo when the trunk history cannot be resolved", async () => {
+    setup_git_mocks({
+      worktree_list: make_porcelain(
+        { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
+        { path: "/repo/worktrees/done", branch: "refs/heads/feature/done", head: "side-tip" },
+      ),
+      merged_branches: "  feature/done\n",
+      rev_parse_missing: ["feature/done"],
+      trunk_unresolvable: true,
+    });
+
+    await sweep_stale_worktrees(registry_for() as any);
+
+    expect(removed_paths()).toHaveLength(0);
+  });
+
+  it("spares a .claude/worktrees directory whose merged branch has no commits of its own", async () => {
+    // Second code path: this sweep matches directories by branch slug, so it
+    // would delete the same fresh worktree by name even if the worktree loop
+    // spared it.
+    setup_git_mocks({
+      worktree_list: make_porcelain({
+        path: "/repo",
+        branch: "refs/heads/main",
+        head: "trunk-tip",
+      }),
+      merged_branches: "  feature/fresh\n",
+      trunk_first_parent: TRUNK,
+      branch_tips: { "feature/fresh": "trunk-tip" },
+    });
+    mock_readdir.mockResolvedValue([{ name: "agent-fresh", isDirectory: () => true }]);
+
+    await sweep_stale_worktrees(registry_for() as any);
+
+    expect(removed_paths()).toHaveLength(0);
+  });
+
+  it("still sweeps a .claude/worktrees directory whose merged branch did work", async () => {
+    setup_git_mocks({
+      worktree_list: make_porcelain({
+        path: "/repo",
+        branch: "refs/heads/main",
+        head: "trunk-tip",
+      }),
+      merged_branches: "  feature/done\n",
+      trunk_first_parent: TRUNK,
+      branch_tips: { "feature/done": "side-tip" },
+    });
+    mock_readdir.mockResolvedValue([{ name: "agent-done", isDirectory: () => true }]);
+
+    await sweep_stale_worktrees(registry_for() as any);
+
+    expect(removed_paths()).toEqual(["/repo/.claude/worktrees/agent-done"]);
   });
 });
