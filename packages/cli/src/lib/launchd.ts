@@ -141,6 +141,26 @@ ${env_section}`;
  * warns. Warnings name the key only, never the value: this output goes to
  * daemon.log.
  *
+ * ## Unterminated quotes are fatal, and bounded (#101)
+ *
+ * A missing *closing* quote used to run the accumulation scan to EOF, so every
+ * secret declared after the malformed one was swallowed into its value and
+ * silently lost — the warning named only the first key. Two changes:
+ *
+ * 1. **The scan is bounded** by the declared-key set. While a quote is open, a
+ *    line that assigns a key `.env.op` actually declares ends the scan and is
+ *    re-parsed as a fresh assignment. So one bad entry costs one entry, and a
+ *    single startup reports *every* malformed key rather than just the first.
+ * 2. **Startup aborts** (exit 1) with `.env.op:<line>: … key '<KEY>'` per
+ *    offending entry. Booting with a silently incomplete credential set is
+ *    worse than not booting: it fails later, deeper, and looks unrelated.
+ *    launchd surfaces the nonzero exit via `get_launchd_job_state()`.
+ *
+ * The bound trades one unlikely failure for one likely one: a quoted value
+ * terminates early if its own body contains a line starting with a declared key
+ * name plus `=`. PEM base64 and JSON do not contain `DISCORD_TOKEN=`, and that
+ * case now reports both key names instead of failing silently.
+ *
  * @param node_path   Absolute path to the node binary.
  * @param daemon_path Absolute path to the daemon entry point (index.js).
  * @param home        Root for env.sh / .env.op lookups. Overridable for tests.
@@ -186,19 +206,35 @@ source "$ENV_FILE"
 # safe to name in warnings. \`op inject\` only substitutes values — it never adds
 # or renames keys — so any line whose key was not declared is a continuation
 # line, however much it looks like an assignment.
+#
+# That declared-key set does double duty: it also BOUNDS the quoted-value scan,
+# so a missing closing quote costs one entry instead of every entry after it
+# (#101). A malformed .env.op then aborts startup rather than booting a daemon
+# that is missing credentials it believes it has.
 ENV_OP="${home}/.lobsterfarm/.env.op"
 if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
   # Colon-delimited set of declared key names, e.g. ":FOO:BAR:".
   op_declared=":"
   op_undeclarable=0
+  # key -> the .env.op line that declares it, so a malformed entry can be
+  # reported as file:line. These are the line numbers of the *template*, which
+  # is what a human actually edits — resolved-text line numbers drift from it
+  # as soon as one multi-line secret expands.
+  typeset -A op_src_line
+  op_src_lineno=0
   # \`|| [[ -n "$op_line" ]]\` so a .env.op without a trailing newline does not
   # silently lose its last declaration — read returns non-zero on EOF even when
   # it produced a partial line, and a missing key here drops a real secret.
   while IFS= read -r op_line || [[ -n "$op_line" ]]; do
+    op_src_lineno=$(( op_src_lineno + 1 ))
     op_line="\${op_line%$'\\r'}"
     [[ "$op_line" =~ '^[[:space:]]*(#|$)' ]] && continue
     if [[ "$op_line" =~ '^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=' ]]; then
-      op_declared="$op_declared\${match[2]}:"
+      op_key_name="\${match[2]}"
+      op_declared="$op_declared$op_key_name:"
+      # First declaration wins — with a duplicated key that is the line a human
+      # is most likely to have meant, and it keeps the report deterministic.
+      [[ -z "\${op_src_line[$op_key_name]}" ]] && op_src_line[$op_key_name]=$op_src_lineno
     else
       # A line we cannot read as a declaration means our key set is incomplete,
       # which would silently reclassify real assignments as continuation lines.
@@ -218,6 +254,7 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
     op_quote=""
     op_candidate=""
     op_malformed=0
+    op_unterminated=0
 
     # Export the buffered assignment. Only *unquoted* values are ever buffered:
     # they are the ambiguous ones, and deferring their export is what lets a
@@ -227,6 +264,25 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
       [[ -n "$op_key" ]] && export "$op_key=$op_value"
       op_key=""
       op_value=""
+    }
+
+    # Set op_candidate to the *declared* key this line assigns, else "".
+    # Undeclared identifier-shaped lines (\`AbCdEf==\`) are continuation text,
+    # not assignments — that distinction is the #98 round-2 fix, and both the
+    # quote-open and normal paths must agree on it, so it lives in one place.
+    op_declared_key() {
+      op_candidate=""
+      if [[ "$1" =~ '^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=' ]]; then
+        [[ "$op_declared" == *":\${match[2]}:"* ]] && op_candidate="\${match[2]}"
+      fi
+    }
+
+    # Report an unterminated quote. Key name, source file and source line only —
+    # never the value, never the line: this lands in daemon.log and in agent
+    # session transcripts, both long-lived and both quotable into a PR.
+    op_report_unterminated() {
+      echo "[start-daemon] FATAL: $ENV_OP:\${op_src_line[$1]:-?}: unterminated quote for key '$1' — value NOT exported" >&2
+      op_unterminated=$(( op_unterminated + 1 ))
     }
 
     while IFS= read -r op_line || [[ -n "$op_line" ]]; do
@@ -241,10 +297,25 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
           op_value+=$'\\n'"$op_line"
           op_quote=""
           op_flush
-        else
-          op_value+=$'\\n'"$op_line"
+          continue
         fi
-        continue
+
+        # Bound the scan (#101). Unbounded, a missing closing quote consumes the
+        # rest of the file: every later secret is absorbed into this value and
+        # vanishes without ever being named. A line assigning a key that
+        # .env.op *declares* is overwhelmingly more likely to be the next
+        # assignment than secret body text, so end the value here and re-parse
+        # this line. Losing one entry loudly beats losing all of them quietly.
+        op_declared_key "$op_line"
+        if [[ -z "$op_candidate" ]]; then
+          op_value+=$'\\n'"$op_line"
+          continue
+        fi
+        op_report_unterminated "$op_key"
+        op_quote=""
+        op_key=""
+        op_value=""
+        # Fall through — this line is a fresh assignment, not continuation text.
       fi
 
       # Blank lines and comments neither open nor close an assignment.
@@ -253,11 +324,8 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
       # A new assignment closes the previous one — but only if .env.op actually
       # declared this key. That is what stops a PEM body line like \`AbCdEf==\`
       # from masquerading as an assignment and flushing a truncated secret.
-      op_candidate=""
-      if [[ "$op_line" =~ '^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=' ]]; then
-        op_candidate="\${match[2]}"
-      fi
-      if [[ -n "$op_candidate" && "$op_declared" == *":$op_candidate:"* ]]; then
+      op_declared_key "$op_line"
+      if [[ -n "$op_candidate" ]]; then
         op_flush
         op_key="$op_candidate"
         op_value="\${op_line#*=}"
@@ -289,8 +357,7 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
     done <<< "$resolved_secrets"
 
     if [[ -n "$op_quote" ]]; then
-      echo "[start-daemon] WARNING: unterminated quote for key '$op_key' in resolved .env.op — value NOT exported" >&2
-      op_malformed=1
+      op_report_unterminated "$op_key"
     else
       op_flush
     fi
@@ -299,8 +366,20 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
       echo "[start-daemon] WARNING: multi-line secrets must be quoted in .env.op, e.g. KEY=\\"op://vault/item/field\\"" >&2
     fi
 
+    # Refuse to boot on an unterminated quote. The daemon would otherwise come
+    # up missing credentials it believes it has and fail far from the cause —
+    # and a half-configured daemon is the security footgun, not the downtime.
+    # Every offending key was named above, so one restart fixes them all.
+    if (( op_unterminated )); then
+      echo "[start-daemon] FATAL: close the quote(s) in $ENV_OP, then run \\\`lf restart\\\`." >&2
+      echo "[start-daemon] FATAL: multi-line secrets must be quoted, e.g. KEY=\\"op://vault/item/field\\"" >&2
+      echo "[start-daemon] FATAL: refusing to start with an incomplete secret environment." >&2
+      exit 1
+    fi
+
     unset resolved_secrets op_line op_key op_value op_quote op_candidate op_declared op_malformed
-    unset -f op_flush
+    unset op_unterminated op_src_line op_src_lineno op_key_name
+    unset -f op_flush op_declared_key op_report_unterminated
   else
     echo "[start-daemon] WARNING: op inject failed — continuing without 1Password secrets" >&2
   fi

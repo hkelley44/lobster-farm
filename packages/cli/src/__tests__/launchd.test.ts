@@ -340,6 +340,21 @@ describe.skipIf(!zsh_available)("generate_wrapper_sh secret injection (zsh)", ()
     "",
   ].join("\n");
 
+  it("emits syntactically valid zsh", () => {
+    // Everything this module produces is shell source assembled in a template
+    // literal, so a stray brace or an unescaped `${` is a runtime-only failure
+    // that otherwise shows up as a dead daemon. `zsh -n` parses without running.
+    const root = mkdtempSync(join(tmpdir(), "lf-wrapper-syntax-"));
+    temp_roots.push(root);
+    const wrapper = join(root, "start-daemon.sh");
+    writeFileSync(wrapper, generate_wrapper_sh("/usr/bin/true", join(root, "index.js"), root));
+
+    const proc = spawnSync(ZSH, ["-n", wrapper], { encoding: "utf-8" });
+
+    expect(proc.stderr ?? "").toBe("");
+    expect(proc.status).toBe(0);
+  });
+
   it("round-trips a quoted multi-line PEM byte-for-byte (#98 review finding)", () => {
     const { env, stderr } = run_wrapper(well_formed);
 
@@ -382,17 +397,21 @@ describe.skipIf(!zsh_available)("generate_wrapper_sh secret injection (zsh)", ()
     expect(env.DISCORD_TOKEN).toBe("still-fine");
   });
 
-  it("warns on an unterminated quote without exporting a partial value", () => {
+  it("aborts startup on an unterminated quote without exporting a partial value", () => {
     const truncated = [
       'GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----',
       "MIIEow",
       "",
     ].join("\n");
 
-    const { env, stderr } = run_wrapper(truncated);
+    const { env, stderr, status } = run_wrapper(truncated);
 
-    expect(env.GITHUB_APP_PRIVATE_KEY).toBe("");
     expect(stderr).toContain("unterminated quote");
+    expect(stderr).toContain("GITHUB_APP_PRIVATE_KEY");
+    // Never a partial value, and never a boot with a credential set we know is
+    // incomplete — node is not exec'd at all, so it reports nothing.
+    expect(env.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
+    expect(status).not.toBe(0);
   });
 
   it("never echoes secret material in its warnings", () => {
@@ -471,6 +490,144 @@ describe.skipIf(!zsh_available)("generate_wrapper_sh secret injection (zsh)", ()
       expect(env.GITHUB_APP_PRIVATE_KEY).toBe(pem);
       expect(env.TRAILING).toBe("after");
       expect(stderr).not.toContain("WARNING");
+    });
+  });
+
+  // Issue #101. The accumulation branch had no stopping condition other than a
+  // closing quote, so a missing one ran the scan to EOF: every secret declared
+  // *after* the malformed entry was absorbed into its value and lost, while the
+  // single warning named only the first key. Those later keys were the silent
+  // part — nothing in the output said they had vanished.
+  //
+  // Two properties are pinned here. The scan is now bounded by the declared-key
+  // set, so a malformed entry costs exactly one entry and one startup reports
+  // every offending key; and a malformed .env.op aborts startup instead of
+  // booting a daemon that is missing credentials it believes it has.
+  describe("unterminated quote is bounded and fatal (#101)", () => {
+    const open_quoted = (key: string) => `${key}="-----BEGIN RSA PRIVATE KEY-----`;
+
+    it("reports every unterminated key, not just the first", () => {
+      // The direct proof the scan terminates: pre-fix, the first open quote ate
+      // SPECIAL's declaration too, so only one key could ever be named.
+      const keys = ["GITHUB_APP_PRIVATE_KEY", "SPECIAL"];
+      const injected = [open_quoted("GITHUB_APP_PRIVATE_KEY"), open_quoted("SPECIAL"), ""].join(
+        "\n",
+      );
+
+      const { stderr } = run_wrapper(injected, keys);
+
+      expect(stderr).toContain("GITHUB_APP_PRIVATE_KEY");
+      expect(stderr).toContain("SPECIAL");
+      expect(stderr.match(/unterminated quote/g) ?? []).toHaveLength(2);
+    });
+
+    it("does not silently swallow the secrets declared after the malformed one", () => {
+      // Pre-fix this exited 0 having exported nothing, with DISCORD_TOKEN and
+      // TRAILING unmentioned anywhere in the output.
+      const keys = ["GITHUB_APP_PRIVATE_KEY", "DISCORD_TOKEN", "TRAILING"];
+      const injected = [
+        open_quoted("GITHUB_APP_PRIVATE_KEY"),
+        "DISCORD_TOKEN=plain-token-value",
+        "TRAILING=after-the-pem",
+        "",
+      ].join("\n");
+
+      const { env, stderr, status } = run_wrapper(injected, keys);
+
+      // The well-formed keys are parsed, not consumed as continuation text: the
+      // report blames only the key that is actually malformed.
+      expect(stderr.match(/unterminated quote/g) ?? []).toHaveLength(1);
+      expect(stderr).toContain("GITHUB_APP_PRIVATE_KEY");
+      // Loud, not silent: startup stops rather than handing node a credential
+      // set we already know is short.
+      expect(status).not.toBe(0);
+      expect(env.DISCORD_TOKEN).toBeUndefined();
+      expect(env.TRAILING).toBeUndefined();
+    });
+
+    it("names the .env.op path and the declaring line number", () => {
+      // The template is what a human edits, so the line number has to index it.
+      // Resolved-text line numbers drift as soon as a multi-line value expands.
+      const keys = ["DISCORD_TOKEN", "SPECIAL", "GITHUB_APP_PRIVATE_KEY"];
+      const template = [
+        "# 1Password references for the daemon",
+        "",
+        "DISCORD_TOKEN=op://vault/item/discord_token",
+        "SPECIAL=op://vault/item/special",
+        'GITHUB_APP_PRIVATE_KEY="op://vault/item/github_app_private_key"',
+        "",
+      ].join("\n");
+      const injected = [
+        "DISCORD_TOKEN=plain-token-value",
+        "SPECIAL=fine",
+        open_quoted("GITHUB_APP_PRIVATE_KEY"),
+        "",
+      ].join("\n");
+
+      const { stderr } = run_wrapper(injected, keys, template);
+
+      // GITHUB_APP_PRIVATE_KEY is declared on template line 5.
+      expect(stderr).toMatch(/\.env\.op:5: unterminated quote for key 'GITHUB_APP_PRIVATE_KEY'/);
+    });
+
+    it("never puts secret material in the fatal report", () => {
+      // These land in daemon.log and in agent session transcripts — both
+      // long-lived, both quotable into a PR. Keys and positions only.
+      const secret_body = ["MIIEowIBAAKCAQEAtest+line/with=padding", "AbCdEf=="];
+      const keys = ["GITHUB_APP_PRIVATE_KEY", "DISCORD_TOKEN"];
+      const injected = [
+        open_quoted("GITHUB_APP_PRIVATE_KEY"),
+        ...secret_body,
+        "DISCORD_TOKEN=super-secret-token-value",
+        "",
+      ].join("\n");
+
+      const { stderr } = run_wrapper(injected, keys);
+
+      expect(stderr).toContain("GITHUB_APP_PRIVATE_KEY");
+      for (const leak of [...secret_body, "super-secret-token-value", "BEGIN RSA PRIVATE KEY"]) {
+        expect(stderr).not.toContain(leak);
+      }
+    });
+
+    it("still accumulates body lines that only look like assignments", () => {
+      // The bound keys off the *declared* set, so this must not regress the #98
+      // round-2 fix: `AbCdEf==` is not a declared key, so it stays body text.
+      const pem = [
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "AbCdEf==",
+        "NOT_DECLARED=still-body-text",
+        "-----END RSA PRIVATE KEY-----",
+      ].join("\n");
+
+      const { env, stderr, status } = run_wrapper(
+        [`GITHUB_APP_PRIVATE_KEY="${pem}"`, "TRAILING=after", ""].join("\n"),
+      );
+
+      expect(env.GITHUB_APP_PRIVATE_KEY).toBe(pem);
+      expect(env.TRAILING).toBe("after");
+      expect(stderr).not.toContain("WARNING");
+      expect(stderr).not.toContain("FATAL");
+      expect(status).toBe(0);
+    });
+
+    it("ends a quoted value early if its body declares a key, and says so", () => {
+      // The documented trade-off: bounding by the declared-key set means a
+      // quoted value whose body starts a line with a declared key name + `=`
+      // terminates there. PEM/JSON bodies do not contain `DISCORD_TOKEN=`, and
+      // this reports both key names rather than failing silently.
+      const keys = ["GITHUB_APP_PRIVATE_KEY", "DISCORD_TOKEN"];
+      const injected = [
+        'GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----',
+        "DISCORD_TOKEN=plain-token-value",
+        '-----END RSA PRIVATE KEY-----"',
+        "",
+      ].join("\n");
+
+      const { stderr, status } = run_wrapper(injected, keys);
+
+      expect(stderr).toContain("unterminated quote for key 'GITHUB_APP_PRIVATE_KEY'");
+      expect(status).not.toBe(0);
     });
   });
 

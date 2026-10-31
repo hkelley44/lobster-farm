@@ -48,6 +48,10 @@ Quoting alone is not enough to be *safe*, though, because a PEM body line can it
 
 If a multi-line value is left unquoted, the wrapper **drops it and warns** to `daemon.log` rather than exporting a truncated key. That is deliberate: a half PEM fails deep inside GitHub App auth at request time, while an absent one fails visibly at startup. Warnings name the key only, never the value.
 
+**A missing closing quote aborts startup** (issue #101). The declared-key set also *bounds* the accumulation scan: while a quote is open, a line assigning a key `.env.op` declares ends the value there and is re-parsed as a fresh assignment. Without that bound the scan ran to EOF, so every secret declared after the malformed one was absorbed into its value and lost while the warning named only the first key -- the silent part, since nothing in the output said the others had vanished. Now one bad entry costs one entry, a single startup reports *every* offending key as `.env.op:<line>: unterminated quote for key '<KEY>'`, and the wrapper exits non-zero instead of handing node a credential set it already knows is short (launchd surfaces that as a non-zero last-exit, which `lf status` reads via `daemon-health.ts`). Reports carry key names and line numbers only -- never values.
+
+The bound trades one unlikely failure for one likely one: a quoted value whose own body starts a line with a declared key name plus `=` terminates early. PEM base64 and JSON do not contain `DISCORD_TOKEN=`, and that case names both keys rather than failing silently.
+
 `export KEY=op://...` is accepted as well as bare `KEY=op://...`.
 
 Also handled: CRLF-saved templates (a trailing `\r` is stripped rather than baked into every value); a template with no trailing newline (the last declaration is still read -- losing it would silently drop that secret *and* the one before it); a line that isn't a `KEY=value` declaration (warned, rather than quietly shrinking the key set); and a `.env.op` that declares no keys at all (injection is skipped with a warning instead of treating every line as garbage).
