@@ -174,3 +174,57 @@ describe("canonical_worktree_path", () => {
     expect(canonical_worktree_path(missing)).toBe(missing);
   });
 });
+
+describe("WorktreeLeaseStore — release is key-symmetric (review 🟡-7)", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "lf-wt-release-"));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("releases a hold whose worktree was deleted mid-hold", () => {
+    // The real sequence: a fixer holds the lease, the PR auto-merges,
+    // `cleanup_after_merge` removes the linked worktree, and only then does the
+    // fixer session end and try to release.
+    const real = join(root, "real");
+    const alias = join(root, "alias");
+    mkdirSync(join(real, "wt"), { recursive: true });
+    symlinkSync(real, alias);
+    const alias_wt = join(alias, "wt");
+
+    const store = new WorktreeLeaseStore();
+    const got = store.acquire(alias_wt, "daemon-cron", "op-1");
+    expect(got.ok).toBe(true);
+    if (!got.ok) return;
+
+    // The tree goes away while the lease is still held.
+    rmSync(join(real, "wt"), { recursive: true, force: true });
+
+    // Releasing by the *path* now misses: `canonical_worktree_path` can no
+    // longer realpath it, so it falls back to lexical resolution and produces a
+    // different key from the one acquire stored. This asymmetry is the finding.
+    expect(store.release(alias_wt, "op-1")).toBe("not_found");
+    expect(store.tracked_count()).toBe(1); // the phantom is still there
+
+    // Releasing by the lease the store handed out cannot diverge.
+    expect(store.release_held(got.lease, "op-1")).toBe("released");
+    expect(store.tracked_count()).toBe(0);
+  });
+
+  it("still refuses to release another owner's hold", () => {
+    // `release_held` must not become a way around the ownership check.
+    const wt = join(root, "wt");
+    mkdirSync(wt);
+    const store = new WorktreeLeaseStore();
+    const got = store.acquire(wt, "daemon-cron", "op-1");
+    expect(got.ok).toBe(true);
+    if (!got.ok) return;
+
+    expect(store.release_held(got.lease, "op-2")).toBe("forbidden");
+    expect(store.get(wt)?.owner_id).toBe("op-1");
+  });
+});

@@ -48,10 +48,16 @@
  *      `live_lease` evicts the lease the moment that pid is gone. A holder that
  *      is SIGKILLed — so no handler of ours ever runs — frees its worktree on
  *      the very next lookup, not after a TTL.
- *   3. **TTL.** Every lease expires. Explicit leases default to 60 min (long
- *      enough for a real fix pass); observed leases to 15 min, rolling forward
- *      on each turn. A lease with neither a release nor a live pid still cannot
- *      outlive its TTL.
+ *   3. **TTL.** Every lease expires, unconditionally. Explicit leases default
+ *      to 60 min (long enough for a real fix pass); observed leases to 15 min,
+ *      rolling forward on each turn. `live_lease` evaluates expiry *after* the
+ *      pid check and independently of it, so a live pid only ever reaps a lease
+ *      *early* — it never extends one. A lease with a live holder is therefore
+ *      no safer from expiry than any other: the holder renews by doing visible
+ *      work (`touch_observed` on each completed turn), not by being alive.
+ *      Consequence worth knowing: a builder stuck inside a *single* turn longer
+ *      than its TTL loses its hold while still working, because the Stop hook
+ *      only fires between turns.
  *   4. **Daemon restart.** The store is in-memory only. A restart drops every
  *      lease, so a hold cannot survive the process that created it. (Inherited
  *      from #60's locked design: leases are cheap to lose.)
@@ -68,7 +74,7 @@
 
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { expand_home } from "@lobster-farm/shared";
+import { type LobsterFarmConfig, expand_home } from "@lobster-farm/shared";
 
 /** Who owns a worktree lease. */
 export type WorktreeLeaseHolder = "daemon-cron" | "agent-observed";
@@ -314,7 +320,30 @@ export class WorktreeLeaseStore {
    *   release another owner's hold.
    */
   release(worktree_path: string, owner_id: string): WorktreeReleaseResult {
-    const key = canonical_worktree_path(worktree_path);
+    return this.release_key(canonical_worktree_path(worktree_path), owner_id);
+  }
+
+  /**
+   * Release a lease by the exact key it was stored under (#105, review 🟡-7).
+   *
+   * `canonical_worktree_path` collapses symlinks only when the path still
+   * exists, falling back to lexical resolution when it does not. So acquiring
+   * and releasing by *path* are not guaranteed to produce the same key if the
+   * worktree is deleted mid-hold — which happens on this platform, where
+   * `cleanup_after_merge` removes the tree while the fixer session may still be
+   * winding down. A diverged key means `release` finds nothing, returns
+   * "not_found", and leaves a phantom entry behind.
+   *
+   * A holder that kept its `WorktreeLease` releases through here instead, using
+   * `lease.worktree_path` — the key the store actually chose at acquire time —
+   * so the two operations cannot disagree by construction rather than by the
+   * caller happening to pass a pre-canonicalized string.
+   */
+  release_held(lease: WorktreeLease, owner_id: string): WorktreeReleaseResult {
+    return this.release_key(lease.worktree_path, owner_id);
+  }
+
+  private release_key(key: string, owner_id: string): WorktreeReleaseResult {
     const existing = this.live_lease(key, Date.now());
     if (!existing) return "not_found";
     if (!owns(existing, owner_id)) return "forbidden";
@@ -337,9 +366,17 @@ export class WorktreeLeaseStore {
    * Record that `session_id` completed a turn in `working_dir`.
    *
    * Called from the Stop hook for every Claude session on the machine, which is
-   * how the daemon learns about occupants it did not spawn. Pure in-memory
-   * upsert — no I/O beyond path canonicalization — because this runs once per
-   * turn per session inside a hook with a tight time budget.
+   * how the daemon learns about occupants it did not spawn. In-memory upsert,
+   * because this runs once per turn per session inside a hook with a tight time
+   * budget.
+   *
+   * The one non-memory cost is `canonical_worktree_path`, which does a
+   * *synchronous* `realpathSync` on the daemon's single event loop. That is a
+   * deliberate tradeoff and not free: the right call today (a few stat()s on a
+   * warm dentry cache, versus making the whole hook path async for a gate that
+   * must not slow an agent's turn), but it is a scaling tripwire. If the daemon
+   * ever fields turns from many sessions at a high rate, or the repo root moves
+   * onto a network filesystem, this is the line to make async first.
    *
    * Never steals or modifies another owner's lease; it only creates a lease
    * where none is live, or rolls its own forward.
@@ -383,4 +420,37 @@ export class WorktreeLeaseStore {
   tracked_count(): number {
     return this.leases.size;
   }
+}
+
+/**
+ * Build the daemon's worktree lease store from config, or null when the mutex
+ * is stood down (#105).
+ *
+ * This exists as a named, exported function rather than as inline wiring in
+ * `index.ts` for one reason: **`index.ts` is not testable.** It ends in a
+ * top-level `void main()`, so importing it boots a real daemon and binds the
+ * real port — no test can touch it, and nothing in the suite does.
+ *
+ * That mattered here more than it usually would. The entire #105 store shipped
+ * once as 386 lines of fully-implemented, fully-tested dead code, because the
+ * one line that constructed it was missing from `index.ts` and no test could
+ * see the omission. Review confirmed the hole was still open: replacing the
+ * construction with `null` left all 26 lease tests green.
+ *
+ * Moving the *policy* here — the kill-switch polarity, the TTL threading, the
+ * default-on behavior of an absent `pr_cron` block — puts it under test. What
+ * necessarily stays in `index.ts` is now a single call with no decisions in it,
+ * guarded structurally by `worktree-wiring.test.ts`.
+ *
+ * Polarity note: the check is `=== false`, not a falsy test. An absent
+ * `pr_cron` block, or a present one with no `worktree_lease_enabled` key, must
+ * yield a real store — the mutex is default-on, and a machine with no `pr_cron`
+ * config at all is exactly the machine most likely to collide.
+ */
+export function make_worktree_lease_store(config: LobsterFarmConfig): WorktreeLeaseStore | null {
+  if (config.pr_cron?.worktree_lease_enabled === false) return null;
+  return new WorktreeLeaseStore(
+    config.pr_cron?.worktree_lease_ttl_ms,
+    config.pr_cron?.worktree_observed_ttl_ms,
+  );
 }

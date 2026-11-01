@@ -616,15 +616,19 @@ export class PRReviewCron {
     repo_path: string,
     branch: string,
     owner_id: string,
-  ): Promise<{ ok: true; path: string | null } | { ok: false; blocker: WorktreeBlocker }> {
-    if (!this.worktree_leases) return { ok: true, path: null };
+  ): Promise<{ ok: true; lease: WorktreeLease | null } | { ok: false; blocker: WorktreeBlocker }> {
+    if (!this.worktree_leases) return { ok: true, lease: null };
 
     const path = await this.pr_worktree_path(repo_path, branch);
-    if (!path) return { ok: true, path: null };
+    if (!path) return { ok: true, lease: null };
 
     const got = this.worktree_leases.acquire(path, "daemon-cron", owner_id);
     if (!got.ok) return { ok: false, blocker: { path, lease: got.current_lease } };
-    return { ok: true, path };
+    // Hand back the lease, not the path we asked with: `release_held` and
+    // `bind_session` then key off the string the store itself chose, so a
+    // worktree deleted mid-hold cannot make acquire and release disagree
+    // (review 🟡-7).
+    return { ok: true, lease: got.lease };
   }
 
   /**
@@ -1500,10 +1504,10 @@ export class PRReviewCron {
       await this.announce_worktree_deferral(entity_id, pr, claim.blocker, "auto-fix");
       return "deferred";
     }
-    const worktree = claim.path;
+    const worktree = claim.lease;
     const release_worktree = () => {
       if (this.worktree_leases && worktree) {
-        this.worktree_leases.release(worktree, owner_id);
+        this.worktree_leases.release_held(worktree, owner_id);
       }
     };
 
@@ -1558,7 +1562,12 @@ export class PRReviewCron {
       // its own Stop-hook turns renew this lease rather than looking like a
       // second occupant.
       if (this.worktree_leases && worktree) {
-        this.worktree_leases.bind_session(worktree, owner_id, session.session_id, session.pid);
+        this.worktree_leases.bind_session(
+          worktree.worktree_path,
+          owner_id,
+          session.session_id,
+          session.pid,
+        );
       }
       this.release_worktree_on_session_end(session.session_id, release_worktree);
       return "spawned";

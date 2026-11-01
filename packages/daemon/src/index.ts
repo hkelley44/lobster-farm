@@ -25,7 +25,7 @@ import { ClaudeSessionManager } from "./session.js";
 import type { ActiveSession, SessionResult } from "./session.js";
 import { acquire_port } from "./singleton.js";
 import { sweep_stale_worktrees } from "./worktree-cleanup.js";
-import { WorktreeLeaseStore } from "./worktree-lease.js";
+import { make_worktree_lease_store } from "./worktree-lease.js";
 
 async function main(): Promise<void> {
   // Rotate the launchd stdout/stderr log first, before we write anything, so a
@@ -355,14 +355,11 @@ async function main(): Promise<void> {
   //
   // Null when stood down via `pr_cron.worktree_lease_enabled: false` — every
   // call site is null-guarded, so off is the pre-#105 code path, not a variant
-  // of it.
-  const worktree_leases =
-    config.pr_cron?.worktree_lease_enabled === false
-      ? null
-      : new WorktreeLeaseStore(
-          config.pr_cron?.worktree_lease_ttl_ms,
-          config.pr_cron?.worktree_observed_ttl_ms,
-        );
+  // of it. The construction decision itself lives in
+  // `make_worktree_lease_store` so it can be unit-tested: this file ends in
+  // `void main()` and is therefore unreachable from any test, which is exactly
+  // how #105 shipped dead the first time.
+  const worktree_leases = make_worktree_lease_store(config);
   if (!worktree_leases) {
     console.log("[pr-cron] Worktree lease disabled via config (worktree_lease_enabled: false)");
   }
