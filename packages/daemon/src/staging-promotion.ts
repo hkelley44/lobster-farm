@@ -315,10 +315,18 @@ export interface StagingPromotionDeps {
 const GIT_TIMEOUT_MS = 60_000;
 
 async function default_fetch_origin(repo_path: string, env: GitEnv): Promise<void> {
-  await exec_async("git", ["-C", repo_path, "fetch", "origin", "--prune"], {
-    env,
-    timeout: GIT_TIMEOUT_MS,
-  });
+  // Explicit wildcard refspec rather than a bare `fetch origin`, which would
+  // honour the clone's *configured* refspec. A single-branch clone
+  // (`clone --single-branch`, as `try_local_rebase` creates) restricts that to
+  // one branch, so `refs/remotes/origin/staging` would never materialize and we
+  // would wrongly report `no_staging_branch` for a repo that does have one.
+  // Spelling the refspec out also guarantees staging's objects are local, which
+  // `merge-base --is-ancestor` needs. Harmless when staging doesn't exist.
+  await exec_async(
+    "git",
+    ["-C", repo_path, "fetch", "origin", "--prune", "+refs/heads/*:refs/remotes/origin/*"],
+    { env, timeout: GIT_TIMEOUT_MS },
+  );
 }
 
 async function default_rev_parse(

@@ -194,6 +194,24 @@ describe("staging-promotion HTTP route (#104)", () => {
     expect(origin_main(fx)).toBe(fx.staging_sha);
   });
 
+  it("PROMOTES from a single-branch clone, whose refspec excludes staging", async () => {
+    // Regression guard: a bare `git fetch origin` honours the clone's
+    // CONFIGURED refspec. Restrict it to main only — the shape
+    // `clone --single-branch` produces — and drop the staging remote-tracking
+    // ref. If the promotion fetched without an explicit refspec,
+    // refs/remotes/origin/staging would never come back and this would wrongly
+    // report no_staging_branch.
+    git(fx.clone, "config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main");
+    git(fx.clone, "update-ref", "-d", "refs/remotes/origin/staging");
+    expect(() => git(fx.clone, "rev-parse", "--verify", "refs/remotes/origin/staging")).toThrow();
+
+    const { status, json } = await post_promotion({ signoff: SIGNOFF });
+
+    expect(status).toBe(200);
+    expect(JSON.stringify(json)).toContain("promoted");
+    expect(origin_main(fx)).toBe(fx.staging_sha);
+  });
+
   it("REFUSES when another review holds the lease — and main does NOT move", async () => {
     // The daemon cron is mid-review on this PR. This is the #102 property,
     // now covering the staging path: no promote while a review is in flight.
