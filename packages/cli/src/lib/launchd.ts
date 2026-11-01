@@ -234,7 +234,11 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
       op_declared="$op_declared$op_key_name:"
       # First declaration wins — with a duplicated key that is the line a human
       # is most likely to have meant, and it keeps the report deterministic.
-      [[ -z "\${op_src_line[$op_key_name]}" ]] && op_src_line[$op_key_name]=$op_src_lineno
+      # \`:-\` is load-bearing: this lookup misses by design on every key's first
+      # declaration, and an \`env.sh\` hardened with \`set -u\` would otherwise kill
+      # the wrapper here on a *well-formed* .env.op, with no [start-daemon] tag
+      # to connect the failure to us.
+      [[ -z "\${op_src_line[$op_key_name]:-}" ]] && op_src_line[$op_key_name]=$op_src_lineno
     else
       # A line we cannot read as a declaration means our key set is incomplete,
       # which would silently reclassify real assignments as continuation lines.
@@ -292,30 +296,38 @@ if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
 
       # Inside a quoted multi-line value: accumulate until the closing quote.
       if [[ -n "$op_quote" ]]; then
-        if [[ "$op_line" == *"$op_quote" ]]; then
-          op_line="\${op_line%$op_quote}"
-          op_value+=$'\\n'"$op_line"
-          op_quote=""
-          op_flush
-          continue
-        fi
-
         # Bound the scan (#101). Unbounded, a missing closing quote consumes the
         # rest of the file: every later secret is absorbed into this value and
         # vanishes without ever being named. A line assigning a key that
         # .env.op *declares* is overwhelmingly more likely to be the next
         # assignment than secret body text, so end the value here and re-parse
         # this line. Losing one entry loudly beats losing all of them quietly.
+        #
+        # This test MUST come before the closing-quote test. Every single-line
+        # quoted declaration ends with a quote character, so testing for the
+        # close first consumed \`DISCORD_TOKEN="…"\` as this value's *closing
+        # line*: the bound never ran, the next secret was silently dropped, and
+        # the open key exported with that secret's bytes spliced into it — exit
+        # 0, no output at all. Since .env.op's own contract tells operators to
+        # quote their secrets, that was the likelier half of the bug.
         op_declared_key "$op_line"
-        if [[ -z "$op_candidate" ]]; then
+        if [[ -n "$op_candidate" ]]; then
+          op_report_unterminated "$op_key"
+          op_quote=""
+          op_key=""
+          op_value=""
+          # Fall through — this line is a fresh assignment, not continuation
+          # text. op_candidate still holds its key, recomputed harmlessly below.
+        elif [[ "$op_line" == *"$op_quote" ]]; then
+          op_line="\${op_line%$op_quote}"
+          op_value+=$'\\n'"$op_line"
+          op_quote=""
+          op_flush
+          continue
+        else
           op_value+=$'\\n'"$op_line"
           continue
         fi
-        op_report_unterminated "$op_key"
-        op_quote=""
-        op_key=""
-        op_value=""
-        # Fall through — this line is a fresh assignment, not continuation text.
       fi
 
       # Blank lines and comments neither open nor close an assignment.

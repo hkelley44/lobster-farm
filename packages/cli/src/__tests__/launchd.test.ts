@@ -260,11 +260,16 @@ interface WrapperRun {
  * injection and uses it to tell an assignment from a continuation line, so it
  * is load-bearing, not scaffolding — tests that vary it are testing real
  * behaviour. Defaults to every key the stub node reports.
+ *
+ * `env_sh_extra` is appended to the generated `env.sh`. env.sh is *sourced*, so
+ * shell options set there apply to the rest of the wrapper — which is how an
+ * operator-hardened `set -u` reaches the parser.
  */
 function run_wrapper(
   injected: string,
   declared: readonly string[] = REPORTED_KEYS,
   template?: string,
+  env_sh_extra = "",
 ): WrapperRun {
   const root = mkdtempSync(join(tmpdir(), "lf-wrapper-"));
   temp_roots.push(root);
@@ -296,7 +301,7 @@ function run_wrapper(
   chmodSync(node_stub, 0o755);
 
   // env.sh only has to put the stub `op` on PATH.
-  writeFileSync(join(lf, "env.sh"), `export PATH=${JSON.stringify(bin)}:$PATH\n`);
+  writeFileSync(join(lf, "env.sh"), `export PATH=${JSON.stringify(bin)}:$PATH\n${env_sh_extra}`);
   // The real template: op:// references, never values. The wrapper parses this
   // for its declared-key set. The stub `op` ignores it and prints `injected`.
   writeFileSync(
@@ -628,6 +633,151 @@ describe.skipIf(!zsh_available)("generate_wrapper_sh secret injection (zsh)", ()
 
       expect(stderr).toContain("unterminated quote for key 'GITHUB_APP_PRIVATE_KEY'");
       expect(status).not.toBe(0);
+    });
+
+    // Review round 5. The bound existed but ran *after* the closing-quote test,
+    // and every single-line quoted declaration ends with a quote character — so
+    // `DISCORD_TOKEN="…"` was consumed as the open value's closing line and the
+    // bound never fired. That is the worse half of the bug, not an edge case:
+    // .env.op's own contract tells operators to quote their secrets, so the
+    // quoted neighbour is the likelier shape. It also failed silently, which the
+    // unquoted shape never did — exit 0, zero output, next secret dropped, and
+    // its bytes spliced into the open key and handed to GitHub App JWT signing.
+    describe("the next declaration is itself quoted", () => {
+      const quoted_neighbour = [
+        'GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----',
+        "FAKEBODYLINE",
+        'DISCORD_TOKEN="fake-token-not-real"',
+        "TRAILING=tail",
+        "",
+      ].join("\n");
+      const keys = ["GITHUB_APP_PRIVATE_KEY", "DISCORD_TOKEN", "TRAILING"];
+
+      it("bounds the scan and aborts instead of exiting 0 in silence", () => {
+        const { stderr, status } = run_wrapper(quoted_neighbour, keys);
+
+        expect(stderr).toContain("unterminated quote for key 'GITHUB_APP_PRIVATE_KEY'");
+        // Pre-fix: exactly 0 — stderr was completely empty.
+        expect(stderr.match(/unterminated quote/g) ?? []).toHaveLength(1);
+        expect(status).not.toBe(0);
+      });
+
+      it("never splices the next secret's bytes into the open key", () => {
+        const { env } = run_wrapper(quoted_neighbour, keys);
+
+        // Pre-fix GITHUB_APP_PRIVATE_KEY was exported as the PEM head plus
+        // `DISCORD_TOKEN="fake-token-not-real`. Cross-secret contamination is
+        // the security-shaped outcome: it fails deep inside JWT signing, far
+        // from the typo. `undefined` here means node was never exec'd at all.
+        expect(env.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
+        expect(env.DISCORD_TOKEN).toBeUndefined();
+        expect(env.TRAILING).toBeUndefined();
+      });
+
+      it("keeps the abort report free of secret material", () => {
+        const { stderr } = run_wrapper(quoted_neighbour, keys);
+
+        for (const leak of ["fake-token-not-real", "FAKEBODYLINE", "BEGIN RSA PRIVATE KEY"]) {
+          expect(stderr).not.toContain(leak);
+        }
+      });
+
+      it("bounds on an empty quoted neighbour too", () => {
+        // `DISCORD_TOKEN=""` is the degenerate case: the value *is* two quote
+        // characters, so it looked even more like a closing line.
+        const injected = [
+          'GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----',
+          'DISCORD_TOKEN=""',
+          "",
+        ].join("\n");
+
+        const { stderr, status } = run_wrapper(injected, [
+          "GITHUB_APP_PRIVATE_KEY",
+          "DISCORD_TOKEN",
+        ]);
+
+        expect(stderr).toContain("unterminated quote for key 'GITHUB_APP_PRIVATE_KEY'");
+        expect(status).not.toBe(0);
+      });
+
+      it("still round-trips a well-formed PEM followed by a quoted declaration", () => {
+        // The reorder must not cost the common real-world layout: a quoted
+        // multi-line secret whose own closing line ends the value, followed by
+        // an ordinary quoted single-line secret.
+        const { env, stderr, status } = run_wrapper(
+          [
+            `GITHUB_APP_PRIVATE_KEY="${PEM}"`,
+            'DISCORD_TOKEN="fake-token-not-real"',
+            "TRAILING=tail",
+            "",
+          ].join("\n"),
+          keys,
+        );
+
+        expect(env.GITHUB_APP_PRIVATE_KEY).toBe(PEM);
+        expect(env.DISCORD_TOKEN).toBe("fake-token-not-real");
+        expect(env.TRAILING).toBe("tail");
+        expect(stderr).not.toContain("WARNING");
+        expect(stderr).not.toContain("FATAL");
+        expect(status).toBe(0);
+      });
+    });
+  });
+
+  // Review round 5. env.sh is sourced, so an operator who hardens it with
+  // `set -u` hardens the parser too. The declared-key lookup misses by design on
+  // every key's first declaration, so without a `:-` default the wrapper died
+  // there on a *well-formed* .env.op — before injection, with no [start-daemon]
+  // prefix to connect the failure to this code. MEMORY.md records that the live
+  // env.sh has been hand-edited, so this is a reachable configuration.
+  describe("an env.sh hardened with `set -u`", () => {
+    const SET_U = "set -u\n";
+
+    it("does not abort on the first declared key of a well-formed .env.op", () => {
+      const { env, stderr, status } = run_wrapper(well_formed, REPORTED_KEYS, undefined, SET_U);
+
+      // The pre-fix failure: "op_src_line[$op_key_name]: parameter not set".
+      expect(stderr).not.toContain("parameter not set");
+      expect(status).toBe(0);
+      expect(env.GITHUB_APP_PRIVATE_KEY).toBe(PEM);
+      expect(env.DISCORD_TOKEN).toBe("plain-token-value");
+    });
+
+    it("still reports an unterminated quote rather than dying first", () => {
+      // The abort path reads op_src_line again, so it needs the same guard.
+      const injected = [
+        'GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----',
+        "DISCORD_TOKEN=plain-token-value",
+        "",
+      ].join("\n");
+
+      const { stderr, status } = run_wrapper(
+        injected,
+        ["GITHUB_APP_PRIVATE_KEY", "DISCORD_TOKEN"],
+        undefined,
+        SET_U,
+      );
+
+      expect(stderr).not.toContain("parameter not set");
+      expect(stderr).toContain("unterminated quote for key 'GITHUB_APP_PRIVATE_KEY'");
+      expect(status).not.toBe(0);
+    });
+
+    it("still warns and continues on an unquoted multi-line value", () => {
+      // The degrade-gracefully paths must stay graceful under `set -u`, not turn
+      // into a hard failure with an unattributed zsh error.
+      const { env, stderr, status } = run_wrapper(
+        ["DISCORD_TOKEN=still-fine", `GITHUB_APP_PRIVATE_KEY=${PEM}`, ""].join("\n"),
+        REPORTED_KEYS,
+        undefined,
+        SET_U,
+      );
+
+      expect(stderr).not.toContain("parameter not set");
+      expect(stderr).toContain("multi-line secrets must be quoted in .env.op");
+      expect(env.DISCORD_TOKEN).toBe("still-fine");
+      expect(env.GITHUB_APP_PRIVATE_KEY).toBe("");
+      expect(status).toBe(0);
     });
   });
 
