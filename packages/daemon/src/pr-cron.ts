@@ -217,6 +217,26 @@ const TIMESTAMP_BUFFER_MS = 60_000; // 60 seconds
  */
 export const MAX_REVIEW_CYCLES = 3;
 
+/**
+ * How many times a deferred auto-fix may fail to *spawn* before the daemon
+ * gives up on it and pages a human (#105, review 🟡-6).
+ *
+ * `spawn_external_pr_fixer` returns "failed" for any throw, which conflates two
+ * very different situations: a token-refresh blip or a momentary EMFILE (retry
+ * and it works) versus something structurally broken (retrying forever just
+ * spams). Clearing the marker on the first failure — the original behavior —
+ * optimized for the second case and silently abandoned the first: `reviewed_at`
+ * is already persisted by then, so `check_repo` skips the PR on every later
+ * tick and the owed fix is gone until someone pushes a new commit. The PR sits
+ * with `changes_requested` and no builder, looking reviewed and handled. That
+ * is the "reported success while doing nothing" shape this repo keeps getting
+ * bitten by.
+ *
+ * Three attempts bounds the spam at roughly the same order as the review-cycle
+ * cap, and the give-up is loud (action_required) rather than a silent delete.
+ */
+export const MAX_DEFERRED_FIX_ATTEMPTS = 3;
+
 export class PRReviewCron {
   private timer: ReturnType<typeof setInterval> | null = null;
   private active_reviews = new Map<string, ActiveReview>(); // key: "entity:pr#"
@@ -580,13 +600,33 @@ export class PRReviewCron {
    * (three different worktree layout conventions exist; no registry does).
    *
    * Returning null when the branch lives in the repo's MAIN working tree is
-   * deliberate and load-bearing. The repo root is a shared workspace: every
-   * daemon spawn path passes it as the session cwd, and a reviewer and a fixer
-   * routinely sit in it at the same time. Leasing it would serialize pairs that
-   * coexist today and could wedge the whole review pipeline behind one stuck
-   * hold — turning a race into an outage. A *linked* worktree is the resource
-   * actually worth a mutex: branch-scoped, agent-private, full of uncommitted
-   * work that the next commit will sweep up.
+   * deliberate and load-bearing — and it is forced, not merely preferable. The
+   * repo root is a shared workspace: every daemon spawn path passes it as the
+   * session cwd, and `touch_observed` fires for every Claude session on the
+   * machine. So an *observed* lease on the root would be created and renewed
+   * essentially continuously. Leasing it would not serialize the occasional
+   * colliding pair; it would block the fixer path near-permanently. Turning a
+   * race into a standing outage is strictly worse than the race. A *linked*
+   * worktree is the resource actually worth a mutex: branch-scoped,
+   * agent-private, full of uncommitted work that the next commit will sweep up.
+   *
+   * ── ACCEPTED RESIDUAL: the main tree is not gated at all (review 🟡-4) ──
+   *
+   * This leaves a real hole, and it is wider than #105's acceptance criterion
+   * ("no second agent is spawned into a worktree that a live session is already
+   * editing") literally allows. If a PR's branch happens to be checked out *at
+   * the repo root* while a human works there, the fixer is spawned into that
+   * tree ungated — and `git checkout <branch>` succeeds rather than refusing,
+   * because the branch is already current. That is the #103 clobber, relocated
+   * to the root.
+   *
+   * It is accepted rather than fixed because the alternative above is worse,
+   * and because the common case is the one that is covered: the daemon's own
+   * feature work lives in linked worktrees by convention, which is where the
+   * actual incident happened. Do not read this gate as total. Closing the root
+   * case needs a different mechanism than a lease — most likely refusing to
+   * spawn a fixer for a branch that is checked out at the root at all, which is
+   * a behavior change worth its own issue.
    *
    * `protected` so tests can supply a path without a real git repo.
    */
@@ -663,6 +703,29 @@ export class PRReviewCron {
    * postmortem correlation. Routine rather than action_required on purpose: the
    * condition clears itself and the next cron tick retries, so it is not
    * something to page a human about.
+   *
+   * ── Why the Discord half is announced once (review 🟡-1) ──
+   *
+   * The log and the breadcrumb fire on **every** deferral, including every
+   * drain retry — the signal is never lost and a postmortem can still count the
+   * ticks. The Discord alert fires only on the **first** deferral of a given
+   * owed fix.
+   *
+   * Un-throttled, this was measured at one identical alert per tick for as long
+   * as the worktree stayed busy. The cron ticks every 5 minutes when no GitHub
+   * App is configured (which is the deployed configuration), so the #103
+   * scenario itself — a human holding a worktree for a three-hour session,
+   * renewing its observed lease on every turn — produces ~36 identical alerts
+   * for one PR. That is the opposite failure from a quiet gate and it lands in
+   * the same place: an operator who has learned to scroll past the repeated
+   * alert is an operator the gate no longer reaches. MEMORY.md already records
+   * un-throttled worktree alerts as a live problem on this platform.
+   *
+   * `fix_deferred_at` is the dedup key and it needs no new state: the completion
+   * handler persists it the moment a first deferral is recorded, so "a marker
+   * already exists" is exactly "we have already said this". It is cleared when
+   * the fix finally spawns or is abandoned, so a genuinely new deferral on a
+   * later review cycle announces again.
    */
   private async announce_worktree_deferral(
     entity_id: string,
@@ -671,6 +734,7 @@ export class PRReviewCron {
     what: string,
   ): Promise<void> {
     const { path, lease } = blocker;
+    const already_announced = this.processed[`${entity_id}:${String(pr.number)}`]?.fix_deferred_at;
     const held_by = lease.session_id ?? lease.owner_id;
     console.warn(
       `[pr-cron] ${what} DEFERRED for PR #${String(pr.number)} — worktree ${path} is held by ` +
@@ -687,13 +751,17 @@ export class PRReviewCron {
         holder: lease.holder,
         held_by,
         expires_at: lease.expires_at,
+        already_announced: already_announced != null,
       },
     });
+
+    if (already_announced) return;
+
     await this.alert_router?.post_alert({
       entity_id,
       tier: "routine",
       title: `PR #${String(pr.number)} ${what} deferred — worktree busy`,
-      body: `${pr.title} — \`${path}\` is already held by ${lease.holder} (${held_by}). Not spawning a second agent into it; will retry next cycle.`,
+      body: `${pr.title} — \`${path}\` is already held by ${lease.holder} (${held_by}). Not spawning a second agent into it; will retry every cycle until it frees up. This is announced once — see the daemon log for each retry.`,
     });
   }
 
@@ -993,47 +1061,16 @@ export class PRReviewCron {
     }
 
     if (review_state === "changes_requested") {
-      // Enforce the per-PR review-cycle cap (#46). Single-dev repos count
-      // findings-comment verdicts; multi-dev repos count formal reviews by
-      // the daemon's login. The latter mirrors today's mental model and is
-      // a strict subset of "all reviews" — we only count Reviewer's passes.
-      const cycles = await this.count_review_cycles(pr.number, repo_path, is_internal, gh_token);
-      const key = `${entity_id}:${String(pr.number)}`;
-      const already_escalated = this.processed[key]?.escalated_at_cycle != null;
-
-      if (cycles >= MAX_REVIEW_CYCLES) {
-        // Don't spawn a Builder — escalate. Persist `escalated_at_cycle` so
-        // the next cron tick sees we already alerted and stays quiet.
-        if (!already_escalated) {
-          await this.alert_router?.post_alert({
-            entity_id,
-            tier: "action_required",
-            title: `\u26a0\ufe0f PR #${String(pr.number)} hit max review cycles (${String(MAX_REVIEW_CYCLES)})`,
-            body: `${pr.title}\nVerdict: Changes Requested (cycle ${String(cycles)}/${String(MAX_REVIEW_CYCLES)})\n${pr.url}\nNeeds human pickup — paging Hunter.`,
-            embed_color: ALERT_COLOR_AMBER,
-          });
-          this.processed[key] = {
-            ...(this.processed[key] ?? {
-              entity_id,
-              pr_number: pr.number,
-              reviewed_at: new Date().toISOString(),
-              outcome: "changes_requested" as const,
-            }),
-            outcome: "changes_requested",
-            ...(verdict_source ? { verdict_source } : {}),
-            escalated_at_cycle: cycles,
-          };
-          await save_pr_reviews(this.processed, this.config);
-          console.log(
-            `[pr-cron] PR #${String(pr.number)} hit cycle cap (${String(cycles)}/${String(MAX_REVIEW_CYCLES)}) — escalated, not spawning builder`,
-          );
-        } else {
-          console.log(
-            `[pr-cron] PR #${String(pr.number)} already escalated at cycle ${String(this.processed[key]?.escalated_at_cycle)} — staying quiet`,
-          );
-        }
-        return;
-      }
+      const cycles = await this.enforce_review_cycle_cap(
+        entity_id,
+        repo_path,
+        pr,
+        is_internal,
+        gh_token,
+        verdict_source,
+      );
+      // Cap hit — escalated to a human instead of spawning a builder.
+      if (cycles === null) return;
 
       const outcome = await this.spawn_external_pr_fixer(entity_id, repo_path, pr, entity_config);
 
@@ -1046,8 +1083,16 @@ export class PRReviewCron {
         return;
       }
 
-      // Only claim we spawned a builder when we actually did.
-      if (outcome !== "spawned") return;
+      if (outcome === "failed") {
+        // Queue it too (review 🟡-6). A failed *spawn* has a different cause
+        // from a busy worktree but it drops the fix the same way: `reviewed_at`
+        // is already persisted, so with no marker nothing ever retries and the
+        // PR sits with `changes_requested` and no builder. Seed the counter at
+        // 1 so this attempt counts against MAX_DEFERRED_FIX_ATTEMPTS and the
+        // drain owns the bounded retry from here.
+        await this.mark_fix_deferred(entity_id, pr, 1);
+        return;
+      }
 
       const prefix = is_internal ? "" : `External (from @${pr.author.login}) `;
       await this.alert_router?.post_alert({
@@ -1193,8 +1238,15 @@ export class PRReviewCron {
    *
    * No reviewer sessions are spawned — this is purely a merge-retry mechanism.
    */
-  /** Persist "a fix is still owed for this PR" after a worktree deferral (#105). */
-  private async mark_fix_deferred(entity_id: string, pr: OpenPR): Promise<void> {
+  /**
+   * Persist "a fix is still owed for this PR" (#105).
+   *
+   * `failures` seeds the spawn-failure counter — passed as 1 when the marker is
+   * being written *because* a spawn failed, so that attempt counts against
+   * MAX_DEFERRED_FIX_ATTEMPTS. Omitted for an ordinary worktree deferral, which
+   * is not a failure and must retry indefinitely while the tree stays busy.
+   */
+  private async mark_fix_deferred(entity_id: string, pr: OpenPR, failures?: number): Promise<void> {
     const key = `${entity_id}:${String(pr.number)}`;
     this.processed[key] = {
       ...(this.processed[key] ?? {
@@ -1204,8 +1256,81 @@ export class PRReviewCron {
         outcome: "changes_requested" as const,
       }),
       fix_deferred_at: new Date().toISOString(),
+      ...(failures != null ? { fix_deferred_failures: failures } : {}),
     };
     await save_pr_reviews(this.processed, this.config);
+  }
+
+  /**
+   * Enforce the per-PR review→fix cycle cap (#46). Returns the current cycle
+   * count, or null when the cap is hit — in which case a human has been paged
+   * and the caller must NOT spawn a builder.
+   *
+   * Single-dev repos count findings-comment verdicts; multi-dev repos count
+   * formal reviews by the daemon's login. The latter mirrors today's mental
+   * model and is a strict subset of "all reviews" — we only count Reviewer's
+   * passes.
+   *
+   * ── Why this is a shared helper (review 🟡-3) ──
+   *
+   * There are **two** entry points into `spawn_external_pr_fixer`: review
+   * completion and the deferred-fix drain. The cap used to be checked only in
+   * the first, so a PR deferred at cycle 2/3 whose count then advanced to 3/3 —
+   * a manual Discord review or a webhook-triggered reviewer landing in between,
+   * which MEMORY.md records as a real race on this repo (#67, #86) — would get
+   * a fourth fix builder from the drain, bypassing the escalation that should
+   * have paged a human.
+   *
+   * This is the same "second entry point into the spawn" class as the draft-flag
+   * gap. That instance was caught during implementation; this one was not. The
+   * fix is a shared helper rather than a second copy of the check, so the class
+   * closes instead of one more instance of it.
+   *
+   * Escalation itself is announced once: `escalated_at_cycle` is persisted on
+   * the first cap hit and suppresses the alert thereafter.
+   */
+  private async enforce_review_cycle_cap(
+    entity_id: string,
+    repo_path: string,
+    pr: OpenPR,
+    is_internal: boolean,
+    gh_token?: string,
+    verdict_source?: ReviewOutcomeSource,
+  ): Promise<number | null> {
+    const cycles = await this.count_review_cycles(pr.number, repo_path, is_internal, gh_token);
+    if (cycles < MAX_REVIEW_CYCLES) return cycles;
+
+    const key = `${entity_id}:${String(pr.number)}`;
+    if (this.processed[key]?.escalated_at_cycle != null) {
+      console.log(
+        `[pr-cron] PR #${String(pr.number)} already escalated at cycle ${String(this.processed[key]?.escalated_at_cycle)} — staying quiet`,
+      );
+      return null;
+    }
+
+    await this.alert_router?.post_alert({
+      entity_id,
+      tier: "action_required",
+      title: `⚠️ PR #${String(pr.number)} hit max review cycles (${String(MAX_REVIEW_CYCLES)})`,
+      body: `${pr.title}\nVerdict: Changes Requested (cycle ${String(cycles)}/${String(MAX_REVIEW_CYCLES)})\n${pr.url}\nNeeds human pickup — paging Hunter.`,
+      embed_color: ALERT_COLOR_AMBER,
+    });
+    this.processed[key] = {
+      ...(this.processed[key] ?? {
+        entity_id,
+        pr_number: pr.number,
+        reviewed_at: new Date().toISOString(),
+        outcome: "changes_requested" as const,
+      }),
+      outcome: "changes_requested",
+      ...(verdict_source ? { verdict_source } : {}),
+      escalated_at_cycle: cycles,
+    };
+    await save_pr_reviews(this.processed, this.config);
+    console.log(
+      `[pr-cron] PR #${String(pr.number)} hit cycle cap (${String(cycles)}/${String(MAX_REVIEW_CYCLES)}) — escalated, not spawning builder`,
+    );
+    return null;
   }
 
   /**
@@ -1219,10 +1344,13 @@ export class PRReviewCron {
    * Three outcomes per PR:
    *   - spawned → clear the marker; the fix is now in flight.
    *   - deferred → leave the marker; the worktree is still busy, try next tick.
-   *   - failed   → clear the marker. The spawn itself broke (already logged and
-   *     sent to Sentry), which is not a worktree-contention problem; retrying it
-   *     every five minutes forever would just spam. A genuinely owed fix comes
-   *     back on the next push via the normal freshness path.
+   *   - failed   → count it and leave the marker, up to
+   *     MAX_DEFERRED_FIX_ATTEMPTS, then clear it and page a human. See that
+   *     constant for why clearing on the *first* failure was wrong.
+   *
+   * The drain re-checks the review-cycle cap before every spawn (review 🟡-3) —
+   * it is a full second entry point into `spawn_external_pr_fixer` and the cap
+   * is not the caller's business to remember. See `enforce_review_cycle_cap`.
    *
    * PRs whose marker is stale because the PR closed are reaped by `check_repo`'s
    * existing "remove processed PRs that are no longer open" sweep, so the queue
@@ -1234,6 +1362,11 @@ export class PRReviewCron {
     prs: OpenPR[],
     entity_config: EntityConfig,
   ): Promise<void> {
+    // Resolved lazily: the overwhelming majority of ticks have an empty queue
+    // and must not pay for a token round-trip.
+    let gh_token: string | undefined;
+    let token_resolved = false;
+
     for (const pr of prs) {
       const key = `${entity_id}:${String(pr.number)}`;
       if (!this.processed[key]?.fix_deferred_at) continue;
@@ -1253,27 +1386,94 @@ export class PRReviewCron {
         continue;
       }
 
+      // Re-check the cycle cap here, not only at review completion (🟡-3). The
+      // count can have advanced since the deferral — a manual or webhook review
+      // landing in between — and spawning a fourth builder would bypass the
+      // escalation that should page a human instead.
+      if (!token_resolved) {
+        gh_token = await this.resolve_entity_token(entity_config);
+        token_resolved = true;
+      }
+      const github_user = entity_config.entity.accounts?.github?.user;
+      const is_internal = github_user != null && pr.author.login === github_user;
+      const cycles = await this.enforce_review_cycle_cap(
+        entity_id,
+        repo_path,
+        pr,
+        is_internal,
+        gh_token,
+      );
+      if (cycles === null) {
+        // Escalated. No builder is coming, so stop carrying the marker —
+        // leaving it would re-run this cap check (a gh round-trip) every tick
+        // forever. The escalation alert is the handoff.
+        await this.clear_fix_deferred(key);
+        console.log(
+          `[pr-cron] PR #${String(pr.number)} hit the cycle cap while its fix was deferred — dropping the queue entry, human has been paged`,
+        );
+        continue;
+      }
+
       console.log(
         `[pr-cron] Retrying deferred auto-fix for PR #${String(pr.number)} in ${entity_id}`,
       );
       const outcome = await this.spawn_external_pr_fixer(entity_id, repo_path, pr, entity_config);
+
+      // Still busy. Hold the marker and try again next tick — a deferral is not
+      // a failure and must not count against the spawn-failure budget.
       if (outcome === "deferred") continue;
 
-      const entry = this.processed[key];
-      if (entry) {
-        delete entry.fix_deferred_at;
-        await save_pr_reviews(this.processed, this.config);
-      }
-
       if (outcome === "spawned") {
+        await this.clear_fix_deferred(key);
         await this.alert_router?.post_alert({
           entity_id,
           tier: "routine",
           title: `PR #${String(pr.number)} auto-fix resumed`,
           body: `${pr.title} — worktree freed up, builder spawned to fix.`,
         });
+        continue;
       }
+
+      // The spawn itself broke (already logged and sent to Sentry by
+      // `spawn_external_pr_fixer`). Bounded retry: a token-refresh blip or a
+      // momentary EMFILE recovers on the next tick; only a persistent failure
+      // gives up, and it gives up loudly (🟡-6).
+      const entry = this.processed[key];
+      if (!entry) continue;
+      const failures = (entry.fix_deferred_failures ?? 0) + 1;
+
+      if (failures < MAX_DEFERRED_FIX_ATTEMPTS) {
+        entry.fix_deferred_failures = failures;
+        await save_pr_reviews(this.processed, this.config);
+        console.warn(
+          `[pr-cron] Deferred auto-fix for PR #${String(pr.number)} failed to spawn ` +
+            `(attempt ${String(failures)}/${String(MAX_DEFERRED_FIX_ATTEMPTS)}) — retrying next cycle`,
+        );
+        continue;
+      }
+
+      await this.clear_fix_deferred(key);
+      console.error(
+        `[pr-cron] Giving up on the deferred auto-fix for PR #${String(pr.number)} after ` +
+          `${String(failures)} failed spawns — escalating`,
+      );
+      await this.alert_router?.post_alert({
+        entity_id,
+        tier: "action_required",
+        title: `⚠️ PR #${String(pr.number)} auto-fix abandoned — builder would not spawn`,
+        body: `${pr.title}\nThe deferred auto-fix failed to spawn ${String(failures)} times (see Sentry for the cause) and is no longer queued.\n${pr.url}\nNeeds human pickup — the PR still has changes requested and no builder.`,
+        embed_color: ALERT_COLOR_AMBER,
+      });
     }
+  }
+
+  /** Drop a deferred-fix queue entry and its failure counter together (#105). */
+  private async clear_fix_deferred(key: string): Promise<void> {
+    const entry = this.processed[key];
+    if (!entry) return;
+    delete entry.fix_deferred_at;
+    delete entry.fix_deferred_failures;
+    await save_pr_reviews(this.processed, this.config);
   }
 
   private async retry_approved_unmerged(

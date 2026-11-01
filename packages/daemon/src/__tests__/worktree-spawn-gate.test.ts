@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { EntityConfigSchema, LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { PRReviewCron } from "../pr-cron.js";
+import { MAX_DEFERRED_FIX_ATTEMPTS, MAX_REVIEW_CYCLES, PRReviewCron } from "../pr-cron.js";
 import type { EntityRegistry } from "../registry.js";
 import { start_server } from "../server.js";
 import { WorktreeLeaseStore } from "../worktree-lease.js";
@@ -109,6 +109,11 @@ class TestCron extends PRReviewCron {
   alerts: Array<{ title: string; body: string }> = [];
   /** Set null to model "this branch lives in the main working tree". */
   worktree_for_branch: string | null = WORKTREE;
+  /**
+   * Review cycles the cap check will see. Settable so a test can model another
+   * reviewer advancing the count *between* a deferral and its drain.
+   */
+  review_cycles = 1;
 
   constructor(leases: WorktreeLeaseStore | null) {
     // `this` is unavailable until super() returns, so the collaborators close
@@ -139,10 +144,10 @@ class TestCron extends PRReviewCron {
     session_manager.spawn = this.spawn_spy;
     this.alerts = sink;
 
-    // Deterministic cycle count so the cap branch (#46) never fires and we
-    // don't need to stub `gh`. Same idiom as pr-cron.test.ts.
+    // Deterministic cycle count so the cap branch (#46) fires only when a test
+    // asks for it, and we don't need to stub `gh`. Same idiom as pr-cron.test.ts.
     (this as unknown as Record<string, unknown>).count_review_cycles = vi.fn(() =>
-      Promise.resolve(1),
+      Promise.resolve(this.review_cycles),
     );
   }
 
@@ -195,25 +200,46 @@ class TestCron extends PRReviewCron {
   }
 
   /** The persisted review-state map, for asserting the deferral marker. */
-  state(): Record<string, { fix_deferred_at?: string }> {
-    return (this as unknown as { processed: Record<string, { fix_deferred_at?: string }> })
-      .processed;
+  state(): Record<string, { fix_deferred_at?: string; fix_deferred_failures?: number }> {
+    return (
+      this as unknown as {
+        processed: Record<string, { fix_deferred_at?: string; fix_deferred_failures?: number }>;
+      }
+    ).processed;
+  }
+
+  /** Our PR's persisted entry, or undefined. */
+  entry(): { fix_deferred_at?: string; fix_deferred_failures?: number } | undefined {
+    return this.state()["lobster-farm:103"];
+  }
+
+  /** Discord alerts whose title contains `needle`. */
+  alerts_matching(needle: string): Array<{ title: string; body: string }> {
+    return this.alerts.filter((a) => a.title.includes(needle));
   }
 }
 
 describe("#105 auto-fix loop must not spawn into an occupied worktree", () => {
   let warn_spy: ReturnType<typeof vi.spyOn>;
   let log_spy: ReturnType<typeof vi.spyOn>;
+  let error_spy: ReturnType<typeof vi.spyOn>;
+
+  /** How many times the per-deferral warn log fired — the un-throttled signal. */
+  function deferral_warnings(): number {
+    return warn_spy.mock.calls.filter((c) => String(c[0]).includes("DEFERRED for PR #103")).length;
+  }
 
   beforeEach(() => {
     STATE_ROOT = mkdtempSync(join(tmpdir(), "lf-worktree-gate-"));
     warn_spy = vi.spyOn(console, "warn").mockImplementation(() => {});
     log_spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    error_spy = vi.spyOn(console, "error").mockImplementation(() => {});
   });
 
   afterEach(() => {
     warn_spy.mockRestore();
     log_spy.mockRestore();
+    error_spy.mockRestore();
     vi.restoreAllMocks();
     rmSync(STATE_ROOT, { recursive: true, force: true });
   });
@@ -363,6 +389,189 @@ describe("#105 auto-fix loop must not spawn into an occupied worktree", () => {
     // ...and the next attempt can proceed.
     cron.spawn_spy.mockResolvedValue({ session_id: "sess-retry", pid: process.pid });
     expect(await cron.spawn_fixer(make_pr())).toBe("spawned");
+  });
+
+  // ── Alert throttling: an ignored alert is a quiet gate (review 🟡-1) ──
+
+  it("announces a deferral once, not once per tick, while the worktree stays busy", async () => {
+    const leases = new WorktreeLeaseStore();
+    const cron = new TestCron(leases);
+    const pr = make_pr();
+
+    // The #103 situation: a human holds the tree for a long session, renewing
+    // its observed lease, and the cron ticks every 5 minutes underneath.
+    leases.touch_observed(WORKTREE, "sess-human-builder");
+    await cron.complete_review_with_changes(pr);
+    for (let tick = 0; tick < 5; tick++) await cron.drain([pr]);
+
+    // Six deferrals happened and all six are in the log...
+    expect(deferral_warnings()).toBe(6);
+    // ...but Discord was told once. Un-throttled this was measured at one
+    // identical alert per tick — ~36 for a three-hour hold.
+    expect(cron.alerts_matching("deferred")).toHaveLength(1);
+    // The alert says it will keep retrying, so "once" is not misleading.
+    expect(cron.alerts_matching("deferred")[0]?.body).toContain("announced once");
+
+    // Throttling the alert must not have quietened the gate itself.
+    expect(cron.spawn_spy).not.toHaveBeenCalled();
+    expect(cron.entry()?.fix_deferred_at).toBeTruthy();
+  });
+
+  it("announces again for a genuinely new deferral after the queue clears", async () => {
+    const leases = new WorktreeLeaseStore();
+    const cron = new TestCron(leases);
+    const pr = make_pr();
+
+    // Deferral 1 → announced, then drained successfully (marker clears).
+    leases.touch_observed(WORKTREE, "sess-human-builder");
+    await cron.complete_review_with_changes(pr);
+    leases.release(WORKTREE, "sess-human-builder");
+    await cron.drain([pr]);
+    expect(cron.entry()?.fix_deferred_at).toBeUndefined();
+    expect(cron.alerts_matching("deferred")).toHaveLength(1);
+
+    // A later review cycle defers again. This is new information, not a repeat,
+    // so the throttle must not swallow it.
+    leases.touch_observed(WORKTREE, "sess-another-agent");
+    await cron.complete_review_with_changes(pr);
+    expect(cron.alerts_matching("deferred")).toHaveLength(2);
+  });
+
+  // ── The drain is a full second entry point (review 🟡-3) ──
+
+  it("does not spawn past the cycle cap when the count advances during a deferral", async () => {
+    const leases = new WorktreeLeaseStore();
+    const cron = new TestCron(leases);
+    const pr = make_pr();
+
+    // Deferred at cycle 1/3 because the tree was busy.
+    leases.touch_observed(WORKTREE, "sess-human-builder");
+    await cron.complete_review_with_changes(pr);
+    expect(cron.entry()?.fix_deferred_at).toBeTruthy();
+
+    // A manual Discord review or a webhook-triggered reviewer lands in between
+    // and takes the PR to the cap. MEMORY.md records this race as real (#67, #86).
+    cron.review_cycles = MAX_REVIEW_CYCLES;
+    leases.release(WORKTREE, "sess-human-builder");
+
+    await cron.drain([pr]);
+
+    // No fourth builder. The cap check lives in a helper both entry points
+    // call, so the drain cannot skip it.
+    expect(cron.spawn_spy).not.toHaveBeenCalled();
+    expect(cron.alerts_matching("hit max review cycles")).toHaveLength(1);
+    // No builder is coming, so the queue entry is dropped rather than re-running
+    // a gh round-trip every tick forever. The escalation is the handoff.
+    expect(cron.entry()?.fix_deferred_at).toBeUndefined();
+  });
+
+  it("still drains normally when the cycle count is below the cap", async () => {
+    // Counterpart: the cap check must not have become a blanket block on the
+    // drain, which would strand every deferred fix.
+    const leases = new WorktreeLeaseStore();
+    const cron = new TestCron(leases);
+    const pr = make_pr();
+
+    leases.touch_observed(WORKTREE, "sess-human-builder");
+    await cron.complete_review_with_changes(pr);
+    leases.release(WORKTREE, "sess-human-builder");
+    cron.review_cycles = MAX_REVIEW_CYCLES - 1;
+
+    await cron.drain([pr]);
+
+    expect(cron.spawn_spy).toHaveBeenCalledTimes(1);
+    expect(cron.alerts_matching("hit max review cycles")).toHaveLength(0);
+    expect(cron.entry()?.fix_deferred_at).toBeUndefined();
+  });
+
+  // ── A transient spawn failure must not drop the owed fix (review 🟡-6) ──
+
+  it("retries a transient spawn failure instead of abandoning the fix", async () => {
+    const leases = new WorktreeLeaseStore();
+    const cron = new TestCron(leases);
+    const pr = make_pr();
+
+    leases.touch_observed(WORKTREE, "sess-human-builder");
+    await cron.complete_review_with_changes(pr);
+    leases.release(WORKTREE, "sess-human-builder");
+
+    // A token refresh blips on the drain tick.
+    cron.spawn_spy.mockRejectedValueOnce(new Error("token refresh failed"));
+    await cron.drain([pr]);
+
+    // The fix is STILL OWED. Clearing the marker here is what made a blip
+    // permanent: `reviewed_at` is persisted, so check_repo skips the PR and the
+    // fix is gone until someone pushes — a silent drop dressed as a review.
+    expect(cron.entry()?.fix_deferred_at).toBeTruthy();
+    expect(cron.entry()?.fix_deferred_failures).toBe(1);
+    expect(cron.alerts_matching("abandoned")).toHaveLength(0);
+
+    // Next tick, the blip is over.
+    await cron.drain([pr]);
+    expect(cron.spawn_spy).toHaveBeenCalledTimes(2);
+    expect(cron.entry()?.fix_deferred_at).toBeUndefined();
+    expect(cron.entry()?.fix_deferred_failures).toBeUndefined();
+    expect(cron.alerts_matching("auto-fix resumed")).toHaveLength(1);
+  });
+
+  it("gives up loudly, not silently, after a persistent spawn failure", async () => {
+    const leases = new WorktreeLeaseStore();
+    const cron = new TestCron(leases);
+    const pr = make_pr();
+
+    leases.touch_observed(WORKTREE, "sess-human-builder");
+    await cron.complete_review_with_changes(pr);
+    leases.release(WORKTREE, "sess-human-builder");
+    cron.spawn_spy.mockRejectedValue(new Error("persistently broken"));
+
+    for (let tick = 0; tick < MAX_DEFERRED_FIX_ATTEMPTS; tick++) await cron.drain([pr]);
+
+    expect(cron.spawn_spy).toHaveBeenCalledTimes(MAX_DEFERRED_FIX_ATTEMPTS);
+    expect(cron.entry()?.fix_deferred_at).toBeUndefined();
+    // Loud: a human is paged. The original behavior left only a Sentry event.
+    expect(cron.alerts_matching("auto-fix abandoned")).toHaveLength(1);
+
+    // ...and it genuinely stops, rather than retrying every five minutes.
+    await cron.drain([pr]);
+    expect(cron.spawn_spy).toHaveBeenCalledTimes(MAX_DEFERRED_FIX_ATTEMPTS);
+    expect(cron.alerts_matching("auto-fix abandoned")).toHaveLength(1);
+  });
+
+  it("a worktree deferral never counts against the spawn-failure budget", async () => {
+    // Otherwise a long human hold would exhaust the budget and abandon a fix
+    // that never actually failed to spawn.
+    const leases = new WorktreeLeaseStore();
+    const cron = new TestCron(leases);
+    const pr = make_pr();
+
+    leases.touch_observed(WORKTREE, "sess-human-builder");
+    await cron.complete_review_with_changes(pr);
+    for (let tick = 0; tick < MAX_DEFERRED_FIX_ATTEMPTS + 3; tick++) await cron.drain([pr]);
+
+    expect(cron.entry()?.fix_deferred_at).toBeTruthy();
+    expect(cron.entry()?.fix_deferred_failures).toBeUndefined();
+    expect(cron.alerts_matching("auto-fix abandoned")).toHaveLength(0);
+  });
+
+  it("queues a fix whose spawn failed at review completion", async () => {
+    // The same drop, at the OTHER entry point: on a failed spawn the completion
+    // handler used to just return, and `reviewed_at` was already persisted.
+    const leases = new WorktreeLeaseStore();
+    const cron = new TestCron(leases);
+    const pr = make_pr();
+
+    cron.spawn_spy.mockRejectedValueOnce(new Error("EMFILE"));
+    await cron.complete_review_with_changes(pr);
+
+    expect(cron.entry()?.fix_deferred_at).toBeTruthy();
+    expect(cron.entry()?.fix_deferred_failures).toBe(1);
+    // It did not claim to have spawned a builder.
+    expect(cron.alerts.some((a) => a.body.includes("spawning builder"))).toBe(false);
+
+    // And the drain owns it from here.
+    await cron.drain([pr]);
+    expect(cron.spawn_spy).toHaveBeenCalledTimes(2);
+    expect(cron.entry()?.fix_deferred_at).toBeUndefined();
   });
 
   // ── Flag-OFF / no-store parity ──
