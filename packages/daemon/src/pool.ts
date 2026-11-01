@@ -2308,9 +2308,23 @@ export class BotPool extends EventEmitter {
    * and the bot's metadata is snapshotted before the async Haiku call is
    * launched. This lets callers fire-and-forget — the lifecycle transition
    * (kill tmux, null fields, persist) proceeds immediately and is never
-   * blocked on the up-to-30s `claude -p` round-trip. Best-effort: a failed
-   * extraction is logged, never thrown. Returns a promise so tests can await
-   * the launched work; production callers ignore it.
+   * blocked on the `claude -p` round-trip.
+   *
+   * Nothing in the daemon waits on the result: every call site is `void`ed,
+   * and the shutdown drain's `has_active_work()` inspects bot state only, so
+   * it has no knowledge of extraction. That is what makes the generous
+   * `EXTRACTION_TIMEOUT_MS` (hooks.ts) affordable.
+   *
+   * It is NOT, however, a bound on the child's lifetime. The timeout is
+   * enforced by a `setTimeout` in this process, so it does not survive the
+   * daemon exiting, and an extraction in flight at shutdown is reaped by
+   * launchd's process-group kill rather than by anything here. See the
+   * "timeout does NOT survive the daemon exiting" section of
+   * `run_claude_print` in claude-cli.ts before changing the budget, the plist,
+   * or this comment — the reasoning depends on facts recorded only there.
+   *
+   * Best-effort: a failed extraction is logged, never thrown. Returns a
+   * promise so tests can await the launched work; production callers ignore it.
    */
   protected extract_on_session_end(bot: PoolBot): Promise<void> {
     // Exactly-once gate, checked synchronously while the bot is still in the

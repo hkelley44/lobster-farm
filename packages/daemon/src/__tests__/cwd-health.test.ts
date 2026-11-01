@@ -10,9 +10,9 @@ const mock_exec_file_sync = vi.fn();
 
 vi.mock("node:child_process", () => ({
   execFileSync: (...args: unknown[]) => mock_exec_file_sync(...args),
+  // pool.ts transitively imports hooks.ts → claude-cli.ts (spawn) and uses
+  // execFile itself. cwd-health never triggers either, so stubs suffice.
   spawn: vi.fn(),
-  // pool.ts transitively imports hooks.ts, which does promisify(execFile) at
-  // module load. cwd-health never triggers extraction, so a stub suffices.
   execFile: vi.fn(),
 }));
 

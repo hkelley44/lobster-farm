@@ -7,9 +7,13 @@
  * post-mortem recovery from a crashed daemon — and *not* once per
  * assistant turn (which would happen if the Stop hook were the venue).
  *
- * We mock `execFile` so the test never actually shells out to `claude -p`;
- * each call to the real `extract_session_learnings` returns a deterministic
- * stdout that we check landed in the daily log.
+ * We mock `run_claude_print` (the daemon's single headless `claude -p` entry
+ * point, claude-cli.ts) so the test never shells out; each call to the real
+ * `extract_session_learnings` returns a deterministic summary that we check
+ * landed in the daily log. The spawn/stdin contract of `run_claude_print`
+ * itself — including the issue-#79 "stdin must be closed" invariant — is
+ * covered against real child processes in claude-cli.test.ts and
+ * hooks-extraction-stdin.test.ts.
  */
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -19,30 +23,21 @@ import { LobsterFarmConfigSchema, entity_daily_dir } from "@lobster-farm/shared"
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Stub `child_process.execFile` so `extract_session_learnings` (which goes
-// through promisify(execFile)) resolves with a canned Haiku summary and
-// NEVER actually spawns a real `claude` binary. Defined as a hoisted ref
-// so `vi.mock` can capture it before the module-under-test loads.
-const { execFile_mock } = vi.hoisted(() => {
-  // The promisified form passes `(cmd, args, opts, cb)` — we pull the
-  // callback off the end and invoke it asynchronously.
-  const mock = vi.fn(
-    (
-      _cmd: string,
-      _args: readonly string[],
-      _opts: unknown,
-      cb: (err: Error | null, result: { stdout: string; stderr: string }) => void,
-    ) => {
-      // simulate a successful Haiku summary
-      setImmediate(() => cb(null, { stdout: "- did things\n- learned stuff", stderr: "" }));
-    },
-  );
-  return { execFile_mock: mock };
-});
+// Stub `run_claude_print` so `extract_session_learnings` resolves with a canned
+// Haiku summary and NEVER actually spawns a real `claude` binary. Defined as a
+// hoisted ref so `vi.mock` can capture it before the module-under-test loads.
+//
+// Signature mirrors the real one: (bin, args, input, timeout_ms) -> stdout.
+// `input` is the prompt — it travels over stdin, never as an argv element.
+const { run_claude_print_mock } = vi.hoisted(() => ({
+  run_claude_print_mock: vi.fn<
+    (bin: string, args: readonly string[], input: string, timeout_ms: number) => Promise<string>
+  >(async () => "- did things\n- learned stuff"),
+}));
 
-vi.mock("node:child_process", async () => {
-  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
-  return { ...actual, execFile: execFile_mock };
+vi.mock("../claude-cli.js", async () => {
+  const actual = await vi.importActual<typeof import("../claude-cli.js")>("../claude-cli.js");
+  return { ...actual, run_claude_print: run_claude_print_mock };
 });
 
 // Mock session transcript resolution so tests control which JSONL (if any)
@@ -238,7 +233,8 @@ describe("pool session-end extraction (#43)", () => {
     temp_dir = await mkdtemp(join(tmpdir(), "pool-session-end-"));
     config = make_config();
     pool = new TestPool(config);
-    execFile_mock.mockClear();
+    run_claude_print_mock.mockReset();
+    run_claude_print_mock.mockImplementation(async () => "- did things\n- learned stuff");
 
     // Default: every session resolves to a real transcript fixture on disk, so
     // the Haiku-path tests below exercise the full read → prompt → summary flow.
@@ -274,7 +270,7 @@ describe("pool session-end extraction (#43)", () => {
     await pool.test_park(bot);
 
     // Haiku invocation fires exactly once.
-    expect(execFile_mock).toHaveBeenCalledTimes(1);
+    expect(run_claude_print_mock).toHaveBeenCalledTimes(1);
 
     // The bot is now parked (not assigned).
     expect(bot.state).toBe("parked");
@@ -300,7 +296,7 @@ describe("pool session-end extraction (#43)", () => {
     // After post-mortem, the recovery code immediately flips to parked.
     bot.state = "parked";
 
-    expect(execFile_mock).toHaveBeenCalledTimes(1);
+    expect(run_claude_print_mock).toHaveBeenCalledTimes(1);
     const entries = await read_daily_entries("test-entity", config);
     expect(entries).toHaveLength(1);
   });
@@ -319,7 +315,7 @@ describe("pool session-end extraction (#43)", () => {
     }
     await pool.test_park(bot);
 
-    expect(execFile_mock).toHaveBeenCalledTimes(1);
+    expect(run_claude_print_mock).toHaveBeenCalledTimes(1);
     const entries = await read_daily_entries("test-entity", config);
     expect(entries).toHaveLength(1);
   });
@@ -338,7 +334,7 @@ describe("pool session-end extraction (#43)", () => {
     bot.last_active = new Date();
     await pool.test_park(bot);
 
-    expect(execFile_mock).toHaveBeenCalledTimes(1);
+    expect(run_claude_print_mock).toHaveBeenCalledTimes(1);
     const entries = await read_daily_entries("test-entity", config);
     expect(entries).toHaveLength(1);
   });
@@ -351,11 +347,11 @@ describe("pool session-end extraction (#43)", () => {
     pool.inject_bots([bot]);
 
     await pool.test_park(bot);
-    expect(execFile_mock).toHaveBeenCalledTimes(1);
+    expect(run_claude_print_mock).toHaveBeenCalledTimes(1);
 
     // bot is now `parked`. Call the helper again — must be a no-op.
     await pool.test_extract(bot);
-    expect(execFile_mock).toHaveBeenCalledTimes(1);
+    expect(run_claude_print_mock).toHaveBeenCalledTimes(1);
   });
 
   it("missing entity/archetype: helper bails silently without writing a log", async () => {
@@ -366,18 +362,16 @@ describe("pool session-end extraction (#43)", () => {
     pool.inject_bots([bot]);
 
     await pool.test_extract(bot);
-    expect(execFile_mock).not.toHaveBeenCalled();
+    expect(run_claude_print_mock).not.toHaveBeenCalled();
 
     const entries = await read_daily_entries("test-entity", config);
     expect(entries).toHaveLength(0);
   });
 
   it("Haiku failure: extraction is best-effort — daily log gets a marker entry", async () => {
-    // `extract_session_learnings` swallows execFile errors and writes a
+    // `extract_session_learnings` swallows `claude -p` errors and writes a
     // fallback marker entry. Verify that contract holds end-to-end.
-    execFile_mock.mockImplementationOnce((_cmd, _args, _opts, cb: (err: Error | null) => void) => {
-      setImmediate(() => cb(new Error("haiku unavailable")));
-    });
+    run_claude_print_mock.mockRejectedValueOnce(new Error("haiku unavailable"));
 
     const bot = assigned_bot(7);
     pool.inject_bots([bot]);
@@ -397,7 +391,7 @@ describe("pool session-end extraction (#43)", () => {
 
     await pool.test_release(bot.channel_id as string);
 
-    expect(execFile_mock).toHaveBeenCalledTimes(1);
+    expect(run_claude_print_mock).toHaveBeenCalledTimes(1);
     // release() frees the bot and clears its session metadata.
     expect(bot.state).toBe("free");
     expect(bot.channel_id).toBeNull();
@@ -420,7 +414,7 @@ describe("pool session-end extraction (#43)", () => {
     await Promise.all([pool.release(channel_id), pool.release(channel_id)]);
     await pool.flush_extractions();
 
-    expect(execFile_mock).toHaveBeenCalledTimes(1);
+    expect(run_claude_print_mock).toHaveBeenCalledTimes(1);
     expect(bot.state).toBe("free");
     const entries = await read_daily_entries("test-entity", config);
     expect(entries).toHaveLength(1);
@@ -440,10 +434,24 @@ describe("pool session-end extraction (#43)", () => {
 
     await pool.test_park(bot);
 
-    expect(execFile_mock).toHaveBeenCalledTimes(1);
-    // execFile is called as (cmd, args, opts, cb). The prompt is the last arg.
-    const args = execFile_mock.mock.calls[0]?.[1] as string[];
-    const prompt = args[args.length - 1] as string;
+    expect(run_claude_print_mock).toHaveBeenCalledTimes(1);
+    // run_claude_print(bin, args, input, timeout_ms) — the prompt is `input`,
+    // i.e. the stdin payload. It must NOT appear in argv (issue #79).
+    const [, args, prompt] = run_claude_print_mock.mock.calls[0] as [
+      string,
+      readonly string[],
+      string,
+      number,
+    ];
+    // NOT the #79 regression guard, despite how it reads. `args` is a
+    // 5-element flag array and `prompt` is a ~13KB multi-line string, so this
+    // comparison can essentially never fail and carries no signal. It is kept
+    // only as documentation of the calling convention. The real guard drives
+    // the actual `spawn` path against a fake CLI in
+    // `hooks-extraction-stdin.test.ts` ("delivers the prompt over stdin, not
+    // as an argv element") — a mocked `run_claude_print` cannot catch a
+    // stdin-lifecycle bug, which is how #79 survived at this call site.
+    expect(args).not.toContain(prompt);
     expect(prompt).toContain(marker);
     expect(prompt).toContain("SESSION TRANSCRIPT");
     // tool_use / user lines must NOT leak into the prompt — only assistant text.
@@ -462,7 +470,7 @@ describe("pool session-end extraction (#43)", () => {
     await pool.test_park(bot);
 
     // No Haiku call, no file lookup.
-    expect(execFile_mock).not.toHaveBeenCalled();
+    expect(run_claude_print_mock).not.toHaveBeenCalled();
     expect(find_session_file_mock).not.toHaveBeenCalled();
 
     const entries = await read_daily_entries("test-entity", config);
@@ -480,7 +488,7 @@ describe("pool session-end extraction (#43)", () => {
 
     await pool.test_park(bot);
 
-    expect(execFile_mock).not.toHaveBeenCalled();
+    expect(run_claude_print_mock).not.toHaveBeenCalled();
     const entries = await read_daily_entries("test-entity", config);
     expect(entries).toHaveLength(1);
     expect(entries[0]).toContain("no transcript to summarize");
@@ -491,15 +499,11 @@ describe("pool session-end extraction (#43)", () => {
     // killed) without waiting on the slow `claude -p` call. Gate a manual
     // resolver so the Haiku call is still pending when we assert.
     let release_haiku: (() => void) | undefined;
-    execFile_mock.mockImplementationOnce(
-      (
-        _cmd,
-        _args,
-        _opts,
-        cb: (err: Error | null, r: { stdout: string; stderr: string }) => void,
-      ) => {
-        release_haiku = () => cb(null, { stdout: "- slow summary", stderr: "" });
-      },
+    run_claude_print_mock.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          release_haiku = () => resolve("- slow summary");
+        }),
     );
 
     const bot = assigned_bot(8);
@@ -514,7 +518,7 @@ describe("pool session-end extraction (#43)", () => {
     // Extraction now does an async transcript read before the Haiku call, so
     // let pending IO/microtasks drain (without resolving the gated Haiku cb)
     // until the `claude -p` invocation is reached but still in flight.
-    await vi.waitFor(() => expect(execFile_mock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(run_claude_print_mock).toHaveBeenCalledTimes(1));
 
     // The daily log hasn't been written yet — extraction is still in flight.
     expect(await read_daily_entries("test-entity", config)).toHaveLength(0);
