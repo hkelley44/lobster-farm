@@ -11,7 +11,7 @@ import { check_required_binaries, propagate_tmux_env } from "./env.js";
 import { init_github_app_from_env } from "./github-app.js";
 import { rotate_log_if_needed } from "./log-rotation.js";
 import { prune_daily_logs } from "./memory-pruning.js";
-import { append_session_log } from "./persistence.js";
+import { append_session_log, sweep_stale_state_temps } from "./persistence.js";
 import { remove_pid, write_pid } from "./pid.js";
 import { BotPool } from "./pool.js";
 import { PRReviewCron } from "./pr-cron.js";
@@ -46,6 +46,27 @@ async function main(): Promise<void> {
 
   // Load global config
   const config = await load_config();
+
+  // Clear orphaned atomic-write temp files. Awaited (not fire-and-forget) and
+  // placed here on purpose: it must complete before any subsystem starts
+  // writing state, which is the precondition that makes the sweep safe — the
+  // singleton guard above already proved we're the only daemon, so no live
+  // write can own a temp file at this instant. Writes that *throw* now clean up
+  // after themselves; this catches the ones that never returned at all, which
+  // is how live state collected four orphans from four different dates.
+  //
+  // `.catch` because the sweep's contract is best-effort — "a missing state dir
+  // or an undeletable entry is not worth failing boot over" — and this is the
+  // critical boot path, ahead of Discord, the pool and the commander. Today
+  // every I/O inside it is already wrapped; the catch is so that a future edit
+  // which throws outside those wrappers degrades to "temps not swept" instead
+  // of a full daemon outage caused by a cleanup routine.
+  const swept_temps = await sweep_stale_state_temps(config).catch(() => [] as string[]);
+  if (swept_temps.length > 0) {
+    console.log(
+      `[persistence] Swept ${String(swept_temps.length)} orphaned state temp file(s): ${swept_temps.join(", ")}`,
+    );
+  }
 
   // Propagate env to tmux (after config load, before pool init)
   propagate_tmux_env();

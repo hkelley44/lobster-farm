@@ -16,8 +16,8 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { readFile } from "node:fs/promises";
+import { write_json_atomic } from "../persistence.js";
 import type { InboundMeta } from "./protocol.js";
 
 /** Lifecycle of a queued inbound message. */
@@ -303,11 +303,25 @@ export class BrokerQueue {
     } while (this.write_pending);
   }
 
+  /**
+   * Write the full queue to disk atomically.
+   *
+   * Shares `persistence.ts`'s `write_json_atomic` rather than re-rolling
+   * write-temp-then-rename, specifically so a failed `rename` removes its temp
+   * file. This writer is the highest-frequency one in the daemon (every enqueue
+   * and every ack) *and* its caller swallows persist failures, so a leak here
+   * was the one that could accumulate silently and forever.
+   *
+   * No config is passed: `this.path` is injected via `QueueOptions.path`, so
+   * there is no configured state root for the test-leak guard to compare
+   * against. Callers that build the path from config pass theirs.
+   *
+   * Throws on failure, as before — `run_persist_loop` catches and logs. That
+   * swallow is deliberate (a transient disk error must not break queue
+   * accounting) and is unchanged here.
+   */
   private async persist_now(): Promise<void> {
     const state: PersistedQueue = { version: 1, entries: [...this.entries.values()] };
-    const tmp = `${this.path}.${randomUUID().slice(0, 8)}.tmp`;
-    await mkdir(dirname(this.path), { recursive: true });
-    await writeFile(tmp, JSON.stringify(state, null, 2), "utf-8");
-    await rename(tmp, this.path);
+    await write_json_atomic(this.path, state);
   }
 }

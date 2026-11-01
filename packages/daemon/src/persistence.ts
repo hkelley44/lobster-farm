@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ArchetypeRole, ChannelType, LobsterFarmConfig } from "@lobster-farm/shared";
 import { entity_dir, lobsterfarm_dir } from "@lobster-farm/shared";
@@ -10,6 +10,44 @@ const POOL_STATE_FILE = "pool-state.json";
 const PR_WATCHES_FILE = "pr-watches.json";
 const DEPLOY_TRIAGE_FILE = "deploy-triage.json";
 
+/* Basenames owned by modules outside this file. They live here, and those
+ * modules import them, so `ATOMIC_STATE_FILES` below cannot drift from the set
+ * of files that actually get atomic temps written next to them. */
+/** `broker/index.ts` builds the queue path from this. */
+export const BROKER_QUEUE_FILE = "broker-queue.json";
+/** `alert-router.ts`. */
+export const ACTIVE_INCIDENTS_FILE = "active-incidents.json";
+/** `sentry-triage.ts`. */
+export const SENTRY_TRIAGES_FILE = "sentry-triages.json";
+
+/**
+ * Every basename `write_json_atomic` can create a temp sibling for — i.e. every
+ * file the daemon atomically writes into `state/`.
+ *
+ * This list is load-bearing in one direction only: `sweep_stale_state_temps`
+ * deletes nothing outside it, so a state writer that is not registered here
+ * leaks its orphans forever rather than risking someone else's file. Register a
+ * new writer here when you add one.
+ *
+ * What makes that checkable rather than a hope: `write_json_atomic` is the only
+ * thing in the repo that produces a `<name>.<8 hex>.tmp` filename, so the list
+ * is exhaustive exactly when every one of its call sites writes a basename that
+ * appears here. Seven call sites, seven entries, verified by grep. (Other
+ * `.tmp` writers exist — `discord.ts`'s room archives — but they use a fixed
+ * `.tmp` suffix and write outside `state/`, so they neither match this pattern
+ * nor need to. `state/avatar-urls.json` is a plain non-atomic `writeFile` and
+ * creates no temp at all.)
+ */
+const ATOMIC_STATE_FILES = [
+  PR_REVIEWS_FILE,
+  POOL_STATE_FILE,
+  PR_WATCHES_FILE,
+  DEPLOY_TRIAGE_FILE,
+  BROKER_QUEUE_FILE,
+  ACTIVE_INCIDENTS_FILE,
+  SENTRY_TRIAGES_FILE,
+] as const;
+
 function state_dir(config: LobsterFarmConfig): string {
   return join(lobsterfarm_dir(config.paths), STATE_DIR);
 }
@@ -17,12 +55,16 @@ function state_dir(config: LobsterFarmConfig): string {
 /**
  * Belt-and-suspenders guard against tests leaking into live state (#102 Gap 3).
  *
- * Under `NODE_ENV === "test"`, refuse to write when the resolved state root is
- * the real `~/.lobsterfarm` — i.e. a test built a config without overriding
- * `paths.lobsterfarm_dir`. Throwing loudly here beats silently corrupting the
- * developer's live daemon state (the `lobster-farm:6010` leak was exactly this:
- * `pr-cron-lease.test.ts` used a fixture PR with no `paths` override, so
- * `save_pr_reviews` wrote straight to `~/.lobsterfarm/state/pr-reviews.json`).
+ * Under `NODE_ENV === "test"`, refuse to touch the state dir when the resolved
+ * state root is the real `~/.lobsterfarm` — i.e. a test built a config without
+ * overriding `paths.lobsterfarm_dir`. Throwing loudly here beats silently
+ * corrupting the developer's live daemon state (the `lobster-farm:6010` leak was
+ * exactly this: `pr-cron-lease.test.ts` used a fixture PR with no `paths`
+ * override, so `save_pr_reviews` wrote straight to
+ * `~/.lobsterfarm/state/pr-reviews.json`).
+ *
+ * Guards writes (`write_json_atomic`) and deletes (`sweep_stale_state_temps`)
+ * alike — the delete is the more dangerous of the two.
  *
  * No-op outside tests — production always writes to the configured root.
  */
@@ -32,9 +74,127 @@ function assert_writable_state_root(path: string, config: LobsterFarmConfig): vo
   const real_root = lobsterfarm_dir(); // default "~/.lobsterfarm", expanded
   if (configured_root === real_root) {
     throw new Error(
-      `[persistence] Refusing to write ${path} under the real state root (${real_root}) during tests. Point config.paths.lobsterfarm_dir at a tmp dir (see #102 Gap 3).`,
+      `[persistence] Refusing to write/delete ${path} under the real state root (${real_root}) during tests. Point config.paths.lobsterfarm_dir at a tmp dir (see #102 Gap 3).`,
     );
   }
+}
+
+/**
+ * Matches exactly the temp files `write_json_atomic` creates: one of the
+ * registered state basenames, followed by `.<8 lowercase hex>.tmp`, anchored at
+ * both ends.
+ *
+ * Anchored to the basename list rather than matching the suffix alone, because
+ * the sweep *deletes*. A suffix-only pattern would also claim
+ * `anything.deadbeef.tmp` — nothing outside the daemon writes `state/` today,
+ * so that was not a live exposure, but "we only ever delete our own files" is
+ * load-bearing in a safety argument and should be a property of the regex, not
+ * of the current inhabitants of the directory.
+ *
+ * Derived from `ATOMIC_STATE_FILES` so the two cannot disagree. `.` is the only
+ * regex metacharacter the basenames contain.
+ */
+const STATE_TEMP_PATTERN = new RegExp(
+  `^(?:${ATOMIC_STATE_FILES.map((f) => f.replaceAll(".", "\\.")).join("|")})\\.[0-9a-f]{8}\\.tmp$`,
+);
+
+/**
+ * Write JSON to `path` atomically: serialize into a unique sibling temp file,
+ * then rename it over the target. rename() is atomic on POSIX same-device, so
+ * a concurrent reader sees either the old file or the new one, never a
+ * half-written one.
+ *
+ * The temp file is removed on every failure path. Without that, a throw from
+ * `writeFile` or `rename` orphaned it permanently: live state had accumulated
+ * four `pr-reviews.json.*.tmp` files from four different dates. All four were
+ * *complete, valid JSON* — so they were left by a failing `rename` (or a death
+ * between the two calls), not by a partial write.
+ *
+ * The cleanup swallows its own error on purpose. The write failure is the one
+ * worth reporting, and letting an unlink ENOENT propagate would replace the
+ * real cause with a bookkeeping detail. The caller sees the original error.
+ *
+ * Note the limit of in-process cleanup: a daemon killed *between* writeFile and
+ * rename never runs this catch and leaves an identically-shaped complete temp
+ * behind. `sweep_stale_state_temps` is what covers that case.
+ *
+ * This is the only place the pattern should be written for `state/` files: all
+ * seven state writers route here (the four savers below, plus `alert-router.ts`,
+ * `sentry-triage.ts` and `broker/queue.ts`). Two more implementations of the
+ * same idea exist for files *outside* `state/` — `pool.ts`'s and
+ * `commander-process.ts`'s access.json writers — and they use a
+ * `.tmp.<uuid>` suffix that `STATE_TEMP_PATTERN` deliberately does not match.
+ * If you are adding a third, prefer calling this.
+ *
+ * `config` feeds the `NODE_ENV=test` state-root guard and must be passed
+ * whenever `path` was derived from `config.paths` — true of every caller except
+ * `broker/queue.ts`, whose path arrives injected through `QueueOptions.path`
+ * with no config alongside it, so there is no configured root to compare the
+ * real one against. Omit it only in that situation.
+ */
+export async function write_json_atomic(
+  path: string,
+  data: unknown,
+  config?: LobsterFarmConfig,
+): Promise<void> {
+  if (config) assert_writable_state_root(path, config);
+  await mkdir(dirname(path), { recursive: true });
+  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
+  try {
+    await writeFile(tmp_path, JSON.stringify(data, null, 2), "utf-8");
+    await rename(tmp_path, path);
+  } catch (err) {
+    await unlink(tmp_path).catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * Remove orphaned atomic-write temp files from the state dir. Returns the names
+ * removed so the caller can log them.
+ *
+ * Complements `write_json_atomic`'s error-path cleanup rather than duplicating
+ * it: that cleanup cannot run when the process dies mid-write, which is the
+ * shape every temp found in live state actually had. Without a sweep those
+ * accumulate forever — nothing else ever looks at them.
+ *
+ * Call at startup, before any subsystem begins writing state. That ordering is
+ * what makes the sweep unconditionally safe: the daemon is single-instance
+ * (singleton.ts binds the port first), so no in-flight write can own a temp
+ * file at this point. Best-effort throughout — a missing state dir or an
+ * undeletable entry is not worth failing boot over.
+ *
+ * Subject to the same `NODE_ENV=test` state-root guard as `write_json_atomic`,
+ * and for a sharper reason: #102 Gap 3 added that guard because a test built a
+ * config with no `paths` override and *wrote* into the developer's live
+ * `~/.lobsterfarm/state/`. The same accident here *deletes* — including a temp
+ * the live daemon is mid-`rename` on, which would fail that rename with ENOENT
+ * and reject its `persist()`. Production is unaffected (the guard is a no-op
+ * outside tests); tests must sandbox `paths.lobsterfarm_dir`.
+ */
+export async function sweep_stale_state_temps(config: LobsterFarmConfig): Promise<string[]> {
+  const dir = state_dir(config);
+  assert_writable_state_root(dir, config);
+  const removed: string[] = [];
+
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return removed; // no state dir yet — nothing to sweep
+  }
+
+  for (const name of entries) {
+    if (!STATE_TEMP_PATTERN.test(name)) continue;
+    try {
+      await unlink(join(dir, name));
+      removed.push(name);
+    } catch {
+      // Raced with another remover, or permissions — leave it for next boot.
+    }
+  }
+
+  return removed;
 }
 
 function pr_reviews_path(config: LobsterFarmConfig): string {
@@ -103,12 +263,7 @@ export async function save_pr_reviews(
   state: PRReviewState,
   config: LobsterFarmConfig,
 ): Promise<void> {
-  const path = pr_reviews_path(config);
-  assert_writable_state_root(path, config);
-  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
-  await rename(tmp_path, path);
+  await write_json_atomic(pr_reviews_path(config), state, config);
 }
 
 /**
@@ -266,17 +421,12 @@ export async function save_pool_state(
   session_history?: Record<string, string>,
   avatar_state?: Record<string, PersistedBotAvatarState>,
 ): Promise<void> {
-  const path = pool_state_path(config);
-  assert_writable_state_root(path, config);
-  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
-  await mkdir(dirname(path), { recursive: true });
   const state: PersistedPoolState = {
     bots,
     session_history: session_history ?? {},
     avatar_state: avatar_state ?? {},
   };
-  await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
-  await rename(tmp_path, path);
+  await write_json_atomic(pool_state_path(config), state, config);
 }
 
 /**
@@ -436,12 +586,7 @@ export async function save_pr_watches(
   state: PRWatchState,
   config: LobsterFarmConfig,
 ): Promise<void> {
-  const path = pr_watches_path(config);
-  assert_writable_state_root(path, config);
-  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
-  await rename(tmp_path, path);
+  await write_json_atomic(pr_watches_path(config), state, config);
 }
 
 /** Load PR watches from disk. Returns empty object if file doesn't exist. */
@@ -479,12 +624,7 @@ export async function save_deploy_triage(
   state: DeployTriageState,
   config: LobsterFarmConfig,
 ): Promise<void> {
-  const path = deploy_triage_path(config);
-  assert_writable_state_root(path, config);
-  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
-  await rename(tmp_path, path);
+  await write_json_atomic(deploy_triage_path(config), state, config);
 }
 
 /** Load deploy triage state from disk. Returns empty object if file doesn't exist. */

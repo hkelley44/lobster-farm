@@ -19,13 +19,13 @@
  * receive event → enrich with API → spawn session → track → handle completion.
  */
 
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { expand_home, lobsterfarm_dir } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import type { AlertRouter } from "./alert-router.js";
 import type { DiscordBot } from "./discord.js";
+import { SENTRY_TRIAGES_FILE, write_json_atomic } from "./persistence.js";
 import type { EntityRegistry } from "./registry.js";
 import { MAX_SENTRY_FIX_ATTEMPTS, build_sentry_fix_prompt } from "./review-utils.js";
 import {
@@ -170,7 +170,7 @@ export interface SentryTriageState {
 }
 
 function state_file_path(config: LobsterFarmConfig): string {
-  return join(lobsterfarm_dir(config.paths), "state", "sentry-triages.json");
+  return join(lobsterfarm_dir(config.paths), "state", SENTRY_TRIAGES_FILE);
 }
 
 export async function load_triage_state(config: LobsterFarmConfig): Promise<SentryTriageState> {
@@ -191,15 +191,13 @@ export async function load_triage_state(config: LobsterFarmConfig): Promise<Sent
   }
 }
 
+/** Save triage state. Shares persistence.ts's atomic writer so a failed
+ * `rename` cleans up its own temp file instead of orphaning it in `state/`. */
 export async function save_triage_state(
   state: SentryTriageState,
   config: LobsterFarmConfig,
 ): Promise<void> {
-  const path = state_file_path(config);
-  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
-  await rename(tmp_path, path);
+  await write_json_atomic(state_file_path(config), state, config);
 }
 
 // Serialize state writes to prevent read-modify-write races when
