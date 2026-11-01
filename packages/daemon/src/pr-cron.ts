@@ -1507,36 +1507,41 @@ export class PRReviewCron {
       }
     };
 
-    // Fetch the actual review comments to give the builder full context
-    const review_comments = await fetch_review_comments(pr.number, repo_path);
-
-    const prompt = [
-      "An external PR needs fixes based on reviewer feedback.",
-      `PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}`,
-      `Repository: ${repo_path}`,
-      "",
-      `First, check out the PR branch: git checkout ${pr.headRefName}`,
-      "",
-      build_review_fix_prompt(pr.number, pr.title, review_comments),
-      "",
-      "Do NOT merge the PR.",
-    ].join("\n");
-
-    console.log(
-      `[pr-cron] Spawning builder to fix external PR #${String(pr.number)} in ${entity_id}`,
-    );
-
-    // Inject GitHub App token if available — uses per-entity installation ID when configured
-    let fix_env: Record<string, string> | undefined;
-    const config = entity_config ?? this.registry.get(entity_id);
-    if (config) {
-      const gh_token = await this.resolve_entity_token(config);
-      if (gh_token) {
-        fix_env = { GH_TOKEN: gh_token };
-      }
-    }
-
+    // Everything from here on runs inside the try, so the lease we just took is
+    // released on ANY throw. The prep steps below don't throw today (both
+    // swallow their own errors), but a held lease with no pid bound is immune to
+    // crash reaping and would block the worktree for the full 60-minute TTL —
+    // far too expensive to leave resting on two callees staying exhaustive.
     try {
+      // Fetch the actual review comments to give the builder full context
+      const review_comments = await fetch_review_comments(pr.number, repo_path);
+
+      const prompt = [
+        "An external PR needs fixes based on reviewer feedback.",
+        `PR #${String(pr.number)}: "${pr.title}" on branch ${pr.headRefName}`,
+        `Repository: ${repo_path}`,
+        "",
+        `First, check out the PR branch: git checkout ${pr.headRefName}`,
+        "",
+        build_review_fix_prompt(pr.number, pr.title, review_comments),
+        "",
+        "Do NOT merge the PR.",
+      ].join("\n");
+
+      console.log(
+        `[pr-cron] Spawning builder to fix external PR #${String(pr.number)} in ${entity_id}`,
+      );
+
+      // Inject GitHub App token if available — uses per-entity installation ID when configured
+      let fix_env: Record<string, string> | undefined;
+      const config = entity_config ?? this.registry.get(entity_id);
+      if (config) {
+        const gh_token = await this.resolve_entity_token(config);
+        if (gh_token) {
+          fix_env = { GH_TOKEN: gh_token };
+        }
+      }
+
       const session = await this.session_manager.spawn({
         entity_id,
         feature_id: `external-pr-fix-${String(pr.number)}`,
@@ -1558,7 +1563,7 @@ export class PRReviewCron {
       this.release_worktree_on_session_end(session.session_id, release_worktree);
       return "spawned";
     } catch (err) {
-      release_worktree(); // spawn threw — don't hold the tree until TTL
+      release_worktree(); // threw before we handed the tree to a live session
       console.error(
         `[pr-cron] Failed to spawn builder for external PR #${String(pr.number)}: ${String(err)}`,
       );

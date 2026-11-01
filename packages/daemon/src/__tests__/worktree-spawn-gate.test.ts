@@ -350,6 +350,21 @@ describe("#105 auto-fix loop must not spawn into an occupied worktree", () => {
     expect(cron.state()["lobster-farm:103"]?.fix_deferred_at).toBeTruthy();
   });
 
+  it("frees the worktree when the spawn throws, instead of blocking it for the TTL", async () => {
+    const leases = new WorktreeLeaseStore();
+    const cron = new TestCron(leases);
+    cron.spawn_spy.mockRejectedValue(new Error("boom"));
+
+    expect(await cron.spawn_fixer(make_pr())).toBe("failed");
+
+    // A lease held with no pid bound is immune to crash reaping, so a leak here
+    // would block the tree for the full 60-minute TTL.
+    expect(leases.get(WORKTREE)).toBeNull();
+    // ...and the next attempt can proceed.
+    cron.spawn_spy.mockResolvedValue({ session_id: "sess-retry", pid: process.pid });
+    expect(await cron.spawn_fixer(make_pr())).toBe("spawned");
+  });
+
   // ── Flag-OFF / no-store parity ──
 
   it("behaves exactly as before when no lease store is wired", async () => {
