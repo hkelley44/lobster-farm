@@ -167,9 +167,20 @@ ${env_section}`;
  *    well-formed secrets still load.
  *
  * The bound trades one unlikely failure for one likely one: a quoted value
- * terminates early if its own body contains a line starting with a declared key
- * name plus `=`. PEM base64 and JSON do not contain `DISCORD_TOKEN=`, and that
- * case now reports both key names instead of failing silently.
+ * terminates early if a line starting with a declared key name plus `=` appears
+ * either in its body OR as its terminating line — the latter is in scope
+ * precisely because the bound is now tested before the closing-quote test.
+ * PEM base64 and JSON do not contain `DISCORD_TOKEN=`, so this is vanishingly
+ * rare, and it aborts loudly with nothing exported rather than exporting a
+ * partial or cross-contaminated value.
+ *
+ * Two things that paragraph does NOT promise, both measured — see the README:
+ *   - Only the *interior*-line case names both keys. On the terminating line the
+ *     collider parses cleanly as a fresh assignment, so no WARNING fires and the
+ *     abort discards it unnamed; only the open key is reported.
+ *   - On the terminating line the quote is actually closed, yet the report still
+ *     says "unterminated quote". The remedy is to move the colliding line, not
+ *     to look for a missing quote.
  *
  * @param node_path   Absolute path to the node binary.
  * @param daemon_path Absolute path to the daemon entry point (index.js).
