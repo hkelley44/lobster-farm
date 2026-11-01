@@ -10,13 +10,13 @@
  * `notify_alerts()` or `send_to_entity("alerts", ...)` go through here.
  */
 
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import { EmbedBuilder } from "discord.js";
 import type { DiscordBot } from "./discord.js";
+import { ACTIVE_INCIDENTS_FILE, write_json_atomic } from "./persistence.js";
 import * as sentry from "./sentry.js";
 
 // ── Types ──
@@ -87,7 +87,9 @@ function daily_cache_key(entity_id: string, now: Date = new Date()): string {
 
 // ── Active incident persistence ──
 
-const ACTIVE_INCIDENTS_FILE = "active-incidents.json";
+// `ACTIVE_INCIDENTS_FILE` is defined in persistence.ts (and imported above)
+// rather than here, so the basename stays in the one list the startup temp
+// sweep is anchored to.
 
 export interface ActiveIncident {
   entity_id: string;
@@ -118,15 +120,13 @@ export async function load_active_incidents(
   }
 }
 
+/** Save active incidents. Shares persistence.ts's atomic writer so a failed
+ * `rename` cleans up its own temp file instead of orphaning it in `state/`. */
 export async function save_active_incidents(
   state: ActiveIncidentsState,
   config: LobsterFarmConfig,
 ): Promise<void> {
-  const path = incidents_path(config);
-  const tmp_path = `${path}.${randomUUID().slice(0, 8)}.tmp`;
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(tmp_path, JSON.stringify(state, null, 2), "utf-8");
-  await rename(tmp_path, path);
+  await write_json_atomic(incidents_path(config), state, config);
 }
 
 // ── Alert Router ──

@@ -14,6 +14,7 @@
 import { join } from "node:path";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
+import { BROKER_QUEUE_FILE } from "../persistence.js";
 import { OutboundExecutor, type ReplyChunkConfig } from "./outbound.js";
 import { BROKER_SOCKET_RELATIVE } from "./protocol.js";
 import type { InboundMeta } from "./protocol.js";
@@ -62,7 +63,7 @@ export class DiscordBroker {
   constructor(opts: DiscordBrokerOptions) {
     const dir = lobsterfarm_dir(opts.config.paths);
     this._socket_path = opts.socket_path ?? join(dir, BROKER_SOCKET_RELATIVE);
-    const queue_path = opts.queue_path ?? join(dir, "state", "broker-queue.json");
+    const queue_path = opts.queue_path ?? join(dir, "state", BROKER_QUEUE_FILE);
 
     this.executor = new OutboundExecutor(opts.fetch_impl);
     this.queue = new BrokerQueue({

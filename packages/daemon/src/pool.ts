@@ -2453,9 +2453,8 @@ export class BotPool extends EventEmitter {
 
   /**
    * Stash a session_id into session_history for a future `--resume`, gated on
-   * the single precondition shared by both terminal release paths
-   * (`handle_crash_loop` and `release_broker_to_dark`): the session is
-   * `session_confirmed` AND its JSONL still exists on disk *right now*.
+   * one precondition: the session is `session_confirmed` AND its JSONL still
+   * exists on disk *right now*.
    *
    * Why the disk pre-flight and not `session_confirmed` alone: `session_confirmed`
    * proves the JSONL existed at *confirmation* time, which can be minutes or
@@ -2464,15 +2463,41 @@ export class BotPool extends EventEmitter {
    * deletion). Stashing a session whose JSONL is gone plants a phantom UUID: the
    * next cold-recreate `--resume`s a non-existent transcript and burns crash-loop
    * retries (issue #256). Confirmation is the *floor*; the live disk check is the
-   * gate. `handle_crash_loop` always did this; `release_broker_to_dark` did not,
-   * which is the gap #92 closes — the two paths now share this one helper so
-   * their stash precondition can't drift again.
+   * gate.
+   *
+   * Callers routed through here (six, as of #96):
+   *   - `release_broker_to_dark` — the #92 gap: it checked `session_confirmed`
+   *     inline and never the disk.
+   *   - `handle_crash_loop` — always did both checks; folded in by #92.
+   *   - `recycle_deaf_channel`, twice (the loop-guard release and the
+   *     recycle-and-reassign).
+   *   - `restart_crashed_session`, twice — the force-free branch and the
+   *     restart-failed `catch`. The #96 gap: both gated on `session_confirmed`
+   *     inline, and the restart path's own disk pre-flight runs *after* the
+   *     statement that throws, so in the `catch` its result was computed,
+   *     logged and then discarded.
+   *
+   * **Two stash sites are still inline and are NOT gated by this helper**, so
+   * the drift this centralisation guards against is reduced, not closed:
+   *   - `release_with_history` — no `session_confirmed` check and no disk
+   *     check; the weakest of the seven, and on the hot message path.
+   *   - the eviction stash in `assign` — `session_confirmed` only.
+   * Both are tracked in #124, together with the structurally cheaper fix: one
+   * disk check at the single *consume* site, which would make all seven stash
+   * sites safe rather than requiring an N-site invariant that has now leaked
+   * twice (#92, #96). Do not read this helper as proof that a stash is gated —
+   * check the call site.
    *
    * Logs the outcome (stashed / skipped-unconfirmed / skipped-JSONL-missing) and
    * returns true iff it stashed.
    *
    * @param label short context string threaded into the log lines (e.g.
    *   "crash-loop", "broker release-to-dark") so logs stay path-specific.
+   *   Tests assert on the full labelled line (`Stashed <label> session history
+   *   for …`) for that reason: the bare `session history for` fragment is also
+   *   emitted by the assign-path lookup, by the consume, and by the two inline
+   *   sites' unlabelled `Stashed session history for …`, so matching the
+   *   fragment does not distinguish a stash from a lookup.
    */
   protected async stash_session_history(
     session_id: string | null,
@@ -3366,14 +3391,31 @@ export class BotPool extends EventEmitter {
 
       // Stash session history when possible — allows a future assignment on
       // this channel to resume the session even though we can't restart now.
-      // Only stash *confirmed* sessions (JSONL on disk) to avoid planting
-      // phantom session_history entries (issue #256).
-      if (session_id && bot.session_confirmed && channel_id && entity_id) {
-        const key = `${entity_id}:${channel_id}`;
-        this.session_history.set(key, session_id);
-        this.session_history_ts.set(key, Date.now());
-        console.log(`[pool] Stashed session history for ${key}: ${session_id.slice(0, 8)}`);
-      }
+      //
+      // Routed through the shared gate (#96) rather than checking
+      // `session_confirmed` inline: confirmation only proves the JSONL existed
+      // at *confirmation* time, which can be hours before this force-free
+      // fires. This branch also returns before the restart path's own disk
+      // pre-flight below ever runs, so there is no other disk check on it —
+      // the helper's live re-read is the only thing standing between a
+      // vanished transcript and a phantom --resume target (#256).
+      //
+      // Note the cost: the helper's disk check is an `await` (a readdir/stat
+      // over ~/.claude/projects) and it now sits BEFORE `bot.state = "free"`
+      // below, where this branch was previously synchronous up to
+      // `await this.persist()`. Node is single-threaded, so the window is only
+      // a few ms of filesystem I/O — but during it a concurrently-arriving
+      // Discord message can still see this bot as `assigned` and route to a
+      // session we have already declared unrestartable. The restart-failed path
+      // has carried the same shape since #92; accepted there and here, because
+      // the alternative is stashing a phantom.
+      await this.stash_session_history(
+        session_id,
+        bot.session_confirmed,
+        channel_id,
+        entity_id,
+        "crash force-free",
+      );
 
       bot.state = "free";
       bot.channel_id = null;
@@ -3494,14 +3536,24 @@ export class BotPool extends EventEmitter {
       });
 
       // Restart failed — fall back to the old behavior: stash session history and free the bot.
-      // Only stash confirmed sessions (JSONL on disk) so the next channel
-      // assignment can't crash-loop on a phantom UUID (issue #256).
-      if (session_id && bot.session_confirmed && channel_id && entity_id) {
-        const key = `${entity_id}:${channel_id}`;
-        this.session_history.set(key, session_id);
-        this.session_history_ts.set(key, Date.now());
-        console.log(`[pool] Stashed session history for ${key}: ${session_id.slice(0, 8)}`);
-      }
+      //
+      // Routed through the shared gate (#96), and here that is a correctness
+      // fix, not just consistency. `bot.session_confirmed` is still its
+      // PRE-restart value on this path: the `session_confirmed = is_resume`
+      // assignment lives past the statement that threw, so a session the
+      // pre-flight above *just proved* has no JSONL on disk arrives here with
+      // `session_confirmed === true`. The old inline check consulted only that
+      // flag and never `is_resume`, so it stashed the known-phantom UUID the
+      // very same call had logged "no JSONL on disk" about — handing the next
+      // assignment on this channel a --resume target that cannot exist (#256).
+      // The helper re-reads the disk, so the phantom is dropped instead.
+      await this.stash_session_history(
+        session_id,
+        bot.session_confirmed,
+        channel_id,
+        entity_id,
+        "crash restart-failed",
+      );
 
       // Post-mortem extraction: the session crashed and the restart failed.
       // Snapshot + fire while we still have entity/archetype/session_id on the

@@ -7,7 +7,11 @@ import { join } from "node:path";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import { resolve_model_id } from "./models.js";
-import { evaluate_plugin_liveness, is_tmux_session_idle } from "./plugin-liveness.js";
+import {
+  LIVENESS_WARMUP_MS,
+  evaluate_plugin_liveness,
+  is_tmux_session_idle,
+} from "./plugin-liveness.js";
 import * as sentry from "./sentry.js";
 import { sq } from "./shell.js";
 
@@ -535,6 +539,48 @@ export class CommanderProcess extends EventEmitter {
 
     const inbound = this.last_inbound_at;
     if (!inbound) return; // nothing delivered — skip the tmux pane read entirely
+
+    // Warm-up gate (#111) — the same gate the pool's two call sites got in
+    // #108, closing the last asymmetry between the two probes that share
+    // `evaluate_plugin_liveness` precisely so their decisions stay provably
+    // identical. `last_started_at` is the commander's `assigned_at`: stamped
+    // when tmux is confirmed running, refreshed on every respawn. During boot
+    // the pane cycles through banners no heuristic can classify, and a single
+    // mis-read toward "working" is destructive — it stamps `last_processing_at`
+    // and clears the armed `last_inbound_at`, silencing the probe for a
+    // genuinely-deaf commander.
+    //
+    // This cannot widen the #118 deaf-after-restart blind spot. The gate window
+    // and the verdict's own grace window are both 90s, and on the path #118
+    // describes the inbound is stamped at-or-after the spawn — so inside the
+    // window the suppressed reading would otherwise have been `grace` (an
+    // identical no-op, marker preserved), `healthy_working`, or
+    // `healthy_processed`. Suppressing `healthy_working` is the entire point:
+    // the armed marker survives, so the first post-warm-up pass can still
+    // return `deaf`. `healthy_processed` is reachable too, when a pre-crash
+    // `last_processing_at` outlives the respawn (only `recover_deaf_commander`
+    // nulls it); suppressing it is harmless, because it is evaluated before
+    // the grace/deaf branches, so the same verdict is reached after the window
+    // and the only cost is clearing a healthy marker up to 90s late — never a
+    // false deaf.
+    //
+    // The one verdict the gate can delay is a `deaf` call derived from a marker
+    // stamped BEFORE this session started — a crash respawn does not null
+    // `last_inbound_at`, only `recover_deaf_commander` does. Judging a fresh
+    // session deaf for a message delivered to its predecessor is a false
+    // positive, which the 90s wait DEFERS rather than suppresses: nothing
+    // inside the window can clear the marker (this gate returns before the
+    // switch, and unlike the pool the commander has no Stop-hook
+    // `mark_processed` to clear it either), so unless a new inbound arrives to
+    // re-stamp it, the first post-warm-up pass still returns `deaf` and the
+    // respawn gets its "went DEAF" alert and a second recovery restart about a
+    // cycle and a half later. `commander-plugin-liveness.test.ts` pins both
+    // halves of that. Detection is deferred, never lost — if you are here
+    // debugging a double-restart-after-crash, this gate delays it, it does not
+    // prevent it.
+    if (this.last_started_at && Date.now() - this.last_started_at.getTime() < LIVENESS_WARMUP_MS) {
+      return;
+    }
 
     const verdict = evaluate_plugin_liveness(
       {
