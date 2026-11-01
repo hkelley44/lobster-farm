@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  AGENT_ACTIVE_MARKER,
   cleanup_after_merge,
   find_worktree_for_branch,
+  has_live_agent_marker,
   is_unstarted_branch,
   is_worktree_safe_to_remove,
   parse_worktree_list,
@@ -101,12 +103,27 @@ function setup_git_mocks(
     branch_tips?: Record<string, string>;
     /** Local branches whose `refs/heads/<branch>` lookup should fail. */
     missing_local_branches?: string[];
+    /**
+     * Branch checked out in a given worktree directory, keyed by absolute
+     * path, for `git -C <dir> symbolic-ref --short HEAD`. A directory absent
+     * from this map resolves to `null` (detached, pruned, or not a worktree),
+     * which `cleanup_claude_worktrees` treats as "do not touch".
+     */
+    worktree_branches?: Record<string, string>;
   } = {},
 ): void {
-  mock_exec_file.mockImplementation((cmd: string, args: string[], _opts: unknown) => {
+  mock_exec_file.mockImplementation((cmd: string, args: string[], exec_opts: unknown) => {
     if (cmd !== "git") return "";
 
     const subcmd = args[0];
+    const cwd = (exec_opts as { cwd?: string } | undefined)?.cwd ?? "";
+
+    // `git -C <dir> symbolic-ref --short HEAD` — the worktree's own branch.
+    if (subcmd === "symbolic-ref") {
+      const own_branch = opts.worktree_branches?.[cwd];
+      if (own_branch === undefined) throw new Error("fatal: ref HEAD is not a symbolic ref");
+      return own_branch;
+    }
 
     if (subcmd === "worktree") {
       if (args[1] === "list") {
@@ -182,9 +199,31 @@ function setup_git_mocks(
 
 // ── Tests ──
 
+/** Paths passed to `git worktree remove`, in call order. */
+function removed_paths(): string[] {
+  return mock_exec_file.mock.calls
+    .filter(
+      (c: unknown[]) =>
+        (c[0] as string) === "git" &&
+        (c[1] as string[])[0] === "worktree" &&
+        (c[1] as string[])[1] === "remove",
+    )
+    .map((c: unknown[]) => (c[1] as string[])[2]);
+}
+
+/**
+ * Default `stat` behavior: every path exists EXCEPT the `.lf-agent-active`
+ * live-agent marker, which must be absent or every removal in this file would
+ * be (correctly) refused. Tests that want the shield engaged override this.
+ */
+function stat_without_agent_marker(path: string): Promise<{ isDirectory: () => boolean }> {
+  if (path.endsWith(AGENT_ACTIVE_MARKER)) return Promise.reject(new Error("ENOENT"));
+  return Promise.resolve({ isDirectory: () => true });
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
-  mock_stat.mockResolvedValue({ isDirectory: () => true });
+  mock_stat.mockImplementation(stat_without_agent_marker);
   mock_readdir.mockResolvedValue([]);
   // Default: tmux not running (execFileSync throws)
   mock_exec_file_sync.mockImplementation(() => {
@@ -531,18 +570,21 @@ describe("cleanup_after_merge", () => {
     expect(alert_router.post_alert).not.toHaveBeenCalled();
   });
 
-  it("scans .claude/worktrees/ for matching agent directories", async () => {
+  it("removes the .claude/worktrees/ directory whose own branch is the merged one", async () => {
+    // Directory names here are the harness's real shape: random hex, no
+    // relation to any branch. Identity comes from `symbolic-ref`, not the name.
     setup_git_mocks({
       worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      worktree_branches: {
+        "/repo/.claude/worktrees/agent-134abcde": "feature/134-auto-cleanup",
+        "/repo/.claude/worktrees/agent-999fedcb": "feature/999-other",
+      },
     });
-
-    // Simulate .claude/worktrees/ directory with a matching entry
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
     mock_readdir.mockImplementation(async (dir: string) => {
       if (dir.includes(".claude/worktrees")) {
         return [
-          { name: "agent-134-auto-cleanup", isDirectory: () => true },
-          { name: "agent-999-other", isDirectory: () => true },
+          { name: "agent-134abcde", isDirectory: () => true },
+          { name: "agent-999fedcb", isDirectory: () => true },
         ];
       }
       return [];
@@ -550,19 +592,52 @@ describe("cleanup_after_merge", () => {
 
     await cleanup_after_merge("/repo", "feature/134-auto-cleanup");
 
-    // Should have tried to remove the matching .claude/worktrees/ entry
     expect(mock_exec_file).toHaveBeenCalledWith(
       "git",
-      ["worktree", "remove", "/repo/.claude/worktrees/agent-134-auto-cleanup", "--force"],
+      ["worktree", "remove", "/repo/.claude/worktrees/agent-134abcde", "--force"],
       expect.objectContaining({ cwd: "/repo" }),
     );
+    expect(removed_paths()).not.toContain("/repo/.claude/worktrees/agent-999fedcb");
+  });
 
-    // Should NOT have tried to remove the non-matching entry
-    const remove_calls = mock_exec_file.mock.calls.filter(
-      (c: unknown[]) => (c[1] as string[])[1] === "remove",
-    );
-    const removed_paths = remove_calls.map((c: unknown[]) => (c[1] as string[])[2]);
-    expect(removed_paths).not.toContain("/repo/.claude/worktrees/agent-999-other");
+  it("never removes a .claude/worktrees/ directory whose own branch differs from the target", async () => {
+    // The regression this guards: the directory name substring-matches the
+    // merged branch's slug ("99" appears in "agent-b199c0de"), but the branch
+    // checked out in it is someone else's live work. Pre-fix this directory
+    // was deleted and #30's unpushed check ran against `fix/99` — the wrong
+    // branch — so it reported "safe".
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      worktree_branches: { "/repo/.claude/worktrees/agent-b199c0de": "feature/live-work" },
+    });
+    mock_readdir.mockImplementation(async (dir: string) => {
+      if (dir.includes(".claude/worktrees")) {
+        return [{ name: "agent-b199c0de", isDirectory: () => true }];
+      }
+      return [];
+    });
+
+    await cleanup_after_merge("/repo", "fix/99");
+
+    expect(removed_paths()).not.toContain("/repo/.claude/worktrees/agent-b199c0de");
+  });
+
+  it("leaves a .claude/worktrees/ directory whose branch cannot be resolved", async () => {
+    // Detached HEAD, pruned metadata, or a plain directory — all unresolvable,
+    // all left alone. `worktree_branches` is empty so symbolic-ref throws.
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+    });
+    mock_readdir.mockImplementation(async (dir: string) => {
+      if (dir.includes(".claude/worktrees")) {
+        return [{ name: "agent-detached", isDirectory: () => true }];
+      }
+      return [];
+    });
+
+    await cleanup_after_merge("/repo", "feature/whatever");
+
+    expect(removed_paths()).not.toContain("/repo/.claude/worktrees/agent-detached");
   });
 
   it("relocates sessions before removing worktree", async () => {
@@ -629,7 +704,10 @@ describe("sweep_stale_worktrees", () => {
     );
     setup_git_mocks({
       worktree_list: porcelain,
-      merged_branches: "  feature/done\n  some-other-branch\n",
+      // `+ ` is how real git marks a branch checked out in another worktree —
+      // which every worktree-held branch here is. `some-other-branch` has no
+      // worktree, so it gets the plain two-space indent.
+      merged_branches: "+ feature/done\n  some-other-branch\n",
       rev_parse_missing: [], // both have remote refs
     });
 
@@ -722,7 +800,7 @@ describe("sweep_stale_worktrees", () => {
     const porcelain = make_porcelain({ path: "/repo", branch: "refs/heads/main" });
     setup_git_mocks({
       worktree_list: porcelain,
-      merged_branches: "  main\n",
+      merged_branches: "* main\n",
     });
 
     const registry = {
@@ -762,7 +840,7 @@ describe("sweep_stale_worktrees", () => {
 describe("is_worktree_safe_to_remove", () => {
   it("returns safe=true on a clean, fully-pushed worktree", async () => {
     setup_git_mocks({ status_porcelain: "", rev_list_unpushed: "" });
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    mock_stat.mockImplementation(stat_without_agent_marker);
 
     const result = await is_worktree_safe_to_remove("/repo", "/repo/wt/foo", "feature/foo");
     expect(result.safe).toBe(true);
@@ -782,7 +860,7 @@ describe("is_worktree_safe_to_remove", () => {
   });
 
   it("flags uncommitted changes to tracked files", async () => {
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    mock_stat.mockImplementation(stat_without_agent_marker);
     setup_git_mocks({
       status_porcelain: " M src/index.ts\n M packages/daemon/src/foo.ts",
       rev_list_unpushed: "",
@@ -797,7 +875,7 @@ describe("is_worktree_safe_to_remove", () => {
   });
 
   it("flags untracked files separately from uncommitted modifications", async () => {
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    mock_stat.mockImplementation(stat_without_agent_marker);
     setup_git_mocks({
       status_porcelain: "?? scratch.md\n?? notes/",
       rev_list_unpushed: "",
@@ -818,7 +896,7 @@ describe("is_worktree_safe_to_remove", () => {
   it("prefers the uncommitted reason over untracked when both are present", async () => {
     // A real-world dirty worktree often has both — we want the more urgent
     // signal (lost-on-disk modifications) to win the alert title.
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    mock_stat.mockImplementation(stat_without_agent_marker);
     setup_git_mocks({
       status_porcelain: " M src/index.ts\n?? scratch.md",
       rev_list_unpushed: "",
@@ -832,7 +910,7 @@ describe("is_worktree_safe_to_remove", () => {
   });
 
   it("flags unpushed commits when working tree is otherwise clean", async () => {
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    mock_stat.mockImplementation(stat_without_agent_marker);
     setup_git_mocks({
       status_porcelain: "",
       rev_list_unpushed:
@@ -854,7 +932,7 @@ describe("is_worktree_safe_to_remove", () => {
     // misleading number for Hunter to act on. The fix removes the cap entirely
     // (the list is bounded by branch length and only runs when the branch is
     // already known to be local-only, so the overhead is negligible).
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    mock_stat.mockImplementation(stat_without_agent_marker);
     const shas = Array.from(
       { length: 12 },
       (_, i) => `${String(i).padStart(8, "0")}deadbeefdeadbeefdeadbeefdeadbeefdead`,
@@ -893,7 +971,7 @@ describe("is_worktree_safe_to_remove", () => {
 describe("remove_worktree — issue #27 guardrail", () => {
   it("proceeds with removal when the worktree is clean and pushed", async () => {
     setup_git_mocks({ status_porcelain: "", rev_list_unpushed: "" });
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    mock_stat.mockImplementation(stat_without_agent_marker);
 
     const alert_router = { post_alert: vi.fn() };
 
@@ -913,7 +991,7 @@ describe("remove_worktree — issue #27 guardrail", () => {
 
   it("skips removal and posts an alert for uncommitted changes", async () => {
     setup_git_mocks({ status_porcelain: " M src/work.ts", rev_list_unpushed: "" });
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    mock_stat.mockImplementation(stat_without_agent_marker);
 
     const alert_router = { post_alert: vi.fn() };
 
@@ -955,7 +1033,7 @@ describe("remove_worktree — issue #27 guardrail", () => {
 
   it("skips removal and posts an alert for untracked files", async () => {
     setup_git_mocks({ status_porcelain: "?? scratch.md", rev_list_unpushed: "" });
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    mock_stat.mockImplementation(stat_without_agent_marker);
 
     const alert_router = { post_alert: vi.fn() };
 
@@ -976,7 +1054,7 @@ describe("remove_worktree — issue #27 guardrail", () => {
       status_porcelain: "",
       rev_list_unpushed: "abc123def456abc123def456abc123def456abcd",
     });
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    mock_stat.mockImplementation(stat_without_agent_marker);
 
     const alert_router = { post_alert: vi.fn() };
 
@@ -1026,7 +1104,7 @@ describe("remove_worktree — issue #27 guardrail", () => {
       status_porcelain: "", // working tree clean
       rev_list_unpushed: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", // but commit is unpushed
     });
-    mock_stat.mockResolvedValue({ isDirectory: () => true });
+    mock_stat.mockImplementation(stat_without_agent_marker);
 
     const alert_router = { post_alert: vi.fn() };
     const registry = {
@@ -1103,17 +1181,6 @@ describe("sweep_stale_worktrees — issue #110 unstarted-branch guardrail", () =
     };
   }
 
-  function removed_paths(): string[] {
-    return mock_exec_file.mock.calls
-      .filter(
-        (c: unknown[]) =>
-          (c[0] as string) === "git" &&
-          (c[1] as string[])[0] === "worktree" &&
-          (c[1] as string[])[1] === "remove",
-      )
-      .map((c: unknown[]) => (c[1] as string[])[2]);
-  }
-
   it("keeps a brand-new worktree whose branch was never pushed (remote-gone path)", async () => {
     // The incident in #110: worktree created seconds ago, branch tip is still
     // origin/main, `origin/<branch>` has never existed so the remote reads as
@@ -1142,7 +1209,10 @@ describe("sweep_stale_worktrees — issue #110 unstarted-branch guardrail", () =
         { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
         { path: "/repo/worktrees/fresh", branch: "refs/heads/feature/fresh", head: "trunk-tip" },
       ),
-      merged_branches: "  feature/fresh\n",
+      // `+ ` — the prefix real git uses for a branch checked out in another
+      // worktree, i.e. every agent worktree branch. With the old `^\\* `-only
+      // strip this arrived as "+ feature/fresh" and Case 1 never fired at all.
+      merged_branches: "+ feature/fresh\n",
       rev_parse_missing: [], // remote ref exists — only the merged test fires
       trunk_first_parent: TRUNK,
     });
@@ -1161,7 +1231,7 @@ describe("sweep_stale_worktrees — issue #110 unstarted-branch guardrail", () =
         { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
         { path: "/repo/worktrees/old", branch: "refs/heads/feature/old", head: "trunk-older" },
       ),
-      merged_branches: "  feature/old\n",
+      merged_branches: "+ feature/old\n",
       rev_parse_missing: ["feature/old"],
       trunk_first_parent: TRUNK,
     });
@@ -1242,42 +1312,144 @@ describe("sweep_stale_worktrees — issue #110 unstarted-branch guardrail", () =
     expect(removed_paths()).toHaveLength(0);
   });
 
-  it("spares a .claude/worktrees directory whose merged branch has no commits of its own", async () => {
-    // Second code path: this sweep matches directories by branch slug, so it
-    // would delete the same fresh worktree by name even if the worktree loop
-    // spared it.
+  it("spares a .claude/worktrees directory whose own branch has no commits of its own", async () => {
     setup_git_mocks({
       worktree_list: make_porcelain({
         path: "/repo",
         branch: "refs/heads/main",
         head: "trunk-tip",
       }),
-      merged_branches: "  feature/fresh\n",
+      merged_branches: "+ feature/fresh\n",
       trunk_first_parent: TRUNK,
       branch_tips: { "feature/fresh": "trunk-tip" },
+      worktree_branches: { "/repo/.claude/worktrees/agent-f8e21c04": "feature/fresh" },
     });
-    mock_readdir.mockResolvedValue([{ name: "agent-fresh", isDirectory: () => true }]);
+    mock_readdir.mockResolvedValue([{ name: "agent-f8e21c04", isDirectory: () => true }]);
 
     await sweep_stale_worktrees(registry_for() as any);
 
     expect(removed_paths()).toHaveLength(0);
   });
 
-  it("still sweeps a .claude/worktrees directory whose merged branch did work", async () => {
+  it("still sweeps a .claude/worktrees directory whose own branch did work", async () => {
     setup_git_mocks({
       worktree_list: make_porcelain({
         path: "/repo",
         branch: "refs/heads/main",
         head: "trunk-tip",
       }),
-      merged_branches: "  feature/done\n",
+      merged_branches: "+ feature/done\n",
       trunk_first_parent: TRUNK,
       branch_tips: { "feature/done": "side-tip" },
+      worktree_branches: { "/repo/.claude/worktrees/agent-7b4d9a10": "feature/done" },
     });
-    mock_readdir.mockResolvedValue([{ name: "agent-done", isDirectory: () => true }]);
+    mock_readdir.mockResolvedValue([{ name: "agent-7b4d9a10", isDirectory: () => true }]);
 
     await sweep_stale_worktrees(registry_for() as any);
 
-    expect(removed_paths()).toEqual(["/repo/.claude/worktrees/agent-done"]);
+    expect(removed_paths()).toEqual(["/repo/.claude/worktrees/agent-7b4d9a10"]);
+  });
+
+  it("passes the directory's OWN branch to the removal, never the matched one", async () => {
+    // The wrong-branch handoff is the load-bearing defect: `remove_worktree`
+    // runs #30's unpushed check against whatever branch it is given, so being
+    // handed a merged (therefore pushed, therefore "safe") branch while
+    // deleting some other branch's directory disables the check entirely.
+    setup_git_mocks({
+      worktree_list: make_porcelain({
+        path: "/repo",
+        branch: "refs/heads/main",
+        head: "trunk-tip",
+      }),
+      merged_branches: "+ feature/done\n",
+      trunk_first_parent: TRUNK,
+      branch_tips: { "feature/done": "side-tip" },
+      worktree_branches: { "/repo/.claude/worktrees/agent-7b4d9a10": "feature/done" },
+    });
+    mock_readdir.mockResolvedValue([{ name: "agent-7b4d9a10", isDirectory: () => true }]);
+
+    await sweep_stale_worktrees(registry_for() as any);
+
+    // The unpushed-commit probe must have been run on the directory's own
+    // branch. (Here they coincide by construction — that is the point: the
+    // only branch a directory can be removed under is the one it is on.)
+    const rev_list_branches = mock_exec_file.mock.calls
+      .filter(
+        (c: unknown[]) => (c[1] as string[])[0] === "rev-list" && (c[1] as string[])[2] === "--not",
+      )
+      .map((c: unknown[]) => (c[1] as string[])[1]);
+    expect(rev_list_branches).toContain("feature/done");
+  });
+});
+
+describe("live-agent marker — issue #110 live-session exemption", () => {
+  const TRUNK = {
+    "refs/remotes/origin/main": ["trunk-tip"],
+    "refs/heads/main": ["trunk-tip"],
+  };
+
+  it("exports the marker filename so the shield is greppable", () => {
+    expect(AGENT_ACTIVE_MARKER).toBe(".lf-agent-active");
+  });
+
+  it("detects the marker regardless of git state", async () => {
+    mock_stat.mockResolvedValue({ isDirectory: () => false });
+    await expect(has_live_agent_marker("/repo/worktrees/held")).resolves.toBe(true);
+    expect(mock_stat).toHaveBeenCalledWith("/repo/worktrees/held/.lf-agent-active");
+  });
+
+  it("reports no marker when the file is absent", async () => {
+    await expect(has_live_agent_marker("/repo/worktrees/free")).resolves.toBe(false);
+  });
+
+  it("refuses to remove a marked worktree and posts no alert", async () => {
+    setup_git_mocks({});
+    mock_stat.mockResolvedValue({ isDirectory: () => true }); // marker present
+    const alert_router = { post_alert: vi.fn() };
+
+    const removed = await remove_worktree("/repo", "/repo/worktrees/held", "feature/held", {
+      alert_router: alert_router as any,
+      entity_id: "test-entity",
+    });
+
+    expect(removed).toBe(false);
+    expect(removed_paths()).toHaveLength(0);
+    // Deliberately held is not stale-but-unsafe — nobody is paged.
+    expect(alert_router.post_alert).not.toHaveBeenCalled();
+  });
+
+  it("does not relocate tmux panes out of a marked worktree", async () => {
+    // Pre-fix the sweep cd'd every live pane out of the directory *first* and
+    // only then discovered it could not remove it — a running agent lost its
+    // cwd for nothing.
+    setup_git_mocks({
+      worktree_list: make_porcelain(
+        { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
+        { path: "/repo/worktrees/held", branch: "refs/heads/feature/held", head: "side-tip" },
+      ),
+      merged_branches: "+ feature/held\n",
+      trunk_first_parent: TRUNK,
+      branch_tips: { "feature/held": "side-tip" },
+    });
+    mock_stat.mockResolvedValue({ isDirectory: () => true }); // marker present
+    mock_exec_file_sync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === "tmux" && args[0] === "list-panes") {
+        return "session1 %0 /repo/worktrees/held\n";
+      }
+      return "";
+    });
+    const registry = {
+      get_active: vi
+        .fn()
+        .mockReturnValue([{ entity: { id: "test-entity", repos: [{ path: "/repo", url: "u" }] } }]),
+    };
+
+    await sweep_stale_worktrees(registry as any);
+
+    expect(removed_paths()).toHaveLength(0);
+    const send_keys = mock_exec_file_sync.mock.calls.filter(
+      (c: unknown[]) => (c[1] as string[])[0] === "send-keys",
+    );
+    expect(send_keys).toHaveLength(0);
   });
 });
