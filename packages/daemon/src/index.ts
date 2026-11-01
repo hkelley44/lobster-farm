@@ -352,10 +352,20 @@ async function main(): Promise<void> {
   // halves must see the same map or the gate is blind to half the agents — the
   // #103 collider was not daemon-spawned, so observed occupancy is the only
   // signal that would have caught it.
-  const worktree_leases = new WorktreeLeaseStore(
-    config.pr_cron?.worktree_lease_ttl_ms,
-    config.pr_cron?.worktree_observed_ttl_ms,
-  );
+  //
+  // Null when stood down via `pr_cron.worktree_lease_enabled: false` — every
+  // call site is null-guarded, so off is the pre-#105 code path, not a variant
+  // of it.
+  const worktree_leases =
+    config.pr_cron?.worktree_lease_enabled === false
+      ? null
+      : new WorktreeLeaseStore(
+          config.pr_cron?.worktree_lease_ttl_ms,
+          config.pr_cron?.worktree_observed_ttl_ms,
+        );
+  if (!worktree_leases) {
+    console.log("[pr-cron] Worktree lease disabled via config (worktree_lease_enabled: false)");
+  }
 
   // Start HTTP server — reuse the socket acquire_port() already bound so there
   // is no second listen() and no bind race with the singleton guard.

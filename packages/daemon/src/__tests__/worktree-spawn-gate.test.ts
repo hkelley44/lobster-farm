@@ -424,6 +424,47 @@ describe("#105 Stop hook feeds observed occupancy", () => {
     expect(store.acquire(WORKTREE, "daemon-cron", "op-autofix").ok).toBe(false);
   });
 
+  it("stays a 200 no-op when the lease is stood down (flag off)", async () => {
+    // `pr_cron.worktree_lease_enabled: false` makes index.ts pass null here.
+    // The route must still answer normally — the Stop hook also drives reply
+    // enforcement and pool liveness, so a disabled lease must not break it.
+    const off = start_server(
+      { get_active: () => [] } as unknown as EntityRegistry,
+      LobsterFarmConfigSchema.parse({ user: { name: "Test" } }),
+      { get_active: () => [] } as never,
+      {
+        get_stats: () => ({ pending: 0, active: 0, total: 0 }),
+        get_pending: () => [],
+        get_active: () => [],
+      } as never,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null, // worktree_leases — stood down
+      0,
+    );
+    await new Promise<void>((resolve) => off.on("listening", resolve));
+    const addr = off.address();
+    const off_port = typeof addr === "object" && addr ? addr.port : 0;
+
+    try {
+      const res = await fetch(`http://localhost:${String(off_port)}/hooks/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "sess-x", working_dir: WORKTREE }),
+      });
+      expect(res.status).toBe(200);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        off.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
+
   it("stays a 200 no-op for a malformed hook body", async () => {
     const res = await fetch(`http://localhost:${String(port)}/hooks/stop`, {
       method: "POST",
