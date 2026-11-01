@@ -29,14 +29,51 @@
  * the merge — precisely "no auto-merge while another review is in flight."
  */
 
-/** Who holds a review lease. The webhook spawn path is in-scope per #60. */
-export type LeaseHolder = "daemon-cron" | "daemon-webhook" | "tidus-manual";
+/**
+ * Who holds a review lease. The webhook spawn path is in-scope per #60;
+ * `daemon-staging` is the staging-gate promotion path (#104).
+ */
+export type LeaseHolder = "daemon-cron" | "daemon-webhook" | "tidus-manual" | "daemon-staging";
 
-const LEASE_HOLDERS: readonly LeaseHolder[] = ["daemon-cron", "daemon-webhook", "tidus-manual"];
+const LEASE_HOLDERS: readonly LeaseHolder[] = [
+  "daemon-cron",
+  "daemon-webhook",
+  "tidus-manual",
+  "daemon-staging",
+];
 
-/** Narrowing guard for untrusted holder strings arriving over HTTP. */
+/**
+ * Holders an external caller may acquire or release over the HTTP lease API.
+ *
+ * `daemon-staging` is deliberately **excluded** (#104). It is taken and
+ * released in-process by the staging-promotion route around a single
+ * promotion; exposing it on `POST/DELETE /review-lease` would let an agent
+ * either squat the holder — stalling every promotion on a 409 — or release the
+ * lease out from under a promotion already in flight. Nothing outside the
+ * daemon has a legitimate reason to hold it.
+ */
+const AGENT_ACQUIRABLE_HOLDERS: readonly LeaseHolder[] = [
+  "daemon-cron",
+  "daemon-webhook",
+  "tidus-manual",
+];
+
+/** Human-readable list for the HTTP error message. */
+export const AGENT_ACQUIRABLE_HOLDER_NAMES = AGENT_ACQUIRABLE_HOLDERS.join(", ");
+
+/** Narrowing guard over every valid holder value. */
 export function is_lease_holder(value: unknown): value is LeaseHolder {
   return typeof value === "string" && (LEASE_HOLDERS as readonly string[]).includes(value);
+}
+
+/**
+ * Narrowing guard for untrusted holder strings arriving over HTTP. Stricter
+ * than `is_lease_holder`: rejects daemon-internal holders (#104).
+ */
+export function is_agent_acquirable_holder(value: unknown): value is LeaseHolder {
+  return (
+    typeof value === "string" && (AGENT_ACQUIRABLE_HOLDERS as readonly string[]).includes(value)
+  );
 }
 
 /** Default lease lifetime. Tunable via `pr_cron.review_lease_ttl_ms`. */

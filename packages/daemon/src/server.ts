@@ -21,7 +21,12 @@ import { QueueFullError } from "./queue.js";
 import type { TaskQueue, TaskSubmission } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
 import { evaluate_stop } from "./reply-enforcement.js";
-import { type ReviewLeaseStore, is_lease_holder } from "./review-lease.js";
+import { find_entity_for_repo } from "./repo-utils.js";
+import {
+  AGENT_ACQUIRABLE_HOLDER_NAMES,
+  type ReviewLeaseStore,
+  is_agent_acquirable_holder,
+} from "./review-lease.js";
 import {
   format_sentry_alert,
   format_sentry_alert_minimal,
@@ -36,6 +41,11 @@ import {
 import * as sentry from "./sentry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import { classify_listen_error, read_incumbent_pid } from "./singleton.js";
+import {
+  type StagingPromotionOutcome,
+  type StagingSignoff,
+  run_staging_promotion,
+} from "./staging-promotion.js";
 import { type WebhookContext, handle_github_webhook } from "./webhook-handler.js";
 import type { WorktreeLeaseStore } from "./worktree-lease.js";
 
@@ -850,9 +860,9 @@ const handle_review_lease_acquire: RouteHandler = async (req, res, ctx) => {
     return;
   }
 
-  if (!is_lease_holder(params.holder)) {
+  if (!is_agent_acquirable_holder(params.holder)) {
     json_response(res, 400, {
-      error: "Unknown holder — must be one of: daemon-cron, daemon-webhook, tidus-manual",
+      error: `Unknown holder — must be one of: ${AGENT_ACQUIRABLE_HOLDER_NAMES}`,
     });
     return;
   }
@@ -895,9 +905,9 @@ const handle_review_lease_release: RouteHandler = async (req, res, ctx) => {
     return;
   }
 
-  if (!is_lease_holder(params.holder)) {
+  if (!is_agent_acquirable_holder(params.holder)) {
     json_response(res, 400, {
-      error: "Unknown holder — must be one of: daemon-cron, daemon-webhook, tidus-manual",
+      error: `Unknown holder — must be one of: ${AGENT_ACQUIRABLE_HOLDER_NAMES}`,
     });
     return;
   }
@@ -912,6 +922,154 @@ const handle_review_lease_release: RouteHandler = async (req, res, ctx) => {
     json_response(res, 403, { error: "Lease held by a different holder" });
   }
 };
+
+// ── Staging-gate promotion route (#104) ──
+//
+// `POST /pr/:owner/:repo/:num/staging-promotion` is the daemon-owned
+// replacement for the hand-run git commands in `pr-review-merge` SOP step
+// 4a.next. The agent's role shrinks from "run the promotion" to "relay that
+// Hunter signed off"; the daemon performs the ff-only promotion behind the same
+// lease-gated chokepoint that owns autonomous merges (#102).
+//
+// The request body carries the human sign-off; without a recognised one the
+// promotion is refused before any git command runs, so centralizing the actor
+// does not make the promotion automatic.
+const STAGING_PROMOTION_PATH = new RegExp(
+  `^/pr/(${GH_SEGMENT})/(${GH_SEGMENT})/(\\d+)/staging-promotion$`,
+);
+
+/** Map a promotion outcome onto an HTTP status. */
+function staging_promotion_status(outcome: StagingPromotionOutcome): number {
+  switch (outcome.kind) {
+    case "promoted":
+    case "already_current":
+      return 200;
+    case "signoff_missing":
+      return 400;
+    case "signoff_unauthorized":
+      return 403;
+    // The chokepoint refused: a review/merge is in flight on this PR, or the
+    // lease lapsed. Same 409 shape the lease API uses for "someone else owns
+    // this PR right now" — the caller should retry later, not escalate.
+    case "lease_not_held":
+      return 409;
+    case "no_staging_branch":
+      return 404;
+    // Divergence and git failures need a human (SOP 4a.next: escalate, never
+    // merge-commit / rebase / force-push).
+    case "diverged":
+      return 409;
+    default:
+      return 500;
+  }
+}
+
+const handle_staging_promotion: RouteHandler = async (req, res, ctx) => {
+  if (!ctx.review_leases) {
+    json_response(res, 503, { error: "Review lease store not initialized" });
+    return;
+  }
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const parsed = parse_pr_path(url.pathname, STAGING_PROMOTION_PATH);
+  if (!parsed) {
+    json_response(res, 400, { error: "Invalid PR path" });
+    return;
+  }
+
+  const body = await read_body(req);
+  let params: { signoff?: unknown };
+  try {
+    params = JSON.parse(body) as typeof params;
+  } catch {
+    json_response(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+
+  const signoff = parse_signoff(params.signoff);
+  if (!signoff) {
+    json_response(res, 400, {
+      error:
+        "Missing or malformed signoff — required: { approved_by, approved_at, source }. " +
+        "Staging promotion requires an explicit human sign-off (SOP 4a step 6).",
+    });
+    return;
+  }
+
+  // Resolve the local clone from the GitHub slug. No entity owns this repo →
+  // nothing to promote.
+  const match = find_entity_for_repo(parsed.owner_repo, ctx.registry);
+  if (!match) {
+    json_response(res, 404, { error: `No active entity owns ${parsed.owner_repo}` });
+    return;
+  }
+
+  let gh_token: string;
+  try {
+    gh_token = ctx.github_app ? await ctx.github_app.get_token() : (process.env.GH_TOKEN ?? "");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    json_response(res, 503, { error: `Could not obtain a GitHub token: ${msg}` });
+    return;
+  }
+
+  // Acquire the chokepoint lease for this promotion. A live lease from a cron
+  // or webhook review means that PR is mid-flight — defer rather than race it.
+  // The session id ties the promotion to this specific acquisition, so a stale
+  // `daemon-staging` lease from another promotion can't be piggybacked (#102).
+  const lease_session_id = `staging-promote-${String(Date.now())}`;
+  const acquired = ctx.review_leases.acquire(
+    parsed.owner_repo,
+    parsed.pr_number,
+    "daemon-staging",
+    { session_id: lease_session_id },
+  );
+  if (!acquired.ok) {
+    json_response(res, 409, {
+      error: "Cannot promote — another review or merge holds the lease for this PR",
+      current_lease: acquired.current_lease,
+    });
+    return;
+  }
+
+  let outcome: StagingPromotionOutcome;
+  try {
+    outcome = await run_staging_promotion({
+      owner_repo: parsed.owner_repo,
+      pr_number: parsed.pr_number,
+      repo_path: match.repo_path,
+      gh_token,
+      signoff,
+      authorized_approvers: [ctx.config.user.name],
+      review_leases: ctx.review_leases,
+      lease_session_id,
+    });
+  } finally {
+    // Always release: a held `daemon-staging` lease would block the next
+    // review on this PR for its full TTL.
+    ctx.review_leases.release(parsed.owner_repo, parsed.pr_number, "daemon-staging");
+  }
+
+  if (outcome.kind !== "promoted" && outcome.kind !== "already_current") {
+    console.error(
+      `[staging-promotion] ${parsed.owner_repo}#${String(parsed.pr_number)} refused: ${outcome.kind}`,
+    );
+  }
+
+  json_response(res, staging_promotion_status(outcome), { outcome });
+};
+
+/**
+ * Narrow an untrusted request body field into a `StagingSignoff`. All three
+ * fields are mandatory — a partial sign-off is not a sign-off.
+ */
+function parse_signoff(value: unknown): StagingSignoff | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { approved_by, approved_at, source } = value as Record<string, unknown>;
+  if (typeof approved_by !== "string" || approved_by.trim() === "") return null;
+  if (typeof approved_at !== "string" || approved_at.trim() === "") return null;
+  if (typeof source !== "string" || source.trim() === "") return null;
+  return { approved_by, approved_at, source };
+}
 
 // ── Channel routes ──
 
@@ -1208,6 +1366,9 @@ const routes: Route[] = [
   { method: "GET", pattern: REVIEW_STATE_PATH, handler: handle_review_state },
   { method: "POST", pattern: REVIEW_LEASE_PATH, handler: handle_review_lease_acquire },
   { method: "DELETE", pattern: REVIEW_LEASE_PATH, handler: handle_review_lease_release },
+  // Staging-gate promotion (#104). Also listed before any broader /pr/*
+  // pattern so the specific path wins.
+  { method: "POST", pattern: STAGING_PROMOTION_PATH, handler: handle_staging_promotion },
   { method: "POST", pattern: /^\/channels\/delete$/, handler: handle_channel_delete },
   {
     method: "POST",
