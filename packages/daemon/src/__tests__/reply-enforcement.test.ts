@@ -13,11 +13,11 @@
  *   - subagent / sidechain → pass-through
  *   - JSONL flush race → retry loop tolerates a brief absence
  *   - Haiku timeout → graceful fail open
- *   - run_claude_print → resolves on exit 0, rejects on non-zero + timeout (#79 a)
+ *   - (run_claude_print's own stdin/timeout/EPIPE contract lives in claude-cli.test.ts)
  *   - parse_last_assistant_turn → reply_text = joined text blocks (#79 b)
  */
 
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -36,7 +36,6 @@ import {
   parse_last_assistant_turn,
   read_last_assistant_turn,
   resolve_bound_channel,
-  run_claude_print,
 } from "../reply-enforcement.js";
 import type { TurnSummary } from "../reply-enforcement.js";
 
@@ -992,126 +991,5 @@ describe("evaluate_stop — acceptance criteria", () => {
     );
     expect(result).toEqual({ ok: true });
     expect(sends.length).toBe(0);
-  });
-});
-
-// ── run_claude_print (issue #79 a — heartbeat stdin fix) ──
-
-describe("run_claude_print", () => {
-  let bin_dir: string;
-
-  beforeEach(async () => {
-    bin_dir = await mkdtemp(join(tmpdir(), "lf-claude-bin-"));
-  });
-
-  afterEach(async () => {
-    await rm(bin_dir, { recursive: true, force: true });
-  });
-
-  /** Write an executable shell script and return its path. */
-  async function make_script(name: string, body: string): Promise<string> {
-    const path = join(bin_dir, name);
-    await writeFile(path, `#!/usr/bin/env bash\n${body}\n`, "utf-8");
-    await chmod(path, 0o755);
-    return path;
-  }
-
-  it("resolves with stdout when the child exits 0", async () => {
-    // Echoes back whatever it reads on stdin, proving the prompt is fed there
-    // and stdin is closed (otherwise `cat` would block forever).
-    const bin = await make_script("ok", "cat");
-    const out = await run_claude_print(bin, [], "hello over stdin", 5_000);
-    expect(out).toBe("hello over stdin");
-  });
-
-  it("closes stdin so a stdin-reading child never hangs", async () => {
-    // `cat` with no args reads until EOF. If stdin were left open this would
-    // hang until the 1s timeout and reject. It must resolve fast instead.
-    const bin = await make_script("cat-eof", "cat");
-    const out = await run_claude_print(bin, [], "", 1_000);
-    expect(out).toBe("");
-  });
-
-  it("rejects when the child exits non-zero, surfacing stderr", async () => {
-    const bin = await make_script("fail", 'echo "boom" >&2\nexit 3');
-    await expect(run_claude_print(bin, [], "x", 5_000)).rejects.toThrow(/claude exited 3/);
-  });
-
-  it("rejects and kills the child on timeout", async () => {
-    // Sleeps well past the timeout; run_claude_print must SIGKILL it and reject.
-    const bin = await make_script("slow", "sleep 5");
-    const started = Date.now();
-    // The rejection message is generic over `bin` — it names the binary and the
-    // elapsed budget rather than a hardcoded "claude -p timeout" string.
-    await expect(run_claude_print(bin, [], "x", 150)).rejects.toThrow(/timed out after 150ms/);
-    // Should reject promptly at the timeout, not wait out the full 5s sleep.
-    expect(Date.now() - started).toBeLessThan(2_000);
-  });
-
-  it("rejects when the binary does not exist (spawn error)", async () => {
-    await expect(
-      run_claude_print(join(bin_dir, "does-not-exist"), [], "x", 1_000),
-    ).rejects.toBeInstanceOf(Error);
-  });
-
-  // ── async stdin EPIPE (issue #81 item 1 — PRIORITY, daemon-crash vector) ──
-
-  it("settles cleanly when the child exits before draining a large stdin payload (async EPIPE)", async () => {
-    // Regression for the daemon-crash vector: a child that exits immediately
-    // leaves its stdin pipe with no reader. Writing a payload LARGER than the OS
-    // pipe buffer (~64 KiB on Darwin/Linux) can't complete synchronously — the
-    // kernel raises EPIPE on the stdin stream ASYNCHRONOUSLY, as an 'error'
-    // event. Without `child.stdin.on("error", ...)` Node escalates that to an
-    // uncaught exception and kills the whole daemon. This test drives the REAL
-    // spawn/stdin path (a real child process that exits at once) and asserts the
-    // promise settles instead of throwing uncaught.
-    const bin = await make_script("exit-fast", "exit 0");
-    // 1 MiB — well past any pipe buffer, guaranteeing the write outlives the child.
-    const big_payload = "x".repeat(1024 * 1024);
-
-    // A rejection is a clean settle (the child exited non-zero or the write path
-    // errored); a resolve is also clean. The ONLY unacceptable outcome is an
-    // uncaught 'error' event crashing the process — which manifests here as the
-    // test runner recording an unhandled error. Guard against that explicitly.
-    let uncaught: unknown;
-    const on_uncaught = (err: unknown) => {
-      uncaught = err;
-    };
-    process.on("uncaughtException", on_uncaught);
-    try {
-      await run_claude_print(bin, [], big_payload, 5_000).then(
-        () => undefined,
-        () => undefined, // reject is a valid clean settle
-      );
-      // Give any async EPIPE a tick to surface before we assert.
-      await new Promise((r) => setTimeout(r, 50));
-    } finally {
-      process.off("uncaughtException", on_uncaught);
-    }
-    expect(uncaught).toBeUndefined();
-  });
-
-  it("does not crash when the child dies mid-write on a large payload", async () => {
-    // Complementary case: the child reads a little then exits, so the writer is
-    // still pushing bytes when the read end closes — the classic broken-pipe
-    // race the reviewer called out (SIGKILL-on-timeout / instant-exit). Must
-    // settle without an uncaught throw.
-    const bin = await make_script("read-then-die", "head -c 10 >/dev/null; exit 0");
-    const big_payload = "y".repeat(1024 * 1024);
-    let uncaught: unknown;
-    const on_uncaught = (err: unknown) => {
-      uncaught = err;
-    };
-    process.on("uncaughtException", on_uncaught);
-    try {
-      await run_claude_print(bin, [], big_payload, 5_000).then(
-        () => undefined,
-        () => undefined,
-      );
-      await new Promise((r) => setTimeout(r, 50));
-    } finally {
-      process.off("uncaughtException", on_uncaught);
-    }
-    expect(uncaught).toBeUndefined();
   });
 });

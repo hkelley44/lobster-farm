@@ -1,12 +1,9 @@
-import { execFile } from "node:child_process";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { promisify } from "node:util";
 import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { entity_daily_dir, lobsterfarm_dir } from "@lobster-farm/shared";
+import { HAIKU_PRINT_ARGS, claude_bin, run_claude_print } from "./claude-cli.js";
 import { find_session_file } from "./session-context.js";
-
-const exec = promisify(execFile);
 
 // ── Session transcript reading ──
 
@@ -26,6 +23,33 @@ const MAX_ASSISTANT_TURNS = 40;
 const MAX_TRANSCRIPT_CHARS = 12_000;
 
 /**
+ * Time budget for the Haiku extraction call.
+ *
+ * Raised from 30s (issue #79's second call site). The old budget was too tight
+ * for two compounding reasons, measured against the live `claude` 2.1.220 CLI
+ * with a full 12k-char transcript:
+ *
+ *   - `execFile` left stdin open, so every call paid a fixed ~3s
+ *     `no stdin data received in 3s` stall before Haiku even started. Routing
+ *     through `run_claude_print` removes that tax (~9.9s → ~6.0s per call,
+ *     measured over three runs each on an idle machine).
+ *   - The remaining ~6s is *idle-machine* cost. These calls fire on session
+ *     end, which in practice means during the noisiest moments the daemon has:
+ *     DEAF-recycle storms, post-restart resume waves, several agents sharing
+ *     the macOS resource coalition's I/O budget. A 3-5x slowdown there is
+ *     ordinary, and 30s left no room for it — which is exactly what the 7
+ *     logged `Memory extraction skipped` failures were.
+ *
+ * 120s is sized for that worst case rather than the happy path. Extraction is
+ * fire-and-forget and strictly off the lifecycle critical path (see
+ * `BotPool.extract_on_session_end`), so a generous budget costs nothing but a
+ * backgrounded child process. A budget that is too tight, by contrast, loses
+ * institutional memory silently — the failure is swallowed as best-effort and
+ * the only symptom is MEMORY.md going stale.
+ */
+const EXTRACTION_TIMEOUT_MS = 120_000;
+
+/**
  * Read the last N assistant text turns from a session's JSONL transcript.
  *
  * We pull only the `text` blocks from assistant messages — that's the agent's
@@ -39,15 +63,32 @@ const MAX_TRANSCRIPT_CHARS = 12_000;
  *
  * Best-effort: returns "" on any failure (file missing, parse error). The
  * caller falls back to its marker-entry behavior when this is empty.
+ *
+ * Every empty-return path logs WHY. The caller's daily-log marker reads the
+ * same ("no transcript to summarize") whatever the cause, which left 21 such
+ * markers in the daemon log undiagnosable after the fact — by the time anyone
+ * looked, the candidate JSONLs had been pruned. Per the MEMORY.md rule that a
+ * lookup gating a health signal must log on failure and not only on success,
+ * these branches now name themselves. Observability only — the best-effort
+ * return contract is unchanged.
  */
 async function read_session_transcript(session_id: string): Promise<string> {
+  const short_id = session_id.slice(0, 8);
+
   // The null-sentinel means the JSONL was never confirmed on disk — nothing
-  // to read. Skip straight to the caller's marker fallback.
+  // to read. Skip straight to the caller's marker fallback. This is the
+  // dominant cause in practice (31 of 44 historical markers): the bot ended
+  // its session before its session id was ever confirmed.
   if (session_id === NO_SESSION) return "";
 
   try {
     const file_path = await find_session_file(session_id);
-    if (!file_path) return "";
+    if (!file_path) {
+      console.log(
+        `[hooks] No JSONL found for session ${short_id} in any ~/.claude/projects dir — nothing to summarize`,
+      );
+      return "";
+    }
 
     const content = await readFile(file_path, "utf-8");
     const lines = content.split("\n").filter(Boolean);
@@ -78,14 +119,22 @@ async function read_session_transcript(session_id: string): Promise<string> {
       }
     }
 
-    if (turns.length === 0) return "";
+    if (turns.length === 0) {
+      console.log(
+        `[hooks] JSONL for session ${short_id} has no assistant text turns ` +
+          `(${String(lines.length)} lines at ${file_path}) — nothing to summarize`,
+      );
+      return "";
+    }
 
     const recent = turns.slice(-MAX_ASSISTANT_TURNS).join("\n\n");
     // Char cap applied tail-first so the latest content survives truncation.
     return recent.length > MAX_TRANSCRIPT_CHARS ? recent.slice(-MAX_TRANSCRIPT_CHARS) : recent;
-  } catch {
+  } catch (err) {
     // Transcript read is best-effort — a missing or unreadable file just
     // means Haiku gets the marker fallback instead of real content.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`[hooks] Transcript read failed for session ${short_id}: ${msg}`);
     return "";
   }
 }
@@ -132,6 +181,12 @@ export async function append_to_daily_log(
  *
  * This runs after a session completes. It asks Haiku to summarize
  * what was accomplished and what's worth remembering.
+ *
+ * Best-effort by design — a failure here must never break session end — which
+ * is also what made the issue-#79 stdin bug so expensive at this call site: it
+ * was swallowed, wrote a plausible "extraction skipped" marker, and the only
+ * symptom was the platform's own memory quietly going stale. The Haiku call
+ * therefore goes through `run_claude_print`; see claude-cli.ts for the rule.
  */
 export async function extract_session_learnings(
   entity_id: string,
@@ -181,11 +236,14 @@ export async function extract_session_learnings(
   ].join("\n");
 
   try {
-    const claude_bin = process.env.CLAUDE_BIN ?? "claude";
-    const { stdout } = await exec(
-      claude_bin,
-      ["-p", "--model", "haiku", "--no-session-persistence", "--print", prompt],
-      { timeout: 30_000 },
+    // The prompt travels over stdin, never as an argv argument — see
+    // `run_claude_print` in claude-cli.ts. Passing it as an arg leaves the
+    // child's stdin open and `claude -p` stalls waiting on it (issue #79).
+    const stdout = await run_claude_print(
+      claude_bin(),
+      HAIKU_PRINT_ARGS,
+      prompt,
+      EXTRACTION_TIMEOUT_MS,
     );
 
     const summary = stdout.trim();
@@ -198,6 +256,25 @@ export async function extract_session_learnings(
 
       await append_to_daily_log(entity_id, entry, config);
       console.log(`[hooks] Extracted session learnings for ${feature_id}`);
+    } else {
+      // Exit 0 with nothing on stdout. Haiku can legitimately return an empty
+      // completion — a refusal, a truncation, a transcript it declines to
+      // summarize — and that is NOT the same thing as the call failing.
+      //
+      // This branch used to be absent, which made it the worst of the three
+      // outcomes: no daily-log entry and no log line, indistinguishable from
+      // extraction never having fired. The day silently lost a session, with
+      // less evidence than the #79 timeout bug left behind. Per the same rule
+      // applied to every empty-return path in `read_session_transcript` — a
+      // lookup gating a health signal must log on failure, not only on success
+      // — the gap names itself in both places, and with wording distinct from
+      // the "extraction skipped" (call failed) and "no transcript to
+      // summarize" (nothing to send) markers so the daily log stays greppable.
+      const entry = `**Session ended: ${archetype} on ${feature_id}** (${session_id.slice(0, 8)}) — extraction returned no summary`;
+      await append_to_daily_log(entity_id, entry, config);
+      console.log(
+        `[hooks] Memory extraction returned empty output for ${feature_id} (exit 0, no summary) — marker written`,
+      );
     }
   } catch (err) {
     // Haiku extraction is best-effort — don't fail the flow

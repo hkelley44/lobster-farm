@@ -23,9 +23,9 @@
  * for the review-follow-up (stdin EPIPE guard, bounded guard, uuid re-key).
  */
 
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { HAIKU_PRINT_ARGS, claude_bin, run_claude_print } from "./claude-cli.js";
 import type { DiscordBot } from "./discord.js";
 import { claude_session_jsonl_path } from "./pool.js";
 import type { BotPool } from "./pool.js";
@@ -345,92 +345,13 @@ export function is_discord_bound(session_id: string, pool: BotPool | null): bool
 // ── Heartbeat generation ──
 
 /**
- * Run `claude -p --print` with the prompt fed over **stdin**, returning stdout.
- *
- * Why spawn (not `promisify(execFile)`): `execFile` never closes the child's
- * stdin, so `claude -p` sits waiting on stdin even when the prompt is passed as
- * an arg — it logs `no stdin data received` and routinely blows past the tight
- * heartbeat budget, so the backstop never posts (issue #79).
- *
- * The fix, verified against the pinned `CLAUDE_BIN`: pipe the prompt into stdin
- * and `end()` it immediately. This is the documented `claude -p` invocation and
- * removes the wait entirely. The essential invariant is **stdin is never left
- * open** — we always close it, whether or not we write.
- *
- * Kills the child on timeout and rejects. Rejects on any non-zero exit. Never
- * leaves a dangling process or timer.
- */
-export function run_claude_print(
-  bin: string,
-  args: string[],
-  input: string,
-  timeout_ms: number,
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill("SIGKILL");
-      reject(new Error(`${bin} timed out after ${String(timeout_ms)}ms`));
-    }, timeout_ms);
-
-    child.stdout.on("data", (d) => {
-      stdout += String(d);
-    });
-    child.stderr.on("data", (d) => {
-      stderr += String(d);
-    });
-    child.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(err);
-    });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code === 0) {
-        resolve(stdout);
-      } else {
-        reject(new Error(`claude exited ${String(code)}: ${stderr.slice(0, 200)}`));
-      }
-    });
-
-    // Swallow async stdin errors. A broken-pipe (EPIPE) is emitted
-    // asynchronously as an `'error'` event on the stdin *stream* when the child
-    // dies before draining a payload larger than the pipe buffer. Without this
-    // listener Node treats it as an unhandled stream error and crashes the
-    // process — violating the module's "NEVER throw / fail-open inside the
-    // Stop-hook budget" invariant. The `child.on("error")` and `try/catch`
-    // below do NOT catch it (it's neither a spawn error nor synchronous). The
-    // `close` handler still settles the promise with the real exit reason.
-    child.stdin.on("error", () => {});
-
-    // Feed the prompt over stdin, then close it — this is what unblocks
-    // `claude -p`. Guard the synchronous write in case the child died before
-    // stdin opened; the async guard above covers the post-write EPIPE case.
-    try {
-      child.stdin.write(input);
-      child.stdin.end();
-    } catch {
-      // The `error`/`close` handlers above will settle the promise.
-    }
-  });
-}
-
-/**
  * Ask Haiku for a one-line "what just happened" summary. Mirrors the shape of
  * `extract_session_learnings` in hooks.ts but bounded tighter — Stop hooks
  * have a 10s budget and Haiku takes 2–5s, so we cap at 6s and bail gracefully.
  *
  * The prompt is fed over stdin (not passed as a positional arg) — see
- * `run_claude_print` for why leaving stdin open breaks the call.
+ * `run_claude_print` in `claude-cli.ts` for why leaving stdin open breaks the
+ * call.
  */
 export async function generate_heartbeat(turn: TurnSummary): Promise<string> {
   const tool_list = turn.tool_summary || "(no tools)";
@@ -447,13 +368,7 @@ export async function generate_heartbeat(turn: TurnSummary): Promise<string> {
     "Reply with ONLY the sentence, no preamble, no quotes.",
   ].join("\n");
 
-  const claude_bin = process.env.CLAUDE_BIN ?? "claude";
-  const stdout = await run_claude_print(
-    claude_bin,
-    ["-p", "--model", "haiku", "--no-session-persistence", "--print"],
-    prompt,
-    6_000,
-  );
+  const stdout = await run_claude_print(claude_bin(), HAIKU_PRINT_ARGS, prompt, 6_000);
   return stdout.trim();
 }
 
