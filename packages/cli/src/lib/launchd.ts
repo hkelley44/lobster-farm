@@ -149,12 +149,22 @@ ${env_section}`;
  *
  * 1. **The scan is bounded** by the declared-key set. While a quote is open, a
  *    line that assigns a key `.env.op` actually declares ends the scan and is
- *    re-parsed as a fresh assignment. So one bad entry costs one entry, and a
- *    single startup reports *every* malformed key rather than just the first.
+ *    re-parsed as a fresh assignment. So a single startup reports *every*
+ *    malformed key rather than just the first. That bound is tested *before*
+ *    the closing-quote test, and the order matters: a single-line quoted
+ *    declaration ends with a quote character, so testing the close first ate
+ *    `KEY="…"` as the open value's closing line — the bound never fired, that
+ *    secret was dropped, and the open key exported with its bytes spliced in,
+ *    at exit 0 with no output. `.env.op` tells operators to quote, so that was
+ *    the likelier shape of the two.
  * 2. **Startup aborts** (exit 1) with `.env.op:<line>: … key '<KEY>'` per
  *    offending entry. Booting with a silently incomplete credential set is
  *    worse than not booting: it fails later, deeper, and looks unrelated.
  *    launchd surfaces the nonzero exit via `get_launchd_job_state()`.
+ *    Note what aborting costs: *nothing* is exported, since node is never
+ *    `exec`'d. One bad entry is reported as one bad entry, but it still costs
+ *    the whole startup — the per-key reporting is not a promise that the
+ *    well-formed secrets still load.
  *
  * The bound trades one unlikely failure for one likely one: a quoted value
  * terminates early if its own body contains a line starting with a declared key
@@ -208,9 +218,11 @@ source "$ENV_FILE"
 # line, however much it looks like an assignment.
 #
 # That declared-key set does double duty: it also BOUNDS the quoted-value scan,
-# so a missing closing quote costs one entry instead of every entry after it
-# (#101). A malformed .env.op then aborts startup rather than booting a daemon
-# that is missing credentials it believes it has.
+# so a missing closing quote names the one entry that is actually malformed
+# instead of swallowing every entry after it unreported (#101). A malformed
+# .env.op then aborts startup rather than booting a daemon that is missing
+# credentials it believes it has — on abort nothing is exported, because node is
+# never reached.
 ENV_OP="${home}/.lobsterfarm/.env.op"
 if [[ -f "$ENV_OP" ]] && command -v op &>/dev/null; then
   # Colon-delimited set of declared key names, e.g. ":FOO:BAR:".
