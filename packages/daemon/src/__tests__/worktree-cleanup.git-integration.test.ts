@@ -410,6 +410,15 @@ describe("resolve_worktree_branch against real git — what `symbolic-ref` actua
   let n1_root: string;
   let n1_repo: string;
   const n1_alerts: AlertPayload[] = [];
+  /**
+   * Fixture state read *before* the sweep ran. Recorded rather than queried
+   * later because the non-vacuity test below has to describe what the sweep
+   * was handed — and with the fix reverted, the sweep destroys some of exactly
+   * that evidence (it deletes `feature/target`). A check that reads post-sweep
+   * state cannot tell "the fixture was never reachable" from "the fixture was
+   * reached and eaten".
+   */
+  let before: { merged: string[]; repo_head: string; plain_head: string; vendored_head: string };
 
   /** A directory under this fixture's `.claude/worktrees/`. */
   function entry(name: string): string {
@@ -486,6 +495,15 @@ describe("resolve_worktree_branch against real git — what `symbolic-ref` actua
 
     git(n1_repo, "fetch", "-q", "--prune");
 
+    before = {
+      merged: git(n1_repo, "branch", "--merged", "main")
+        .split("\n")
+        .map((line) => line.trim().replace(/^[*+]\s+/, "")),
+      repo_head: git(n1_repo, "symbolic-ref", "--short", "HEAD").trim(),
+      plain_head: git(entry("plain-leftover"), "symbolic-ref", "--short", "HEAD").trim(),
+      vendored_head: git(entry("vendored"), "symbolic-ref", "--short", "HEAD").trim(),
+    };
+
     const registry = {
       get_active: () => [{ entity: { id: "n1-entity", repos: [{ path: n1_repo, url: origin }] } }],
     };
@@ -511,20 +529,17 @@ describe("resolve_worktree_branch against real git — what `symbolic-ref` actua
   it("had both shapes reachable, so the cases below are not passing by default", () => {
     // Without this, every assertion here would be satisfied by a sweep that
     // simply never looked. Both resolvable shapes point at a branch the sweep
-    // is genuinely targeting this run: `feature/enclosing` (what the plain
+    // genuinely targeted this run: `feature/enclosing` (what the plain
     // directory resolves to) and `feature/target` (the nested repo's branch).
     // Both are merged into main with commits of their own, so both survive the
     // #110 unstarted-branch filter and reach `cleanup_claude_worktrees`.
-    const merged = git(n1_repo, "branch", "--merged", "main").split("\n");
-    const names = merged.map((line) => line.trim().replace(/^[*+]\s+/, ""));
-    expect(names).toContain("feature/enclosing");
-    expect(names).toContain("feature/target");
-    expect(git(n1_repo, "symbolic-ref", "--short", "HEAD").trim()).toBe("feature/enclosing");
-    // And git really does answer for the enclosing repo, not the directory.
-    expect(git(entry("plain-leftover"), "symbolic-ref", "--short", "HEAD").trim()).toBe(
-      "feature/enclosing",
-    );
-    expect(git(entry("vendored"), "symbolic-ref", "--short", "HEAD").trim()).toBe("feature/target");
+    expect(before.merged).toContain("feature/enclosing");
+    expect(before.merged).toContain("feature/target");
+    expect(before.repo_head).toBe("feature/enclosing");
+    // And git really does answer for the enclosing repo, not the directory —
+    // the claim the old docstring got wrong, asserted against git itself.
+    expect(before.plain_head).toBe("feature/enclosing");
+    expect(before.vendored_head).toBe("feature/target");
   });
 
   it("leaves a plain directory alone, and never treats it as a worktree", () => {
@@ -597,13 +612,19 @@ describe("remove_worktree against real git — the branch-identity invariant", (
     }
     git(inv_repo, "push", "-q", "origin", "main");
 
-    // Direction A: name the wrong branch. `feature/done` is merged and pushed,
-    // so #30 would wave this through — which is precisely why being handed the
-    // wrong branch is dangerous rather than merely untidy.
+    // `live` then does what a live agent does: commits, and has not pushed
+    // yet. #30 exists to make that directory unremovable — but #30 is
+    // evaluated against the branch it is *given*, so naming `feature/done`
+    // (merged, pushed, therefore "safe") disables it. The working tree stays
+    // clean, so the #27 status checks, which do look at the right directory,
+    // find nothing to object to.
+    commit(join(inv_root, "live"), "unpushed-work.txt", "hours of work");
+
+    // Direction A: name the wrong branch.
     const refused = await remove_worktree(inv_repo, join(inv_root, "live"), "feature/done");
 
     expect(refused).toBe(false);
-    expect(existsSync(join(inv_root, "live", "live.txt"))).toBe(true);
+    expect(existsSync(join(inv_root, "live", "unpushed-work.txt"))).toBe(true);
     expect(git(inv_repo, "worktree", "list")).toContain(join(inv_root, "live"));
     // Neither branch may be touched: not the directory's own, not the one the
     // caller wrongly named.
