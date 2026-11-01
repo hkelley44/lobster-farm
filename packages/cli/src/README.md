@@ -56,7 +56,7 @@ The bound is tested *before* the closing-quote test, and that order is load-bear
 
 The bound trades one unlikely failure for one likely one: a quoted value whose own body starts a line with a declared key name plus `=` terminates early. PEM base64 and JSON do not contain `DISCORD_TOKEN=`, and that case names both keys rather than failing silently. Since the bound is now tested first, this also applies to the value's *terminating* line.
 
-**Known limitation (unhandled, tracked separately).** The closing-quote test does not understand backslash-escaped quotes: a value whose *interior* line ends in `\"` is treated as closing there, exporting a truncated secret with exit 0. So the "missing closing quote aborts startup" guarantee above holds for the neighbour shapes described, not for a body line that ends in an escaped quote. `op inject` substitutes raw field bytes, so a 1Password field containing such a line reproduces it.
+**Known limitation (unhandled, tracked as issue #119).** The closing-quote test does not understand backslash-escaped quotes: a value whose *interior* line ends in `\"` is treated as closing there, exporting a truncated secret with exit 0. So the "missing closing quote aborts startup" guarantee above holds for the neighbour shapes described, not for a body line that ends in an escaped quote. `op inject` substitutes raw field bytes, so a 1Password field containing such a line reproduces it.
 
 `export KEY=op://...` is accepted as well as bare `KEY=op://...`.
 
