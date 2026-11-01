@@ -14,11 +14,15 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { AGENT_ACTIVE_MARKER, sweep_stale_worktrees } from "../worktree-cleanup.js";
+import {
+  AGENT_ACTIVE_MARKER,
+  remove_worktree,
+  sweep_stale_worktrees,
+} from "../worktree-cleanup.js";
 
 /** Hermetic git env — ignore the host's global/system config and identity. */
 const GIT_ENV = {
@@ -303,7 +307,7 @@ describe("sweep_stale_worktrees against real git — .claude/worktrees/ wrong-br
 
   it("keeps a harness worktree holding unpushed work that a merged branch's slug matched", () => {
     // The wrong-branch handoff defeated #30 outright here: the unpushed check
-    // ran against `fix/99` (pushed) while this directory, on an entirely
+    // ran against `fix/30` (pushed) while this directory, on an entirely
     // different branch with a never-pushed commit, was the one deleted.
     expect(existsSync(claude_wt("agent-30fe4d82"))).toBe(true);
     expect(existsSync(join(claude_wt("agent-30fe4d82"), "live-agent-work.txt"))).toBe(true);
@@ -376,6 +380,244 @@ describe("sweep_stale_worktrees against real git — known limitation: squash me
     expect(existsSync(wt("squashed"))).toBe(true);
     expect(alert_for("squashed")?.title).toContain("Unpushed");
   });
+});
+
+describe("resolve_worktree_branch against real git — what `symbolic-ref` actually answers", () => {
+  // Issue #110 review round 2, finding N1.
+  //
+  // `symbolic-ref --short HEAD` does not report the branch checked out in the
+  // directory you hand it. It reports the branch of whatever repository
+  // *encloses* that directory, because git walks up the tree. Two shapes
+  // therefore resolve to a branch that is not checked out where we are
+  // pointing — which is the wrong-branch handoff finding 1 was about,
+  // reappearing inside the function written to fix it:
+  //
+  //   - a plain leftover directory  -> the enclosing repo's current branch
+  //   - an unrelated nested repo    -> that repo's own branch
+  //
+  // Neither is hypothetical: `.claude/worktrees/` is a plain directory that
+  // the harness fills, and a directory left behind by a crashed `git worktree
+  // add`, or a vendored checkout parked there by hand, is exactly shape one
+  // and shape two. The mocked suite could not catch this, because it was
+  // mocking `symbolic-ref` to throw for both — asserting our *belief* about
+  // git rather than git. Hence a real repository.
+  //
+  // This fixture is deliberately separate from the one above: it needs the
+  // main checkout to sit on a merged feature branch (that is what makes the
+  // plain-directory shape reachable), which would perturb every assertion in
+  // the shared fixture.
+
+  let n1_root: string;
+  let n1_repo: string;
+  const n1_alerts: AlertPayload[] = [];
+
+  /** A directory under this fixture's `.claude/worktrees/`. */
+  function entry(name: string): string {
+    return join(n1_repo, ".claude", "worktrees", name);
+  }
+
+  beforeAll(async () => {
+    // `realpathSync` deliberately. `sweep_repo` identifies the main working
+    // tree by string-comparing the configured repo path against the path in
+    // `git worktree list --porcelain`, and git answers in *physical* form — so
+    // under a symlinked root (macOS `/var` -> `/private/var`) that comparison
+    // misses and the main checkout is treated as a sweepable worktree. That is
+    // a pre-existing defect, byte-identical on `main`, and it only becomes
+    // visible when the main checkout is on a non-`main` branch — which this
+    // fixture needs. It is not this fixture's subject, so it is normalized away
+    // here rather than silently steering the assertions below.
+    n1_root = realpathSync(mkdtempSync(join(tmpdir(), "lf-sweep-resolve-")));
+    const origin = join(n1_root, "origin.git");
+    n1_repo = join(n1_root, "repo");
+
+    execFileSync("git", ["init", "--bare", "-q", "-b", "main", origin], { env: GIT_ENV });
+    execFileSync("git", ["init", "-q", "-b", "main", n1_repo], { env: GIT_ENV });
+    git(n1_repo, "remote", "add", "origin", origin);
+
+    // No `.gitignore` for `.claude/` here, on purpose: it is what makes the
+    // plain-directory shape's damage observable. Pre-fix, the #27 status probe
+    // for that directory runs in the *enclosing* working tree, so it reports
+    // the enclosing repo's untracked files and an alert fires naming a
+    // directory that was never a worktree. Post-fix there is no alert at all.
+    commit(n1_repo, "base.txt", "base");
+    git(n1_repo, "push", "-q", "-u", "origin", "main");
+
+    // `feature/target` — merged, pushed, remote ref retained, and NOT checked
+    // out anywhere, so `git branch -d` would succeed on it. This is the ref
+    // the nested-repo shape destroys.
+    git(n1_repo, "checkout", "-q", "-b", "feature/target");
+    commit(n1_repo, "target-work.txt", "shipped");
+    git(n1_repo, "push", "-q", "-u", "origin", "feature/target");
+    git(n1_repo, "checkout", "-q", "main");
+    git(n1_repo, "merge", "-q", "--no-ff", "-m", "merge feature/target", "feature/target");
+
+    // `feature/enclosing` — merged with commits of its own (so the sweep
+    // considers it a removal target) and left checked out in the main working
+    // tree, which is what a plain subdirectory's HEAD resolves to.
+    git(n1_repo, "checkout", "-q", "-b", "feature/enclosing");
+    commit(n1_repo, "enclosing-work.txt", "shipped");
+    git(n1_repo, "push", "-q", "-u", "origin", "feature/enclosing");
+    git(n1_repo, "checkout", "-q", "main");
+    git(n1_repo, "merge", "-q", "--no-ff", "-m", "merge feature/enclosing", "feature/enclosing");
+    git(n1_repo, "push", "-q", "origin", "main");
+    git(n1_repo, "checkout", "-q", "feature/enclosing");
+
+    mkdirSync(join(n1_repo, ".claude", "worktrees"), { recursive: true });
+
+    // Shape A — a plain directory. `git -C <dir> symbolic-ref --short HEAD`
+    // here prints `feature/enclosing`.
+    mkdirSync(entry("plain-leftover"), { recursive: true });
+    writeFileSync(join(entry("plain-leftover"), "leftover.txt"), "someone's notes\n");
+
+    // Shape E — an independent repository whose own branch happens to be
+    // named like one of ours. Nothing about it belongs to this repo.
+    execFileSync("git", ["init", "-q", "-b", "feature/target", entry("vendored")], {
+      env: GIT_ENV,
+    });
+    commit(entry("vendored"), "vendored.txt", "not ours");
+
+    // Shape C — a real worktree whose metadata has been pruned out from under
+    // it. Every git command inside it fails.
+    git(n1_repo, "worktree", "add", "-q", entry("agent-pruned"), "-b", "feature/pruned", "main");
+    rmSync(join(n1_repo, ".git", "worktrees", "agent-pruned"), { recursive: true, force: true });
+
+    // Shape D — detached HEAD. `symbolic-ref` genuinely fails here.
+    git(n1_repo, "worktree", "add", "-q", "--detach", entry("agent-detached"), "main");
+
+    git(n1_repo, "fetch", "-q", "--prune");
+
+    const registry = {
+      get_active: () => [{ entity: { id: "n1-entity", repos: [{ path: n1_repo, url: origin }] } }],
+    };
+    const alert_router = {
+      post_alert: (payload: AlertPayload) => {
+        n1_alerts.push(payload);
+        return Promise.resolve();
+      },
+    };
+
+    await sweep_stale_worktrees(
+      registry as unknown as Parameters<typeof sweep_stale_worktrees>[0],
+      {
+        alert_router: alert_router as unknown as never,
+      },
+    );
+  }, 60_000);
+
+  afterAll(() => {
+    if (n1_root) rmSync(n1_root, { recursive: true, force: true });
+  });
+
+  it("had both shapes reachable, so the cases below are not passing by default", () => {
+    // Without this, every assertion here would be satisfied by a sweep that
+    // simply never looked. Both resolvable shapes point at a branch the sweep
+    // is genuinely targeting this run: `feature/enclosing` (what the plain
+    // directory resolves to) and `feature/target` (the nested repo's branch).
+    // Both are merged into main with commits of their own, so both survive the
+    // #110 unstarted-branch filter and reach `cleanup_claude_worktrees`.
+    const merged = git(n1_repo, "branch", "--merged", "main").split("\n");
+    const names = merged.map((line) => line.trim().replace(/^[*+]\s+/, ""));
+    expect(names).toContain("feature/enclosing");
+    expect(names).toContain("feature/target");
+    expect(git(n1_repo, "symbolic-ref", "--short", "HEAD").trim()).toBe("feature/enclosing");
+    // And git really does answer for the enclosing repo, not the directory.
+    expect(git(entry("plain-leftover"), "symbolic-ref", "--short", "HEAD").trim()).toBe(
+      "feature/enclosing",
+    );
+    expect(git(entry("vendored"), "symbolic-ref", "--short", "HEAD").trim()).toBe("feature/target");
+  });
+
+  it("leaves a plain directory alone, and never treats it as a worktree", () => {
+    expect(existsSync(entry("plain-leftover"))).toBe(true);
+    expect(existsSync(join(entry("plain-leftover"), "leftover.txt"))).toBe(true);
+    // Pre-fix this directory was matched and handed to `remove_worktree`,
+    // which refused it only because the #27 probe — running in the enclosing
+    // working tree — found the repo's untracked files and alerted about a
+    // directory that is not a worktree at all. git's own refusals (`worktree
+    // remove` declines a non-worktree) were the rest of the safety. Now the
+    // directory is never considered, so there is nothing to alert about.
+    expect(n1_alerts.find((a) => a.body.includes(entry("plain-leftover")))).toBeUndefined();
+  });
+
+  it("leaves an unrelated nested repo alone, and keeps OUR branch of the same name", () => {
+    expect(existsSync(join(entry("vendored"), "vendored.txt"))).toBe(true);
+    // The load-bearing assertion. Pre-fix, the nested repo's `feature/target`
+    // matched our merged `feature/target`, the #27/#30 probes ran against the
+    // nested repo's clean tree and our pushed branch, `git worktree remove`
+    // no-op'd with "not a working tree" — and then `git branch -d
+    // feature/target` deleted OUR ref. git refuses that one only when the
+    // branch is checked out somewhere, and this one is not.
+    expect(git(n1_repo, "branch", "--list", "feature/target")).toContain("feature/target");
+  });
+
+  it("leaves pruned-metadata and detached-HEAD directories alone", () => {
+    expect(existsSync(entry("agent-pruned"))).toBe(true);
+    expect(existsSync(entry("agent-detached"))).toBe(true);
+  });
+
+  it("raises no alerts at all — nothing here is stale-but-unsafe", () => {
+    expect(n1_alerts).toEqual([]);
+  });
+});
+
+describe("remove_worktree against real git — the branch-identity invariant", () => {
+  // `remove_worktree` is exported and its contract says `branch` must be the
+  // branch checked out in `worktree_path`, because #30's unpushed check is
+  // evaluated against `branch` while the directory destroyed is
+  // `worktree_path`. Every caller in this module is correct, so the invariant
+  // used to hold by convention alone — at an exported boundary, for the exact
+  // parameter whose misuse destroyed work (#110 review, finding 1). It is now
+  // enforced in the function. Both directions in one test, against real git.
+
+  let inv_root: string;
+
+  afterAll(() => {
+    if (inv_root) rmSync(inv_root, { recursive: true, force: true });
+  });
+
+  it("refuses a mismatched branch, and still removes on a correct one", async () => {
+    inv_root = realpathSync(mkdtempSync(join(tmpdir(), "lf-invariant-")));
+    const origin = join(inv_root, "origin.git");
+    const inv_repo = join(inv_root, "repo");
+
+    execFileSync("git", ["init", "--bare", "-q", "-b", "main", origin], { env: GIT_ENV });
+    execFileSync("git", ["init", "-q", "-b", "main", inv_repo], { env: GIT_ENV });
+    git(inv_repo, "remote", "add", "origin", origin);
+    commit(inv_repo, "base.txt", "base");
+    git(inv_repo, "push", "-q", "-u", "origin", "main");
+
+    // Two worktrees, both sweepable on their own merits: own commit, pushed,
+    // merged into main, clean tree, no marker. Nothing but the invariant
+    // stands between either of them and removal.
+    for (const name of ["live", "done"] as const) {
+      git(inv_repo, "worktree", "add", "-q", join(inv_root, name), "-b", `feature/${name}`, "main");
+      commit(join(inv_root, name), `${name}.txt`, "shipped");
+      git(join(inv_root, name), "push", "-q", "-u", "origin", `feature/${name}`);
+      git(inv_repo, "merge", "-q", "--no-ff", "-m", `merge feature/${name}`, `feature/${name}`);
+    }
+    git(inv_repo, "push", "-q", "origin", "main");
+
+    // Direction A: name the wrong branch. `feature/done` is merged and pushed,
+    // so #30 would wave this through — which is precisely why being handed the
+    // wrong branch is dangerous rather than merely untidy.
+    const refused = await remove_worktree(inv_repo, join(inv_root, "live"), "feature/done");
+
+    expect(refused).toBe(false);
+    expect(existsSync(join(inv_root, "live", "live.txt"))).toBe(true);
+    expect(git(inv_repo, "worktree", "list")).toContain(join(inv_root, "live"));
+    // Neither branch may be touched: not the directory's own, not the one the
+    // caller wrongly named.
+    expect(git(inv_repo, "branch", "--list", "feature/live")).toContain("feature/live");
+    expect(git(inv_repo, "branch", "--list", "feature/done")).toContain("feature/done");
+
+    // Direction B: name the right branch for the same shape of worktree, so
+    // the refusal above cannot be some unrelated guardrail firing.
+    const removed = await remove_worktree(inv_repo, join(inv_root, "done"), "feature/done");
+
+    expect(removed).toBe(true);
+    expect(existsSync(join(inv_root, "done"))).toBe(false);
+    expect(git(inv_repo, "branch", "--list", "feature/done")).toBe("");
+  }, 60_000);
 });
 
 describe("sweep_stale_worktrees against real git — #30 safety preconditions", () => {

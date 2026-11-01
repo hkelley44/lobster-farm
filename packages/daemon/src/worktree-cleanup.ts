@@ -14,15 +14,11 @@
  * deliberately held, not stale-but-unsafe. Drop the file in a worktree root to
  * pin it; delete the file to release it.
  *
- * This used to be a convention with nothing behind it: `grep -rn
- * lf-agent-active` over the repo returned zero hits, and the marker "worked"
- * only as an accident of #30's untracked-file check. Adding it to `.gitignore`
- * (or committing it) would have silently disarmed the only thing protecting
- * live agent worktrees across the whole fleet. It is now an explicit check —
- * see `has_live_agent_marker` — so the shield is real, greppable, and
- * independent of gitignore state. Do not add `.lf-agent-active` to
- * `.gitignore`; it does not need to be ignored, and ignoring it is a
- * historical foot-gun.
+ * The marker is honored regardless of git ignore state: it is checked with
+ * `stat`, not `git status`. (It had to be said, because it used to be a
+ * convention with nothing behind it — the marker "worked" only as an accident
+ * of #30's untracked-file check, so one ignore line anywhere disarmed the
+ * whole fleet's shield. See `has_live_agent_marker`.)
  */
 
 import { execFile, execFileSync } from "node:child_process";
@@ -85,10 +81,11 @@ export const AGENT_ACTIVE_MARKER = ".lf-agent-active";
  * alerts exist to surface work that is stuck, and a marked worktree is not
  * stuck, it is claimed.
  *
- * Deliberately independent of git: it does not matter whether the marker is
- * tracked, untracked, or gitignored. Before this check existed the marker was
- * honored only as a side effect of #30's untracked-file scan, which meant a
- * single `.gitignore` line could disarm the whole fleet's shield.
+ * Deliberately independent of git: `stat`, not `git status`, so it does not
+ * matter whether the marker is tracked, untracked, or ignored. Before this
+ * check existed the marker was honored only as a side effect of #30's
+ * `--exclude-standard` untracked scan, which meant a single ignore rule could
+ * disarm the whole fleet's shield.
  *
  * Unlike the rest of #110's guardrails this is unconditional — no grace
  * period, no age component. A marked worktree stays until the marker goes.
@@ -499,6 +496,15 @@ function short_branch(ref: string): string {
  * `worktree_path` — that mismatch was a live data-loss path through
  * `cleanup_claude_worktrees` (issue #110 review).
  *
+ * That requirement is *enforced*, not merely documented (step 0b): if the
+ * directory's own branch resolves and disagrees with `branch`, the removal is
+ * refused. This function is exported, so the invariant would otherwise survive
+ * only by every caller's good manners — and misuse of exactly this parameter
+ * is the defect above. A directory whose branch cannot be resolved at all is
+ * allowed through, because that is also the shape of a worktree that has
+ * already been removed out-of-band, and refusing there would break the
+ * "already gone" no-op path.
+ *
  * @param repo_path - Root repo path (not the worktree itself)
  * @param worktree_path - Absolute path to the worktree directory
  * @param branch - Branch checked out in `worktree_path` (short form, e.g. "feature/134-auto-cleanup")
@@ -518,7 +524,25 @@ export async function remove_worktree(
     return false;
   }
 
-  // Step 0b: safety guardrail. Refuse to remove worktrees with unsaved work.
+  // Step 0b: branch-identity invariant. #30's unpushed check below runs against
+  // `branch`, so a caller that names a branch other than the one checked out
+  // here would be checking the wrong thing. Refuse rather than trust.
+  const repo_common_dir = await resolve_repo_common_dir(repo_path);
+  if (repo_common_dir !== null) {
+    const own_branch = await resolve_worktree_branch(worktree_path, repo_common_dir);
+    if (own_branch !== null && own_branch !== branch) {
+      console.error(
+        `[worktree-cleanup] Refusing to remove ${worktree_path}: caller named branch ${branch}, but ${own_branch} is checked out there (issue #110 review)`,
+      );
+      sentry.captureMessage("worktree-cleanup: branch-identity invariant violated", "error", {
+        tags: { module: "worktree-cleanup", action: "remove_worktree" },
+        contexts: { worktree: { path: worktree_path, named_branch: branch, own_branch } },
+      });
+      return false;
+    }
+  }
+
+  // Step 0c: safety guardrail. Refuse to remove worktrees with unsaved work.
   const check = await is_worktree_safe_to_remove(repo_path, worktree_path, branch);
   if (!check.safe) {
     console.warn(
@@ -710,15 +734,99 @@ export async function cleanup_after_merge(
 }
 
 /**
- * Resolve the branch actually checked out in a worktree directory.
+ * Absolute path of a repo's *common* git dir — the single `.git` shared by the
+ * main working tree and every linked worktree. `null` if `repo_path` is not a
+ * git repo (or the probe failed).
  *
- * `symbolic-ref` fails on a detached HEAD and on a directory that is not a
- * live worktree (pruned metadata, plain directory, different repo), both of
- * which return `null` — and `null` means "do not touch it". That is the only
- * safe default: a directory whose branch we cannot name is a directory whose
- * contents we cannot reason about.
+ * This is the identity of "this repo", used by `resolve_worktree_branch` to
+ * tell a linked worktree of ours from an unrelated repository that merely sits
+ * in the same directory. `--path-format=absolute` is what makes the comparison
+ * sound: git then prints this path in *physical* form (symlinks resolved) from
+ * the main repo and from any linked worktree alike, so the two answers are
+ * textually comparable even when the configured repo path reaches the repo
+ * through a symlink. Comparing `rev-parse --show-toplevel` against the path we
+ * were handed does NOT have that property — on macOS, `/var/...` in, physical
+ * `/private/var/...` out — and would reject every genuine worktree under a
+ * symlinked root.
  */
-async function resolve_worktree_branch(worktree_path: string): Promise<string | null> {
+async function resolve_repo_common_dir(repo_path: string): Promise<string | null> {
+  try {
+    const { stdout } = await exec(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { cwd: repo_path, timeout: GIT_TIMEOUT_MS },
+    );
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the branch actually checked out in a worktree directory, or `null`.
+ *
+ * `null` means "do not touch it", and that is the only safe default: a
+ * directory whose branch we cannot name is a directory whose contents we
+ * cannot reason about.
+ *
+ * ## Why `symbolic-ref` alone is not the answer
+ *
+ * **Git walks up.** It does not answer questions about the directory you hand
+ * it; it answers questions about whatever repository encloses it. Probed on
+ * git 2.50.1, the five shapes a `.claude/worktrees/` entry can take are:
+ *
+ * | shape                       | `symbolic-ref --short HEAD` |
+ * |-----------------------------|-----------------------------|
+ * | A plain leftover directory  | the **enclosing repo's** branch |
+ * | B genuine linked worktree   | its own branch (correct)    |
+ * | C pruned worktree metadata  | fatal → `null`              |
+ * | D detached HEAD             | fatal → `null`              |
+ * | E unrelated nested repo     | **that repo's** branch      |
+ *
+ * A and E hand back a branch that is not checked out in the directory being
+ * targeted, which is precisely the wrong-branch handoff this whole code path
+ * was rewritten to eliminate (issue #110 review, finding 1). Both were
+ * non-destructive only by git's own refusals — `git worktree remove` declines
+ * a non-worktree, `git branch -d` declines a checked-out branch — except for
+ * shape E, where the branch delete lands on the *parent* repo's merged ref and
+ * succeeds. Safety that comes from the subprocess refusing is not safety.
+ *
+ * So two gates, both from one `rev-parse`:
+ *
+ *  1. `--show-cdup` must be empty: the directory must *be* the root of its
+ *     working tree, not somewhere inside one. Rejects A. (Relative output, so
+ *     no path comparison and no symlink hazard.)
+ *  2. `--git-common-dir` must equal this repo's. Rejects E, and any linked
+ *     worktree belonging to some other repository.
+ *
+ * C makes the `rev-parse` itself fail; D fails the `symbolic-ref`. All three
+ * rejections land on `null`.
+ */
+async function resolve_worktree_branch(
+  worktree_path: string,
+  repo_common_dir: string,
+): Promise<string | null> {
+  let cdup: string;
+  let common_dir: string;
+  try {
+    const { stdout } = await exec(
+      "git",
+      ["rev-parse", "--show-cdup", "--path-format=absolute", "--git-common-dir"],
+      { cwd: worktree_path, timeout: GIT_TIMEOUT_MS },
+    );
+    const [raw_cdup = "", raw_common = ""] = stdout.split("\n");
+    cdup = raw_cdup.trim();
+    common_dir = raw_common.trim();
+  } catch {
+    // Not a git directory at all (shape C), or rev-parse failed.
+    return null;
+  }
+
+  // Gate 1: a subdirectory of some working tree, not a worktree root (shape A).
+  if (cdup !== "") return null;
+  // Gate 2: a worktree root, but not one of *ours* (shape E).
+  if (common_dir === "" || common_dir !== repo_common_dir) return null;
+
   try {
     const { stdout } = await exec("git", ["symbolic-ref", "--short", "HEAD"], {
       cwd: worktree_path,
@@ -726,6 +834,7 @@ async function resolve_worktree_branch(worktree_path: string): Promise<string | 
     });
     return stdout.trim() || null;
   } catch {
+    // Detached HEAD (shape D).
     return null;
   }
 }
@@ -761,6 +870,11 @@ async function resolve_worktree_branch(worktree_path: string): Promise<string | 
  *
  * So: ask the directory what branch it is on, act only on an exact match, and
  * pass *that* branch to `remove_worktree`. The name is never consulted.
+ *
+ * "Ask the directory" is load-bearing and is harder than one `symbolic-ref` —
+ * git answers for the repository *enclosing* a path, not for the path. See
+ * `resolve_worktree_branch`: an entry is only ever acted on if it is the root
+ * of a working tree that belongs to this very repo.
  */
 async function cleanup_claude_worktrees(
   repo_path: string,
@@ -778,13 +892,25 @@ async function cleanup_claude_worktrees(
     return;
   }
 
+  // Identity of this repo, for `resolve_worktree_branch`'s second gate. If we
+  // cannot establish it we cannot tell our own worktrees from a foreign repo
+  // that happens to sit in this directory, so we decline the whole scan — and
+  // say so, rather than silently reclassifying every entry as unresolvable.
+  const repo_common_dir = await resolve_repo_common_dir(repo_path);
+  if (repo_common_dir === null) {
+    console.warn(
+      `[worktree-cleanup] Could not resolve the git common dir of ${repo_path} — skipping .claude/worktrees/ scan`,
+    );
+    return;
+  }
+
   try {
     const entries = await readdir(claude_wt_dir, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
 
       const wt_path = join(claude_wt_dir, entry.name);
-      const own_branch = await resolve_worktree_branch(wt_path);
+      const own_branch = await resolve_worktree_branch(wt_path, repo_common_dir);
       if (own_branch === null) {
         console.log(
           `[worktree-cleanup] Leaving .claude/worktrees/ entry with no resolvable branch: ${wt_path}`,
@@ -900,7 +1026,10 @@ async function load_trunk_history(repo_path: string): Promise<TrunkHistory> {
  * Net effect: ff-merged and squash-merged worktrees leak. That is bounded,
  * visible in the sweep log, and the right side of the trade for a destructive
  * operation. Reclaiming them needs its own design (marker adoption first),
- * not a widened classifier here.
+ * not a widened classifier here — tracked in **issue #129**, along with the
+ * other half of the same problem: a marker left behind by a crashed agent pins
+ * its worktree forever, with no expiry and no digest of what the sweep
+ * declined to touch.
  */
 export function is_unstarted_branch(tip_sha: string, trunk: TrunkHistory): boolean {
   if (!tip_sha) return true;

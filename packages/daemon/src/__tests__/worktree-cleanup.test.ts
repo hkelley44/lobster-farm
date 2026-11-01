@@ -50,6 +50,7 @@ vi.mock("node:fs/promises", () => ({
 
 vi.mock("../sentry.js", () => ({
   captureException: vi.fn(),
+  captureMessage: vi.fn(),
   addBreadcrumb: vi.fn(),
 }));
 
@@ -104,12 +105,32 @@ function setup_git_mocks(
     /** Local branches whose `refs/heads/<branch>` lookup should fail. */
     missing_local_branches?: string[];
     /**
-     * Branch checked out in a given worktree directory, keyed by absolute
-     * path, for `git -C <dir> symbolic-ref --short HEAD`. A directory absent
-     * from this map resolves to `null` (detached, pruned, or not a worktree),
-     * which `cleanup_claude_worktrees` treats as "do not touch".
+     * Branch `git -C <dir> symbolic-ref --short HEAD` reports for a directory,
+     * keyed by absolute path. A directory absent from this map makes
+     * `symbolic-ref` fail, as it does on a detached HEAD.
+     *
+     * Note this models git's *actual* behavior, which is to answer for the
+     * repository enclosing the path: a plain directory or an unrelated nested
+     * repo resolves to a branch too, just not to one checked out there. Use
+     * `worktree_shapes` to say which kind of directory it is.
      */
     worktree_branches?: Record<string, string>;
+    /**
+     * What kind of directory a path actually is, keyed by absolute path.
+     * Anything absent is a genuine linked worktree of `repo_root`.
+     *
+     * Drives `git rev-parse --show-cdup --path-format=absolute
+     * --git-common-dir`, the probe `resolve_worktree_branch` uses to reject a
+     * directory whose `symbolic-ref` answer came from some other repository:
+     *  - `subdirectory`: a plain directory inside `repo_root`'s working tree —
+     *    non-empty `--show-cdup` (real git: `../../../`).
+     *  - `foreign`: an independent repo (or another repo's worktree) — its own
+     *    `--git-common-dir`, which will not match `repo_root`'s.
+     *  - `non-git`: pruned worktree metadata or no repo at all — rev-parse fails.
+     */
+    worktree_shapes?: Record<string, "subdirectory" | "foreign" | "non-git">;
+    /** Repo root the fixture's worktrees belong to. Defaults to "/repo". */
+    repo_root?: string;
   } = {},
 ): void {
   mock_exec_file.mockImplementation((cmd: string, args: string[], exec_opts: unknown) => {
@@ -118,7 +139,8 @@ function setup_git_mocks(
     const subcmd = args[0];
     const cwd = (exec_opts as { cwd?: string } | undefined)?.cwd ?? "";
 
-    // `git -C <dir> symbolic-ref --short HEAD` — the worktree's own branch.
+    // `git -C <dir> symbolic-ref --short HEAD` — the branch git reports for
+    // this directory, which is not necessarily one checked out *in* it.
     if (subcmd === "symbolic-ref") {
       const own_branch = opts.worktree_branches?.[cwd];
       if (own_branch === undefined) throw new Error("fatal: ref HEAD is not a symbolic ref");
@@ -151,6 +173,20 @@ function setup_git_mocks(
     if (subcmd === "fetch") {
       if (opts.fetch_error) throw opts.fetch_error;
       return "";
+    }
+
+    if (subcmd === "rev-parse" && args.includes("--git-common-dir")) {
+      // Worktree-identity probe (issue #110 review, finding N1). Two forms:
+      //   ["rev-parse", "--path-format=absolute", "--git-common-dir"]  (repo)
+      //   ["rev-parse", "--show-cdup", "--path-format=absolute", "--git-common-dir"]
+      const repo_root = opts.repo_root ?? "/repo";
+      const shape = opts.worktree_shapes?.[cwd];
+      if (shape === "non-git") {
+        throw new Error(`fatal: not a git repository: ${cwd}`);
+      }
+      const common_dir = shape === "foreign" ? `${cwd}/.git` : `${repo_root}/.git`;
+      if (!args.includes("--show-cdup")) return common_dir;
+      return `${shape === "subdirectory" ? "../../../" : ""}\n${common_dir}\n`;
     }
 
     if (subcmd === "rev-parse") {
@@ -437,6 +473,47 @@ describe("remove_worktree", () => {
 
     expect(result).toBe(true); // worktree removal succeeded
   });
+
+  it("refuses when the named branch is not the one checked out there", async () => {
+    // The exported-boundary invariant (#110 review). #30's unpushed check runs
+    // against the branch it is given, so a caller that names the wrong one
+    // disables it — which is how the original defect destroyed work. Enforced
+    // here rather than left to every caller's good manners.
+    setup_git_mocks({
+      worktree_branches: { "/repo/worktrees/live": "feature/someone-elses-work" },
+    });
+    const alert_router = { post_alert: vi.fn() };
+
+    const result = await remove_worktree("/repo", "/repo/worktrees/live", "feature/merged", {
+      alert_router: alert_router as any,
+      entity_id: "test-entity",
+    });
+
+    expect(result).toBe(false);
+    expect(removed_paths()).toHaveLength(0);
+    // Nor may it delete the branch it was wrongly handed.
+    expect(mock_exec_file).not.toHaveBeenCalledWith(
+      "git",
+      ["branch", "-d", "feature/merged"],
+      expect.anything(),
+    );
+    // A caller-contract violation is a bug to fix, not work for Hunter to
+    // recover — so it is logged and reported, not alerted.
+    expect(alert_router.post_alert).not.toHaveBeenCalled();
+  });
+
+  it("proceeds when the directory's branch cannot be resolved at all", async () => {
+    // A worktree removed out-of-band resolves to nothing, and the already-gone
+    // no-op path has to keep working. Unresolvable is not a mismatch.
+    setup_git_mocks({
+      worktree_shapes: { "/repo/worktrees/vanished": "non-git" },
+      worktree_remove_error: new Error("not a working tree"),
+    });
+
+    const result = await remove_worktree("/repo", "/repo/worktrees/vanished", "feature/vanished");
+
+    expect(result).toBe(true);
+  });
 });
 
 describe("find_worktree_for_branch", () => {
@@ -622,9 +699,9 @@ describe("cleanup_after_merge", () => {
     expect(removed_paths()).not.toContain("/repo/.claude/worktrees/agent-b199c0de");
   });
 
-  it("leaves a .claude/worktrees/ directory whose branch cannot be resolved", async () => {
-    // Detached HEAD, pruned metadata, or a plain directory — all unresolvable,
-    // all left alone. `worktree_branches` is empty so symbolic-ref throws.
+  it("leaves a .claude/worktrees/ directory whose HEAD is detached", async () => {
+    // Detached HEAD: `symbolic-ref` genuinely fails, so there is no branch to
+    // match and nothing to hand to `remove_worktree`.
     setup_git_mocks({
       worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
     });
@@ -638,6 +715,92 @@ describe("cleanup_after_merge", () => {
     await cleanup_after_merge("/repo", "feature/whatever");
 
     expect(removed_paths()).not.toContain("/repo/.claude/worktrees/agent-detached");
+  });
+
+  it("leaves a .claude/worktrees/ directory whose worktree metadata was pruned", async () => {
+    // `git worktree prune` removed `.git/worktrees/<name>` but the directory
+    // survives; every git command in it fails with "not a git repository".
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      worktree_shapes: { "/repo/.claude/worktrees/agent-pruned": "non-git" },
+    });
+    mock_readdir.mockImplementation(async (dir: string) => {
+      if (dir.includes(".claude/worktrees")) {
+        return [{ name: "agent-pruned", isDirectory: () => true }];
+      }
+      return [];
+    });
+
+    await cleanup_after_merge("/repo", "feature/whatever");
+
+    expect(removed_paths()).not.toContain("/repo/.claude/worktrees/agent-pruned");
+  });
+
+  it("leaves a plain leftover directory, whose HEAD resolves to the ENCLOSING repo's branch", async () => {
+    // The shape the previous version of this test got wrong (#110 review, N1).
+    // A plain directory is NOT unresolvable: git walks up and answers for the
+    // repository that encloses it, so `symbolic-ref` returns the enclosing
+    // checkout's branch — here, the very branch being cleaned up. Only the
+    // "is this directory the root of a working tree" gate stops the handoff.
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/feature/enclosing" }),
+      worktree_branches: { "/repo/.claude/worktrees/leftover": "feature/enclosing" },
+      worktree_shapes: { "/repo/.claude/worktrees/leftover": "subdirectory" },
+    });
+    mock_readdir.mockImplementation(async (dir: string) => {
+      if (dir.includes(".claude/worktrees")) {
+        return [{ name: "leftover", isDirectory: () => true }];
+      }
+      return [];
+    });
+
+    await cleanup_after_merge("/repo", "feature/enclosing");
+
+    expect(removed_paths()).not.toContain("/repo/.claude/worktrees/leftover");
+  });
+
+  it("leaves an unrelated nested repo, whose HEAD resolves to ITS OWN branch", async () => {
+    // The other half of N1. An independent repository checked out under
+    // `.claude/worktrees/` IS the root of a working tree, and `symbolic-ref`
+    // reports its own branch — which may coincide with a branch name we are
+    // cleaning up in the parent repo. Acting on it would delete the *parent's*
+    // branch ref (git does not refuse that one). The git-common-dir gate is
+    // what rejects it.
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      worktree_branches: { "/repo/.claude/worktrees/vendored": "feature/shared-name" },
+      worktree_shapes: { "/repo/.claude/worktrees/vendored": "foreign" },
+    });
+    mock_readdir.mockImplementation(async (dir: string) => {
+      if (dir.includes(".claude/worktrees")) {
+        return [{ name: "vendored", isDirectory: () => true }];
+      }
+      return [];
+    });
+
+    await cleanup_after_merge("/repo", "feature/shared-name");
+
+    expect(removed_paths()).toHaveLength(0);
+  });
+
+  it("declines the whole .claude/worktrees/ scan when the repo's identity is unknown", async () => {
+    // Fail-safe: if we cannot establish which repo we are sweeping, we cannot
+    // tell our own worktrees from a foreign one, so nothing is touched.
+    setup_git_mocks({
+      worktree_list: make_porcelain({ path: "/repo", branch: "refs/heads/main" }),
+      worktree_branches: { "/repo/.claude/worktrees/agent-134abcde": "feature/134-auto-cleanup" },
+      worktree_shapes: { "/repo": "non-git" },
+    });
+    mock_readdir.mockImplementation(async (dir: string) => {
+      if (dir.includes(".claude/worktrees")) {
+        return [{ name: "agent-134abcde", isDirectory: () => true }];
+      }
+      return [];
+    });
+
+    await cleanup_after_merge("/repo", "feature/134-auto-cleanup");
+
+    expect(removed_paths()).not.toContain("/repo/.claude/worktrees/agent-134abcde");
   });
 
   it("relocates sessions before removing worktree", async () => {
@@ -1247,7 +1410,11 @@ describe("sweep_stale_worktrees — issue #110 unstarted-branch guardrail", () =
         { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
         { path: "/repo/worktrees/done", branch: "refs/heads/feature/done", head: "side-tip" },
       ),
-      merged_branches: "  feature/done\n",
+      // `+ `, because the branch is checked out in another worktree — which is
+      // the only output real git can produce for this fixture. `rev_parse_missing`
+      // is empty so Case 2 cannot fire: Case 1 is the only route here, which
+      // makes this the one mocked test whose realism is load-bearing.
+      merged_branches: "+ feature/done\n",
       rev_parse_missing: [],
       trunk_first_parent: TRUNK,
     });
@@ -1302,7 +1469,7 @@ describe("sweep_stale_worktrees — issue #110 unstarted-branch guardrail", () =
         { path: "/repo", branch: "refs/heads/main", head: "trunk-tip" },
         { path: "/repo/worktrees/done", branch: "refs/heads/feature/done", head: "side-tip" },
       ),
-      merged_branches: "  feature/done\n",
+      merged_branches: "+ feature/done\n",
       rev_parse_missing: ["feature/done"],
       trunk_unresolvable: true,
     });
@@ -1350,11 +1517,19 @@ describe("sweep_stale_worktrees — issue #110 unstarted-branch guardrail", () =
     expect(removed_paths()).toEqual(["/repo/.claude/worktrees/agent-7b4d9a10"]);
   });
 
-  it("passes the directory's OWN branch to the removal, never the matched one", async () => {
+  it("picks the directory by branch identity even when another directory's NAME matches", async () => {
     // The wrong-branch handoff is the load-bearing defect: `remove_worktree`
     // runs #30's unpushed check against whatever branch it is given, so being
     // handed a merged (therefore pushed, therefore "safe") branch while
     // deleting some other branch's directory disables the check entirely.
+    //
+    // So the fixture makes the directory *name* actively misleading.
+    // `agent-done42` contains the merged branch's slug ("done") but holds
+    // someone else's live branch; `agent-7b4d9a10` contains nothing of it but
+    // is genuinely on `feature/done`. The old name-substring matcher picked
+    // the first and handed over `feature/done`; identity-matching picks the
+    // second and hands over its own branch. Both halves are asserted, so this
+    // cannot pass with the two confused.
     setup_git_mocks({
       worktree_list: make_porcelain({
         path: "/repo",
@@ -1364,21 +1539,29 @@ describe("sweep_stale_worktrees — issue #110 unstarted-branch guardrail", () =
       merged_branches: "+ feature/done\n",
       trunk_first_parent: TRUNK,
       branch_tips: { "feature/done": "side-tip" },
-      worktree_branches: { "/repo/.claude/worktrees/agent-7b4d9a10": "feature/done" },
+      worktree_branches: {
+        "/repo/.claude/worktrees/agent-done42": "feature/other-live",
+        "/repo/.claude/worktrees/agent-7b4d9a10": "feature/done",
+      },
     });
-    mock_readdir.mockResolvedValue([{ name: "agent-7b4d9a10", isDirectory: () => true }]);
+    mock_readdir.mockResolvedValue([
+      { name: "agent-done42", isDirectory: () => true },
+      { name: "agent-7b4d9a10", isDirectory: () => true },
+    ]);
 
     await sweep_stale_worktrees(registry_for() as any);
 
-    // The unpushed-commit probe must have been run on the directory's own
-    // branch. (Here they coincide by construction — that is the point: the
-    // only branch a directory can be removed under is the one it is on.)
+    expect(removed_paths()).toEqual(["/repo/.claude/worktrees/agent-7b4d9a10"]);
+
+    // And the unpushed-commit probe ran against the removed directory's own
+    // branch — never against the live directory's.
     const rev_list_branches = mock_exec_file.mock.calls
       .filter(
         (c: unknown[]) => (c[1] as string[])[0] === "rev-list" && (c[1] as string[])[2] === "--not",
       )
       .map((c: unknown[]) => (c[1] as string[])[1]);
     expect(rev_list_branches).toContain("feature/done");
+    expect(rev_list_branches).not.toContain("feature/other-live");
   });
 });
 
