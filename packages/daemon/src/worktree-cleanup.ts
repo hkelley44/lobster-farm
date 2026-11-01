@@ -747,7 +747,10 @@ export async function cleanup_after_merge(
  * through a symlink. Comparing `rev-parse --show-toplevel` against the path we
  * were handed does NOT have that property — on macOS, `/var/...` in, physical
  * `/private/var/...` out — and would reject every genuine worktree under a
- * symlinked root.
+ * symlinked root, silently turning the whole scan into a no-op.
+ *
+ * `--path-format` needs git >= 2.31. On anything older this returns `null`,
+ * which declines the scan with a log line rather than guessing.
  */
 async function resolve_repo_common_dir(repo_path: string): Promise<string | null> {
   try {
