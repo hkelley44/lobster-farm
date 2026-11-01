@@ -75,6 +75,35 @@ export interface ProcessedPR {
    * cycle cap (#46). Set so subsequent cron ticks don't re-alert for the
    * same cap-hit state. */
   escalated_at_cycle?: number;
+  /**
+   * ISO timestamp of when an auto-fix builder spawn was deferred because the
+   * PR's worktree was already held by another live agent (#105).
+   *
+   * This is the queue entry for a deferred fix, and it has to be persisted:
+   * once `reviewed_at` is written, `check_repo`'s freshness guard skips the PR
+   * entirely, so without a marker a deferred fix would never be retried — a
+   * silent drop dressed up as a successful review cycle. `retry_deferred_fixes`
+   * drains this on every cron tick and clears it once the builder actually
+   * spawns.
+   */
+  fix_deferred_at?: string;
+  /**
+   * How many times the deferred auto-fix has failed to *spawn* (#105).
+   *
+   * Distinct from `fix_deferred_at`, which only says a fix is owed. A worktree
+   * deferral is not a failure and never touches this; a throw out of
+   * `spawn_external_pr_fixer` does. Bounded by `MAX_DEFERRED_FIX_ATTEMPTS` so a
+   * transient cause (token refresh, momentary EMFILE) gets retried while a
+   * persistent one escalates instead of retrying every five minutes forever.
+   *
+   * Persisted rather than in-memory because the whole point of the queue is to
+   * survive a daemon restart — an in-memory counter would reset the budget on
+   * every restart and turn "gives up after 3" back into "retries forever".
+   *
+   * Cleared together with `fix_deferred_at` (`clear_fix_deferred`), so a fresh
+   * deferral on a later review cycle starts with a full budget.
+   */
+  fix_deferred_failures?: number;
 
   // ── v2 PR lifecycle (#257) ──
   /** Last head SHA the v2 check-suite-handler dispatched on.

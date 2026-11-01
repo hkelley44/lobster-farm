@@ -1322,8 +1322,10 @@ function make_cycle_cap_test_cron(opts: {
   cron_any.count_review_cycles = vi.fn().mockResolvedValue(opts.cycles);
 
   // Stub spawn_external_pr_fixer so changes_requested under the cap doesn't
-  // try to actually spawn a builder session.
-  const spawn_fixer = vi.fn().mockResolvedValue(undefined);
+  // try to actually spawn a builder session. Resolves "spawned" because the
+  // method returns a SpawnOutcome since #105, and the caller only posts the
+  // "spawning builder" alert when the spawn actually happened.
+  const spawn_fixer = vi.fn().mockResolvedValue("spawned");
   cron_any.spawn_external_pr_fixer = spawn_fixer;
 
   // Seed processed state if provided.

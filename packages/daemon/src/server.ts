@@ -37,6 +37,7 @@ import * as sentry from "./sentry.js";
 import type { ClaudeSessionManager } from "./session.js";
 import { classify_listen_error, read_incumbent_pid } from "./singleton.js";
 import { type WebhookContext, handle_github_webhook } from "./webhook-handler.js";
+import type { WorktreeLeaseStore } from "./worktree-lease.js";
 
 interface ServerContext {
   registry: EntityRegistry;
@@ -50,6 +51,7 @@ interface ServerContext {
   pr_watches: PRWatchStore | null;
   alert_router: AlertRouter | null;
   review_leases: ReviewLeaseStore | null;
+  worktree_leases: WorktreeLeaseStore | null;
 }
 
 type RouteHandler = (
@@ -464,6 +466,26 @@ const handle_stop_hook: RouteHandler = async (req, res, ctx) => {
   // session deaf because its turn happened to fit between two 30s pane
   // samples. Cheap in-memory lookup; no-op for non-pool sessions.
   ctx.pool?.mark_processed(session_id);
+
+  // Record that this session is working in `working_dir` (#105). This is the
+  // daemon's ONLY inbound signal about agents it did not spawn — a human's CLI
+  // session, a pool bot, a commander-dispatched builder — and it is what lets
+  // the auto-fix loop refuse to spawn a second editor into an occupied
+  // worktree. On PR #103 the colliding agent was not daemon-spawned, so no
+  // explicit lease could ever have covered it; without this call the whole gate
+  // is blind to the exact case that motivated it.
+  //
+  // Deliberately before `evaluate_stop`: that call can return early or throw,
+  // and occupancy must be recorded either way. `touch_observed` is a pure
+  // in-memory upsert that never steals another owner's lease, so it is safe to
+  // run unconditionally inside the hook's tight time budget.
+  try {
+    ctx.worktree_leases?.touch_observed(working_dir, session_id);
+  } catch (err) {
+    // Hook budget is tight and occupancy is an optimization, never a gate on
+    // the agent's own turn completing. Degrade to "unseen", never to a 500.
+    console.warn(`[hooks] worktree occupancy record failed: ${String(err)}`);
+  }
 
   try {
     const result = await evaluate_stop(
@@ -1240,6 +1262,7 @@ export function start_server(
   pr_watches: PRWatchStore | null = null,
   alert_router: AlertRouter | null = null,
   review_leases: ReviewLeaseStore | null = null,
+  worktree_leases: WorktreeLeaseStore | null = null,
   port: number = DAEMON_PORT,
   existing_server: Server | null = null,
 ): Server {
@@ -1255,6 +1278,7 @@ export function start_server(
     pr_watches,
     alert_router,
     review_leases,
+    worktree_leases,
   };
 
   const on_request = (req: IncomingMessage, res: ServerResponse) => {

@@ -25,6 +25,7 @@ import { ClaudeSessionManager } from "./session.js";
 import type { ActiveSession, SessionResult } from "./session.js";
 import { acquire_port } from "./singleton.js";
 import { sweep_stale_worktrees } from "./worktree-cleanup.js";
+import { make_worktree_lease_store } from "./worktree-lease.js";
 
 async function main(): Promise<void> {
   // Rotate the launchd stdout/stderr log first, before we write anything, so a
@@ -345,6 +346,24 @@ async function main(): Promise<void> {
   // handler. Instantiated once here so they contend on the same leases.
   const review_leases = new ReviewLeaseStore(config.pr_cron?.review_lease_ttl_ms);
 
+  // Per-worktree single-owner mutex (#105). Also one shared store: the cron
+  // acquires explicit holds here before spawning a fixer, while the Stop hook
+  // route feeds it *observed* occupancy for every agent on the machine. Both
+  // halves must see the same map or the gate is blind to half the agents — the
+  // #103 collider was not daemon-spawned, so observed occupancy is the only
+  // signal that would have caught it.
+  //
+  // Null when stood down via `pr_cron.worktree_lease_enabled: false` — every
+  // call site is null-guarded, so off is the pre-#105 code path, not a variant
+  // of it. The construction decision itself lives in
+  // `make_worktree_lease_store` so it can be unit-tested: this file ends in
+  // `void main()` and is therefore unreachable from any test, which is exactly
+  // how #105 shipped dead the first time.
+  const worktree_leases = make_worktree_lease_store(config);
+  if (!worktree_leases) {
+    console.log("[pr-cron] Worktree lease disabled via config (worktree_lease_enabled: false)");
+  }
+
   // Start HTTP server — reuse the socket acquire_port() already bound so there
   // is no second listen() and no bind race with the singleton guard.
   const server = start_server(
@@ -359,6 +378,7 @@ async function main(): Promise<void> {
     pr_watches,
     alert_router,
     review_leases,
+    worktree_leases,
     DAEMON_PORT,
     bound_server,
   );
@@ -373,6 +393,7 @@ async function main(): Promise<void> {
     pr_watches,
     alert_router,
     review_leases,
+    worktree_leases,
   );
   const pr_cron_enabled = config.pr_cron?.enabled !== false; // default true for backward compat
   if (pr_cron_enabled) {
