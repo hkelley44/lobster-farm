@@ -62,8 +62,8 @@ function wt(name: string): string {
  *
  * Names here are deliberately the real shape produced by the Claude Code
  * harness's `EnterWorktree` tool: `agent-<random hex8>`, with no relationship
- * to the branch checked out in them. Both contain "99", which is what the old
- * slug-substring matcher keyed on.
+ * to the branch checked out in them. Each contains one of the merged issue
+ * numbers below, which is what the old slug-substring matcher keyed on.
  */
 function claude_wt(name: string): string {
   return join(repo, ".claude", "worktrees", name);
@@ -135,51 +135,62 @@ beforeAll(async () => {
 
   // ── Issue #110 review, finding 1: the `.claude/worktrees/` wrong-branch path.
   //
-  // `fix/99` is a real merged branch with real commits: pushed, `--no-ff`
-  // merged, remote-deleted, local ref kept so `git branch --merged main` still
-  // lists it. Its slug is "99", and "99" is a substring of both harness
-  // directory names below — which is all the old matcher needed. Neither
-  // directory is on `fix/99`.
-  git(repo, "checkout", "-q", "-b", "fix/99");
-  commit(repo, "ninetynine.txt", "shipped");
-  git(repo, "push", "-q", "-u", "origin", "fix/99");
-  git(repo, "checkout", "-q", "main");
-  git(repo, "merge", "-q", "--no-ff", "-m", "merge fix/99", "fix/99");
-  git(repo, "push", "-q", "origin", "main");
-  git(repo, "push", "-q", "origin", "--delete", "fix/99");
+  // `fix/27` and `fix/30` are real merged branches with real commits — pushed,
+  // `--no-ff` merged, remote-deleted, local refs kept so `git branch --merged
+  // main` still lists them. Their slugs are "27" and "30", and under this
+  // project's `{type}/{issue#}-{slug}` convention a slug that begins with an
+  // issue number is the norm; a bare issue number is what a quick local branch
+  // looks like. Each one is a substring of exactly one of the harness
+  // directory names below — which is all the old matcher needed — and neither
+  // directory is on either branch. One merged branch per directory, so the
+  // branch-ref deletion that follows one removal cannot accidentally change
+  // the verdict on the other.
+  for (const [branch, file] of [
+    ["fix/27", "twentyseven.txt"],
+    ["fix/30", "thirty.txt"],
+  ] as const) {
+    git(repo, "checkout", "-q", "-b", branch);
+    commit(repo, file, "shipped");
+    git(repo, "push", "-q", "-u", "origin", branch);
+    git(repo, "checkout", "-q", "main");
+    git(repo, "merge", "-q", "--no-ff", "-m", `merge ${branch}`, branch);
+    git(repo, "push", "-q", "origin", "main");
+    git(repo, "push", "-q", "origin", "--delete", branch);
+  }
 
   mkdirSync(join(repo, ".claude", "worktrees"), { recursive: true });
 
   // Brand-new harness worktree, nothing written yet — the #110 shape, in the
   // one place the #110 fix did not reach. Spared by the main loop, then
-  // deleted by the slug-matched sweep three lines later.
+  // deleted by the slug-matched sweep three lines later. Matched by "27".
   git(
     repo,
     "worktree",
     "add",
     "-q",
-    claude_wt("agent-b199c0de"),
+    claude_wt("agent-9c27a1b5"),
     "-b",
     "feature/live-fresh",
     "origin/main",
   );
 
   // Harness worktree holding a real, never-pushed commit. #30's unpushed check
-  // would catch this — except the old code evaluated it against `fix/99`
-  // (merged, therefore pushed, therefore "safe") while deleting this
+  // would catch this — except the old code evaluated it against the matched
+  // branch (merged, therefore pushed, therefore "safe") while deleting this
   // directory, so the check reported safe and the work's only checkout went
-  // with it. The tracked state is clean, so nothing else protects it.
+  // with it. The tracked state is clean, so nothing else protects it. Matched
+  // by "30".
   git(
     repo,
     "worktree",
     "add",
     "-q",
-    claude_wt("agent-99f1a2b3"),
+    claude_wt("agent-30fe4d82"),
     "-b",
     "feature/live-work",
     "origin/main",
   );
-  commit(claude_wt("agent-99f1a2b3"), "live-agent-work.txt", "hours of work");
+  commit(claude_wt("agent-30fe4d82"), "live-agent-work.txt", "hours of work");
 
   // ── Issue #110 review, finding 2: the `.lf-agent-active` live-agent shield.
   //
@@ -201,12 +212,16 @@ beforeAll(async () => {
   // Merged into main via `--no-ff`, but the remote branch is deliberately NOT
   // deleted, so "remote gone" (Case 2) cannot fire and Case 1 — "branch
   // merged" — is the only route to sweeping it. Since the branch is checked
-  // out in a worktree, git lists it as "+ feature/mergedheld"; stripping only
+  // out in a worktree, git lists it as "+ feature/caseone"; stripping only
   // "* " left the marker in the string and Case 1 could never match.
-  git(repo, "worktree", "add", "-q", wt("mergedheld"), "-b", "feature/mergedheld", "origin/main");
-  commit(wt("mergedheld"), "mergedheld-work.txt", "shipped");
-  git(wt("mergedheld"), "push", "-q", "-u", "origin", "feature/mergedheld");
-  git(repo, "merge", "-q", "--no-ff", "-m", "merge feature/mergedheld", "feature/mergedheld");
+  //
+  // Named "caseone" rather than anything containing another fixture's name:
+  // several assertions here are substring checks against `git worktree list`,
+  // so a fixture whose path contains another's would cross-trip them.
+  git(repo, "worktree", "add", "-q", wt("caseone"), "-b", "feature/caseone", "origin/main");
+  commit(wt("caseone"), "caseone-work.txt", "shipped");
+  git(wt("caseone"), "push", "-q", "-u", "origin", "feature/caseone");
+  git(repo, "merge", "-q", "--no-ff", "-m", "merge feature/caseone", "feature/caseone");
   git(repo, "push", "-q", "origin", "main");
 
   // ── Issue #110 review, finding 5: squash merge, the project's actual mode.
@@ -281,27 +296,32 @@ describe("sweep_stale_worktrees against real git — .claude/worktrees/ wrong-br
   // checked-out branch instead, so the name is never consulted.
 
   it("keeps a brand-new harness worktree whose name merely contains a merged branch's slug", () => {
-    expect(existsSync(claude_wt("agent-b199c0de"))).toBe(true);
-    expect(git(repo, "worktree", "list")).toContain(claude_wt("agent-b199c0de"));
-    expect(alert_for_path(claude_wt("agent-b199c0de"))).toBeUndefined();
+    expect(existsSync(claude_wt("agent-9c27a1b5"))).toBe(true);
+    expect(git(repo, "worktree", "list")).toContain(claude_wt("agent-9c27a1b5"));
+    expect(alert_for_path(claude_wt("agent-9c27a1b5"))).toBeUndefined();
   });
 
   it("keeps a harness worktree holding unpushed work that a merged branch's slug matched", () => {
     // The wrong-branch handoff defeated #30 outright here: the unpushed check
     // ran against `fix/99` (pushed) while this directory, on an entirely
     // different branch with a never-pushed commit, was the one deleted.
-    expect(existsSync(claude_wt("agent-99f1a2b3"))).toBe(true);
-    expect(existsSync(join(claude_wt("agent-99f1a2b3"), "live-agent-work.txt"))).toBe(true);
+    expect(existsSync(claude_wt("agent-30fe4d82"))).toBe(true);
+    expect(existsSync(join(claude_wt("agent-30fe4d82"), "live-agent-work.txt"))).toBe(true);
     // It IS classified stale by the main loop (its remote never existed), and
     // there #30 sees the right branch and blocks with the right reason.
-    expect(alert_for_path(claude_wt("agent-99f1a2b3"))?.title).toContain("Unpushed");
+    expect(alert_for_path(claude_wt("agent-30fe4d82"))?.title).toContain("Unpushed");
   });
 
-  it("left the merged branch's own commit reachable from main", () => {
-    // Sanity check that `fix/99` really was a genuinely-merged branch with
-    // work of its own, i.e. that the sweep had a legitimate reason to act on
-    // it and the directories above were spared on their own merits.
-    expect(git(repo, "branch", "--merged", "main")).toContain("fix/99");
+  it("had genuinely-merged branches to act on, so the directories were spared on their merits", () => {
+    // If `fix/27`/`fix/30` were not merged branches with commits of their own,
+    // the two cases above would pass for the wrong reason — the sweep would
+    // simply never have considered either directory. Asserted against main's
+    // log rather than `git branch --merged`, because the branch refs are
+    // themselves collateral: pre-fix, destroying these directories deleted
+    // them.
+    const trunk_log = git(repo, "log", "--oneline", "main");
+    expect(trunk_log).toContain("merge fix/27");
+    expect(trunk_log).toContain("merge fix/30");
   });
 });
 
@@ -335,14 +355,12 @@ describe("sweep_stale_worktrees against real git — genuinely stale worktrees",
   it("sweeps a merged worktree whose remote branch still exists (Case 1 only)", () => {
     // Review finding 3. `git branch --merged` prefixes "+ " for a branch
     // checked out in another worktree, so this branch arrived as
-    // "+ feature/mergedheld", `merged_branches.has(...)` was always false, and
+    // "+ feature/caseone", `merged_branches.has(...)` was always false, and
     // Case 1 was dead for every worktree-held branch. Nothing else can reach
     // this fixture: its remote ref is intact, so Case 2 does not fire.
-    expect(
-      git(repo, "rev-parse", "--verify", "refs/remotes/origin/feature/mergedheld"),
-    ).toBeTruthy();
-    expect(existsSync(wt("mergedheld"))).toBe(false);
-    expect(git(repo, "worktree", "list")).not.toContain(wt("mergedheld"));
+    expect(git(repo, "rev-parse", "--verify", "refs/remotes/origin/feature/caseone")).toBeTruthy();
+    expect(existsSync(wt("caseone"))).toBe(false);
+    expect(git(repo, "worktree", "list")).not.toContain(wt("caseone"));
   });
 });
 

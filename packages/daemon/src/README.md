@@ -17,6 +17,19 @@ The LobsterFarm daemon process. Manages entities, spawns Claude Code agent sessi
 - `gateway-watchdog.ts` -- `GatewayWatchdog` (#107). Heartbeat-recency liveness for the daemon's single Discord gateway: samples shard heartbeat-ack timestamps (`shard.lastPingTimestamp`, discord.js v14) on a timer and, on sustained silence (default 3 missed heartbeat intervals ≈ 2 min) with no discord.js reconnect in flight, destroys and re-logs-in the client. Sentry event fires FIRST (Discord itself may be the sick component), then a best-effort Discord alert. Not broker-flag-gated — protects today's gateway too. Probe/recycle/clock all injectable; `DiscordBot` hosts the probe and the recycle.
 - `plugin-liveness.ts` -- Shared MCP plugin-liveness probe logic (issues #73, #77). `evaluate_plugin_liveness` is a pure verdict function comparing inbound/processing timestamps against tmux pane-idle state to detect a "deaf but alive" session; `is_tmux_session_idle` reads the pane. Consumed by both `pool.ts` and `commander-process.ts` (re-exported from `pool.ts` for existing importers).
 - `actions.ts` -- Side-effect functions: git worktree create/cleanup, GitHub PR create/merge via `gh`, test runner, and Discord notification dispatch.
+- `worktree-cleanup.ts` -- Worktree removal: post-merge cleanup (`cleanup_after_merge`) and the hourly stale sweep (`sweep_stale_worktrees`). Four independent gates stand between a worktree and deletion, and all four fail toward *keeping* it. (1) **Live-agent shield** (#110): a worktree root holding `.lf-agent-active` is never removed, by any path, with no alert and no tmux relocation -- see "Live-agent shield" below. (2) **Unstarted-branch classifier** (#110): a branch whose tip sits on the trunk's first-parent history has produced no commits of its own, so it is unstarted rather than finished; an unresolvable trunk abandons the whole repo. (3) **#27/#30 safety preconditions**: no uncommitted changes, no untracked files, no commits unreachable from any remote ref -- a failure here skips the removal and posts an action-required alert. (4) **Branch identity**: `remove_worktree` is only ever called with the branch actually checked out in the directory being deleted, because #30's unpushed check is evaluated against the branch it is given. `.claude/worktrees/` directories are therefore matched on their own `symbolic-ref`, never on their name -- those are the Claude Code harness's `EnterWorktree` worktrees, named randomly (`agent-<hex8>`) with no relation to any branch. Known limitation: fast-forward-merged and squash-merged worktrees are never reclaimed automatically; both are documented in the source.
+
+## Live-agent shield
+
+To pin a worktree against the hourly sweep, create `.lf-agent-active` in its root:
+
+```
+touch /path/to/worktree/.lf-agent-active
+```
+
+The sweep then skips it unconditionally -- no removal, no branch delete, no tmux `cd`, and no alert (it is deliberately held, not stuck). Delete the file to release it. There is no grace period and no expiry: a marked worktree stays until the marker goes.
+
+Two rules. **Do not add `.lf-agent-active` to `.gitignore`** -- it does not need to be ignored, and ignoring it was historically a foot-gun (before `has_live_agent_marker` existed, the marker worked only as a side effect of #30's untracked-file scan, so a single ignore line disarmed the whole fleet). **Do not commit it** -- it is per-worktree, transient state.
 - `review-utils.ts` -- Utility functions for PR review feedback: fetch review comments from GitHub and build fix prompts for the auto-fix loop.
 - `hooks.ts` -- Post-session hooks. Extracts session learnings via Haiku and appends them to daily logs. Also manages the global learnings file.
 - `models.ts` -- Maps abstract model tiers (opus/sonnet/haiku + think level) to Claude CLI flags.
