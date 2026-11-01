@@ -59,6 +59,7 @@ describe("POST /pool/assign broker driver contract (#107)", () => {
       null, // pr_watches
       null, // alert_router
       null, // review_leases
+      null, // worktree_leases
       0, // ephemeral port
     );
     await new Promise<void>((resolve) => server.on("listening", resolve));
