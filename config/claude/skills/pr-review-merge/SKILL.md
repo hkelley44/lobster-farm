@@ -165,12 +165,21 @@ The Reviewer:
 
 ### 4. Merge — terminal step (branch-aware)
 
-**Who merges (#102):** on the **autonomous** main-only path (4b), the **daemon**
-performs the merge — a single lease-gated chokepoint. Reviewer agents no longer
-run `gh pr merge` themselves. The **staging gate** (4a) is the one exception: it
-is a Hunter-gated manual promotion with no daemon equivalent, so Tidus still runs
-those merge/promote commands by hand — but only after Hunter's explicit ✅, and
-only for repos that have an `origin/staging` branch.
+**Who merges (#102, #104):** merges are centralized in the **daemon** as a single
+lease-gated chokepoint. Where that stands per step:
+
+| Step | Operation | Actor |
+|------|-----------|-------|
+| 4b | PR → `main` (autonomous) | **Daemon** (#102) |
+| 4a.3 | PR → `staging` | **Agent — known gap, see the warning in 4a.3** |
+| 4a.next | `staging` → `main` (after Hunter's ✅) | **Daemon** (#104) |
+
+#104 moved the `staging → main` promotion into the daemon. Hunter's ✅ is still
+the only trigger; what changed is that Tidus **relays** that sign-off to the
+daemon instead of running the promotion itself.
+
+On the two daemon-owned rows, agents must **not** run `gh pr merge`,
+`git merge`, or `git push` — approve (or relay) and stop.
 
 The terminal step depends on whether the repo has a staging branch. Detect with:
 
@@ -192,6 +201,26 @@ Branch existence is the only signal — no per-repo config flag. If the repo gro
    gh pr merge {number} --squash --delete-branch
    ```
    If the PR is already based on `staging`, skip the `gh pr edit` and run the merge directly.
+
+   > ⚠️ **KNOWN GAP — this merge is still agent-side (#104 follow-up).** Unlike
+   > 4b and 4a.next, the PR → `staging` merge has no daemon equivalent yet, so
+   > it is **not** behind the lease-gated chokepoint. It is also the *more*
+   > race-prone of the two staging merges: it fires immediately after the
+   > Approved verdict — exactly the window where a second, incomplete review can
+   > still be in flight. That is the #86 false-approve shape (two racing
+   > reviewers, one of which had found a live bot-token exfil hole).
+   >
+   > **Until a daemon-side path exists, before running this merge you MUST**
+   > confirm you still hold the step-0 review lease and that no second reviewer
+   > pass has landed:
+   > ```bash
+   > curl -fsS "http://localhost:7749/pr/OWNER/REPO/NUM/review-state"
+   > gh pr view NUM --json comments --jq \
+   >   '[.comments[] | select(.body | startswith("**Verdict:"))] | length'
+   > ```
+   > If the lease is held by someone else, or more than one verdict comment
+   > exists, **stop and reconcile the union of all findings** (the Layer-1 union
+   > rule from step 1) before merging anything.
 4. **Post step-by-step test instructions** in two places — same content, two formats:
    - **Discord post in #work-log:**
      ```
@@ -215,17 +244,50 @@ Branch existence is the only signal — no per-repo config flag. If the repo gro
 
 ##### 4a.next. Promote staging → main (after Hunter's ✅)
 
+**Do not run the promotion by hand (#104).** The daemon owns it, behind the same
+lease-gated chokepoint as autonomous merges. Your job is to **relay Hunter's
+sign-off**, not to perform the merge:
+
 ```bash
-git fetch origin
-git checkout main
-git pull --ff-only origin main
-git merge --ff-only origin/staging
-git push origin main
+curl -fsS -X POST "http://localhost:7749/pr/OWNER/REPO/NUM/staging-promotion" \
+  -H 'Content-Type: application/json' \
+  -d '{"signoff":{
+        "approved_by":"Hunter",
+        "approved_at":"2026-10-31T12:00:00Z",
+        "source":"<permalink to the approving message in #alerts>"
+      }}' -w '\n%{http_code}'
 ```
 
-Fast-forward only — if `main` has diverged from `staging` and a fast-forward isn't possible, escalate to #alerts with the divergence details and wait. Don't merge with a merge commit, don't rebase, don't force-push.
+`approved_by` must match the configured human (`user.name` in
+`~/.lobsterfarm/config.yaml`) — the daemon refuses a sign-off from anyone else,
+including an agent naming itself. All three sign-off fields are mandatory; a
+partial sign-off is not a sign-off. **Never synthesize a sign-off.** If Hunter
+hasn't said ✅, there is nothing to relay — go back to step 4a.6 and wait.
 
-After the promotion:
+Response handling:
+
+| Code | `outcome.kind` | What it means | What to do |
+|------|----------------|---------------|------------|
+| `200` | `promoted` | `main` fast-forwarded to the staging SHA | Notify #work-log (below) |
+| `200` | `already_current` | `main` already matched `staging` — a duplicate relay | Nothing; it's a no-op |
+| `400` | — | Missing/malformed sign-off | Fix the payload; don't invent fields |
+| `403` | `signoff_unauthorized` | `approved_by` isn't the configured human | Stop. Do not retry with a different name |
+| `409` | — | A review or merge holds the lease for this PR | Wait and retry after it releases (≤ lease TTL) |
+| `409` | `diverged` | `main` has commits `staging` lacks — no fast-forward | **Escalate to #alerts** with both SHAs and wait |
+| `404` | `no_staging_branch` | Repo has no `origin/staging` | You're on path 4b, not 4a |
+
+Fast-forward only, enforced by the daemon in two places: an ancestry check that
+yields the precise `diverged` outcome, and a plain non-forced push the remote
+rejects on a non-fast-forward. Don't merge with a merge commit, don't rebase,
+don't force-push — and don't work around a `diverged` result, escalate it.
+
+**If the daemon is unreachable**, do **not** fall back to promoting by hand.
+Unlike the step-0 review lease (which fails *open* so a degraded daemon can't
+freeze all reviews), this one fails **closed**: a promotion to `main` is
+irreversible-ish and rare, so waiting is always cheaper than racing. Escalate to
+#alerts that the daemon is down and the promotion is pending.
+
+After a `promoted` response:
 - Notify #work-log: "Feature <title> shipped to main."
 - The GitHub issue auto-closes via the PR's `Closes #<issue>` line (which followed the PR through both merges).
 
@@ -278,6 +340,7 @@ This isn't about asking permission for every line of code. It's about being a co
 - Track which PRs are being processed
 - Hold the per-PR review lease **through** the merge, and gate every merge on it (`assert_can_merge`) — no auto-merge fires while another review is in flight (#102)
 - **Perform the merge** on the autonomous path (squash, rebase, re-check CI) — the single lease-gated chokepoint. Agents do not self-merge here (#102)
+- **Perform the `staging → main` promotion** on the staging path, behind the same lease gate, triggered by a relayed human sign-off (#104). Refuses without a sign-off naming the configured human, and refuses if any review/merge holds the PR's lease
 
 **Agents (intelligent):**
 - Review code against standards
@@ -301,6 +364,9 @@ Cycle counting and branch detection are agent-side responsibilities for v1. A fu
 - Don't hold a PR open waiting for a response longer than 24h without re-pinging
 - Don't loop past 3 cycles — escalate to Hunter instead, the loop has exhausted its budget
 - Don't auto-promote staging → main — Hunter's ✅ is the only valid signal, no timeout fallback
+- Don't run the staging → main promotion by hand (#104) — relay Hunter's ✅ to `POST /pr/.../staging-promotion` and let the daemon do it. No `git merge --ff-only` / `git push origin main` from an agent
+- Don't ever synthesize a sign-off to satisfy that endpoint — no inventing `approved_by`, no signing off as yourself, no "Hunter would obviously approve this." The daemon refuses anyone but the configured human, and attempting it is a far more serious error than a stalled promotion
+- Don't fall back to a manual promotion when the daemon is unreachable — that gate fails **closed** (unlike the step-0 review lease, which fails open). Escalate and wait
 - Don't spawn a reviewer without first acquiring the review lease (step 0) — the lease is the shared mutex across all three spawn paths (daemon cron, GitHub webhook, this manual SOP); skipping it lets two reviewers collide on the same PR and produce conflicting findings
 - Don't emit `cd <path> && git ...` compounds anywhere in this SOP — use `git -C <path> ...` for every git invocation against a non-cwd repo or worktree (the harness backstop crash-loops pool bots; see the "Critical" callout near the top of this file)
 
