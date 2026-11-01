@@ -39,7 +39,12 @@ import {
 } from "./review-utils.js";
 import * as sentry from "./sentry.js";
 import type { ClaudeSessionManager } from "./session.js";
-import { cleanup_after_merge } from "./worktree-cleanup.js";
+import { cleanup_after_merge, find_worktree_for_branch } from "./worktree-cleanup.js";
+import {
+  type WorktreeLease,
+  type WorktreeLeaseStore,
+  canonical_worktree_path,
+} from "./worktree-lease.js";
 
 const exec = promisify(execFile);
 
@@ -145,6 +150,22 @@ interface OpenPR {
   isDraft: boolean;
 }
 
+/** A live lease standing between us and a worktree we wanted to spawn into. */
+interface WorktreeBlocker {
+  path: string;
+  lease: WorktreeLease;
+}
+
+/**
+ * Why a builder spawn did not happen (#105).
+ *
+ * `deferred` is distinct from `failed` on purpose: it means the work is still
+ * owed and the next cron tick must retry, so callers must not record it as
+ * handled or consume a retry slot for it. Collapsing the two would make a
+ * busy worktree look like a spent attempt — a silent drop.
+ */
+type SpawnOutcome = "spawned" | "deferred" | "failed";
+
 interface ActiveReview {
   pr_number: number;
   entity_id: string;
@@ -213,6 +234,7 @@ export class PRReviewCron {
     private pr_watches: PRWatchStore | null = null,
     private alert_router: AlertRouter | null = null,
     private review_leases: ReviewLeaseStore | null = null,
+    private worktree_leases: WorktreeLeaseStore | null = null,
   ) {}
 
   /** Start the polling cron. Loads persisted review state before first poll. */
@@ -400,6 +422,11 @@ export class PRReviewCron {
       await this.review_pr(entity_id, repo_path, pr, entity_config);
     }
 
+    // Re-attempt auto-fixes that were deferred because their worktree was busy
+    // (#105). Runs before the merge retry: a PR awaiting a fix is not a PR
+    // awaiting a merge.
+    await this.retry_deferred_fixes(entity_id, repo_path, prs, entity_config);
+
     // Retry merge for approved-but-unmerged PRs whose CI was pending (#189)
     await this.retry_approved_unmerged(entity_id, repo_path, prs, entity_config);
   }
@@ -543,6 +570,127 @@ export class PRReviewCron {
     // nwo_from_url returns undefined on an unparseable URL — normalize to null so
     // callers have a single "skip the mutex" sentinel.
     return (repo ? nwo_from_url(repo.url) : null) ?? null;
+  }
+
+  /**
+   * The linked worktree a builder for this PR would actually be editing, or
+   * null when there is no such tree to protect (#105).
+   *
+   * `git worktree list` is the only reliable branch→path mapping in this repo
+   * (three different worktree layout conventions exist; no registry does).
+   *
+   * Returning null when the branch lives in the repo's MAIN working tree is
+   * deliberate and load-bearing. The repo root is a shared workspace: every
+   * daemon spawn path passes it as the session cwd, and a reviewer and a fixer
+   * routinely sit in it at the same time. Leasing it would serialize pairs that
+   * coexist today and could wedge the whole review pipeline behind one stuck
+   * hold — turning a race into an outage. A *linked* worktree is the resource
+   * actually worth a mutex: branch-scoped, agent-private, full of uncommitted
+   * work that the next commit will sweep up.
+   *
+   * `protected` so tests can supply a path without a real git repo.
+   */
+  protected async pr_worktree_path(repo_path: string, branch: string): Promise<string | null> {
+    const found = await find_worktree_for_branch(repo_path, branch);
+    if (!found) return null;
+    const canonical = canonical_worktree_path(found);
+    if (canonical === canonical_worktree_path(repo_path)) return null;
+    return canonical;
+  }
+
+  /**
+   * Claim this PR's worktree for a builder we are about to spawn (#105).
+   *
+   * Returns the claimed path (null when there is nothing to claim and the spawn
+   * should just proceed), or the lease that blocked us.
+   *
+   * There is deliberately no "is it free?" check before the acquire. `acquire`
+   * IS the test-and-set: it is synchronous and the store is single-writer, so
+   * no `await` can interleave between reading the current lease and writing
+   * ours. A separate pre-check would reintroduce exactly the check-then-act
+   * window this issue is about — two callers could both see "free" and both
+   * spawn. One atomic acquire makes a tie impossible: one caller gets the
+   * lease, the other gets the winner's lease back and defers.
+   */
+  private async claim_pr_worktree(
+    repo_path: string,
+    branch: string,
+    owner_id: string,
+  ): Promise<{ ok: true; path: string | null } | { ok: false; blocker: WorktreeBlocker }> {
+    if (!this.worktree_leases) return { ok: true, path: null };
+
+    const path = await this.pr_worktree_path(repo_path, branch);
+    if (!path) return { ok: true, path: null };
+
+    const got = this.worktree_leases.acquire(path, "daemon-cron", owner_id);
+    if (!got.ok) return { ok: false, blocker: { path, lease: got.current_lease } };
+    return { ok: true, path };
+  }
+
+  /**
+   * Release a worktree lease once its builder session ends (#105).
+   *
+   * Mirrors the review lease's three-way discipline: the caller releases in its
+   * own `catch` if the spawn throws, and this wires the two terminal session
+   * events. Between them, every path out of a spawned session frees the tree —
+   * the TTL and the pid reaper are backstops, never the primary mechanism.
+   */
+  private release_worktree_on_session_end(session_id: string, release: () => void): void {
+    const finish = (id: string) => {
+      if (id !== session_id) return;
+      this.session_manager.removeListener("session:completed", on_complete);
+      this.session_manager.removeListener("session:failed", on_fail);
+      release();
+    };
+    const on_complete = (result: { session_id: string }) => finish(result.session_id);
+    const on_fail = (id: string) => finish(id);
+
+    this.session_manager.on("session:completed", on_complete);
+    this.session_manager.on("session:failed", on_fail);
+  }
+
+  /**
+   * Announce that a builder spawn was deferred because its worktree is busy.
+   *
+   * Deferral must never be quiet. This codebase has repeatedly been bitten by
+   * gates that reported success while doing nothing (#99's dead review gate),
+   * so a skipped spawn gets a warn-level log naming the current holder, a
+   * routine alert in the entity's activity thread, and a Sentry breadcrumb for
+   * postmortem correlation. Routine rather than action_required on purpose: the
+   * condition clears itself and the next cron tick retries, so it is not
+   * something to page a human about.
+   */
+  private async announce_worktree_deferral(
+    entity_id: string,
+    pr: OpenPR,
+    blocker: { path: string; lease: WorktreeLease },
+    what: string,
+  ): Promise<void> {
+    const { path, lease } = blocker;
+    const held_by = lease.session_id ?? lease.owner_id;
+    console.warn(
+      `[pr-cron] ${what} DEFERRED for PR #${String(pr.number)} — worktree ${path} is held by ` +
+        `${lease.holder} (${held_by}, expires ${lease.expires_at}); retrying next cycle`,
+    );
+    sentry.addBreadcrumb({
+      category: "pr-cron.worktree-lease",
+      message: `Deferred ${what} for PR #${String(pr.number)} — worktree busy`,
+      level: "warning",
+      data: {
+        pr_number: pr.number,
+        entity_id,
+        worktree_path: path,
+        holder: lease.holder,
+        held_by,
+        expires_at: lease.expires_at,
+      },
+    });
+    await this.alert_router?.post_alert({
+      entity_id,
+      tier: "routine",
+      title: `PR #${String(pr.number)} ${what} deferred — worktree busy`,
+      body: `${pr.title} — \`${path}\` is already held by ${lease.holder} (${held_by}). Not spawning a second agent into it; will retry next cycle.`,
+    });
   }
 
   /** Spawn a reviewer session for a PR. */
@@ -883,7 +1031,20 @@ export class PRReviewCron {
         return;
       }
 
-      await this.spawn_external_pr_fixer(entity_id, repo_path, pr, entity_config);
+      const outcome = await this.spawn_external_pr_fixer(entity_id, repo_path, pr, entity_config);
+
+      if (outcome === "deferred") {
+        // Queue the fix so a later tick picks it up (#105). `reviewed_at` is
+        // already persisted by this point, which makes `check_repo` skip the PR
+        // on every subsequent tick — so the marker is the ONLY thing that keeps
+        // this work alive. `retry_deferred_fixes` drains it.
+        await this.mark_fix_deferred(entity_id, pr);
+        return;
+      }
+
+      // Only claim we spawned a builder when we actually did.
+      if (outcome !== "spawned") return;
+
       const prefix = is_internal ? "" : `External (from @${pr.author.login}) `;
       await this.alert_router?.post_alert({
         entity_id,
@@ -1028,6 +1189,76 @@ export class PRReviewCron {
    *
    * No reviewer sessions are spawned — this is purely a merge-retry mechanism.
    */
+  /** Persist "a fix is still owed for this PR" after a worktree deferral (#105). */
+  private async mark_fix_deferred(entity_id: string, pr: OpenPR): Promise<void> {
+    const key = `${entity_id}:${String(pr.number)}`;
+    this.processed[key] = {
+      ...(this.processed[key] ?? {
+        entity_id,
+        pr_number: pr.number,
+        reviewed_at: new Date().toISOString(),
+        outcome: "changes_requested" as const,
+      }),
+      fix_deferred_at: new Date().toISOString(),
+    };
+    await save_pr_reviews(this.processed, this.config);
+  }
+
+  /**
+   * Drain the deferred-fix queue (#105).
+   *
+   * Runs once per cron tick, after the main review loop. For every open PR
+   * carrying a `fix_deferred_at` marker, re-attempt the builder spawn. No
+   * reviewer is spawned — the review already happened and its verdict stands;
+   * only the fix was postponed because the worktree was busy.
+   *
+   * Three outcomes per PR:
+   *   - spawned → clear the marker; the fix is now in flight.
+   *   - deferred → leave the marker; the worktree is still busy, try next tick.
+   *   - failed   → clear the marker. The spawn itself broke (already logged and
+   *     sent to Sentry), which is not a worktree-contention problem; retrying it
+   *     every five minutes forever would just spam. A genuinely owed fix comes
+   *     back on the next push via the normal freshness path.
+   *
+   * PRs whose marker is stale because the PR closed are reaped by `check_repo`'s
+   * existing "remove processed PRs that are no longer open" sweep, so the queue
+   * cannot accumulate entries for dead PRs.
+   */
+  private async retry_deferred_fixes(
+    entity_id: string,
+    repo_path: string,
+    prs: OpenPR[],
+    entity_config: EntityConfig,
+  ): Promise<void> {
+    for (const pr of prs) {
+      const key = `${entity_id}:${String(pr.number)}`;
+      if (!this.processed[key]?.fix_deferred_at) continue;
+      // A live review session on this PR will route its own fix on completion.
+      if (this.active_reviews.has(key)) continue;
+
+      console.log(
+        `[pr-cron] Retrying deferred auto-fix for PR #${String(pr.number)} in ${entity_id}`,
+      );
+      const outcome = await this.spawn_external_pr_fixer(entity_id, repo_path, pr, entity_config);
+      if (outcome === "deferred") continue;
+
+      const entry = this.processed[key];
+      if (entry) {
+        delete entry.fix_deferred_at;
+        await save_pr_reviews(this.processed, this.config);
+      }
+
+      if (outcome === "spawned") {
+        await this.alert_router?.post_alert({
+          entity_id,
+          tier: "routine",
+          title: `PR #${String(pr.number)} auto-fix resumed`,
+          body: `${pr.title} — worktree freed up, builder spawned to fix.`,
+        });
+      }
+    }
+  }
+
   private async retry_approved_unmerged(
     entity_id: string,
     repo_path: string,
@@ -1234,13 +1465,35 @@ export class PRReviewCron {
     }
   }
 
-  /** Spawn a builder session to fix an external PR based on reviewer feedback. */
+  /**
+   * Spawn a builder session to fix a PR based on reviewer feedback.
+   *
+   * Single-owner-per-worktree (#105): if this PR's branch lives in a linked
+   * worktree that another live agent already holds, we defer instead of
+   * spawning a second editor into it. On PR #103 the absence of this check let
+   * the auto-fix builder sweep a concurrently-working agent's uncommitted
+   * changes into its own commit and push the combined tree.
+   */
   private async spawn_external_pr_fixer(
     entity_id: string,
     repo_path: string,
     pr: OpenPR,
     entity_config?: EntityConfig,
-  ): Promise<void> {
+  ): Promise<SpawnOutcome> {
+    // Claim the worktree before anything else, so a deferral costs nothing.
+    const owner_id = randomUUID();
+    const claim = await this.claim_pr_worktree(repo_path, pr.headRefName, owner_id);
+    if (!claim.ok) {
+      await this.announce_worktree_deferral(entity_id, pr, claim.blocker, "auto-fix");
+      return "deferred";
+    }
+    const worktree = claim.path;
+    const release_worktree = () => {
+      if (this.worktree_leases && worktree) {
+        this.worktree_leases.release(worktree, owner_id);
+      }
+    };
+
     // Fetch the actual review comments to give the builder full context
     const review_comments = await fetch_review_comments(pr.number, repo_path);
 
@@ -1271,7 +1524,7 @@ export class PRReviewCron {
     }
 
     try {
-      await this.session_manager.spawn({
+      const session = await this.session_manager.spawn({
         entity_id,
         feature_id: `external-pr-fix-${String(pr.number)}`,
         archetype: "builder",
@@ -1282,7 +1535,17 @@ export class PRReviewCron {
         interactive: false,
         env: fix_env,
       });
+
+      // Bind the worker so the pid reaper can free the tree if it dies, and so
+      // its own Stop-hook turns renew this lease rather than looking like a
+      // second occupant.
+      if (this.worktree_leases && worktree) {
+        this.worktree_leases.bind_session(worktree, owner_id, session.session_id, session.pid);
+      }
+      this.release_worktree_on_session_end(session.session_id, release_worktree);
+      return "spawned";
     } catch (err) {
+      release_worktree(); // spawn threw — don't hold the tree until TTL
       console.error(
         `[pr-cron] Failed to spawn builder for external PR #${String(pr.number)}: ${String(err)}`,
       );
@@ -1290,6 +1553,7 @@ export class PRReviewCron {
         tags: { module: "pr-cron", entity: entity_id, action: "spawn_fixer" },
         contexts: { pr: { number: pr.number, title: pr.title } },
       });
+      return "failed";
     }
   }
 
