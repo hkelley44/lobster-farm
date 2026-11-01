@@ -150,6 +150,7 @@ describe("staging-promotion HTTP route (#104)", () => {
       null, // pr_watches
       null, // alert_router
       store, // review_leases
+      null, // worktree_leases
       0, // ephemeral port
     );
     await new Promise<void>((resolve) => server.on("listening", resolve));
