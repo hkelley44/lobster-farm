@@ -6,6 +6,19 @@
  *
  * All functions are designed to fail silently — cleanup should never break
  * the merge handler, PR cron, or daemon lifecycle.
+ *
+ * ## The live-agent shield: `.lf-agent-active`
+ *
+ * A worktree whose root contains a file named `.lf-agent-active` is NEVER
+ * removed by any path in this module, and no alert is raised for it — it is
+ * deliberately held, not stale-but-unsafe. Drop the file in a worktree root to
+ * pin it; delete the file to release it.
+ *
+ * The marker is honored regardless of git ignore state: it is checked with
+ * `stat`, not `git status`. (It had to be said, because it used to be a
+ * convention with nothing behind it — the marker "worked" only as an accident
+ * of #30's untracked-file check, so one ignore line anywhere disarmed the
+ * whole fleet's shield. See `has_live_agent_marker`.)
  */
 
 import { execFile, execFileSync } from "node:child_process";
@@ -22,6 +35,69 @@ const exec = promisify(execFile);
 
 /** Timeout for git commands — generous but bounded. */
 const GIT_TIMEOUT_MS = 30_000;
+
+/**
+ * Refs whose first-parent history counts as "trunk" (issue #110).
+ *
+ * Both forms are checked and unioned: a worktree is typically created from
+ * `origin/main`, which can be ahead of the local `main` ref (or behind it, if
+ * someone committed locally). Taking the union means a branch sitting on
+ * *either* lineage is recognized as having done no work of its own.
+ */
+const TRUNK_REFS = [
+  "refs/remotes/origin/main",
+  "refs/heads/main",
+  // This repo carries a live `upstream` remote; a worktree branched off
+  // `upstream/main` while it is ahead of both refs above must still be
+  // recognized as having done no work of its own. Unresolvable refs are
+  // skipped individually, so this is a no-op in repos without an upstream.
+  "refs/remotes/upstream/main",
+] as const;
+
+/**
+ * `rev-list` of a long trunk can exceed execFile's 1 MiB default stdout cap
+ * (~24k commits at 41 bytes/sha). Raise it so the probe doesn't fail — and
+ * therefore fall into the fail-safe "skip everything" path — on a big repo.
+ */
+const REV_LIST_MAX_BUFFER = 64 * 1024 * 1024;
+
+// ── Live-agent shield (issue #110) ──
+
+/**
+ * Marker file that pins a worktree against every removal path in this module.
+ *
+ * Named rather than inlined so `grep -rn lf-agent-active` finds the
+ * implementation, not just the convention. See the module docstring.
+ */
+export const AGENT_ACTIVE_MARKER = ".lf-agent-active";
+
+/**
+ * True when a worktree root holds the `.lf-agent-active` marker (issue #110).
+ *
+ * This is the live-session half of #110's acceptance criteria. A marked
+ * worktree is deliberately held by whoever dropped the file, so it is kept
+ * unconditionally and *silently*: no removal, no branch delete, no session
+ * relocation, and no alert. An alert would be wrong here — "unsafe to remove"
+ * alerts exist to surface work that is stuck, and a marked worktree is not
+ * stuck, it is claimed.
+ *
+ * Deliberately independent of git: `stat`, not `git status`, so it does not
+ * matter whether the marker is tracked, untracked, or ignored. Before this
+ * check existed the marker was honored only as a side effect of #30's
+ * `--exclude-standard` untracked scan, which meant a single ignore rule could
+ * disarm the whole fleet's shield.
+ *
+ * Unlike the rest of #110's guardrails this is unconditional — no grace
+ * period, no age component. A marked worktree stays until the marker goes.
+ */
+export async function has_live_agent_marker(worktree_path: string): Promise<boolean> {
+  try {
+    await stat(join(worktree_path, AGENT_ACTIVE_MARKER));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ── Safety guardrail (issue #27) ──
 
@@ -405,14 +481,33 @@ function short_branch(ref: string): string {
  * Remove a single worktree and its branch. Best-effort — logs errors but
  * never throws. Safe to call even if the worktree or branch no longer exists.
  *
+ * Issue #110 shield: a worktree holding `.lf-agent-active` is never removed,
+ * checked here so every caller inherits it whether or not it remembered to
+ * ask. No alert — see `has_live_agent_marker`.
+ *
  * Issue #27 guardrail: before any removal, runs `is_worktree_safe_to_remove`.
  * If the worktree has uncommitted changes, untracked files, or unpushed
  * commits, the removal is skipped, an action-required alert is posted, and
  * this function returns `false` without touching disk.
  *
+ * `branch` MUST be the branch actually checked out in `worktree_path`. Passing
+ * any other branch silently defeats the unpushed-commit precondition, which is
+ * evaluated against `branch` while the directory destroyed is
+ * `worktree_path` — that mismatch was a live data-loss path through
+ * `cleanup_claude_worktrees` (issue #110 review).
+ *
+ * That requirement is *enforced*, not merely documented (step 0b): if the
+ * directory's own branch resolves and disagrees with `branch`, the removal is
+ * refused. This function is exported, so the invariant would otherwise survive
+ * only by every caller's good manners — and misuse of exactly this parameter
+ * is the defect above. A directory whose branch cannot be resolved at all is
+ * allowed through, because that is also the shape of a worktree that has
+ * already been removed out-of-band, and refusing there would break the
+ * "already gone" no-op path.
+ *
  * @param repo_path - Root repo path (not the worktree itself)
  * @param worktree_path - Absolute path to the worktree directory
- * @param branch - Branch name (short form, e.g. "feature/134-auto-cleanup")
+ * @param branch - Branch checked out in `worktree_path` (short form, e.g. "feature/134-auto-cleanup")
  * @param deps - Optional alert routing for unsafe-skip events.
  */
 export async function remove_worktree(
@@ -421,7 +516,33 @@ export async function remove_worktree(
   branch: string,
   deps: CleanupDeps = {},
 ): Promise<boolean> {
-  // Step 0: safety guardrail. Refuse to remove worktrees with unsaved work.
+  // Step 0a: live-agent shield. Backstop for callers that did not pre-check.
+  if (await has_live_agent_marker(worktree_path)) {
+    console.log(
+      `[worktree-cleanup] Keeping worktree (live agent marker ${AGENT_ACTIVE_MARKER}): ${worktree_path} [${branch}]`,
+    );
+    return false;
+  }
+
+  // Step 0b: branch-identity invariant. #30's unpushed check below runs against
+  // `branch`, so a caller that names a branch other than the one checked out
+  // here would be checking the wrong thing. Refuse rather than trust.
+  const repo_common_dir = await resolve_repo_common_dir(repo_path);
+  if (repo_common_dir !== null) {
+    const own_branch = await resolve_worktree_branch(worktree_path, repo_common_dir);
+    if (own_branch !== null && own_branch !== branch) {
+      console.error(
+        `[worktree-cleanup] Refusing to remove ${worktree_path}: caller named branch ${branch}, but ${own_branch} is checked out there (issue #110 review)`,
+      );
+      sentry.captureMessage("worktree-cleanup: branch-identity invariant violated", "error", {
+        tags: { module: "worktree-cleanup", action: "remove_worktree" },
+        contexts: { worktree: { path: worktree_path, named_branch: branch, own_branch } },
+      });
+      return false;
+    }
+  }
+
+  // Step 0c: safety guardrail. Refuse to remove worktrees with unsaved work.
   const check = await is_worktree_safe_to_remove(repo_path, worktree_path, branch);
   if (!check.safe) {
     console.warn(
@@ -487,6 +608,41 @@ export async function remove_worktree(
   return removed_worktree;
 }
 
+/**
+ * Relocate any tmux panes out of a worktree, then remove it.
+ *
+ * The ordering is the reason this helper exists. `relocate_sessions_from_path`
+ * sends `cd` to every pane sitting in the directory — if the removal is then
+ * refused, a live agent has been yanked out of its cwd for nothing. So the
+ * live-agent marker is consulted *before* the relocation, not just inside
+ * `remove_worktree`. All three removal paths in this module go through here so
+ * none of them can get that order wrong again (issue #110 review).
+ *
+ * @param branch - Must be the branch checked out in `worktree_path`.
+ */
+async function relocate_then_remove(
+  repo_path: string,
+  worktree_path: string,
+  branch: string,
+  deps: CleanupDeps,
+): Promise<boolean> {
+  if (await has_live_agent_marker(worktree_path)) {
+    console.log(
+      `[worktree-cleanup] Keeping worktree (live agent marker ${AGENT_ACTIVE_MARKER}): ${worktree_path} [${branch}]`,
+    );
+    return false;
+  }
+
+  const relocated = relocate_sessions_from_path(worktree_path, repo_path);
+  if (relocated > 0) {
+    console.log(
+      `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${worktree_path}`,
+    );
+  }
+
+  return remove_worktree(repo_path, worktree_path, branch, deps);
+}
+
 // ── Find worktree for a specific branch ──
 
 /**
@@ -534,14 +690,9 @@ export async function cleanup_after_merge(
   // 1. Check git worktree list for a worktree on this branch
   const worktree_path = await find_worktree_for_branch(repo_path, branch);
   if (worktree_path) {
-    // Relocate any sessions whose cwd is inside this worktree before removal
-    const relocated = relocate_sessions_from_path(worktree_path, repo_path);
-    if (relocated > 0) {
-      console.log(
-        `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${worktree_path}`,
-      );
-    }
-    await remove_worktree(repo_path, worktree_path, branch, deps);
+    // `find_worktree_for_branch` matched on the worktree's own branch ref, so
+    // `branch` is by construction the one checked out here.
+    await relocate_then_remove(repo_path, worktree_path, branch, deps);
   } else {
     console.log(`[worktree-cleanup] No git worktree found for branch: ${branch}`);
     // If the branch ref itself doesn't exist locally, there's literally nothing
@@ -578,20 +729,163 @@ export async function cleanup_after_merge(
     }
   }
 
-  // 2. Check .claude/worktrees/ for agent-created worktrees matching this branch
-  await cleanup_claude_worktrees(repo_path, branch, deps);
+  // 2. Check .claude/worktrees/ for agent-created worktrees on this branch
+  await cleanup_claude_worktrees(repo_path, new Set([branch]), deps);
 }
 
 /**
- * Scan .claude/worktrees/ in the repo for directories that reference the
- * given branch. Agent-created worktrees follow the pattern of branch slug
- * as directory name (e.g., .claude/worktrees/agent-feature-134-auto-cleanup).
+ * Absolute path of a repo's *common* git dir — the single `.git` shared by the
+ * main working tree and every linked worktree. `null` if `repo_path` is not a
+ * git repo (or the probe failed).
+ *
+ * This is the identity of "this repo", used by `resolve_worktree_branch` to
+ * tell a linked worktree of ours from an unrelated repository that merely sits
+ * in the same directory. `--path-format=absolute` is what makes the comparison
+ * sound: git then prints this path in *physical* form (symlinks resolved) from
+ * the main repo and from any linked worktree alike, so the two answers are
+ * textually comparable even when the configured repo path reaches the repo
+ * through a symlink. Comparing `rev-parse --show-toplevel` against the path we
+ * were handed does NOT have that property — on macOS, `/var/...` in, physical
+ * `/private/var/...` out — and would reject every genuine worktree under a
+ * symlinked root, silently turning the whole scan into a no-op.
+ *
+ * `--path-format` needs git >= 2.31. On anything older this returns `null`,
+ * which declines the scan with a log line rather than guessing.
+ */
+async function resolve_repo_common_dir(repo_path: string): Promise<string | null> {
+  try {
+    const { stdout } = await exec(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { cwd: repo_path, timeout: GIT_TIMEOUT_MS },
+    );
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the branch actually checked out in a worktree directory, or `null`.
+ *
+ * `null` means "do not touch it", and that is the only safe default: a
+ * directory whose branch we cannot name is a directory whose contents we
+ * cannot reason about.
+ *
+ * ## Why `symbolic-ref` alone is not the answer
+ *
+ * **Git walks up.** It does not answer questions about the directory you hand
+ * it; it answers questions about whatever repository encloses it. Probed on
+ * git 2.50.1, the five shapes a `.claude/worktrees/` entry can take are:
+ *
+ * | shape                       | `symbolic-ref --short HEAD` |
+ * |-----------------------------|-----------------------------|
+ * | A plain leftover directory  | the **enclosing repo's** branch |
+ * | B genuine linked worktree   | its own branch (correct)    |
+ * | C pruned worktree metadata  | fatal → `null`              |
+ * | D detached HEAD             | fatal → `null`              |
+ * | E unrelated nested repo     | **that repo's** branch      |
+ *
+ * A and E hand back a branch that is not checked out in the directory being
+ * targeted, which is precisely the wrong-branch handoff this whole code path
+ * was rewritten to eliminate (issue #110 review, finding 1). Both were
+ * non-destructive only by git's own refusals — `git worktree remove` declines
+ * a non-worktree, `git branch -d` declines a checked-out branch — except for
+ * shape E, where the branch delete lands on the *parent* repo's merged ref and
+ * succeeds. Safety that comes from the subprocess refusing is not safety.
+ *
+ * So two gates, both from one `rev-parse`:
+ *
+ *  1. `--show-cdup` must be empty: the directory must *be* the root of its
+ *     working tree, not somewhere inside one. Rejects A. (Relative output, so
+ *     no path comparison and no symlink hazard.)
+ *  2. `--git-common-dir` must equal this repo's. Rejects E, and any linked
+ *     worktree belonging to some other repository.
+ *
+ * C makes the `rev-parse` itself fail; D fails the `symbolic-ref`. All three
+ * rejections land on `null`.
+ */
+async function resolve_worktree_branch(
+  worktree_path: string,
+  repo_common_dir: string,
+): Promise<string | null> {
+  let cdup: string;
+  let common_dir: string;
+  try {
+    const { stdout } = await exec(
+      "git",
+      ["rev-parse", "--show-cdup", "--path-format=absolute", "--git-common-dir"],
+      { cwd: worktree_path, timeout: GIT_TIMEOUT_MS },
+    );
+    const [raw_cdup = "", raw_common = ""] = stdout.split("\n");
+    cdup = raw_cdup.trim();
+    common_dir = raw_common.trim();
+  } catch {
+    // Not a git directory at all (shape C), or rev-parse failed.
+    return null;
+  }
+
+  // Gate 1: a subdirectory of some working tree, not a worktree root (shape A).
+  if (cdup !== "") return null;
+  // Gate 2: a worktree root, but not one of *ours* (shape E).
+  if (common_dir === "" || common_dir !== repo_common_dir) return null;
+
+  try {
+    const { stdout } = await exec("git", ["symbolic-ref", "--short", "HEAD"], {
+      cwd: worktree_path,
+      timeout: GIT_TIMEOUT_MS,
+    });
+    return stdout.trim() || null;
+  } catch {
+    // Detached HEAD (shape D).
+    return null;
+  }
+}
+
+/**
+ * Remove `.claude/worktrees/` directories whose own checked-out branch is in
+ * `target_branches`.
+ *
+ * ## Why this matches on branch identity and not on directory name
+ *
+ * This function used to match directories by *substring of the target
+ * branch's slug* (`entry.name.includes(slug)`) and then hand the **target**
+ * branch to `remove_worktree` — a branch with no necessary relationship to the
+ * directory being destroyed. Two things went wrong at once:
+ *
+ *  1. #30's unpushed-commit precondition was evaluated against the target
+ *     branch (merged, therefore pushed, therefore "safe") while the directory
+ *     deleted belonged to some other branch whose commits may never have been
+ *     pushed. Only the uncommitted/untracked `git status` checks looked at the
+ *     right directory, and a clean worktree trips neither.
+ *  2. #110's unstarted-branch guard was likewise evaluated against the target
+ *     branch, so the sweep's main loop could spare a brand-new worktree and
+ *     this path would delete the same directory three lines later.
+ *
+ * The slug heuristic was also just wrong about the world. `.claude/worktrees/`
+ * is the Claude Code harness's own worktree feature (`EnterWorktree`), which
+ * names directories from its `name` argument or, by default, **randomly** —
+ * every live example on this machine is `agent-<hex8>`, e.g. `agent-aa3e284a`
+ * holding `feature/7-live-dashboard`. So the name never contains the slug when
+ * you want it to, and a short slug substring-matches hex when you don't:
+ * `"agent-aa3e284a".includes("2")` is `true`, which is enough to delete a
+ * live worktree over a merged `.../2`.
+ *
+ * So: ask the directory what branch it is on, act only on an exact match, and
+ * pass *that* branch to `remove_worktree`. The name is never consulted.
+ *
+ * "Ask the directory" is load-bearing and is harder than one `symbolic-ref` —
+ * git answers for the repository *enclosing* a path, not for the path. See
+ * `resolve_worktree_branch`: an entry is only ever acted on if it is the root
+ * of a working tree that belongs to this very repo.
  */
 async function cleanup_claude_worktrees(
   repo_path: string,
-  branch: string,
+  target_branches: ReadonlySet<string>,
   deps: CleanupDeps = {},
 ): Promise<void> {
+  if (target_branches.size === 0) return;
+
   const claude_wt_dir = join(repo_path, ".claude", "worktrees");
 
   try {
@@ -601,31 +895,161 @@ async function cleanup_claude_worktrees(
     return;
   }
 
-  // The branch slug is the part after the last slash, lowercased
-  // e.g. "feature/134-auto-cleanup" → "134-auto-cleanup"
-  const branch_slug = branch.includes("/") ? branch.slice(branch.lastIndexOf("/") + 1) : branch;
+  // Identity of this repo, for `resolve_worktree_branch`'s second gate. If we
+  // cannot establish it we cannot tell our own worktrees from a foreign repo
+  // that happens to sit in this directory, so we decline the whole scan — and
+  // say so, rather than silently reclassifying every entry as unresolvable.
+  const repo_common_dir = await resolve_repo_common_dir(repo_path);
+  if (repo_common_dir === null) {
+    console.warn(
+      `[worktree-cleanup] Could not resolve the git common dir of ${repo_path} — skipping .claude/worktrees/ scan`,
+    );
+    return;
+  }
 
   try {
     const entries = await readdir(claude_wt_dir, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
 
-      // Match directories that contain the branch slug
-      if (entry.name.includes(branch_slug)) {
-        const wt_path = join(claude_wt_dir, entry.name);
-        console.log(`[worktree-cleanup] Found .claude/worktrees/ match: ${wt_path}`);
-        // Relocate any sessions whose cwd is inside this worktree before removal
-        const relocated = relocate_sessions_from_path(wt_path, repo_path);
-        if (relocated > 0) {
-          console.log(
-            `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${wt_path}`,
-          );
-        }
-        await remove_worktree(repo_path, wt_path, branch, deps);
+      const wt_path = join(claude_wt_dir, entry.name);
+      const own_branch = await resolve_worktree_branch(wt_path, repo_common_dir);
+      if (own_branch === null) {
+        console.log(
+          `[worktree-cleanup] Leaving .claude/worktrees/ entry with no resolvable branch: ${wt_path}`,
+        );
+        continue;
       }
+      if (!target_branches.has(own_branch)) continue;
+
+      console.log(`[worktree-cleanup] Found .claude/worktrees/ match: ${wt_path} [${own_branch}]`);
+      await relocate_then_remove(repo_path, wt_path, own_branch, deps);
     }
   } catch (err) {
     console.error(`[worktree-cleanup] Error scanning .claude/worktrees/: ${String(err)}`);
+  }
+}
+
+// ── Stale-classification guardrail (issue #110) ──
+
+/**
+ * The set of commits on the trunk's first-parent history, or `null` when it
+ * could not be determined. `null` is load-bearing: callers treat "unknown
+ * trunk" as "cannot prove this branch did any work" and skip removal.
+ */
+export type TrunkHistory = Set<string> | null;
+
+/**
+ * Read the trunk's first-parent history (issue #110).
+ *
+ * First-parent history is the discriminator that makes `is_unstarted_branch`
+ * work. Every commit ever *merged in* from a side branch is reachable from
+ * trunk but is NOT on trunk's first-parent chain (it hangs off a merge
+ * commit's second parent). Commits that are on the chain are trunk commits —
+ * so a branch pointing at one is a branch that has produced nothing.
+ *
+ * Refs that don't resolve are skipped individually, so a repo with no
+ * `origin` remote still gets a usable answer from `refs/heads/main`.
+ *
+ * @returns Union of the first-parent histories of every resolvable trunk ref,
+ *   or `null` if none resolved (i.e. we have no idea what trunk looks like).
+ */
+async function load_trunk_history(repo_path: string): Promise<TrunkHistory> {
+  const shas = new Set<string>();
+  let any_resolved = false;
+
+  for (const ref of TRUNK_REFS) {
+    try {
+      const { stdout } = await exec("git", ["rev-list", "--first-parent", ref], {
+        cwd: repo_path,
+        timeout: GIT_TIMEOUT_MS,
+        maxBuffer: REV_LIST_MAX_BUFFER,
+      });
+      any_resolved = true;
+      for (const line of stdout.split("\n")) {
+        const sha = line.trim();
+        if (sha) shas.add(sha);
+      }
+    } catch {
+      // Ref doesn't exist in this repo (or rev-list failed) — try the next one.
+    }
+  }
+
+  return any_resolved ? shas : null;
+}
+
+/**
+ * True when a branch has produced no commits of its own (issue #110).
+ *
+ * This is the fix for the sweep misclassifying freshly-created worktrees as
+ * stale. A brand-new worktree (`git worktree add <dir> -b <branch> origin/main`)
+ * has a branch tip that is *literally a trunk commit*: zero commits ahead, a
+ * clean working tree, and no `origin/<branch>` ref yet. That made it
+ * indistinguishable from finished work to both of `sweep_repo`'s stale tests —
+ * `git branch --merged main` lists it, and `is_remote_branch_gone` reports its
+ * never-created remote ref as "gone" — while #27/#30's safety preconditions
+ * found nothing to protect (nothing uncommitted, untracked, or unpushed,
+ * because nothing had been written yet). The worktree was deleted out from
+ * under a running agent.
+ *
+ * A branch whose tip is on trunk's first-parent history cannot be finished
+ * work: its commits, if it had any, would hang off trunk rather than sit on
+ * it. Checking the tip (rather than "zero commits ahead of main") is what
+ * keeps genuinely-merged worktrees sweepable — a branch merged into main via
+ * a merge commit is also zero-ahead, but its tip is *off* the first-parent
+ * chain, so it stays eligible.
+ *
+ * Deliberately conservative in both unknown cases — an empty `tip_sha` or an
+ * unknown trunk returns `true` (treat as unstarted → do not remove). Leaking
+ * a stale worktree costs disk; removing a live one destroys work.
+ *
+ * ## Known limitation: fast-forward merges are never swept
+ *
+ * `git merge --ff-only feature/x` (and plain `git merge feature/x` when it can
+ * fast-forward, which is git's default) moves trunk *to* the branch tip rather
+ * than creating a merge commit. The branch tip is then literally a trunk
+ * commit on the first-parent chain, so this function returns `true` for it
+ * forever and the worktree can never be reclaimed by the sweep, however long
+ * it sits or however thoroughly its branch was merged and deleted on the
+ * remote. (`--no-ff` and `--squash` merges are unaffected: a `--no-ff` tip
+ * hangs off a merge commit's second parent and stays sweepable, while a
+ * `--squash` tip is blocked earlier by #30's unpushed check — see
+ * `worktree-cleanup.git-integration.test.ts`.)
+ *
+ * This is documented rather than fixed, deliberately. Distinguishing
+ * "ff-merged and abandoned" from "created ten minutes ago and in use" needs
+ * evidence that `origin/<branch>` *once* existed, which is exactly the
+ * evidence `git fetch --prune` has already destroyed; the available proxies
+ * (reflog archaeology, a worktree-age grace window) either expire or re-open
+ * #110 for any long-lived worktree. The live-agent marker above is the
+ * intended escape hatch for the age-based variant, and it has zero adoption
+ * today — nothing in the fleet writes it yet — so shipping an age-based
+ * reclaim path now would mean shipping it unshielded.
+ *
+ * Net effect: ff-merged and squash-merged worktrees leak. That is bounded,
+ * visible in the sweep log, and the right side of the trade for a destructive
+ * operation. Reclaiming them needs its own design (marker adoption first),
+ * not a widened classifier here — tracked in **issue #129**, along with the
+ * other half of the same problem: a marker left behind by a crashed agent pins
+ * its worktree forever, with no expiry and no digest of what the sweep
+ * declined to touch.
+ */
+export function is_unstarted_branch(tip_sha: string, trunk: TrunkHistory): boolean {
+  if (!tip_sha) return true;
+  if (trunk === null) return true;
+  return trunk.has(tip_sha);
+}
+
+/** Resolve a branch name to its tip sha. Returns null if it doesn't resolve. */
+async function resolve_branch_tip(repo_path: string, branch: string): Promise<string | null> {
+  try {
+    const { stdout } = await exec("git", ["rev-parse", "--verify", `refs/heads/${branch}`], {
+      cwd: repo_path,
+      timeout: GIT_TIMEOUT_MS,
+    });
+    return stdout.trim() || null;
+  } catch {
+    return null;
   }
 }
 
@@ -635,6 +1059,11 @@ async function cleanup_claude_worktrees(
  * Sweep all entity repos for stale worktrees. A worktree is stale if:
  * - Its branch has been merged into main, or
  * - Its branch's remote tracking ref no longer exists
+ *
+ * ...and, per issue #110, only if its branch has produced at least one commit
+ * of its own (see `is_unstarted_branch` — both stale tests above fire on a
+ * brand-new worktree, which is why that guardrail exists) and its root does
+ * not hold the `.lf-agent-active` marker (see `has_live_agent_marker`).
  *
  * Designed to run periodically (e.g., hourly) as a safety net.
  */
@@ -687,6 +1116,23 @@ async function sweep_repo(repo_path: string, deps: CleanupDeps = {}): Promise<nu
     // Non-critical — we'll still check local state
   }
 
+  // Trunk first-parent history, for the issue #110 unstarted-branch guardrail.
+  // Loaded once per repo per sweep and shared by both removal paths below.
+  //
+  // Probed here — straight after the fetch, ahead of the merged-branch and
+  // worktree-list probes — because `trunk === null` abandons the whole repo,
+  // so those two subprocesses would be wasted work on the failure path. It
+  // deliberately stays *after* the fetch: computed against a stale
+  // `origin/main` the trunk set is smaller, which would make the guardrail
+  // less conservative, not more.
+  const trunk = await load_trunk_history(repo_path);
+  if (trunk === null) {
+    console.warn(
+      `[worktree-cleanup] Could not resolve trunk history in ${repo_path} — skipping sweep (issue #110 guardrail)`,
+    );
+    return 0;
+  }
+
   // Get the list of branches merged into main
   let merged_branches: Set<string>;
   try {
@@ -697,7 +1143,13 @@ async function sweep_repo(repo_path: string, deps: CleanupDeps = {}): Promise<nu
     merged_branches = new Set(
       stdout
         .split("\n")
-        .map((line) => line.trim().replace(/^\* /, ""))
+        // Git marks the current branch with `* ` and a branch checked out in
+        // ANOTHER worktree with `+ ` — i.e. every agent worktree branch. The
+        // original pattern stripped only `* `, so these arrived as
+        // "+ feature/x", `merged_branches.has("feature/x")` was always false,
+        // and Case 1 below could never fire for precisely the branches this
+        // sweep exists to evaluate. (Every removal logged "remote gone".)
+        .map((line) => line.trim().replace(/^[*+]\s+/, ""))
         .filter((b) => b && b !== "main"),
     );
   } catch {
@@ -731,6 +1183,18 @@ async function sweep_repo(repo_path: string, deps: CleanupDeps = {}): Promise<nu
     // Check if this is the main working tree (same path as repo_path)
     if (entry.path === repo_path) continue;
 
+    // Issue #110: a branch that has produced no commits of its own is not
+    // stale, it's unstarted — an agent is very likely working in it right now.
+    // This runs BEFORE either stale test because both of them fire on a
+    // brand-new worktree (merged-into-main via `branch --merged`, remote-gone
+    // via a never-pushed branch) and neither is evidence that work is done.
+    if (is_unstarted_branch(entry.head, trunk)) {
+      console.log(
+        `[worktree-cleanup] Keeping worktree (branch has no commits of its own): ${entry.path} [${branch}]`,
+      );
+      continue;
+    }
+
     let should_clean = false;
 
     // Case 1: Branch is merged into main
@@ -748,22 +1212,26 @@ async function sweep_repo(repo_path: string, deps: CleanupDeps = {}): Promise<nu
     }
 
     if (should_clean) {
-      // Relocate any sessions whose cwd is inside this worktree before removal
-      const relocated = relocate_sessions_from_path(entry.path, repo_path);
-      if (relocated > 0) {
-        console.log(
-          `[worktree-cleanup] Relocated ${String(relocated)} session(s) from ${entry.path}`,
-        );
-      }
-      const removed = await remove_worktree(repo_path, entry.path, branch, deps);
+      const removed = await relocate_then_remove(repo_path, entry.path, branch, deps);
       if (removed) cleaned++;
     }
   }
 
-  // Also sweep .claude/worktrees/ for agent directories referencing merged branches
+  // Also sweep .claude/worktrees/ for agent directories on merged branches.
+  //
+  // Issue #110 applies here too, so the guardrail is applied to each candidate
+  // branch before it is offered as a removal target. `cleanup_claude_worktrees`
+  // then matches directories on their *own* checked-out branch, so a directory
+  // can only be destroyed under a branch that is both in this filtered set and
+  // actually checked out in it — never, as before, under an unrelated branch
+  // whose slug happened to appear in the directory's name.
+  const sweepable_merged = new Set<string>();
   for (const branch of merged_branches) {
-    await cleanup_claude_worktrees(repo_path, branch, deps);
+    const tip = await resolve_branch_tip(repo_path, branch);
+    if (tip === null || is_unstarted_branch(tip, trunk)) continue;
+    sweepable_merged.add(branch);
   }
+  await cleanup_claude_worktrees(repo_path, sweepable_merged, deps);
 
   return cleaned;
 }
