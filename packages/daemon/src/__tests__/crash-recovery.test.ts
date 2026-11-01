@@ -332,6 +332,92 @@ describe("crash recovery (issue #157)", () => {
       const history = pool.get_session_history();
       expect(history.get("test-entity:ch-1")).toBe("sess-abc-123");
     });
+
+    /**
+     * #96: the two inline stash sites in `restart_crashed_session` claimed
+     * "confirmed = JSONL on disk" and gated on `session_confirmed` alone. That
+     * is false — confirmation only proves the JSONL existed at *confirmation*
+     * time — and on the restart-failed path it is demonstrably wrong rather
+     * than merely imprecise, which is why these two cases assert behavior and
+     * not comment text.
+     *
+     * Both tests force "JSONL absent" (the base class otherwise reports every
+     * session as present on disk, which is exactly why the gap survived #92).
+     */
+    it("does NOT stash a phantom session when the restart-failed path has no JSONL on disk (#96)", async () => {
+      mock_start_tmux.mockRejectedValue(new Error("tmux launch failed"));
+      // The pre-flight inside restart_crashed_session reads this and logs "no
+      // JSONL on disk", then spawns fresh. `session_confirmed` is NEVER
+      // downgraded to match, because the `= is_resume` assignment lives past
+      // the statement that threw — so the catch block sees a confirmed session
+      // whose transcript this very call already proved is gone.
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "check_session_jsonl_exists_anywhere" as never,
+      ).mockResolvedValue(false as never);
+
+      const bot = make_bot({
+        id: 2,
+        state: "assigned",
+        channel_id: "ch-1",
+        entity_id: "test-entity",
+        archetype: "planner",
+        session_id: "sess-vanished",
+        session_confirmed: true,
+      });
+      pool.inject_bots([bot]);
+
+      await pool.run_health_check();
+
+      // Stashing it would hand the channel's next assignment a --resume target
+      // that cannot exist, burning crash-loop retries (#256).
+      expect(pool.get_session_history().has("test-entity:ch-1")).toBe(false);
+    });
+
+    it("does NOT stash a phantom session on the force-free path when the JSONL is gone (#96)", async () => {
+      // Missing archetype → restart_crashed_session force-frees and returns
+      // BEFORE its own JSONL pre-flight ever runs, so the shared helper's disk
+      // re-read is the only gate on this path.
+      vi.spyOn(
+        pool as unknown as Record<string, unknown>,
+        "check_session_jsonl_exists_anywhere" as never,
+      ).mockResolvedValue(false as never);
+
+      const bot = make_bot({
+        id: 2,
+        state: "assigned",
+        channel_id: "ch-1",
+        entity_id: "test-entity",
+        archetype: null,
+        session_id: "sess-vanished",
+        session_confirmed: true,
+      });
+      pool.inject_bots([bot]);
+
+      await pool.run_health_check();
+
+      expect(pool.get_session_history().has("test-entity:ch-1")).toBe(false);
+      expect(mock_start_tmux).not.toHaveBeenCalled(); // took the force-free branch
+    });
+
+    it("still stashes on the force-free path when the JSONL IS on disk (#96 — no over-correction)", async () => {
+      // Same force-free branch, JSONL present (base-class default). The #96
+      // change must tighten the gate, not disable the stash.
+      const bot = make_bot({
+        id: 2,
+        state: "assigned",
+        channel_id: "ch-1",
+        entity_id: "test-entity",
+        archetype: null,
+        session_id: "sess-alive",
+        session_confirmed: true,
+      });
+      pool.inject_bots([bot]);
+
+      await pool.run_health_check();
+
+      expect(pool.get_session_history().get("test-entity:ch-1")).toBe("sess-alive");
+    });
   });
 
   // ── Crash loop detection ──

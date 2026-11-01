@@ -1717,9 +1717,26 @@ describe("BotPool persistence", () => {
         pool as unknown as { check_assigned_health: () => Promise<void> }
       ).check_assigned_health();
 
-      // Should log session history stash (not orphan message)
+      // Should log the stash (not the orphan message).
+      //
+      // Matched on the FULL path-specific label, not on the shared
+      // "session history for" fragment. This bot has a null `archetype`
+      // (make_bot's default), so `restart_crashed_session` takes the
+      // force-free branch — hence "crash force-free" and not the
+      // restart-failed label.
+      //
+      // Why the full label: the bare fragment also appears in
+      // `Found session history for channel …` (the assign-path lookup),
+      // `Consumed session history for …`, and the unlabelled
+      // `Stashed session history for …` of the two stash sites that are still
+      // inline. So a change that dropped this stash and fell through into
+      // assign() would keep a fragment-matching assertion green while the
+      // exact behaviour this test exists to pin had vanished. The labels exist
+      // so logs stay path-specific; the assertion uses one (#96).
       const stash_log = log_spy.mock.calls.find(
-        (call) => typeof call[0] === "string" && call[0].includes("Stashed session history"),
+        (call) =>
+          typeof call[0] === "string" &&
+          call[0].includes("Stashed crash force-free session history for"),
       );
       expect(stash_log).toBeDefined();
 
