@@ -113,6 +113,22 @@ export const LobsterFarmConfigSchema = z.object({
        * short enough that a stuck lease self-heals within one cron window.
        */
       review_lease_ttl_ms: z.number().int().positive().default(1_200_000),
+      /**
+       * Per-worktree explicit lease TTL in ms (#105). How long a daemon-spawned
+       * builder's hold on a linked worktree survives without a release. Generous
+       * (60 min) because a real review-fix pass legitimately runs that long; the
+       * pid reaper, not this TTL, is what frees a crashed holder promptly.
+       */
+      worktree_lease_ttl_ms: z.number().int().positive().default(3_600_000),
+      /**
+       * Per-worktree *observed* lease TTL in ms (#105), measured from an agent's
+       * last completed turn as reported by the Stop hook. Shorter (15 min) than
+       * an explicit hold because it is inferred rather than claimed: it must
+       * lapse on its own once the agent stops working there. Errs toward
+       * blocking — over-blocking costs a deferred auto-fix that retries next
+       * tick, under-blocking costs clobbered history.
+       */
+      worktree_observed_ttl_ms: z.number().int().positive().default(900_000),
     })
     .optional(),
 

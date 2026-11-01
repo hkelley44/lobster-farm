@@ -1235,6 +1235,19 @@ export class PRReviewCron {
       if (!this.processed[key]?.fix_deferred_at) continue;
       // A live review session on this PR will route its own fix on completion.
       if (this.active_reviews.has(key)) continue;
+      // Respect the draft flag, exactly as the main review loop does (#105).
+      // This drain is a second, independent entry point into the builder spawn
+      // and iterates the *unfiltered* PR list, so the main loop's draft `continue`
+      // does not cover it. A PR flipped to draft after its deferral is a builder
+      // still iterating — the precise sequence #105 calls out ("the review+builder
+      // were spawned just before the draft flag was set"). Hold the marker rather
+      // than clearing it: the fix is still owed once the PR is ready again.
+      if (pr.isDraft) {
+        console.log(
+          `[pr-cron] PR #${String(pr.number)} is now a draft — holding deferred auto-fix`,
+        );
+        continue;
+      }
 
       console.log(
         `[pr-cron] Retrying deferred auto-fix for PR #${String(pr.number)} in ${entity_id}`,
