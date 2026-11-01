@@ -105,9 +105,16 @@ export const PLUGIN_DEAF_THRESHOLD_MS = 90_000;
  * Equal to PLUGIN_DEAF_THRESHOLD_MS deliberately: no verdict can be *needed*
  * earlier (the grace window already spans 0–90s after an inbound), so gating
  * reads for the same span costs nothing while guaranteeing boot noise is
- * never read at all. Healthy sessions are still cleared promptly after
+ * never read at all. Healthy pool sessions are still cleared promptly after
  * warm-up via the Stop-hook `mark_processed` stamp (`healthy_processed`),
  * which is immune to pane noise.
+ *
+ * That last mitigation is pool-only: the commander has no `mark_processed`
+ * (`commander-process.ts` writes `last_processing_at` solely from its own
+ * verdict switch), so its probe depends entirely on post-warm-up pane reads.
+ * The "provably identical decisions" the three call sites share is a property
+ * of `evaluate_plugin_liveness` below — the surrounding mitigations are not
+ * symmetric, and the commander's are thinner.
  */
 export const LIVENESS_WARMUP_MS = 90_000;
 

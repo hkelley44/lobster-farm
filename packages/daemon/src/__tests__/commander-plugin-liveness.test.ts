@@ -64,6 +64,13 @@ class TestCommander extends CommanderProcess {
     (this as unknown as { recovering_plugin: boolean }).recovering_plugin = v;
   }
 
+  /** The commander's analogue of the pool's `assigned_at` — stamped when tmux
+   * is confirmed running, refreshed on every respawn. Drives the #111 warm-up
+   * gate. Left null by the other tests, which is why they are unaffected. */
+  set_started_at(at: Date | null): void {
+    (this as unknown as { last_started_at: Date | null }).last_started_at = at;
+  }
+
   // Report tmux as not-alive so recovery skips the real kill-session call (no
   // real `pat` session exists in tests); start() is stubbed to avoid spawning.
   stub_internals(): void {
@@ -221,6 +228,99 @@ describe("commander plugin-liveness probe (issue #77)", () => {
     commander.set_inbound(null);
     commander.mark_inbound();
     expect(commander.get_inbound()).not.toBeNull();
+  });
+
+  // ── Warm-up gate (#111) ──
+  //
+  // Mirrors the pool's three warm-up tests in pool-plugin-liveness.test.ts:
+  // no reading inside the window, readings resume after it, and a verdict
+  // delayed by the gate is never swallowed.
+
+  it("warm-up gate: takes NO reading on a freshly-respawned commander, even when boot noise reads as working (#111)", async () => {
+    // Boot banner mis-read as "working" at T≈0. Without the gate this is
+    // healthy_working: last_processing_at falsely stamped and the armed marker
+    // cleared, silencing the probe for a commander that may be genuinely deaf.
+    commander.set_started_at(new Date()); // just respawned — inside the window
+    commander.set_inbound(new Date());
+    commander.set_processing(null);
+    idle_mock.mockReturnValue(false); // "working" per the pane heuristic
+
+    await commander.run_probe();
+
+    // No reading taken: marker preserved, no processing stamp, no recovery.
+    expect(commander.get_inbound()).not.toBeNull();
+    expect(commander.get_processing()).toBeNull();
+    expect(commander.start_calls).toBe(0);
+    expect(alert_mock).not.toHaveBeenCalled();
+  });
+
+  it("warm-up gate: does not even read the pane inside the window (#111)", async () => {
+    // The gate must short-circuit BEFORE is_tmux_session_idle — a pane read is
+    // the thing whose result cannot be trusted during boot.
+    commander.set_started_at(new Date());
+    commander.set_inbound(new Date());
+    idle_mock.mockClear();
+
+    await commander.run_probe();
+
+    expect(idle_mock).not.toHaveBeenCalled();
+  });
+
+  it("warm-up gate: readings resume once the session has settled past the window", async () => {
+    // Same conditions, but the commander has been up for a while — the gate no
+    // longer applies and a genuinely-working pane clears the marker as before.
+    commander.set_started_at(new Date(Date.now() - 10 * 60 * 1000));
+    commander.set_inbound(new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000));
+    commander.set_processing(null);
+    idle_mock.mockReturnValue(false); // working
+
+    await commander.run_probe();
+
+    expect(commander.get_inbound()).toBeNull();
+    expect(commander.get_processing()).not.toBeNull();
+    expect(commander.start_calls).toBe(0);
+  });
+
+  it("warm-up gate: a commander still idle after the window IS judged deaf and recovered (#111)", async () => {
+    // Armed at spawn, warm-up elapsed, still idle with zero processing — the
+    // gate delays the verdict but must never swallow it. This is the property
+    // that keeps the gate from becoming a permanent blind spot (#118).
+    const spawn_time = new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000);
+    commander.set_started_at(spawn_time);
+    commander.set_inbound(spawn_time);
+    commander.set_processing(null);
+    idle_mock.mockReturnValue(true);
+
+    await commander.run_probe();
+
+    expect(commander.start_calls).toBe(1);
+    expect(String(alert_mock.mock.calls[0]?.[0])).toContain("went DEAF");
+  });
+
+  it("warm-up gate: the suppressed reading keeps the marker armed so the NEXT pass can judge it deaf (#111/#118)", async () => {
+    // The two halves of the same timeline, which together show detection is
+    // deferred rather than lost: a tick inside the window must not consume the
+    // marker, and the tick after it must reach a deaf verdict.
+    const spawn_time = new Date();
+    commander.set_started_at(spawn_time);
+    commander.set_inbound(spawn_time);
+    commander.set_processing(null);
+    idle_mock.mockReturnValue(false); // boot banner reads as "working"
+
+    await commander.run_probe(); // inside warm-up — gated
+    expect(commander.get_inbound()).not.toBeNull();
+    expect(commander.start_calls).toBe(0);
+
+    // Advance past both the warm-up and the deaf threshold; pane now reads idle.
+    const aged = new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000);
+    commander.set_started_at(aged);
+    commander.set_inbound(aged);
+    idle_mock.mockReturnValue(true);
+
+    await commander.run_probe();
+
+    expect(commander.start_calls).toBe(1);
+    expect(String(alert_mock.mock.calls[0]?.[0])).toContain("went DEAF");
   });
 
   it("still releases the in-flight lock if the respawn throws", async () => {
