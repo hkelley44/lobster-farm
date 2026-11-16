@@ -78,6 +78,12 @@ const MAX_CAPTURE_FAILURES = 6;
  * leak the extra Enters into whatever comes next. */
 const REPRESS_AFTER_MS = 3_000;
 
+/** Minimum gap between arrow keys. Arrows cannot dismiss a dialog, so they need
+ * no guard against leaking into the prompt — but a second arrow sent before the
+ * first has been drawn can wrap the cursor back onto the decline option and
+ * thrash. One redraw is far shorter than this. */
+const ARROW_REPRESS_AFTER_MS = 1_500;
+
 export type StartupDialogKey = "Enter" | "Up" | "Down";
 
 function default_send_key(tmux_session: string, key: StartupDialogKey): void {
@@ -102,6 +108,14 @@ const DECLINE_OPTIONS: Record<StartupDialog, readonly string[]> = {
   dev_channels_dialog: ["Exit"],
 };
 
+/** `Array.prototype.findLastIndex`, which the daemon's ES target predates. */
+function last_index_where(lines: string[], test: (line: string) => boolean): number {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (test(lines[i] ?? "")) return i;
+  }
+  return -1;
+}
+
 /**
  * The single key that moves a startup dialog one step closer to accepted, or
  * null when the pane does not show enough to decide.
@@ -120,11 +134,17 @@ const DECLINE_OPTIONS: Record<StartupDialog, readonly string[]> = {
 export function next_key_for_dialog(dialog: StartupDialog, pane: string): StartupDialogKey | null {
   const lines = pane_tail(pane, 14);
   const accept = ACCEPT_OPTION[dialog];
-  const accept_index = lines.findIndex((line) => line.includes(accept));
+  // The cursor on any accept row is conclusive. Checked across every match
+  // rather than the first, so the label echoed higher up (scrollback, a
+  // wrapped line) cannot hide the live row.
+  if (lines.some((line) => line.includes(accept) && line.includes("❯"))) return "Enter";
+  // Otherwise navigate relative to the LAST match: an open dialog owns the
+  // bottom of the pane, so the lowest occurrence is its option row.
+  const accept_index = last_index_where(lines, (line) => line.includes(accept));
   if (accept_index === -1) return null;
-  if (lines[accept_index]?.includes("❯")) return "Enter";
 
-  const cursor_index = lines.findIndex(
+  const cursor_index = last_index_where(
+    lines,
     (line) => line.includes("❯") && DECLINE_OPTIONS[dialog].some((opt) => line.includes(opt)),
   );
   if (cursor_index === -1) return null;
@@ -162,6 +182,7 @@ export async function answer_startup_dialogs(
   let capture_failures = 0;
   let last_dialog: StartupDialog | null = null;
   let last_pressed: { dialog: StartupDialog; at: number } | null = null;
+  let last_arrow_at: number | null = null;
   let prompt_seen = false;
 
   while (now() - started < timeout_ms) {
@@ -191,6 +212,13 @@ export async function answer_startup_dialogs(
       }
       const key = next_key_for_dialog(dialog, pane);
       if (key === null) continue; // cannot tell where the cursor is — do not guess
+      if (
+        key !== "Enter" &&
+        last_arrow_at !== null &&
+        now() - last_arrow_at < ARROW_REPRESS_AFTER_MS
+      ) {
+        continue; // the previous arrow may not have been drawn yet
+      }
       try {
         send_key(tmux_session, key);
       } catch {
@@ -200,7 +228,10 @@ export async function answer_startup_dialogs(
       // confirms only if the cursor really landed on the accept option, so a
       // dropped or doubled keypress corrects itself instead of confirming the
       // wrong choice.
-      if (key !== "Enter") continue;
+      if (key !== "Enter") {
+        last_arrow_at = now();
+        continue;
+      }
       if (!same_as_pressed) answered.push(dialog);
       last_pressed = { dialog, at: now() };
       continue;

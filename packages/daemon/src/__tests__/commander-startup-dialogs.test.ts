@@ -95,6 +95,11 @@ describe("commander startup-dialog wiring (#144)", () => {
 
     expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("reworded startup dialog"));
     expect(alert_mock).not.toHaveBeenCalled();
+    expect(capture_message_mock).toHaveBeenCalledWith(
+      "Commander did not reach the prompt after startup",
+      "warning",
+      { tags: { module: "commander" } },
+    );
   });
 
   it("swallows a responder that rejects", async () => {

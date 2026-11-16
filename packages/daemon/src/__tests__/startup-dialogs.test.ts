@@ -188,6 +188,8 @@ describe("answer_startup_dialogs", () => {
     const result = await answer_startup_dialogs("pat", { timeout_ms: 5_000, on_stuck }, deps);
     expect(send_key).toHaveBeenCalled();
     expect(send_key.mock.calls.every(([, key]) => key === "Down")).toBe(true);
+    // Throttled: 10 polls in 5s, but an arrow at most every 1.5s.
+    expect(send_key.mock.calls.length).toBeLessThanOrEqual(4);
     expect(result).toMatchObject({ answered: [], ended: "timeout", stuck: "trust_dialog" });
     expect(on_stuck).toHaveBeenCalledWith("trust_dialog");
   });
@@ -221,6 +223,22 @@ describe("next_key_for_dialog", () => {
       " ❯ 2. No, exit",
     ].join("\n");
     expect(next_key_for_dialog("trust_dialog", accept_listed_first)).toBe("Up");
+  });
+
+  it("is not fooled by the accept label echoed above the live dialog", () => {
+    const echoed = [
+      "  earlier output quoting: Yes, I trust this folder",
+      " Quick safety check: Is this a project you created or one you trust?",
+      " ❯ No, exit",
+      "   Yes, I trust this folder",
+    ].join("\n");
+    expect(next_key_for_dialog("trust_dialog", echoed)).toBe("Down");
+    expect(
+      next_key_for_dialog(
+        "trust_dialog",
+        echoed.replace("❯ No, exit", "  No, exit").replace("   Yes, I trust", " ❯ Yes, I trust"),
+      ),
+    ).toBe("Enter");
   });
 
   it("returns null when the accept option is not on screen", () => {

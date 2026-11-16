@@ -527,6 +527,11 @@ export class CommanderProcess extends EventEmitter {
         console.warn(
           `[commander] did not reach the prompt within the startup window and showed no recognised dialog — if #command-center is dark, check tmux session ${PAT_TMUX_SESSION} for a reworded startup dialog`,
         );
+        // Same signal the pool raises. Not alerted (the session may be fine),
+        // but a dark #command-center must leave a breadcrumb outside this log.
+        sentry.captureMessage("Commander did not reach the prompt after startup", "warning", {
+          tags: { module: "commander" },
+        });
       },
     }).catch((err: unknown) => {
       console.warn(`[commander] Startup-dialog watcher failed: ${String(err)}`);
