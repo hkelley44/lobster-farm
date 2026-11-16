@@ -356,3 +356,20 @@ describe("TemplateVariablesSchema", () => {
     expect(() => TemplateVariablesSchema.parse({ USER_NAME: "Jax" })).toThrow(); // missing MACHINE_NAME, MACHINE_HARDWARE
   });
 });
+
+describe("discord.deaf_policy", () => {
+  const parse = (discord: Record<string, unknown>) =>
+    LobsterFarmConfigSchema.parse({ user: { name: "Test" }, discord });
+
+  it("defaults to redeliver_then_recycle", () => {
+    expect(parse({ server_id: "1" }).discord?.deaf_policy).toBe("redeliver_then_recycle");
+  });
+
+  it("accepts the escape hatches and rejects anything else", () => {
+    expect(parse({ server_id: "1", deaf_policy: "recycle" }).discord?.deaf_policy).toBe("recycle");
+    expect(parse({ server_id: "1", deaf_policy: "alert_only" }).discord?.deaf_policy).toBe(
+      "alert_only",
+    );
+    expect(() => parse({ server_id: "1", deaf_policy: "restart" })).toThrow();
+  });
+});

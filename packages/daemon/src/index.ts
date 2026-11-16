@@ -11,6 +11,7 @@ import { check_required_binaries, propagate_tmux_env } from "./env.js";
 import { init_github_app_from_env } from "./github-app.js";
 import { rotate_log_if_needed } from "./log-rotation.js";
 import { prune_daily_logs } from "./memory-pruning.js";
+import { create_pending_inbound_store } from "./pending-inbound.js";
 import { append_session_log, sweep_stale_state_temps } from "./persistence.js";
 import { remove_pid, write_pid } from "./pid.js";
 import { BotPool } from "./pool.js";
@@ -196,6 +197,23 @@ async function main(): Promise<void> {
 
   // Wire pool to actions module so assign_work_room() checks pool state
   set_pool(pool);
+
+  // Durable queue for inbound Discord messages the plugin transport cannot be
+  // trusted to deliver (all bots busy, an assign in flight, a session still
+  // booting). Loaded before Discord connects so messages queued before a
+  // restart are delivered after it. Fail-open: without the store the pool
+  // behaves as it did before the queue existed.
+  try {
+    const pending_inbound = await create_pending_inbound_store(config);
+    pool.set_pending_inbound(pending_inbound);
+    const carried = pending_inbound.total();
+    if (carried > 0) {
+      console.log(`[pending-inbound] ${String(carried)} queued message(s) carried over`);
+    }
+  } catch (err) {
+    console.error(`[pending-inbound] failed to initialize: ${String(err)}`);
+    sentry.captureException(err, { tags: { module: "startup", phase: "pending-inbound" } });
+  }
 
   // ── Daemon-owned Discord gateway broker (epic #84 / #85) ──
   // Default OFF: only constructed when config.discord.broker.enabled is true.

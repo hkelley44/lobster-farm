@@ -44,6 +44,7 @@ import { BrokerQueue } from "../broker/queue.js";
 import {
   ACTIVE_INCIDENTS_FILE,
   BROKER_QUEUE_FILE,
+  PENDING_INBOUND_FILE,
   SENTRY_TRIAGES_FILE,
   save_deploy_triage,
   save_pool_state,
@@ -243,7 +244,7 @@ describe("sweep_stale_state_temps", () => {
 
   it("sweeps temps for every registered state writer, not just the four in persistence.ts", async () => {
     // The anchored pattern trades "matches anything" for "matches a known list",
-    // so the list has to actually cover all seven writers — a missing entry is a
+    // so the list has to actually cover all eight writers — a missing entry is a
     // silent never-swept leak rather than a loud failure.
     const state_path = join(temp_dir, "state");
     await mkdir(state_path, { recursive: true });
@@ -255,6 +256,7 @@ describe("sweep_stale_state_temps", () => {
       `${BROKER_QUEUE_FILE}.00000005.tmp`,
       `${ACTIVE_INCIDENTS_FILE}.00000006.tmp`,
       `${SENTRY_TRIAGES_FILE}.00000007.tmp`,
+      `${PENDING_INBOUND_FILE}.00000008.tmp`,
     ];
     for (const name of orphans) {
       await real_write_file(join(state_path, name), "{}", "utf-8");

@@ -35,6 +35,12 @@ class TestCommander extends CommanderProcess {
    * real path where the commander goes silently dark. */
   start_leaves_stopped = false;
 
+  /** What the commander's pane shows, as the blocking-state classifier sees it. */
+  blocking: "permission_prompt" | "rate_limit_modal" | null = null;
+  protected override commander_blocking_state() {
+    return this.blocking;
+  }
+
   // Drive the probe directly without the 10s interval.
   async run_probe(): Promise<void> {
     await (
@@ -173,6 +179,51 @@ describe("commander plugin-liveness probe (issue #77)", () => {
     expect(alert_mock).toHaveBeenCalledTimes(2);
     expect(String(alert_mock.mock.calls[0]?.[0])).toContain("went DEAF");
     expect(String(alert_mock.mock.calls[1]?.[0])).toContain("recovered");
+  });
+
+  it("does not restart a commander parked on a blocking state — alerts once, resumes when it clears", async () => {
+    commander.set_state("running");
+    const deaf_eligible = () => new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000);
+    commander.set_inbound(deaf_eligible());
+    idle_mock.mockReturnValue(true);
+    commander.blocking = "permission_prompt";
+
+    await commander.run_probe();
+    await commander.run_probe();
+    await commander.run_probe();
+
+    expect(commander.start_calls).toBe(0);
+    expect(alert_mock).toHaveBeenCalledTimes(1);
+    expect(String(alert_mock.mock.calls[0]?.[0])).toContain("permission prompt");
+    // Marker stays armed so the probe picks up again once the prompt is gone.
+    expect(commander.get_inbound()).not.toBeNull();
+
+    commander.blocking = null;
+    await commander.run_probe();
+    expect(commander.start_calls).toBe(1);
+  });
+
+  it("alerts again when the same blocking state recurs after a healthy turn", async () => {
+    commander.set_state("running");
+    const deaf_eligible = () => new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000);
+    commander.blocking = "permission_prompt";
+    commander.set_inbound(deaf_eligible());
+    await commander.run_probe();
+    expect(alert_mock).toHaveBeenCalledTimes(1);
+
+    // Operator clears the prompt; Pat runs a turn.
+    commander.blocking = null;
+    idle_mock.mockReturnValue(false);
+    await commander.run_probe();
+    expect(commander.get_inbound()).toBeNull();
+
+    // Later, the same prompt again.
+    idle_mock.mockReturnValue(true);
+    commander.set_processing(null);
+    commander.blocking = "permission_prompt";
+    commander.set_inbound(deaf_eligible());
+    await commander.run_probe();
+    expect(alert_mock).toHaveBeenCalledTimes(2);
   });
 
   it("surfaces a FAILED recovery when start() leaves the commander non-running (dark)", async () => {

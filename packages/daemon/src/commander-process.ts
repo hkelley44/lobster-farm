@@ -8,7 +8,11 @@ import type { LobsterFarmConfig } from "@lobster-farm/shared";
 import { lobsterfarm_dir } from "@lobster-farm/shared";
 import { resolve_model_id } from "./models.js";
 import {
+  type BlockingPaneState,
   LIVENESS_WARMUP_MS,
+  capture_tmux_pane_text,
+  classify_blocking_pane,
+  describe_blocking_state,
   evaluate_plugin_liveness,
   is_tmux_session_idle,
 } from "./plugin-liveness.js";
@@ -130,6 +134,9 @@ export class CommanderProcess extends EventEmitter {
    * cycles — this stops a second pass from firing a duplicate recovery (mirrors
    * the pool's `recovering_plugin` set). */
   private recovering_plugin = false;
+  /** The blocking state last alerted on, so a commander parked on a prompt
+   * alerts once rather than every health tick. */
+  private blocking_alerted: BlockingPaneState | null = null;
   /** Optional farm-level alert sink (e.g. #system-status). Set by the daemon. */
   private alert_notifier: AlertNotifier | null = null;
 
@@ -160,6 +167,13 @@ export class CommanderProcess extends EventEmitter {
   /** Whether the commander's tmux pane is currently idle at the prompt. */
   private is_commander_idle(): boolean {
     return is_tmux_session_idle(PAT_TMUX_SESSION);
+  }
+
+  /** The blocking state visible on the commander's pane, if any. Protected so
+   * tests can supply one without tmux. */
+  protected commander_blocking_state(): BlockingPaneState | null {
+    const pane = capture_tmux_pane_text(PAT_TMUX_SESSION);
+    return pane ? classify_blocking_pane(pane) : null;
   }
 
   /** Read `state` as the full union, defeating literal narrowing.
@@ -603,13 +617,34 @@ export class CommanderProcess extends EventEmitter {
         // never mistaken for deafness.
         this.last_processing_at = new Date();
         this.last_inbound_at = null;
+        this.blocking_alerted = null; // unblocked — a recurrence alerts again
         return;
       case "healthy_processed":
         // Processed after the inbound, then returned to idle — received and
         // handled. Clear the marker.
         this.last_inbound_at = null;
+        this.blocking_alerted = null;
         return;
       case "deaf": {
+        // An idle pane 90s after an inbound is also what a commander parked on
+        // a permission prompt or a usage-limit modal looks like. Restarting it
+        // cures nothing and discards the context that explains why it stopped,
+        // so name the state for the operator and leave the session alone. The
+        // marker stays armed: the probe resumes once the block clears. (Same
+        // rule as the pool's probe; the commander has no inject path, so there
+        // is no redelivery step here.)
+        const blocking = this.commander_blocking_state();
+        if (blocking) {
+          if (this.blocking_alerted !== blocking) {
+            this.blocking_alerted = blocking;
+            console.warn(`[commander] ${describe_blocking_state(blocking)} — not restarting`);
+            await this.post_alert(
+              `🟠 Commander (Pat) is ${describe_blocking_state(blocking)} and is not answering #command-center. Not restarting it — attach to tmux session \`${PAT_TMUX_SESSION}\` to clear it.`,
+            );
+          }
+          return;
+        }
+        this.blocking_alerted = null;
         const since_inbound = Date.now() - inbound.getTime();
         console.error(
           `[commander] appears DEAF to inbound Discord — idle ${String(
