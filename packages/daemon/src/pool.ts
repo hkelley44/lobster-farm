@@ -360,25 +360,33 @@ function squash(text: string): string {
   return text.replace(/\s+/g, "");
 }
 
-/** How much of the message's head is searched for. Long enough to be
- * unmistakable, short enough to sit on the first wrapped row. */
+/** Length of each probe taken from the message — one from its head, one from
+ * its tail. Long enough to be unmistakable, short enough to sit on one wrapped
+ * row. */
 const SUBMIT_PROBE_CHARS = 48;
 
 /**
  * Is `message` still sitting, unsubmitted, in the session's input box?
  *
  * When the box can be located the answer comes from the box alone. When it
- * cannot (an older or reworded layout), fall back to the whole pane: that can
+ * cannot (an older or reworded layout, or a box so tall its top rule has
+ * scrolled out of the capture), fall back to the whole pane: that can
  * mistake a submitted turn's echo for stuck input, which only costs a harmless
  * extra Enter, whereas the opposite mistake loses the message.
  *
  * Pure: no I/O.
  */
 export function message_still_in_input(pane: string, message: string): boolean {
-  const probe = squash(message).slice(0, SUBMIT_PROBE_CHARS);
-  if (probe.length === 0) return false;
-  const box = input_box_text(pane);
-  return squash(box ?? pane).includes(probe);
+  const squashed = squash(message);
+  if (squashed.length === 0) return false;
+  // Either end is enough. The capture is the visible pane only, so a message
+  // tall enough to outgrow it scrolls its head off the top while the tail
+  // stays beside the cursor; a short one may show only its head on a narrow
+  // first row. Searching for one end alone reopens #149 at a larger size.
+  const head = squashed.slice(0, SUBMIT_PROBE_CHARS);
+  const tail = squashed.slice(Math.max(0, squashed.length - SUBMIT_PROBE_CHARS));
+  const haystack = squash(input_box_text(pane) ?? pane);
+  return haystack.includes(head) || haystack.includes(tail);
 }
 
 /** Pause between typing the text and pressing Enter. See the function below. */

@@ -255,6 +255,21 @@ describe("message_still_in_input (#149)", () => {
     expect(message_still_in_input("❯ ", "hello there")).toBe(false);
   });
 
+  it("sees a message taller than the pane, whose head has scrolled off", () => {
+    // Visible pane only: the top rule and the first rows are gone, the tail
+    // and the cursor are still on screen.
+    const tall = `${LONG} ${"padding words to make this very long ".repeat(40)}the end of it`;
+    const rows = tall.match(/.{1,110}/g) ?? [];
+    const visible = [
+      ...rows.slice(-6).map((r) => `  ${r}`),
+      RULE,
+      "  ⏵⏵ bypass permissions on",
+    ].join("\n");
+    expect(input_box_text(visible)).toBeNull(); // only the bottom rule is visible
+    expect(visible.includes("A Discord message reached")).toBe(false); // head is gone
+    expect(message_still_in_input(visible, tall)).toBe(true);
+  });
+
   it("reads only the region between the last two rules", () => {
     expect(input_box_text(SUBMITTED_ECHO)).toBe("❯ ");
   });
