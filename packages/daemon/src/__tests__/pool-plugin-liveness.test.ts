@@ -808,19 +808,50 @@ describe("deaf_policy (redeliver before recycle)", () => {
     expect(pool.sent[0]!.text).toContain("chat_id=chan-foods");
   });
 
-  it("a redelivery that cannot be typed still counts as the one attempt", async () => {
+  it("a redelivery that could not be typed does not count — it is retried, and only then recycled", async () => {
     setup("redeliver_then_recycle");
     const bot = deaf_bot();
     pool.panes.set("pool-3", null); // pane unreadable → cannot inject
 
-    await pool.run_probe(bot);
+    await pool.run_probe(bot); // attempt 1: nothing typed
     expect(pool.sent).toHaveLength(0);
-    expect(start_tmux).not.toHaveBeenCalled();
     expect(alerts().some((m) => m.includes("could not re-send"))).toBe(true);
 
     make_deaf_eligible(bot);
-    await pool.run_probe(bot);
+    await pool.run_probe(bot); // attempt 2: still not recycled
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(bot.state).toBe("assigned");
+
+    make_deaf_eligible(bot);
+    await pool.run_probe(bot); // untypeable for two windows → recycle
     expect(start_tmux).toHaveBeenCalledTimes(1);
+  });
+
+  it("a retry that does get typed is the redelivery; the session is not recycled for the earlier miss", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot();
+    pool.panes.set("pool-3", null);
+    await pool.run_probe(bot);
+
+    pool.panes.set("pool-3", IDLE_PROMPT);
+    make_deaf_eligible(bot);
+    await pool.run_probe(bot);
+
+    expect(pool.sent).toHaveLength(1);
+    expect(start_tmux).not.toHaveBeenCalled();
+  });
+
+  it("login_required on an UNCONFIRMED session does not stash a phantom resume id (#256)", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot();
+    bot.session_confirmed = false;
+    pool.panes.set("pool-3", LOGIN_REQUIRED);
+
+    await pool.run_probe(bot);
+
+    expect(bot.state).toBe("free");
+    const history = (pool as unknown as { session_history: Map<string, string> }).session_history;
+    expect(history.has("healthydogs:chan-foods")).toBe(false);
   });
 
   it("never recycles while a permission prompt is on screen, and alerts once", async () => {

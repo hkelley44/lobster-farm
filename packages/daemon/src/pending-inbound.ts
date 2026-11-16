@@ -114,18 +114,33 @@ export function format_injected_inbound(
 ): string {
   const label = channel_name ? `#${channel_name}` : "channel";
   const blocks = messages.map((m) => {
-    const flat = m.content.replace(/\s*\r?\n\s*/g, " ⏎ ").trim();
+    const flat = neutralize(m.content).trim();
     const body =
       flat.length > MAX_INJECTED_CONTENT
         ? `${flat.slice(0, MAX_INJECTED_CONTENT)}… [truncated — fetch message_id ${m.message_id} for the full text]`
         : flat;
-    return `[Discord · ${label} · from ${m.user} · chat_id=${m.channel_id} · message_id ${m.message_id}] ${body}`;
+    return `[Discord · ${label} · from ${neutralize(m.user)} · chat_id=${m.channel_id} · message_id ${m.message_id}] ${body}`;
   });
   const lead =
     messages.length > 1
       ? `${String(messages.length)} Discord messages reached the daemon but not this session — answer each with the Discord reply tool: `
       : "A Discord message reached the daemon but not this session — answer it with the Discord reply tool: ";
   return lead + blocks.join(" ‖ ");
+}
+
+/**
+ * Make user-controlled text safe to embed in the injected line.
+ *
+ * - Any line break — including a lone carriage return, which a terminal treats
+ *   as Enter — becomes a visible marker, so the text cannot submit early.
+ * - The block separator and the header opener are defused, so a message body
+ *   cannot forge a second "[Discord · … · from someone-else …]" block.
+ */
+function neutralize(text: string): string {
+  return text
+    .replace(/\s*(?:\r\n|\r|\n)\s*/g, " ⏎ ")
+    .replace(/‖/g, "|")
+    .replace(/\[Discord ·/g, "(Discord ·");
 }
 
 function is_entry(value: unknown): value is PendingInboundEntry {
@@ -138,10 +153,11 @@ function is_entry(value: unknown): value is PendingInboundEntry {
     typeof e.entity_id === "string" &&
     typeof e.user === "string" &&
     typeof e.content === "string" &&
-    typeof e.ts === "string" &&
     typeof e.queued_at === "string"
   );
 }
+
+const REASONS: readonly PendingInboundReason[] = ["busy", "assigning", "not_ready"];
 
 export class PendingInboundStore {
   private readonly path: string;
@@ -189,8 +205,12 @@ export class PendingInboundStore {
           seen.add(candidate.message_id);
           this.entries.push({
             ...candidate,
+            // Only what delivery cannot do without is required above. The rest
+            // is repaired rather than used as a reason to discard a message
+            // the daemon already accepted.
+            ts: typeof candidate.ts === "string" ? candidate.ts : candidate.queued_at,
             attempts: typeof candidate.attempts === "number" ? candidate.attempts : 0,
-            reason: candidate.reason ?? "busy",
+            reason: REASONS.includes(candidate.reason) ? candidate.reason : "busy",
           });
         }
       }
@@ -326,6 +346,11 @@ export class PendingInboundStore {
     }
     this.write_loop = this.run_persist_loop().finally(() => {
       this.write_loop = null;
+      // A mutation can land after the loop's last `write_pending` check but
+      // before this callback runs. It saw a live loop and only set the flag;
+      // without this relaunch that write would wait for the next mutation —
+      // and be lost if the daemon died first.
+      if (this.write_pending) this.schedule_persist();
     });
   }
 

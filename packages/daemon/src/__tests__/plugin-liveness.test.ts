@@ -319,6 +319,15 @@ describe("classify_blocking_pane", () => {
     expect(pane_ready_for_input(pane)).toBe(true);
   });
 
+  it("ignores a stale 'Not logged in' line far up in scrollback (the remedy restarts the session)", () => {
+    const pane = [
+      "  ⎿  Not logged in · Please run /login",
+      ...Array.from({ length: 40 }, (_, i) => `● later output ${String(i)}`),
+      "│ ❯ │",
+    ].join("\n");
+    expect(classify_blocking_pane(pane)).toBeNull();
+  });
+
   it("ignores dialog wording that has scrolled into history", () => {
     const pane = [
       "The CLI asked: Do you want to proceed? — I answered yes.",

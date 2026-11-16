@@ -100,14 +100,17 @@ export const LOGIN_REQUIRED_MARKERS = [
   "Authentication required · Sign in again",
 ] as const;
 
+/** How far up from the bottom a login-failure line still counts as current. */
+const LOGIN_REQUIRED_TAIL_LINES = 24;
+
 /**
  * Classify a pane capture as one of the known blocking states, or null.
  *
  * Dialogs are matched against the tail of the pane (a dialog owns the bottom of
  * the screen while it is open; the same words further up are scrollback — e.g.
- * an agent quoting a prompt it saw). Login failure is matched against the whole
- * pane, mirroring `is_pane_stale_oauth`: the CLI prints it as a turn result and
- * then returns to an ordinary-looking prompt beneath it.
+ * an agent quoting a prompt it saw). Login failure is matched against a wider
+ * tail: the CLI prints it as a turn result and then returns to an
+ * ordinary-looking prompt beneath it.
  *
  * Rate-limit detection mirrors `detect_rate_limit_modal` (rate-limit-recovery.ts)
  * rather than importing it, so this module stays free of pool imports.
@@ -134,7 +137,12 @@ export function classify_blocking_pane(pane_text: string): BlockingPaneState | n
   if (has(PERMISSION_PROMPT_MARKERS) && /^\s*(?:❯\s*)?1\.\s/m.test(tail)) {
     return "permission_prompt";
   }
-  if (LOGIN_REQUIRED_MARKERS.some((m) => pane_text.includes(m))) return "login_required";
+  // Wider than the dialog tail (the CLI prints this as a turn result and then
+  // draws an ordinary prompt under it) but not the whole capture: a stale line
+  // left in scrollback after a re-login must not read as "login expired",
+  // because the remedy for this state restarts the session.
+  const recent = pane_tail(pane_text, LOGIN_REQUIRED_TAIL_LINES).join("\n");
+  if (LOGIN_REQUIRED_MARKERS.some((m) => recent.includes(m))) return "login_required";
   return null;
 }
 

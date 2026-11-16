@@ -617,11 +617,13 @@ export class CommanderProcess extends EventEmitter {
         // never mistaken for deafness.
         this.last_processing_at = new Date();
         this.last_inbound_at = null;
+        this.blocking_alerted = null; // unblocked — a recurrence alerts again
         return;
       case "healthy_processed":
         // Processed after the inbound, then returned to idle — received and
         // handled. Clear the marker.
         this.last_inbound_at = null;
+        this.blocking_alerted = null;
         return;
       case "deaf": {
         // An idle pane 90s after an inbound is also what a commander parked on

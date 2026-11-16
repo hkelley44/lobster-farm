@@ -167,6 +167,10 @@ const MAX_STUCK_INJECT_ATTEMPTS = 3;
  * by the daemon has a dead plugin listener; past this it is recycled. */
 export const MAX_REDELIVERIES_PER_WINDOW = 2;
 
+/** Redeliveries that could not be typed in (pane not at the prompt) before the
+ * probe stops retrying and recycles. */
+const MAX_UNSENT_REDELIVERIES = 2;
+
 /** How many recent inbound messages are remembered per bot for redelivery. */
 const MAX_RECENT_INBOUND = 10;
 
@@ -713,6 +717,8 @@ export class BotPool extends EventEmitter {
    * process needs a human, not another restart. Keyed by channel because the
    * release it performs resets every bot-keyed map. */
   private login_recovery_at = new Map<string, number>();
+  /** Consecutive redeliveries that could not be typed in (bot_id → count). */
+  private unsent_redeliveries = new Map<number, number>();
   /** A drain was requested while one was running — run again when it ends. */
   private _pending_drain_again = false;
   /** When the scheduled drain timer is due (epoch ms). */
@@ -926,9 +932,13 @@ export class BotPool extends EventEmitter {
       sentry.captureException(err, { tags: { module: "pool", action: "drain_pending_inbound" } });
     } finally {
       this._pending_drain_running = false;
-      if (this._pending_drain_again || skipped_locked) {
+      if (this._pending_drain_again) {
         this._pending_drain_again = false;
         this.schedule_pending_drain(1_000);
+      } else if (skipped_locked) {
+        // The lock holder schedules its own drain when it finishes; this is a
+        // backstop, so it need not spin while a slow assign holds the lock.
+        this.schedule_pending_drain(5_000);
       }
     }
   }
@@ -981,9 +991,12 @@ export class BotPool extends EventEmitter {
       // for 24h helps nobody: give up after a few and say so.
       store.note_attempt([first.message_id]);
       if (first.attempts >= MAX_PENDING_START_FAILURES) {
-        const dropped = store.take_channel(channel_id);
+        // Only the message that exhausted its attempts. The rest of the
+        // channel's queue has not driven a start yet; the next one gets its
+        // own tries (the fault may have been specific to this message).
+        store.remove([first.message_id]);
         await this.alert_expired_inbound(
-          dropped,
+          [first],
           `a session for the channel failed to start ${String(MAX_PENDING_START_FAILURES)} times`,
         );
         return "dropped";
@@ -3866,6 +3879,7 @@ export class BotPool extends EventEmitter {
 
   private clear_deaf_tracking(bot_id: number): void {
     this.deaf_redelivered.delete(bot_id);
+    this.unsent_redeliveries.delete(bot_id);
     this.blocking_alerted.delete(bot_id);
   }
 
@@ -3947,8 +3961,20 @@ export class BotPool extends EventEmitter {
         // Re-arm: the redelivery is itself an inbound the session must act on.
         // If it stays idle through another full window, the next verdict is
         // for a session that ignored a message typed directly into it.
-        this.deaf_redelivered.set(bot.id, session_key);
-        if (outcome.sent) recent_redeliveries.push(now);
+        // Only a redelivery that was actually typed in counts as "redelivered".
+        // One that could not be sent (pane not at the prompt) is retried on the
+        // next verdict — up to MAX_UNSENT_REDELIVERIES, after which a session
+        // that has been idle and untypeable for several windows is recycled
+        // (its unanswered messages are parked for the replacement first).
+        if (outcome.sent) {
+          this.deaf_redelivered.set(bot.id, session_key);
+          this.unsent_redeliveries.delete(bot.id);
+          recent_redeliveries.push(now);
+        } else {
+          const unsent = (this.unsent_redeliveries.get(bot.id) ?? 0) + 1;
+          this.unsent_redeliveries.set(bot.id, unsent);
+          if (unsent >= MAX_UNSENT_REDELIVERIES) this.deaf_redelivered.set(bot.id, session_key);
+        }
         bot.last_inbound_at = new Date();
         console.warn(
           `[pool] pool-${String(bot.id)} idle ${since_s}s after an inbound with no processing (channel: ${bot.channel_id ?? "none"}) — ${
@@ -3961,7 +3987,7 @@ export class BotPool extends EventEmitter {
           bot,
           outcome.sent
             ? `🟡 Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) showed no activity ${since_s}s after an inbound Discord message for ${this.bot_label(bot)}. Re-sent ${String(outcome.count)} message(s) directly into the session; it will be recycled only if it stays silent.`
-            : `🟡 Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) showed no activity ${since_s}s after an inbound Discord message for ${this.bot_label(bot)}, and the daemon could not re-send it (session not at the prompt). It will be recycled if it stays silent.`,
+            : `🟡 Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) showed no activity ${since_s}s after an inbound Discord message for ${this.bot_label(bot)}, and the daemon could not re-send it (session not at the prompt). It will try again, then recycle the session if it still cannot.`,
         );
         return;
       }
@@ -4121,23 +4147,52 @@ export class BotPool extends EventEmitter {
     }
     this.login_recovery_at.set(channel_id, now);
 
+    const session_id = bot.session_id;
+    const session_confirmed = bot.session_confirmed;
+    const entity_id = bot.entity_id;
+    const entity_config = entity_id ? this.registry?.get(entity_id) : undefined;
     const parked = await this.park_missed_inbound(bot);
+    // Parking read the transcript. Everything from here is destructive, so
+    // make sure this is still the session that was judged — and do the
+    // teardown before any further await (the alert is a network call).
+    if (
+      bot.state !== "assigned" ||
+      bot.channel_id !== channel_id ||
+      bot.session_id !== session_id
+    ) {
+      return;
+    }
     console.warn(
       `[pool] pool-${String(bot.id)} is not logged in (channel: ${channel_id}) — releasing with history${
         parked > 0 ? `; ${String(parked)} unanswered message(s) queued for the next session` : ""
       }`,
     );
-    await this.alert_bot(
-      bot,
-      `${describe} ${
-        parked > 0
-          ? `Restarting it with a fresh process; ${String(parked)} unanswered message(s) will be re-sent.`
-          : "Released the session; it resumes with a fresh process on the next message."
-      }`,
-    );
     try {
       this.kill_tmux(bot.tmux_session);
-      await this.release_with_history(bot.id);
+      // The gated stash, not release_with_history(): only a confirmed session
+      // whose JSONL is on disk is worth resuming. An unconfirmed one would
+      // plant a phantom id for the restart to --resume and crash on (#256).
+      await this.stash_session_history(
+        session_id,
+        session_confirmed,
+        channel_id,
+        entity_id,
+        "login-expired",
+      );
+      await this.release(channel_id);
+      try {
+        await notify(
+          "alerts",
+          `${describe} ${
+            parked > 0
+              ? `Restarting it with a fresh process; ${String(parked)} unanswered message(s) will be re-sent.`
+              : "Released the session; it resumes with a fresh process on the next message."
+          }`,
+          entity_config,
+        );
+      } catch (notify_err) {
+        console.warn(`[pool] Failed to alert on expired login: ${String(notify_err)}`);
+      }
     } catch (err) {
       console.error(`[pool] Releasing not-logged-in pool-${String(bot.id)} failed: ${String(err)}`);
       sentry.captureException(err, {

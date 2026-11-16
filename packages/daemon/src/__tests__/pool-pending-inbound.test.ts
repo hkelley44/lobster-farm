@@ -499,9 +499,12 @@ describe("BotPool pending-inbound drain", () => {
     for (let i = 0; i < 4; i++) await pool.drain_pending_inbound();
     expect(store.depth("ch-1")).toBe(1); // still retrying
 
+    pool.queue_inbound(msg("a2"), "acme", "busy"); // queued just now, never tried
     await pool.drain_pending_inbound();
-    expect(store.depth("ch-1")).toBe(0);
+    // Only the message that used up its attempts is dropped.
+    expect(store.peek_channel("ch-1").map((e) => e.message_id)).toEqual(["a2"]);
     expect(String(notify_mock.mock.calls.at(-1)?.[1])).toContain("failed to start 5 times");
+    expect(String(notify_mock.mock.calls.at(-1)?.[1])).toContain("1 queued Discord message(s)");
     error_spy.mockRestore();
   });
 
