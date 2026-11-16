@@ -14,7 +14,7 @@ vi.mock("node:child_process", async () => {
 });
 
 import { execFileSync } from "node:child_process";
-import { send_keys_with_submit_retry } from "../pool.js";
+import { input_box_text, message_still_in_input, send_keys_with_submit_retry } from "../pool.js";
 
 /**
  * Build an execFileSync mock that:
@@ -43,12 +43,12 @@ function mock_pane(pane_outputs: string[], message: string) {
 
   return {
     send_keys_calls,
-    /** Number of times Enter (with or without text) was sent. */
-    submit_count: () => send_keys_calls.length,
-    /** Number of bare-Enter re-sends: ["send-keys", "-t", <session>, "Enter"].
-     * The initial submit is ["send-keys", "-t", <session>, <message>, "Enter"]
-     * (length 5), so a length-4 call is a retry. */
-    retry_count: () => send_keys_calls.filter((a) => a.length === 4 && a[3] === "Enter").length,
+    /** Bare-Enter sends: ["send-keys", "-t", <session>, "Enter"]. The text goes
+     * in as its own ["send-keys", "-t", <session>, "-l", <message>] call. */
+    enter_count: () => send_keys_calls.filter((a) => a.length === 4 && a[3] === "Enter").length,
+    /** Enter RE-sends — every bare Enter after the first, which is the submit. */
+    retry_count: () =>
+      Math.max(0, send_keys_calls.filter((a) => a.length === 4 && a[3] === "Enter").length - 1),
   };
 }
 
@@ -73,7 +73,8 @@ function mock_pane_capture_fails() {
 
   return {
     send_keys_calls,
-    retry_count: () => send_keys_calls.filter((a) => a.length === 4 && a[3] === "Enter").length,
+    retry_count: () =>
+      Math.max(0, send_keys_calls.filter((a) => a.length === 4 && a[3] === "Enter").length - 1),
   };
 }
 
@@ -206,6 +207,125 @@ describe("send_keys_with_submit_retry", () => {
     // The pane-unreadable failure is surfaced, and the give-up is logged.
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("Pane read failed"));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("could not confirm submit"));
+    warn.mockRestore();
+  });
+});
+
+// ── #149: wrapped input, and text + Enter as separate calls ──
+
+const RULE = "─".repeat(120);
+const LONG =
+  "A Discord message reached the daemon but not this session — answer it with the Discord reply tool: [Discord · #general · from Hunter · chat_id=1488009160628109412 · message_id 1571718356141219881] active?";
+
+/** The pane as CLI 2.1.325 draws it with LONG typed but not submitted: the
+ * input box wraps the line, so the literal message is not in the capture. */
+const STUCK_WRAPPED = [
+  " ▐▛███▛█   Claude Code v2.1.325",
+  `${RULE} tidus ─`,
+  `❯ ${LONG.slice(0, 110)}`,
+  `  ${LONG.slice(110)}`,
+  RULE,
+  "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+].join("\n");
+
+/** After a successful submit: the turn is echoed above an empty box. */
+const SUBMITTED_ECHO = [
+  `❯ ${LONG.slice(0, 110)}`,
+  `  ${LONG.slice(110)}`,
+  "⏺ Done.",
+  `${RULE} tidus ─`,
+  "❯ ",
+  RULE,
+  "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+].join("\n");
+
+describe("message_still_in_input (#149)", () => {
+  it("sees wrapped text that a literal search misses", () => {
+    expect(STUCK_WRAPPED.includes(LONG)).toBe(false); // the old check's blind spot
+    expect(message_still_in_input(STUCK_WRAPPED, LONG)).toBe(true);
+  });
+
+  it("does not mistake the submitted turn's echo for stuck input", () => {
+    expect(message_still_in_input(SUBMITTED_ECHO, LONG)).toBe(false);
+  });
+
+  it("falls back to the whole pane when the box cannot be located", () => {
+    expect(input_box_text("❯ hello")).toBeNull();
+    expect(message_still_in_input("❯ hello there", "hello there")).toBe(true);
+    expect(message_still_in_input("❯ ", "hello there")).toBe(false);
+  });
+
+  it("sees a message taller than the pane, whose head has scrolled off", () => {
+    // Visible pane only: the top rule and the first rows are gone, the tail
+    // and the cursor are still on screen.
+    const tall = `${LONG} ${"padding words to make this very long ".repeat(40)}the end of it`;
+    const rows = tall.match(/.{1,110}/g) ?? [];
+    const visible = [
+      ...rows.slice(-6).map((r) => `  ${r}`),
+      RULE,
+      "  ⏵⏵ bypass permissions on",
+    ].join("\n");
+    expect(input_box_text(visible)).toBeNull(); // only the bottom rule is visible
+    expect(visible.includes("A Discord message reached")).toBe(false); // head is gone
+    expect(message_still_in_input(visible, tall)).toBe(true);
+  });
+
+  it("reads only the region between the last two rules", () => {
+    expect(input_box_text(SUBMITTED_ECHO)).toBe("❯ ");
+  });
+});
+
+describe("send_keys_with_submit_retry — submit mechanics (#149)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("types the text literally, then sends Enter as a separate call", async () => {
+    const m = mock_pane(["esc to interrupt"], LONG);
+
+    const p = send_keys_with_submit_retry("pool-2", LONG, { poll_ms: 50, confirm_ms: 400 });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(await p).toBe(true);
+
+    expect(m.send_keys_calls).toEqual([
+      ["send-keys", "-t", "pool-2", "-l", LONG],
+      ["send-keys", "-t", "pool-2", "Enter"],
+    ]);
+  });
+
+  it("re-sends Enter for wrapped text left in the box, instead of reporting it submitted", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const m = mock_pane([STUCK_WRAPPED, STUCK_WRAPPED, SUBMITTED_ECHO], LONG);
+
+    const p = send_keys_with_submit_retry("pool-2", LONG, {
+      poll_ms: 100,
+      confirm_ms: 150,
+      max_retries: 3,
+    });
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(await p).toBe(true);
+
+    expect(m.retry_count()).toBe(1);
+    warn.mockRestore();
+  });
+
+  it("reports failure when wrapped text never leaves the box", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const m = mock_pane([STUCK_WRAPPED], LONG);
+
+    const p = send_keys_with_submit_retry("pool-2", LONG, {
+      poll_ms: 100,
+      confirm_ms: 150,
+      max_retries: 2,
+    });
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(await p).toBe(false);
+    expect(m.retry_count()).toBe(2);
     warn.mockRestore();
   });
 });

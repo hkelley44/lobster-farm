@@ -323,19 +323,93 @@ function capture_pane(tmux_session: string): string | null {
   }
 }
 
+/** A horizontal rule the CLI draws above and below its input box. The top one
+ * may end in an agent label ("──── tidus ─"). */
+function is_rule_line(line: string): boolean {
+  return (line.match(/─/g)?.length ?? 0) >= 20;
+}
+
+/**
+ * The text currently in the CLI's input box, or null when the box cannot be
+ * located in this capture.
+ *
+ * The box is the region between the last two rule lines. Reading it — rather
+ * than searching the whole pane — is what lets the submit check tell stuck
+ * input from the same text echoed in the transcript after a successful submit.
+ *
+ * Pure: no I/O.
+ */
+export function input_box_text(pane: string): string | null {
+  const lines = pane.split("\n");
+  let bottom = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!is_rule_line(lines[i] ?? "")) continue;
+    if (bottom === -1) {
+      bottom = i;
+      continue;
+    }
+    return lines.slice(i + 1, bottom).join("\n");
+  }
+  return null;
+}
+
+/** Whitespace-free form used to compare typed text against a pane capture. The
+ * input box wraps long text — inserting a newline and an indent, possibly
+ * mid-word — so no whitespace-sensitive comparison survives it. */
+function squash(text: string): string {
+  return text.replace(/\s+/g, "");
+}
+
+/** Length of each probe taken from the message — one from its head, one from
+ * its tail. Long enough to be unmistakable, short enough to sit on one wrapped
+ * row. */
+const SUBMIT_PROBE_CHARS = 48;
+
+/**
+ * Is `message` still sitting, unsubmitted, in the session's input box?
+ *
+ * When the box can be located the answer comes from the box alone. When it
+ * cannot (an older or reworded layout, or a box so tall its top rule has
+ * scrolled out of the capture), fall back to the whole pane: that can
+ * mistake a submitted turn's echo for stuck input, which only costs a harmless
+ * extra Enter, whereas the opposite mistake loses the message.
+ *
+ * Pure: no I/O.
+ */
+export function message_still_in_input(pane: string, message: string): boolean {
+  const squashed = squash(message);
+  if (squashed.length === 0) return false;
+  // Either end is enough. The capture is the visible pane only, so a message
+  // tall enough to outgrow it scrolls its head off the top while the tail
+  // stays beside the cursor; a short one may show only its head on a narrow
+  // first row. Searching for one end alone reopens #149 at a larger size.
+  const head = squashed.slice(0, SUBMIT_PROBE_CHARS);
+  const tail = squashed.slice(Math.max(0, squashed.length - SUBMIT_PROBE_CHARS));
+  const haystack = squash(input_box_text(pane) ?? pane);
+  return haystack.includes(head) || haystack.includes(tail);
+}
+
+/** Pause between typing the text and pressing Enter. See the function below. */
+const SUBMIT_GAP_MS = 250;
+
 /**
  * Inject a message into a tmux pane via send-keys and verify the submit landed.
  *
- * tmux `send-keys` for the message text and the subsequent Enter are racy: if
- * the Enter arrives before the input is committed (or during a redraw), it's
- * dropped and the text sits in the input box, unsubmitted — the agent never
- * starts a turn and the message is silently lost (issue #65).
+ * The text and the Enter are sent as two separate `send-keys` calls with a
+ * pause between them. Sent as one call, the CLI receives text and Enter in a
+ * single burst, takes a long line as pasted input, and the Enter does not
+ * submit: the text sits in the input box, the agent never starts a turn and
+ * the message is silently lost (#65, #149). The text goes in with `-l` so a
+ * message that happens to spell a tmux key name is typed, not pressed.
  *
- * After sending text + Enter, this polls the pane for a bounded window to
- * confirm the turn actually started. A submit is considered confirmed when the
- * pane shows an active-turn indicator ("esc to interrupt") OR the input box no
- * longer contains the message text. If the text is still sitting unsubmitted
- * after the poll window, a bare Enter is re-sent — up to `max_retries` times.
+ * After the Enter, this polls the pane for a bounded window to confirm the
+ * turn actually started. A submit is confirmed when the pane shows an
+ * active-turn indicator ("esc to interrupt") OR the input box no longer holds
+ * the message (see `message_still_in_input` — the comparison ignores
+ * whitespace, because a message longer than the pane is wrapped in the box and
+ * a literal search for it never matches; that false "confirmed" is the other
+ * half of #149). If the text is still there after the poll window, a bare
+ * Enter is re-sent — up to `max_retries` times.
  *
  * Logs a warning whenever a retry was needed so submit-race frequency is
  * measurable in the daemon logs.
@@ -345,23 +419,30 @@ function capture_pane(tmux_session: string): string | null {
  * @param opts.poll_ms - poll interval while waiting for confirmation (default 200ms)
  * @param opts.confirm_ms - how long to wait for confirmation per attempt (default 800ms)
  * @param opts.max_retries - max bare-Enter retries after the initial submit (default 3)
+ * @param opts.submit_gap_ms - pause between the text and the first Enter (default 250ms)
  * @returns true if the submit was confirmed, false if it remained unconfirmed
  */
 export async function send_keys_with_submit_retry(
   tmux_session: string,
   message: string,
-  opts?: { poll_ms?: number; confirm_ms?: number; max_retries?: number },
+  opts?: { poll_ms?: number; confirm_ms?: number; max_retries?: number; submit_gap_ms?: number },
 ): Promise<boolean> {
   const poll_ms = opts?.poll_ms ?? 200;
   const confirm_ms = opts?.confirm_ms ?? 800;
   const max_retries = opts?.max_retries ?? 3;
+  const submit_gap_ms = opts?.submit_gap_ms ?? SUBMIT_GAP_MS;
 
-  // Send the message text and the initial submit in one send-keys call. If the
-  // session died between the at-prompt check and now, this throws — log and
-  // treat as not-confirmed so the retry/give-up path handles it rather than
+  // Type the text, pause, then submit — never in one call (see above). If the
+  // session died between the at-prompt check and now, either call throws — log
+  // and treat as not-confirmed so the retry/give-up path handles it rather than
   // aborting the surrounding health-check iteration mid-loop.
   try {
-    execFileSync("tmux", ["send-keys", "-t", tmux_session, message, "Enter"], {
+    execFileSync("tmux", ["send-keys", "-t", tmux_session, "-l", message], {
+      stdio: "ignore",
+      timeout: 5000,
+    });
+    await new Promise((resolve) => setTimeout(resolve, submit_gap_ms));
+    execFileSync("tmux", ["send-keys", "-t", tmux_session, "Enter"], {
       stdio: "ignore",
       timeout: 5000,
     });
@@ -371,9 +452,7 @@ export async function send_keys_with_submit_retry(
   }
 
   // A turn started if the status bar shows the active-generation indicator, or
-  // the input box no longer echoes the message text we just typed. Scan the
-  // whole pane — long input wraps across lines, so a last-line check would
-  // falsely report "submitted" for wrapped text still sitting in the box.
+  // the input box no longer holds the message text we just typed.
   //
   // A failed pane read (null) is indeterminate, NOT confirmed — returning true
   // there would fail-open and silently mask a dropped message on a dead session.
@@ -391,7 +470,7 @@ export async function send_keys_with_submit_retry(
       return false;
     }
     if (pane.includes("esc to interrupt")) return true;
-    return !pane.includes(message);
+    return !message_still_in_input(pane, message);
   };
 
   for (let retry = 0; retry <= max_retries; retry++) {
