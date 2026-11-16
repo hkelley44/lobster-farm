@@ -97,6 +97,7 @@ function make_mock_pool(opts?: {
     release_with_history: vi.fn().mockResolvedValue(undefined),
     set_nickname_handler: vi.fn(),
     set_avatar_handler: vi.fn(),
+    set_channel_resolver: vi.fn(),
     on: vi.fn().mockReturnThis(),
   } as unknown as BotPool;
 }

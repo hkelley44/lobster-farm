@@ -94,6 +94,9 @@ describe.skipIf(!hook_available)("session-start-inject.sh hook", () => {
     expect(ctx).toContain("alice");
     expect(ctx).toContain("hello bot");
     expect(ctx).toContain("1234567890"); // channel_id
+    // The message id is in the context so it lands in the transcript — the
+    // daemon's "was this message delivered?" check looks for it there.
+    expect(ctx).toContain("Message ID: 9876543210");
     expect(ctx).toContain("2026-04-16T12:00:00.000Z"); // ts
   });
 

@@ -15,19 +15,33 @@ import type { InboundMeta } from "./broker/protocol.js";
 import { resolve_binary } from "./env.js";
 import { NO_SESSION, extract_session_learnings } from "./hooks.js";
 import { resolve_effort, resolve_model_id } from "./models.js";
+import {
+  type InboundResolution,
+  type PendingInboundEntry,
+  type PendingInboundReason,
+  type PendingInboundStore,
+  format_injected_inbound,
+  log_inbound_resolved,
+} from "./pending-inbound.js";
 import { load_pool_state, save_pool_state } from "./persistence.js";
 import type { PersistedBotAvatarState, PersistedPoolBot } from "./persistence.js";
 import {
+  type BlockingPaneState,
   LIVENESS_WARMUP_MS,
   PLUGIN_DEAF_THRESHOLD_MS,
+  capture_tmux_pane_text,
+  classify_blocking_pane,
+  describe_blocking_state,
   evaluate_plugin_liveness,
   is_tmux_session_idle,
+  pane_ready_for_input,
 } from "./plugin-liveness.js";
 import { scan_and_recover } from "./rate-limit-recovery.js";
 import type { EntityRegistry } from "./registry.js";
 import * as sentry from "./sentry.js";
 import { find_session_file } from "./session-context.js";
 import { sq } from "./shell.js";
+import { answer_startup_dialogs } from "./startup-dialogs.js";
 
 // ── Types ──
 
@@ -95,7 +109,51 @@ export interface PoolStatus {
     state: string;
     last_active: string | null;
   }>;
+  /** Inbound messages the daemon is holding for delivery (plugin transport).
+   * Absent when no pending-inbound store is wired. */
+  pending_inbound?: { total: number; by_channel: Record<string, number> };
 }
+
+/**
+ * What the pool needs to know about a Discord channel to start a session for
+ * it. Registered by DiscordBot (`set_channel_resolver`), which owns the channel
+ * map — the pool never imports DiscordBot. Returns null for an unmapped channel.
+ */
+export interface ChannelTarget {
+  entity_id: string;
+  archetype: ArchetypeRole;
+  channel_type: ChannelType;
+  /** Discord channel name, for the header on injected messages. */
+  channel_name: string | null;
+}
+/** `null` = the channel is definitely not mapped; `undefined` = cannot tell
+ * yet (gateway not ready) — ask again later. */
+export type ChannelResolver = (channel_id: string) => ChannelTarget | null | undefined;
+
+/** Payload of the pool's `inbound:delivered` event: queued messages that were
+ * just handed to a session (or found already delivered by its plugin). */
+export interface InboundDeliveredEvent {
+  channel_id: string;
+  message_ids: string[];
+  how: InboundResolution;
+  archetype: ArchetypeRole | null;
+}
+
+/** Deaf-probe policy — see `discord.deaf_policy` in the config schema. */
+export type DeafPolicy = "recycle" | "redeliver_then_recycle" | "alert_only";
+
+/** A queued message is not typed into a session until it is at least this old.
+ * The wait gives a plugin that *was* connected time to deliver the message and
+ * get it into the transcript, where the pre-injection check finds it — so the
+ * agent is not handed the same message twice. */
+export const PENDING_INJECT_MIN_AGE_MS = 8_000;
+
+/** Session bring-up failures (assign() throwing) tolerated for a queued
+ * message before its channel's queue is dropped with an alert. */
+const MAX_PENDING_START_FAILURES = 5;
+
+/** How many recent inbound messages are remembered per bot for redelivery. */
+const MAX_RECENT_INBOUND = 10;
 
 /** Activity state computed on demand from observable signals (tmux pane, timestamps). */
 export type ActivityState = "idle" | "working" | "waiting_for_human" | "active_conversation";
@@ -603,6 +661,32 @@ export class BotPool extends EventEmitter {
   >();
   /** One-shot timer for the post-restart heal pass. */
   private post_restart_heal_timer: ReturnType<typeof setTimeout> | null = null;
+  /** Durable queue of inbound messages the plugin cannot be trusted to deliver
+   * (see pending-inbound.ts). Null until wired from index.ts; while null every
+   * queueing decision resolves to "rely on the plugin", i.e. the old behaviour. */
+  private pending_inbound: PendingInboundStore | null = null;
+  /** Channel lookup registered by DiscordBot — see `ChannelResolver`. */
+  private channel_resolver: ChannelResolver | null = null;
+  /** Re-entrancy guard for `drain_pending_inbound`. */
+  private _pending_drain_running = false;
+  /** Debounce timer for `schedule_pending_drain`. */
+  private pending_drain_timer: ReturnType<typeof setTimeout> | null = null;
+  /** When each bot's current CLI process was spawned (bot_id → epoch ms), set
+   * by `start_tmux`. A new process means a new Discord plugin connection, so
+   * evidence that the plugin works only counts if it is newer than this.
+   * In-memory only. */
+  private process_started_at = new Map<number, number>();
+  /** The last few inbound messages routed to each bot on the plugin path, so
+   * the deaf probe can re-send what the plugin dropped instead of recycling the
+   * session (bot_id → messages, newest last). In-memory only. */
+  private recent_inbound = new Map<number, Array<PendingMessage & { received_at: number }>>();
+  /** Bots that have had their one redelivery for the current silence, keyed to
+   * the session it was sent to (bot_id → session_id). The next deaf verdict for
+   * the same session recycles. Cleared on any healthy verdict. */
+  private deaf_redelivered = new Map<number, string>();
+  /** Blocking-state alerts already posted (bot_id → "<session>:<state>"), so a
+   * session parked on a prompt alerts once, not every health tick. */
+  private blocking_alerted = new Map<number, string>();
 
   constructor(config: LobsterFarmConfig) {
     super();
@@ -628,6 +712,402 @@ export class BotPool extends EventEmitter {
    * decision resolves to "plugin" and behavior is byte-identical to today. */
   set_broker(broker: DiscordBroker): void {
     this.broker = broker;
+  }
+
+  // ── Pending inbound (plugin transport) ──
+
+  /** Wire the durable pending-inbound store. Called from index.ts before
+   * Discord starts. */
+  set_pending_inbound(store: PendingInboundStore): void {
+    this.pending_inbound = store;
+  }
+
+  /** Register the channel lookup used to start sessions for queued messages. */
+  set_channel_resolver(resolver: ChannelResolver): void {
+    this.channel_resolver = resolver;
+  }
+
+  /** True while an `assign()` for this channel is in flight. */
+  is_assigning(channel_id: string): boolean {
+    return this.assigning_channels.has(channel_id);
+  }
+
+  /** Number of inbound messages queued for a channel (0 with no store). */
+  pending_inbound_depth(channel_id: string): number {
+    return this.pending_inbound?.depth(channel_id) ?? 0;
+  }
+
+  /**
+   * Hold an inbound message for daemon-driven delivery. Returns null when no
+   * store is wired (caller falls back to its old behaviour); otherwise the
+   * channel's place in the waiting line and how many of its messages are held.
+   * A duplicate message id is reported as queued — it already is.
+   *
+   * Never throws.
+   */
+  queue_inbound(
+    message: PendingMessage,
+    entity_id: string,
+    reason: PendingInboundReason,
+  ): { position: number; depth: number } | null {
+    const store = this.pending_inbound;
+    if (!store) return null;
+    try {
+      store.enqueue(message, entity_id, reason);
+      // A session may already be free, or about to finish booting — look soon.
+      // The delay clears PENDING_INJECT_MIN_AGE_MS so the first pass can act.
+      this.schedule_pending_drain(reason === "busy" ? 1_000 : PENDING_INJECT_MIN_AGE_MS + 1_000);
+      return {
+        position: store.position(message.channel_id),
+        depth: store.depth(message.channel_id),
+      };
+    } catch (err) {
+      console.error(`[pool] queue_inbound failed for ${message.message_id}: ${String(err)}`);
+      sentry.captureException(err, { tags: { module: "pool", action: "queue_inbound" } });
+      return null;
+    }
+  }
+
+  /**
+   * Has this bot's Discord plugin been seen working for its current session?
+   *
+   * The daemon cannot ask the plugin whether its gateway is connected, so this
+   * is evidence-based: the current CLI process has completed (or been observed
+   * running) a turn since it was spawned. Until then a message sent to the
+   * channel may reach nobody — the plugin could still be booting — and the
+   * caller should queue it rather than trust the plugin. Once a process has
+   * run a turn it stays "ready" until it is replaced; steady-state deafness
+   * after that is the probe's job.
+   *
+   * (The pane's "Listening for channel messages" banner would be a more direct
+   * signal, but it is not present in every CLI version and scrolls away, so it
+   * is not relied on here.)
+   */
+  is_plugin_ready(bot: PoolBot): boolean {
+    if (bot.state !== "assigned") return false;
+    const processed = bot.last_processing_at?.getTime() ?? 0;
+    if (processed === 0) return false;
+    const since = this.process_started_at.get(bot.id) ?? bot.assigned_at?.getTime() ?? 0;
+    return processed >= since;
+  }
+
+  /**
+   * Should a steady-state inbound for this channel be queued rather than left
+   * to the plugin? True only when a store is wired, the channel is on the
+   * plugin transport, and its session has not yet proven its plugin works —
+   * or the channel already has queued messages, which this one must follow.
+   */
+  should_queue_steady_inbound(channel_id: string): boolean {
+    const store = this.pending_inbound;
+    if (!store) return false;
+    if (this.uses_broker(channel_id) || this.broker_owns(channel_id)) return false;
+    const bot = this.get_assignment(channel_id);
+    if (!bot) return false;
+    if (store.depth(channel_id) > 0) return true;
+    return !this.is_plugin_ready(bot);
+  }
+
+  /** Run a drain pass after `delay_ms`, coalescing with one already scheduled. */
+  schedule_pending_drain(delay_ms = 1_000): void {
+    if (!this.pending_inbound || this._draining || this.pending_drain_timer) return;
+    this.pending_drain_timer = setTimeout(() => {
+      this.pending_drain_timer = null;
+      void this.drain_pending_inbound();
+    }, delay_ms);
+    // Never hold the process open for a retry.
+    this.pending_drain_timer.unref?.();
+  }
+
+  /**
+   * Hand queued inbound messages to sessions.
+   *
+   * For each waiting channel, oldest first:
+   *   - no session → `assign()` one, with the channel's oldest message as its
+   *     first turn. If the pool has no slot, later sessionless channels are
+   *     skipped this pass (they would get the same answer).
+   *   - live session → type the queued messages into its prompt, once it is at
+   *     the prompt and the messages are old enough that a working plugin would
+   *     already have delivered them.
+   *
+   * Runs from the health tick, after a release, and shortly after a message is
+   * queued. Never throws; one channel's failure does not stop the others.
+   */
+  async drain_pending_inbound(): Promise<void> {
+    const store = this.pending_inbound;
+    if (!store || this._draining || this._pending_drain_running) return;
+    this._pending_drain_running = true;
+    try {
+      await this.alert_expired_inbound(store.expire());
+
+      let no_slot = false;
+      for (const channel_id of store.channels_waiting()) {
+        if (this._draining) break;
+        try {
+          if (this.assigning_channels.has(channel_id)) continue;
+          if (this.releasing_channels.has(channel_id)) continue;
+          const bot = this.get_assignment(channel_id);
+          if (bot) {
+            await this.inject_pending_inbound(store, bot);
+            continue;
+          }
+          if (no_slot) continue;
+          if ((await this.start_session_for_pending(store, channel_id)) === "no_slot") {
+            no_slot = true;
+          }
+        } catch (err) {
+          console.error(`[pool] Pending-inbound drain failed for ${channel_id}: ${String(err)}`);
+          sentry.captureException(err, {
+            tags: { module: "pool", action: "drain_pending_inbound" },
+            contexts: { drain: { channel_id } },
+          });
+        }
+      }
+    } catch (err) {
+      console.error(`[pool] Pending-inbound drain failed: ${String(err)}`);
+      sentry.captureException(err, { tags: { module: "pool", action: "drain_pending_inbound" } });
+    } finally {
+      this._pending_drain_running = false;
+    }
+  }
+
+  /** Start a session for a waiting channel, driven by its oldest message. */
+  private async start_session_for_pending(
+    store: PendingInboundStore,
+    channel_id: string,
+  ): Promise<"started" | "no_slot" | "waiting" | "dropped"> {
+    const first = store.peek_channel(channel_id)[0];
+    if (!first) return "waiting";
+
+    // No resolver, or one that cannot answer yet, means Discord is not
+    // connected — the channel map does not exist. Wait rather than guess.
+    const target = this.channel_resolver?.(channel_id);
+    if (target === undefined) return "waiting";
+    if (target === null) {
+      // The channel was unmapped (or deleted) while its messages waited. No
+      // session can ever be started for it — say so instead of holding them
+      // until they expire.
+      const dropped = store.take_channel(channel_id);
+      await this.alert_expired_inbound(dropped, "its channel is no longer mapped to an entity");
+      return "dropped";
+    }
+
+    let assignment: PoolAssignment | null = null;
+    try {
+      assignment = await this.assign(
+        channel_id,
+        target.entity_id,
+        target.archetype,
+        undefined,
+        target.channel_type,
+        undefined,
+        {
+          user: first.user,
+          channel_id: first.channel_id,
+          message_id: first.message_id,
+          content: first.content,
+          ts: first.ts,
+        },
+      );
+    } catch (err) {
+      console.error(`[pool] assign() for queued inbound on ${channel_id} threw: ${String(err)}`);
+      sentry.captureException(err, {
+        tags: { module: "pool", action: "start_session_for_pending" },
+        contexts: { drain: { channel_id, message_id: first.message_id } },
+      });
+      // A throw is a bring-up failure, not a full pool. Retrying it every tick
+      // for 24h helps nobody: give up after a few and say so.
+      store.note_attempt([first.message_id]);
+      if (first.attempts >= MAX_PENDING_START_FAILURES) {
+        const dropped = store.take_channel(channel_id);
+        await this.alert_expired_inbound(
+          dropped,
+          `a session for the channel failed to start ${String(MAX_PENDING_START_FAILURES)} times`,
+        );
+        return "dropped";
+      }
+      return "waiting";
+    }
+    // null = no slot (or draining). Not a failure of this message; it waits.
+    if (!assignment) return "no_slot";
+
+    store.remove([first.message_id]);
+    this.arm_inbound_probe(channel_id, first);
+    log_inbound_resolved(first.message_id, "first_turn");
+    this.emit_inbound_delivered(channel_id, [first.message_id], "first_turn", target.archetype);
+    // Any further messages for this channel follow as injected turns.
+    if (store.depth(channel_id) > 0) {
+      this.schedule_pending_drain(PENDING_INJECT_MIN_AGE_MS + 1_000);
+    }
+    return "started";
+  }
+
+  /** Type a live session's queued messages into its prompt, in order. */
+  private async inject_pending_inbound(store: PendingInboundStore, bot: PoolBot): Promise<void> {
+    const channel_id = bot.channel_id;
+    if (!channel_id) return;
+    const entries = store.peek_channel(channel_id);
+    if (entries.length === 0) return;
+
+    // Dead tmux is the health monitor's to restart; the entries wait for it.
+    if (!this.is_tmux_alive(bot.tmux_session)) return;
+
+    const now = Date.now();
+    if (entries.some((e) => now - Date.parse(e.queued_at) < PENDING_INJECT_MIN_AGE_MS)) {
+      this.schedule_pending_drain(PENDING_INJECT_MIN_AGE_MS);
+      return;
+    }
+
+    const pane = this.read_pane(bot.tmux_session);
+    if (pane === null || !pane_ready_for_input(pane)) return; // busy or blocked — next pass
+
+    // Drop anything the plugin delivered after all. The message id is in the
+    // transcript exactly when the session has been shown the message, whether
+    // by the plugin or by an earlier injection of ours.
+    const session_id = bot.session_id;
+    const undelivered: PendingInboundEntry[] = [];
+    const already: string[] = [];
+    for (const entry of entries) {
+      if (await this.transcript_has_message(bot, entry.message_id)) {
+        already.push(entry.message_id);
+      } else {
+        undelivered.push(entry);
+      }
+    }
+    if (already.length > 0) {
+      store.remove(already);
+      for (const id of already) log_inbound_resolved(id, "plugin_delivered");
+      this.emit_inbound_delivered(channel_id, already, "plugin_delivered", bot.archetype);
+    }
+    if (undelivered.length === 0) return;
+
+    // The transcript reads awaited — make sure this is still the same session.
+    if (
+      bot.state !== "assigned" ||
+      bot.channel_id !== channel_id ||
+      bot.session_id !== session_id
+    ) {
+      return;
+    }
+
+    const ids = undelivered.map((e) => e.message_id);
+    const text = format_injected_inbound(undelivered, this.channel_name(channel_id));
+    let sent = false;
+    try {
+      sent = await this.send_via_tmux(bot.tmux_session, text);
+    } catch (err) {
+      console.warn(
+        `[pool] Injecting queued inbound into ${bot.tmux_session} threw: ${String(err)}`,
+      );
+    }
+    if (!sent) {
+      // Left queued. Nothing else holds a copy (this path does not use
+      // `pending_injections`), so the next pass cannot double-send.
+      store.note_attempt(ids);
+      return;
+    }
+
+    store.remove(ids);
+    bot.last_active = new Date();
+    for (const id of ids) log_inbound_resolved(id, "injected");
+    this.emit_inbound_delivered(channel_id, ids, "injected", bot.archetype);
+  }
+
+  /** Alert that queued messages were dropped undelivered. Never throws. */
+  private async alert_expired_inbound(
+    expired: readonly PendingInboundEntry[],
+    why = "they waited more than 24h for a free bot",
+  ): Promise<void> {
+    if (expired.length === 0) return;
+    const by_entity = new Map<string, PendingInboundEntry[]>();
+    for (const e of expired) {
+      log_inbound_resolved(e.message_id, "expired");
+      const list = by_entity.get(e.entity_id) ?? [];
+      list.push(e);
+      by_entity.set(e.entity_id, list);
+    }
+    for (const [entity_id, list] of by_entity) {
+      const channels = [...new Set(list.map((e) => this.channel_label(entity_id, e.channel_id)))];
+      try {
+        await notify(
+          "alerts",
+          `🔴 ${String(list.length)} queued Discord message(s) for ${entity_id}/${channels.join(", ")} were dropped undelivered — ${why}. Senders: ${[...new Set(list.map((e) => e.user))].join(", ")}.`,
+          this.registry?.get(entity_id),
+        );
+      } catch (err) {
+        console.warn(`[pool] Failed to alert on expired inbound for ${entity_id}: ${String(err)}`);
+      }
+    }
+  }
+
+  private emit_inbound_delivered(
+    channel_id: string,
+    message_ids: string[],
+    how: InboundResolution,
+    archetype: ArchetypeRole | null,
+  ): void {
+    const event: InboundDeliveredEvent = { channel_id, message_ids, how, archetype };
+    try {
+      this.emit("inbound:delivered", event);
+    } catch (err) {
+      console.warn(`[pool] inbound:delivered listener threw: ${String(err)}`);
+    }
+  }
+
+  /** Discord channel name via the registered resolver, or null. */
+  private channel_name(channel_id: string): string | null {
+    try {
+      return this.channel_resolver?.(channel_id)?.channel_name ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Visible pane text for a session, or null if unreadable. Protected so
+   * tests can supply pane content without tmux. */
+  protected read_pane(tmux_session: string): string | null {
+    return capture_tmux_pane_text(tmux_session);
+  }
+
+  /**
+   * Whether a Discord message id appears in the bot's session transcript — i.e.
+   * the session has been shown that message, by the plugin or by an earlier
+   * injection. False when the transcript cannot be found or read: callers use
+   * this to *skip* a delivery, and a duplicate is better than a loss.
+   *
+   * Looks in the default `~/.claude/projects` and, for an entity with its own
+   * `CLAUDE_CONFIG_DIR`, in that directory's `projects/` too — a session
+   * launched under a per-entity config writes its transcript there.
+   *
+   * Protected so tests can override.
+   */
+  protected async transcript_has_message(bot: PoolBot, message_id: string): Promise<boolean> {
+    const session_id = bot.session_id;
+    if (!session_id || !message_id) return false;
+    try {
+      let file = await find_session_file(session_id);
+      if (!file && bot.entity_id) {
+        const config_dir = this.resolve_claude_config_dir(bot.entity_id);
+        if (config_dir) {
+          const projects = join(config_dir, "projects");
+          for (const dir of await readdir(projects, { withFileTypes: true })) {
+            if (!dir.isDirectory()) continue;
+            const candidate = join(projects, dir.name, `${session_id}.jsonl`);
+            try {
+              await access(candidate);
+              file = candidate;
+              break;
+            } catch {
+              /* not in this project dir */
+            }
+          }
+        }
+      }
+      if (!file) return false;
+      const transcript = await readFile(file, "utf-8");
+      return transcript.includes(message_id);
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -1727,6 +2207,15 @@ export class BotPool extends EventEmitter {
         continue;
       }
 
+      // Same guards as the steady-state probe: a session parked on a prompt
+      // is not deaf, and `alert_only` never recycles. In both cases the
+      // bot-level marker stays armed, so the probe (which alerts) owns it.
+      if (this.deaf_policy() !== "recycle") {
+        const pane = this.read_pane(bot.tmux_session);
+        if (pane && classify_blocking_pane(pane)) continue;
+        if (this.deaf_policy() === "alert_only") continue;
+      }
+
       const label = `${probation.entity_id}/${this.channel_label(probation.entity_id, probation.channel_id)}`;
       console.error(
         `[pool] pool-${String(bot_id)} never processed its resume nudge after the daemon restart (session ${probation.session_id.slice(0, 8)}, channel ${probation.channel_id}) — plugin connection did not re-establish; auto-recycling`,
@@ -2263,6 +2752,11 @@ export class BotPool extends EventEmitter {
       this.emit("bot:released", { bot_id });
     } finally {
       this.releasing_channels.delete(channel_id);
+      this.recent_inbound.delete(bot.id);
+      this.process_started_at.delete(bot.id);
+      this.clear_deaf_tracking(bot.id);
+      // A slot just opened — a channel may be waiting for exactly that.
+      this.schedule_pending_drain(1_000);
     }
   }
 
@@ -2773,6 +3267,18 @@ export class BotPool extends EventEmitter {
           state: b.state,
           last_active: b.last_active?.toISOString() ?? null,
         })),
+      ...(this.pending_inbound
+        ? {
+            pending_inbound: {
+              total: this.pending_inbound.total(),
+              by_channel: Object.fromEntries(
+                this.pending_inbound
+                  .channels_waiting()
+                  .map((id) => [id, this.pending_inbound?.depth(id) ?? 0]),
+              ),
+            },
+          }
+        : {}),
     };
   }
 
@@ -2854,12 +3360,54 @@ export class BotPool extends EventEmitter {
    * uses to detect prolonged inbound silence: if the bot never starts
    * processing after an inbound, the plugin is deaf. Called from the discord.ts
    * steady-state `touch()` call-site for already-assigned, live bots.
+   *
+   * Pass the message itself when there is one: the probe then re-sends exactly
+   * what the plugin dropped before it considers recycling the session.
    */
-  mark_inbound(channel_id: string): void {
+  mark_inbound(channel_id: string, message?: PendingMessage): void {
     const bot = this.bots.find((b) => b.channel_id === channel_id && b.state === "assigned");
     if (bot) {
       bot.last_inbound_at = new Date();
+      if (message?.message_id) this.remember_inbound(bot, message);
     }
+  }
+
+  /**
+   * Arm the deaf probe for a message that was just handed to a session by the
+   * daemon as its first turn. The hand-over is the SessionStart hook's
+   * additionalContext, which the daemon gets no receipt for; arming the probe
+   * means a session that never acts on it gets the message typed in directly
+   * instead of sitting silent.
+   */
+  arm_inbound_probe(channel_id: string, message: PendingMessage): void {
+    // Under `recycle` an armed probe means a recycle on the first verdict —
+    // the legacy policy never armed here, so neither does this.
+    if (this.deaf_policy() === "recycle") return;
+    // Broker sessions are driven and acked by the broker queue.
+    if (this.uses_broker(channel_id)) return;
+    this.mark_inbound(channel_id, message);
+  }
+
+  private remember_inbound(bot: PoolBot, message: PendingMessage): void {
+    const list = (this.recent_inbound.get(bot.id) ?? []).filter(
+      (m) => m.message_id !== message.message_id,
+    );
+    list.push({ ...message, received_at: Date.now() });
+    this.recent_inbound.set(bot.id, list.slice(-MAX_RECENT_INBOUND));
+  }
+
+  /** Inbound messages routed to this bot's current assignment that it has not
+   * been seen to process — the candidates for redelivery. */
+  private missed_inbound(bot: PoolBot): PendingMessage[] {
+    const since = Math.max(bot.assigned_at?.getTime() ?? 0, bot.last_processing_at?.getTime() ?? 0);
+    return (this.recent_inbound.get(bot.id) ?? [])
+      .filter((m) => m.channel_id === bot.channel_id && m.received_at >= since)
+      .map(({ received_at: _received_at, ...message }) => message);
+  }
+
+  /** Effective deaf-probe policy. */
+  private deaf_policy(): DeafPolicy {
+    return this.config.discord?.deaf_policy ?? "redeliver_then_recycle";
   }
 
   /**
@@ -2879,6 +3427,10 @@ export class BotPool extends EventEmitter {
     const bot = this.bots.find((b) => b.session_id === session_id && b.state === "assigned");
     if (bot) {
       bot.last_processing_at = new Date();
+      // A finished turn is when queued follow-ups can go in.
+      if (bot.channel_id && this.pending_inbound_depth(bot.channel_id) > 0) {
+        this.schedule_pending_drain(1_000);
+      }
     }
   }
 
@@ -3064,6 +3616,10 @@ export class BotPool extends EventEmitter {
         // Attempt restart
         await this.restart_crashed_session(bot);
       }
+
+      // Hand over any inbound the daemon is holding for plugin channels. Last,
+      // so it sees this tick's restarts and releases. Never throws.
+      await this.drain_pending_inbound();
     } finally {
       this._health_check_running = false;
     }
@@ -3153,22 +3709,229 @@ export class BotPool extends EventEmitter {
         // reply) is never mistaken for deafness.
         bot.last_processing_at = new Date();
         bot.last_inbound_at = null;
+        this.clear_deaf_tracking(bot.id);
         return;
       case "healthy_processed":
         // Processed after the inbound, then returned to idle — received and
         // handled. Clear the marker.
         bot.last_inbound_at = null;
+        this.clear_deaf_tracking(bot.id);
         return;
-      case "deaf": {
-        const since_inbound = Date.now() - inbound.getTime();
-        console.error(
-          `[pool] pool-${String(bot.id)} appears DEAF to inbound Discord — idle ${String(
-            Math.round(since_inbound / 1000),
-          )}s after a message with no processing (channel: ${bot.channel_id}). MCP plugin likely stopped delivering — recovering.`,
-        );
-        await this.recover_deaf_bot(bot);
+      case "deaf":
+        await this.handle_deaf_verdict(bot, inbound);
+        return;
+    }
+  }
+
+  private clear_deaf_tracking(bot_id: number): void {
+    this.deaf_redelivered.delete(bot_id);
+    this.blocking_alerted.delete(bot_id);
+  }
+
+  /**
+   * Act on a deaf verdict according to `discord.deaf_policy`.
+   *
+   * A deaf verdict is one idle pane reading 90s after an inbound. It is right
+   * when the plugin's listener died, and wrong whenever the session is alive
+   * but waiting on something the reading cannot see. So before the session is
+   * thrown away:
+   *
+   *   1. If the pane shows a blocking state (permission prompt, usage-limit
+   *      modal, startup dialog, expired login), recycling cures nothing — alert
+   *      naming the state, apply the targeted remedy where one exists, stop.
+   *   2. Re-send what was missed, typed straight into the prompt. A session
+   *      whose plugin is deaf can still be told what it missed; a session that
+   *      is truly stuck will ignore this too.
+   *   3. Only a second deaf verdict for the same session, after that
+   *      redelivery, recycles it.
+   *
+   * `recycle` skips 1–2 (the pre-existing behaviour); `alert_only` never
+   * reaches 3.
+   */
+  private async handle_deaf_verdict(bot: PoolBot, inbound: Date): Promise<void> {
+    const policy = this.deaf_policy();
+    const since_s = String(Math.round((Date.now() - inbound.getTime()) / 1000));
+    const session_key = bot.session_id ?? "none";
+
+    if (policy !== "recycle") {
+      const pane = this.read_pane(bot.tmux_session);
+      const blocking = pane ? classify_blocking_pane(pane) : null;
+      if (blocking) {
+        await this.handle_blocked_bot(bot, blocking);
         return;
       }
+      this.blocking_alerted.delete(bot.id);
+
+      if (policy === "alert_only") {
+        console.error(
+          `[pool] pool-${String(bot.id)} appears DEAF to inbound Discord — idle ${since_s}s after a message with no processing (channel: ${bot.channel_id ?? "none"}). deaf_policy=alert_only — not recycling.`,
+        );
+        // Consume the marker so this silence alerts once, not every tick.
+        bot.last_inbound_at = null;
+        await this.alert_bot(
+          bot,
+          `🔴 Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) appears DEAF to inbound Discord for ${this.bot_label(bot)} — idle ${since_s}s after a message. Not recycling (deaf_policy: alert_only); recycle manually with /reset if it stays silent.`,
+        );
+        return;
+      }
+
+      if (this.deaf_redelivered.get(bot.id) !== session_key) {
+        const outcome = await this.redeliver_missed_inbound(bot, pane);
+        if (outcome === "stale") return;
+        if (outcome === "plugin_delivered") {
+          // Every message we thought was missed is in the transcript: the
+          // plugin delivered, the reading was wrong. Not deaf.
+          bot.last_inbound_at = null;
+          this.clear_deaf_tracking(bot.id);
+          return;
+        }
+        // Re-arm: the redelivery is itself an inbound the session must act on.
+        // If it stays idle through another full window, the next verdict is
+        // for a session that ignored a message typed directly into it.
+        this.deaf_redelivered.set(bot.id, session_key);
+        bot.last_inbound_at = new Date();
+        console.warn(
+          `[pool] pool-${String(bot.id)} idle ${since_s}s after an inbound with no processing (channel: ${bot.channel_id ?? "none"}) — ${
+            outcome.sent
+              ? `re-sent ${String(outcome.count)} message(s) directly`
+              : "could not re-send (pane not at the prompt)"
+          }; recycling only if it stays silent`,
+        );
+        await this.alert_bot(
+          bot,
+          outcome.sent
+            ? `🟡 Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) showed no activity ${since_s}s after an inbound Discord message for ${this.bot_label(bot)}. Re-sent ${String(outcome.count)} message(s) directly into the session; it will be recycled only if it stays silent.`
+            : `🟡 Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) showed no activity ${since_s}s after an inbound Discord message for ${this.bot_label(bot)}, and the daemon could not re-send it (session not at the prompt). It will be recycled if it stays silent.`,
+        );
+        return;
+      }
+    }
+
+    this.clear_deaf_tracking(bot.id);
+    console.error(
+      `[pool] pool-${String(bot.id)} appears DEAF to inbound Discord — idle ${since_s}s after a message with no processing (channel: ${bot.channel_id ?? "none"}). MCP plugin likely stopped delivering — recovering.`,
+    );
+    await this.recover_deaf_bot(bot);
+  }
+
+  /**
+   * Re-send the inbound message(s) a deaf-looking session missed.
+   *
+   * Returns `plugin_delivered` when every remembered message is already in the
+   * transcript (nothing was missed), `stale` when the bot moved on while the
+   * transcript was being read, otherwise whether the text was submitted. With
+   * no remembered message (the probe was armed by a daemon-injected nudge, not
+   * a human message) a generic catch-up prompt is sent instead.
+   */
+  private async redeliver_missed_inbound(
+    bot: PoolBot,
+    pane: string | null,
+  ): Promise<"plugin_delivered" | "stale" | { sent: boolean; count: number }> {
+    const channel_id = bot.channel_id;
+    const session_id = bot.session_id;
+    const missed = this.missed_inbound(bot);
+
+    const undelivered: PendingMessage[] = [];
+    for (const message of missed) {
+      if (await this.transcript_has_message(bot, message.message_id)) {
+        continue;
+      }
+      undelivered.push(message);
+    }
+    if (
+      bot.state !== "assigned" ||
+      bot.channel_id !== channel_id ||
+      bot.session_id !== session_id
+    ) {
+      return "stale";
+    }
+    if (missed.length > 0 && undelivered.length === 0) return "plugin_delivered";
+
+    const text =
+      undelivered.length > 0
+        ? format_injected_inbound(undelivered, channel_id ? this.channel_name(channel_id) : null)
+        : `A Discord message for this session may not have reached you. Fetch the recent messages in chat_id=${channel_id ?? "this channel"} and answer anything left unanswered with the Discord reply tool.`;
+
+    let sent = false;
+    if (pane !== null && pane_ready_for_input(pane)) {
+      try {
+        sent = await this.send_via_tmux(bot.tmux_session, text);
+      } catch (err) {
+        console.warn(`[pool] Redelivery into ${bot.tmux_session} threw: ${String(err)}`);
+      }
+    }
+    if (sent) {
+      for (const message of undelivered) log_inbound_resolved(message.message_id, "redelivered");
+    }
+    return { sent, count: Math.max(undelivered.length, 1) };
+  }
+
+  /**
+   * A session the probe would have called deaf is in fact parked on something.
+   * Alert once per (session, state) and apply the remedy that exists:
+   *
+   *   - `login_required` — the CLI's auth expired. The message-path remedy
+   *     (`has_stale_oauth` in discord.ts) is to kill the process and release
+   *     with history so the next assignment starts a fresh CLI with `--resume`;
+   *     do the same here, after moving the missed messages into the pending
+   *     queue so that assignment is driven by them rather than waiting for the
+   *     human to notice and repeat themselves.
+   *   - `rate_limit_modal` — the 60s rate-limit monitor dismisses it.
+   *   - everything else needs a human; the alert is the remedy.
+   *
+   * The inbound marker stays armed (except on release) so the probe resumes
+   * once the block clears.
+   */
+  private async handle_blocked_bot(bot: PoolBot, state: BlockingPaneState): Promise<void> {
+    const alert_key = `${bot.session_id ?? "none"}:${state}`;
+    const first_time = this.blocking_alerted.get(bot.id) !== alert_key;
+    this.blocking_alerted.set(bot.id, alert_key);
+
+    if (first_time) {
+      console.warn(
+        `[pool] pool-${String(bot.id)} is ${describe_blocking_state(state)} (channel: ${bot.channel_id ?? "none"}) — not recycling`,
+      );
+      const remedy =
+        state === "login_required"
+          ? "Restarting the session with a fresh login; unanswered messages will be re-sent."
+          : state === "rate_limit_modal"
+            ? "The rate-limit monitor will dismiss it."
+            : "It needs a human — attach to the session, or /reset the channel.";
+      await this.alert_bot(
+        bot,
+        `🟠 Pool bot ${String(bot.id)} (${bot.archetype ?? "unknown"}) for ${this.bot_label(bot)} is ${describe_blocking_state(state)} and is not answering Discord. ${remedy}`,
+      );
+    }
+
+    if (state !== "login_required") return;
+
+    const channel_id = bot.channel_id;
+    const entity_id = bot.entity_id;
+    if (channel_id && entity_id && this.pending_inbound) {
+      for (const message of this.missed_inbound(bot)) {
+        this.pending_inbound.enqueue(message, entity_id, "not_ready");
+      }
+    }
+    this.kill_tmux(bot.tmux_session);
+    await this.release_with_history(bot.id);
+    this.schedule_pending_drain(1_000);
+  }
+
+  /** "<entity>/<channel label>" for alerts about a bot. */
+  private bot_label(bot: PoolBot): string {
+    return `${bot.entity_id ?? "unknown"}/${this.channel_label(bot.entity_id, bot.channel_id)}`;
+  }
+
+  /** Post to the bot's entity #alerts channel. Never throws. */
+  private async alert_bot(bot: PoolBot, message: string): Promise<void> {
+    try {
+      await notify(
+        "alerts",
+        message,
+        bot.entity_id ? this.registry?.get(bot.entity_id) : undefined,
+      );
+    } catch (err) {
+      console.warn(`[pool] Failed to alert for pool-${String(bot.id)}: ${String(err)}`);
     }
   }
 
@@ -3842,6 +4605,13 @@ export class BotPool extends EventEmitter {
     }
     this.post_restart_probation.clear();
 
+    if (this.pending_drain_timer) {
+      clearTimeout(this.pending_drain_timer);
+      this.pending_drain_timer = null;
+    }
+    // Queued inbound survives the restart only if it reaches disk.
+    await this.pending_inbound?.flush().catch(() => {});
+
     // Cancel all in-flight session confirmation watchers — we're about to
     // kill tmux anyway, and the timers would otherwise keep the event loop
     // alive past shutdown.
@@ -4187,6 +4957,9 @@ export class BotPool extends EventEmitter {
   ): Promise<void> {
     const claude_bin = process.env.CLAUDE_BIN ?? "claude";
     const agent_name = resolve_agent_name(archetype, this.config);
+    // New process, new plugin connection: earlier evidence that this bot's
+    // plugin works no longer applies (see is_plugin_ready).
+    this.process_started_at.set(bot.id, Date.now());
 
     // ── Transport selector (epic #84 / #85) ──
     // Default is the official Discord plugin, byte-identical to today. Only when
@@ -4363,37 +5136,14 @@ export class BotPool extends EventEmitter {
         }
 
         if (this.is_tmux_alive(bot.tmux_session)) {
-          // Auto-accept workspace trust dialog
-          setTimeout(() => {
-            try {
-              execFileSync("tmux", ["send-keys", "-t", bot.tmux_session, "Enter"], {
-                stdio: "ignore",
-              });
-            } catch {
-              /* dialog may not appear */
-            }
-          }, 3000);
-
-          // Broker sessions launch with --dangerously-load-development-channels
-          // (#114), which pops a confirmation dialog at CLI startup with the
-          // accept option preselected — Enter confirms. The dialog blocks the
-          // whole startup (MCP servers don't spawn until it's answered), so an
-          // unanswered dialog is a dark channel. A second keypress covers the
-          // case where the first Enter was consumed by the trust dialog; a
-          // spare Enter at an idle prompt (or during a running turn) is a
-          // no-op. Broker branch only — plugin sessions keep the single
-          // trust-dialog press, byte-identical to before.
-          if (use_broker) {
-            setTimeout(() => {
-              try {
-                execFileSync("tmux", ["send-keys", "-t", bot.tmux_session, "Enter"], {
-                  stdio: "ignore",
-                });
-              } catch {
-                /* dialog may not appear */
-              }
-            }, 6000);
-          }
+          // Answer the CLI's startup dialogs (workspace trust; and, on the
+          // broker transport, the --dangerously-load-development-channels
+          // confirmation, #114) by matching them on the pane — one Enter per
+          // dialog actually seen. Both dialogs block the whole startup, so an
+          // unanswered one is a dark channel; a blind Enter, on the other
+          // hand, lands in the prompt. Not awaited: bring-up returns as soon
+          // as tmux is up, exactly as it did with the old timers.
+          this.watch_startup_dialogs(bot, use_broker);
 
           console.log(`[pool] pool-${String(bot.id)} running as ${agent_name} in tmux`);
           resolve();
@@ -4408,6 +5158,39 @@ export class BotPool extends EventEmitter {
           reject(new Error("tmux session did not start"));
         }
       });
+    });
+  }
+
+  /**
+   * Run the pane-matched startup-dialog responder for a just-spawned session.
+   * Fire-and-forget and fail-open: a dialog still open at the timeout raises an
+   * alert and a Sentry event; the session is never killed for it. Protected so
+   * tests can observe or stub it.
+   */
+  protected watch_startup_dialogs(bot: PoolBot, expect_dev_channels: boolean): void {
+    const bot_id = bot.id;
+    const tmux_session = bot.tmux_session;
+    void answer_startup_dialogs(tmux_session, {
+      expect_dev_channels,
+      on_stuck: (dialog) => {
+        console.error(
+          `[pool] pool-${String(bot_id)} is still ${describe_blocking_state(dialog)} after startup — channel is dark until it is answered`,
+        );
+        sentry.captureMessage("Pool session stuck at a startup dialog", "warning", {
+          tags: { module: "pool", bot_id: String(bot_id), dialog },
+        });
+        const current = this.bots.find((b) => b.id === bot_id);
+        if (current && current.tmux_session === tmux_session) {
+          void this.alert_bot(
+            current,
+            `🟠 Pool bot ${String(bot_id)} for ${this.bot_label(current)} is ${describe_blocking_state(dialog)} and the daemon could not get past it. The channel is dark until someone attaches to tmux session ${tmux_session} and answers it.`,
+          );
+        }
+      },
+    }).catch((err: unknown) => {
+      console.warn(
+        `[pool] Startup-dialog watcher failed for pool-${String(bot_id)}: ${String(err)}`,
+      );
     });
   }
 

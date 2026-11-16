@@ -19,10 +19,13 @@ vi.mock("../actions.js", async (importOriginal) => {
 
 let temp_dir: string;
 
-function make_config(): LobsterFarmConfig {
+type DeafPolicy = "recycle" | "redeliver_then_recycle" | "alert_only";
+
+function make_config(deaf_policy?: DeafPolicy): LobsterFarmConfig {
   return LobsterFarmConfigSchema.parse({
     user: { name: "Test" },
     paths: { lobsterfarm_dir: temp_dir },
+    ...(deaf_policy ? { discord: { server_id: "guild-1", deaf_policy } } : {}),
   });
 }
 
@@ -112,6 +115,22 @@ class TestBotPool extends BotPoolTestBase {
     return this.idle.get(bot.id) ?? true;
   }
 
+  /** tmux_session → pane text (null = unreadable, the default). */
+  panes = new Map<string, string | null>();
+  /** Message ids present in the session transcript. */
+  transcript = new Set<string>();
+  /** Text typed into sessions via the redelivery path. */
+  sent: Array<{ session: string; text: string }> = [];
+  send_ok = true;
+
+  protected override read_pane(tmux_session: string): string | null {
+    return this.panes.get(tmux_session) ?? null;
+  }
+
+  protected override async transcript_has_message(_bot: PoolBot, id: string): Promise<boolean> {
+    return this.transcript.has(id);
+  }
+
   // Expose the protected probe for direct invocation.
   async run_probe(bot: PoolBot): Promise<void> {
     await (
@@ -139,7 +158,11 @@ describe("check_plugin_liveness (issue #73)", () => {
     temp_dir = await mkdtemp(join(tmpdir(), "pool-plugin-liveness-"));
     notify_mock.mockClear();
 
-    pool = new TestBotPool(make_config());
+    // This suite pins the recycle mechanics themselves (alerts, release-to-fresh,
+    // loop guard), so it runs under `deaf_policy: "recycle"` — recycle on the
+    // first verdict. The default policy's redeliver-first gate has its own
+    // suite below.
+    pool = new TestBotPool(make_config("recycle"));
     (pool as unknown as { registry: EntityRegistry }).registry = make_registry([
       make_entity_config("healthydogs", ["chan-foods"]),
     ]);
@@ -580,5 +603,342 @@ describe("check_plugin_liveness (issue #73)", () => {
 
     expect(assigned.last_inbound_at).not.toBeNull();
     expect(other.last_inbound_at).toBeNull();
+  });
+});
+
+const IDLE_PROMPT = ["● Done.", "╭────╮", "│ ❯  │", "╰────╯", "  ⏵⏵ bypass permissions on"].join(
+  "\n",
+);
+const PERMISSION_PROMPT = [
+  "● Bash(rm -rf build)",
+  " Do you want to proceed?",
+  " ❯ 1. Yes",
+  "   2. No, and tell Claude what to do differently (esc)",
+].join("\n");
+const LOGIN_REQUIRED = ["> hi", "  ⎿  Not logged in · Please run /login", "│ ❯  │"].join("\n");
+
+function human_message(id: string, content = `content ${id}`) {
+  return {
+    user: "ada",
+    channel_id: "chan-foods",
+    message_id: id,
+    content,
+    ts: new Date().toISOString(),
+  };
+}
+
+/**
+ * The deaf verdict is one idle pane reading. Under the default policy it must
+ * not end a session until the daemon has (a) ruled out a visible blocking
+ * state and (b) re-sent what the session missed.
+ */
+describe("deaf_policy (redeliver before recycle)", () => {
+  let pool: TestBotPool;
+  let start_tmux: ReturnType<typeof vi.spyOn>;
+
+  function setup(policy?: DeafPolicy): void {
+    pool = new TestBotPool(make_config(policy));
+    (pool as unknown as { registry: EntityRegistry }).registry = make_registry([
+      make_entity_config("healthydogs", ["chan-foods"]),
+    ]);
+    for (const method of [
+      "kill_tmux",
+      "write_access_json",
+      "set_bot_nickname",
+      "set_bot_avatar",
+      "persist",
+      "resolve_github_token_ref",
+    ] as const) {
+      vi.spyOn(pool as unknown as Record<string, unknown>, method as never).mockImplementation(
+        (() => undefined) as never,
+      );
+    }
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "check_session_jsonl_exists_anywhere" as never,
+    ).mockResolvedValue(true as never);
+    vi.spyOn(
+      pool as unknown as Record<string, unknown>,
+      "send_via_tmux" as never,
+    ).mockImplementation((async (session: string, text: string) => {
+      pool.sent.push({ session, text });
+      return pool.send_ok;
+    }) as never);
+    start_tmux = vi
+      .spyOn(pool as unknown as Record<string, unknown>, "start_tmux" as never)
+      .mockResolvedValue(undefined as never);
+  }
+
+  /** An assigned, alive, idle bot that received `ids` and never processed. */
+  function deaf_bot(ids: string[] = ["m1"]): PoolBot {
+    const bot = make_bot({
+      id: 3,
+      state: "assigned",
+      channel_id: "chan-foods",
+      entity_id: "healthydogs",
+      archetype: "planner",
+      session_id: "sess-live",
+      assigned_at: new Date(Date.now() - 60 * 60_000),
+    });
+    pool.inject_bots([bot]);
+    pool.set_tmux_alive("pool-3", true);
+    pool.set_bot_idle_state(3, true);
+    pool.panes.set("pool-3", IDLE_PROMPT);
+    for (const id of ids) pool.mark_inbound("chan-foods", human_message(id));
+    make_deaf_eligible(bot);
+    return bot;
+  }
+
+  function make_deaf_eligible(bot: PoolBot): void {
+    bot.last_inbound_at = new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000);
+  }
+
+  function alerts(): string[] {
+    return notify_mock.mock.calls.map((c) => String(c[1]));
+  }
+
+  beforeEach(async () => {
+    temp_dir = await mkdtemp(join(tmpdir(), "pool-deaf-policy-"));
+    notify_mock.mockClear();
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(temp_dir, { recursive: true, force: true });
+  });
+
+  it("is the default when no policy is configured", async () => {
+    setup(); // no discord block at all
+    const bot = deaf_bot();
+    await pool.run_probe(bot);
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(pool.sent).toHaveLength(1);
+  });
+
+  it("first deaf verdict re-sends the missed messages, in order, and does NOT release", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot(["m1", "m2"]);
+
+    await pool.run_probe(bot);
+
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(bot.state).toBe("assigned");
+    expect(bot.session_id).toBe("sess-live");
+    expect(pool.sent).toHaveLength(1);
+    const text = pool.sent[0]!.text;
+    expect(text).toContain("message_id m1");
+    expect(text).toContain("message_id m2");
+    expect(text.indexOf("message_id m1")).toBeLessThan(text.indexOf("message_id m2"));
+    // Re-armed against the redelivery itself.
+    expect(bot.last_inbound_at!.getTime()).toBeGreaterThan(Date.now() - 5_000);
+    expect(alerts().some((m) => m.includes("Re-sent 2 message(s)"))).toBe(true);
+    expect(alerts().some((m) => m.includes("went DEAF"))).toBe(false);
+  });
+
+  it("second consecutive deaf verdict after the redelivery recycles", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot();
+
+    await pool.run_probe(bot); // redeliver
+    make_deaf_eligible(bot); // still silent a full window later
+    await pool.run_probe(bot); // recycle
+
+    expect(pool.sent).toHaveLength(1); // no second redelivery
+    expect(start_tmux).toHaveBeenCalledTimes(1);
+    expect(alerts().some((m) => m.includes("went DEAF"))).toBe(true);
+  });
+
+  it("a healthy reading between verdicts resets the redelivery — the next silence gets its own", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot();
+
+    await pool.run_probe(bot); // redeliver
+    pool.set_bot_idle_state(3, false); // it picked the redelivery up
+    await pool.run_probe(bot); // healthy_working → tracking cleared
+    expect(bot.last_inbound_at).toBeNull();
+
+    // A new message later goes unanswered.
+    pool.set_bot_idle_state(3, true);
+    bot.last_processing_at = new Date(Date.now() - 30 * 60_000);
+    pool.mark_inbound("chan-foods", human_message("m9"));
+    make_deaf_eligible(bot);
+    await pool.run_probe(bot);
+
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(pool.sent).toHaveLength(2);
+    expect(pool.sent[1]!.text).toContain("message_id m9");
+  });
+
+  it("does not re-send — or recycle — when the transcript shows the plugin delivered", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot(["m1"]);
+    pool.transcript.add("m1");
+
+    await pool.run_probe(bot);
+
+    expect(pool.sent).toHaveLength(0);
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(notify_mock).not.toHaveBeenCalled();
+    expect(bot.last_inbound_at).toBeNull(); // not deaf after all
+  });
+
+  it("re-sends only what the transcript is missing", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot(["m1", "m2"]);
+    pool.transcript.add("m1");
+
+    await pool.run_probe(bot);
+
+    expect(pool.sent[0]!.text).not.toContain("message_id m1");
+    expect(pool.sent[0]!.text).toContain("message_id m2");
+  });
+
+  it("sends a generic catch-up prompt when the probe was armed without a message", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot([]);
+    pool.mark_inbound("chan-foods"); // daemon-injected nudge: no message recorded
+    make_deaf_eligible(bot);
+
+    await pool.run_probe(bot);
+
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(pool.sent).toHaveLength(1);
+    expect(pool.sent[0]!.text).toContain("chat_id=chan-foods");
+  });
+
+  it("a redelivery that cannot be typed still counts as the one attempt", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot();
+    pool.panes.set("pool-3", null); // pane unreadable → cannot inject
+
+    await pool.run_probe(bot);
+    expect(pool.sent).toHaveLength(0);
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(alerts().some((m) => m.includes("could not re-send"))).toBe(true);
+
+    make_deaf_eligible(bot);
+    await pool.run_probe(bot);
+    expect(start_tmux).toHaveBeenCalledTimes(1);
+  });
+
+  it("never recycles while a permission prompt is on screen, and alerts once", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot();
+    pool.panes.set("pool-3", PERMISSION_PROMPT);
+
+    for (let i = 0; i < 4; i++) {
+      await pool.run_probe(bot);
+      make_deaf_eligible(bot);
+    }
+
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(pool.sent).toHaveLength(0); // never type into a dialog
+    expect(bot.state).toBe("assigned");
+    const blocked = alerts().filter((m) => m.includes("waiting on a permission prompt"));
+    expect(blocked).toHaveLength(1);
+  });
+
+  it("resumes normal handling once the blocking state clears", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot();
+    pool.panes.set("pool-3", PERMISSION_PROMPT);
+    await pool.run_probe(bot);
+
+    pool.panes.set("pool-3", IDLE_PROMPT);
+    make_deaf_eligible(bot);
+    await pool.run_probe(bot);
+
+    expect(pool.sent).toHaveLength(1); // redelivered, not recycled
+    expect(start_tmux).not.toHaveBeenCalled();
+  });
+
+  it("login_required: releases with history instead of deaf-recycling", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot();
+    pool.panes.set("pool-3", LOGIN_REQUIRED);
+
+    await pool.run_probe(bot);
+
+    expect(bot.state).toBe("free");
+    expect(start_tmux).not.toHaveBeenCalled(); // no blind reassign into the same wall
+    expect(alerts().some((m) => m.includes("not logged in"))).toBe(true);
+    expect(alerts().some((m) => m.includes("went DEAF"))).toBe(false);
+    const history = (pool as unknown as { session_history: Map<string, string> }).session_history;
+    expect(history.get("healthydogs:chan-foods")).toBe("sess-live");
+  });
+
+  it("alert_only: alerts once and never recycles or types anything", async () => {
+    setup("alert_only");
+    const bot = deaf_bot();
+
+    await pool.run_probe(bot);
+    await pool.run_probe(bot); // marker consumed → nothing more
+
+    expect(start_tmux).not.toHaveBeenCalled();
+    expect(pool.sent).toHaveLength(0);
+    expect(bot.state).toBe("assigned");
+    expect(alerts().filter((m) => m.includes("alert_only"))).toHaveLength(1);
+  });
+
+  it("alert_only still names a blocking state rather than calling it deaf", async () => {
+    setup("alert_only");
+    const bot = deaf_bot();
+    pool.panes.set("pool-3", PERMISSION_PROMPT);
+
+    await pool.run_probe(bot);
+
+    expect(alerts().some((m) => m.includes("permission prompt"))).toBe(true);
+    expect(alerts().some((m) => m.includes("DEAF"))).toBe(false);
+  });
+
+  it("recycle: first verdict recycles even with a blocking pane (legacy behaviour)", async () => {
+    setup("recycle");
+    const bot = deaf_bot();
+    pool.panes.set("pool-3", PERMISSION_PROMPT);
+
+    await pool.run_probe(bot);
+
+    expect(pool.sent).toHaveLength(0);
+    expect(start_tmux).toHaveBeenCalledTimes(1);
+  });
+
+  it("remembers at most 10 inbound per bot and forgets what was processed", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot([]);
+    for (let i = 0; i < 14; i++) pool.mark_inbound("chan-foods", human_message(`old-${String(i)}`));
+    const recent = (
+      pool as unknown as { recent_inbound: Map<number, Array<{ message_id: string }>> }
+    ).recent_inbound.get(3)!;
+    expect(recent).toHaveLength(10);
+    expect(recent[0]!.message_id).toBe("old-4");
+
+    // The session then processes a turn; a later message is the only one missed.
+    await new Promise((r) => setTimeout(r, 5));
+    pool.mark_processed("sess-live");
+    await new Promise((r) => setTimeout(r, 5));
+    pool.mark_inbound("chan-foods", human_message("fresh"));
+    // Call the redelivery directly to see exactly what it would send.
+    const outcome = await (
+      pool as unknown as {
+        redeliver_missed_inbound: (b: PoolBot, pane: string | null) => Promise<unknown>;
+      }
+    ).redeliver_missed_inbound(bot, IDLE_PROMPT);
+    expect(outcome).toEqual({ sent: true, count: 1 });
+    expect(pool.sent[0]!.text).toContain("message_id fresh");
+    expect(pool.sent[0]!.text).not.toContain("old-");
+  });
+
+  it("arm_inbound_probe arms for a first-turn message — except under `recycle`", () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot([]);
+    bot.last_inbound_at = null;
+    pool.arm_inbound_probe("chan-foods", human_message("first"));
+    expect(bot.last_inbound_at).not.toBeNull();
+
+    setup("recycle");
+    const legacy = deaf_bot([]);
+    legacy.last_inbound_at = null;
+    pool.arm_inbound_probe("chan-foods", human_message("first"));
+    expect(legacy.last_inbound_at).toBeNull();
   });
 });

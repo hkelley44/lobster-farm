@@ -44,8 +44,13 @@ import type { InboundMeta } from "./broker/protocol.js";
 import type { CommanderProcess } from "./commander-process.js";
 import { PAT_TMUX_SESSION } from "./commander-process.js";
 import { type GatewaySnapshot, GatewayWatchdog } from "./gateway-watchdog.js";
+import {
+  type InboundOutcome,
+  type PendingInboundReason,
+  log_inbound_outcome,
+} from "./pending-inbound.js";
 import { is_tmux_session_idle } from "./pool.js";
-import type { BotPool, PendingMessage, PoolBot } from "./pool.js";
+import type { BotPool, InboundDeliveredEvent, PendingMessage, PoolBot } from "./pool.js";
 import type { TaskQueue } from "./queue.js";
 import type { EntityRegistry } from "./registry.js";
 import type { RoutedMessage } from "./router.js";
@@ -2758,6 +2763,111 @@ export class DiscordBot extends EventEmitter {
         }
       },
     );
+
+    // The pool starts sessions for queued inbound on its own (a slot freed up,
+    // long after the message arrived) and needs what handle_message would have
+    // looked up. `undefined` = "ask again later": before the gateway is ready
+    // the channel map is empty, and an empty map must not read as "this
+    // channel was deleted".
+    pool.set_channel_resolver((channel_id) => {
+      if (!this.client.isReady() || this.channel_map.size === 0) return undefined;
+      const entry = this.channel_map.get(channel_id);
+      if (!entry) return null;
+      const channel = this.client.channels.cache.get(channel_id);
+      return {
+        entity_id: entry.entity_id,
+        archetype: entry.assigned_archetype ?? "planner",
+        channel_type: entry.channel_type,
+        channel_name: channel && "name" in channel ? (channel.name ?? null) : null,
+      };
+    });
+
+    // Queued inbound was handed to a session: swap ⏳ → 👀 on those messages
+    // and show the same "working" affordances a directly-delivered message gets.
+    pool.on("inbound:delivered", (event: InboundDeliveredEvent) => {
+      void this.on_inbound_delivered(event);
+    });
+  }
+
+  /** React to the pool delivering queued inbound. Best-effort — never throws. */
+  private async on_inbound_delivered(event: InboundDeliveredEvent): Promise<void> {
+    try {
+      const channel = await this.client.channels.fetch(event.channel_id);
+      if (channel?.isTextBased()) {
+        for (const message_id of event.message_ids) {
+          try {
+            const message = await channel.messages.fetch(message_id);
+            await message.reactions.cache.get("⏳")?.users.remove(this.client.user?.id);
+            await message.react("👀");
+          } catch {
+            /* message deleted, or reactions not permitted — cosmetic only */
+          }
+        }
+      }
+      // The plugin delivered these itself; the session is already past them.
+      if (event.how === "plugin_delivered") return;
+      this.start_typing_loop(event.channel_id);
+      void this.send_status_embed(event.channel_id, event.archetype ?? "planner");
+    } catch (err) {
+      console.warn(`[discord] inbound:delivered handling failed: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Hold an inbound message in the pool's durable pending queue. Returns the
+   * queue position, or null when the message could not be queued (no store
+   * wired, or the pool threw) — the caller then falls back to its previous
+   * behaviour. Never throws into the message handler.
+   */
+  private try_queue_inbound(
+    message: Message,
+    pending: PendingMessage,
+    entity_id: string,
+    reason: PendingInboundReason,
+  ): { position: number; depth: number } | null {
+    try {
+      const queued = this._pool?.queue_inbound(pending, entity_id, reason) ?? null;
+      if (queued) {
+        log_inbound_outcome(message.channelId, message.id, `queued_${reason}` as InboundOutcome);
+      }
+      return queued;
+    } catch (err) {
+      console.error(`[discord] Failed to queue inbound ${message.id}: ${String(err)}`);
+      sentry.captureException(err, { tags: { module: "discord", action: "queue_inbound" } });
+      return null;
+    }
+  }
+
+  /**
+   * Why a message for a channel with no live assignment must be queued instead
+   * of driving `assign()` directly, or null if it should go ahead.
+   *
+   * - `assigning`: another message's `assign()` for this channel is in flight.
+   *   Calling assign() again returns null (the lock) and the message used to be
+   *   dropped behind a "busy" reply. Broker channels keep their own buffer.
+   * - `busy`: earlier messages for this channel are already waiting. This one
+   *   must follow them, not overtake them by winning a slot first.
+   */
+  private prequeue_reason(channel_id: string): PendingInboundReason | null {
+    try {
+      const pool = this._pool;
+      if (!pool || pool.channel_uses_broker(channel_id)) return null;
+      if (pool.is_assigning(channel_id)) return "assigning";
+      if (pool.pending_inbound_depth(channel_id) > 0) return "busy";
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Whether a steady-state inbound should be queued rather than left to the
+   * plugin (see BotPool.should_queue_steady_inbound). Fail-open to "plugin". */
+  private should_queue_steady(channel_id: string): boolean {
+    try {
+      return this._pool?.should_queue_steady_inbound(channel_id) ?? false;
+    } catch {
+      return false;
+    }
   }
 
   // ── Internal message handling ──
@@ -2781,6 +2891,7 @@ export class DiscordBot extends EventEmitter {
       // inbound→commander path is pure MCP plugin — no daemon send-keys — so this
       // is the daemon's only record that a message was handed to the commander.
       this._commander?.mark_inbound();
+      log_inbound_outcome(message.channelId, message.id, "commander");
       this.start_commander_typing_loop(message.channelId);
       void this.send_status_embed(message.channelId, "commander");
       return;
@@ -2816,7 +2927,10 @@ export class DiscordBot extends EventEmitter {
     if (!entry) return;
 
     // Ignore legacy !lf text commands — all commands are now slash commands.
-    if (message.content.trim().startsWith("!lf")) return;
+    if (message.content.trim().startsWith("!lf")) {
+      log_inbound_outcome(message.channelId, message.id, "ignored");
+      return;
+    }
 
     // Intercept !reset — release current bot, next real message triggers fresh assignment
     if (message.content.trim().toLowerCase() === "!reset") {
@@ -2874,24 +2988,51 @@ export class DiscordBot extends EventEmitter {
           /* ignore */
         }
 
+        const pending: PendingMessage = {
+          user: message.author.displayName,
+          channel_id: message.channelId,
+          message_id: message.id,
+          content: message.content,
+          ts: new Date(message.createdTimestamp).toISOString(),
+        };
+
+        // Queue rather than assign when this message would otherwise be dropped
+        // behind an in-flight assign, or would overtake messages already
+        // waiting for this channel. Silent: ⏳ stays on the message and flips
+        // to 👀 when the pool hands it to the session.
+        const prequeue = this.prequeue_reason(message.channelId);
+        if (prequeue && this.try_queue_inbound(message, pending, entry.entity_id, prequeue)) {
+          return;
+        }
+
         // Pass the user's message as a pending_message so the SessionStart
         // hook can inject it as additionalContext when the Claude CLI
         // starts (issue #290). No tmux send-keys bridging required.
-        const result = await this._pool.assign(
-          message.channelId,
-          entry.entity_id,
-          archetype,
-          undefined, // resume_session_id — pool handles auto-resume from parked bots + session_history
-          entry.channel_type,
-          undefined, // working_dir — use entity default
-          {
-            user: message.author.displayName,
-            channel_id: message.channelId,
-            message_id: message.id,
-            content: message.content,
-            ts: new Date(message.createdTimestamp).toISOString(),
-          },
-        );
+        //
+        // A throw here used to propagate out of the handler with the message
+        // already gone; treat it like "no slot" so the message is queued and
+        // the pool retries it (bounded — see start_session_for_pending).
+        let result: Awaited<ReturnType<BotPool["assign"]>> = null;
+        try {
+          result = await this._pool.assign(
+            message.channelId,
+            entry.entity_id,
+            archetype,
+            undefined, // resume_session_id — pool handles auto-resume from parked bots + session_history
+            entry.channel_type,
+            undefined, // working_dir — use entity default
+            pending,
+          );
+        } catch (err) {
+          console.error(
+            `[discord] assign() threw for channel ${message.channelId}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          sentry.captureException(err, {
+            tags: { module: "discord", action: "assign_on_message" },
+          });
+        }
         if (result) {
           try {
             await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
@@ -2899,6 +3040,15 @@ export class DiscordBot extends EventEmitter {
           } catch {
             /* ignore */
           }
+          // The first turn is handed over through the SessionStart hook, for
+          // which the daemon gets no receipt. Arm the liveness probe so a
+          // session that never acts on it has the message re-sent.
+          try {
+            this._pool.arm_inbound_probe(message.channelId, pending);
+          } catch {
+            /* fail-open */
+          }
+          log_inbound_outcome(message.channelId, message.id, "first_turn");
           // Start typing indicator loop + status embed while bot processes
           this.start_typing_loop(message.channelId);
           void this.send_status_embed(message.channelId, archetype);
@@ -2909,58 +3059,86 @@ export class DiscordBot extends EventEmitter {
           // session, hand it to the broker so it lands on the single
           // cold-recreated session as an ordered follow-up turn. Returns true if
           // the broker took it (delivered or buffered). On plugin channels (and
-          // flag-OFF) this is a no-op returning false, so the "busy" path below
-          // is byte-identical to today.
-          const taken = this._pool.deliver_or_buffer_broker_inbound(message.channelId, {
-            user: message.author.displayName,
-            channel_id: message.channelId,
-            message_id: message.id,
-            content: message.content,
-            ts: new Date(message.createdTimestamp).toISOString(),
-          });
-          try {
-            await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
-          } catch {
-            /* ignore */
-          }
+          // flag-OFF) this is a no-op returning false.
+          const taken = this._pool.deliver_or_buffer_broker_inbound(message.channelId, pending);
           if (taken) {
             // The broker owns delivery for this message — show the same
             // "received" affordance as a normal broker inbound and let the
             // cold-recreated session reply.
             try {
+              await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
               await message.react("👀");
             } catch {
               /* ignore */
             }
+            log_inbound_outcome(message.channelId, message.id, "broker");
             this.start_typing_loop(message.channelId);
             void this.send_status_embed(message.channelId, archetype);
           } else {
+            // Plugin channel and no bot could be assigned. Hold the message in
+            // the durable pending queue — the pool starts a session for this
+            // channel, with this message as its first turn, as soon as a slot
+            // opens. ⏳ stays on the message until then.
+            const queued = this.try_queue_inbound(message, pending, entry.entity_id, "busy");
+            const notice = queued
+              ? `All bots are busy. Queued (position ${String(queued.position)}) — I'll start a session for this channel as soon as a bot frees up.`
+              : "All bots are busy right now and I couldn't queue your message — please send it again in a few minutes.";
+            if (!queued) {
+              try {
+                await message.reactions.cache.get("⏳")?.users.remove(this.client.user!.id);
+              } catch {
+                /* ignore */
+              }
+              log_inbound_outcome(message.channelId, message.id, "ignored");
+            }
             try {
-              await message.reply(
-                "All bots are busy right now. Your message will be picked up when a slot opens.",
-              );
+              await message.reply(notice);
             } catch {
-              await this.send(
-                message.channelId,
-                "All bots are busy right now. Your message will be picked up when a slot opens.",
-              );
+              await this.send(message.channelId, notice);
             }
           }
         }
       } else {
         // Bot is assigned and tmux is alive — touch for LRU tracking
         this._pool.touch(message.channelId);
+        const pending: PendingMessage = {
+          user: message.author.displayName,
+          channel_id: message.channelId,
+          message_id: message.id,
+          content: message.content,
+          ts: new Date(message.createdTimestamp).toISOString(),
+        };
+        // The session is alive, but on the plugin transport that says nothing
+        // about whether its Discord plugin is connected yet: a session still
+        // booting (or resumed and not yet through a turn) has no listener, and
+        // Discord will not replay this message to it later. Until the session
+        // has proven its plugin works, the daemon holds the message and types
+        // it in itself once the session is at the prompt — skipping it if the
+        // plugin turns out to have delivered it after all.
+        if (this.should_queue_steady(message.channelId)) {
+          if (this.try_queue_inbound(message, pending, entry.entity_id, "not_ready")) {
+            try {
+              await message.react("⏳");
+            } catch {
+              /* ignore */
+            }
+            return;
+          }
+        }
         // Record the inbound delivery so the plugin-liveness probe can detect
         // a live-but-deaf bot that never picks the message up (#73). This is the
         // pure-MCP-plugin steady-state path — no daemon send-keys, so this is the
-        // daemon's only record that a message was handed to the bot.
-        this._pool.mark_inbound(message.channelId);
+        // daemon's only record that a message was handed to the bot. The message
+        // itself is kept so the probe can re-send it before recycling anything.
+        this._pool.mark_inbound(message.channelId, pending);
         // Broker-owned channels (#85): the plugin isn't listening on this
         // channel — the daemon delivers inbound through the broker instead. On
         // the plugin path this is a no-op. Fail-open: feed() never throws.
-        if (this._pool.broker_owns(message.channelId)) {
+        const via_broker = this._pool.broker_owns(message.channelId);
+        if (via_broker) {
           this._pool.feed_broker_inbound(build_broker_inbound(message));
         }
+        log_inbound_outcome(message.channelId, message.id, via_broker ? "broker" : "plugin");
         // Start typing indicator loop + status embed while bot processes the new message
         this.start_typing_loop(message.channelId);
         void this.send_status_embed(message.channelId, assignment.archetype ?? "planner");
@@ -3123,7 +3301,13 @@ export class DiscordBot extends EventEmitter {
   /** Format pool capacity summary. */
   private format_pool_summary(pool: BotPool): string {
     const status = pool.get_status();
-    return `Pool: ${String(status.assigned)}/${String(status.total)} assigned, ${String(status.free)} free`;
+    const base = `Pool: ${String(status.assigned)}/${String(status.total)} assigned, ${String(status.free)} free`;
+    const queued = status.pending_inbound;
+    if (!queued || queued.total === 0) return base;
+    const per_channel = Object.entries(queued.by_channel)
+      .map(([channel_id, depth]) => `<#${channel_id}>: ${String(depth)}`)
+      .join(", ");
+    return `${base}\nQueued inbound: ${String(queued.total)} message(s) waiting (${per_channel})`;
   }
 
   /** Build the cross-entity status dashboard shown in #command-center.

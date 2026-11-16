@@ -50,6 +50,7 @@ function make_fake_pool(assign_result: unknown = null): FakePool {
     // set_pool() wires these handlers/listeners on the real pool; inert here.
     set_nickname_handler: vi.fn(),
     set_avatar_handler: vi.fn(),
+    set_channel_resolver: vi.fn(),
     on: vi.fn(),
   } as unknown as FakePool;
 }

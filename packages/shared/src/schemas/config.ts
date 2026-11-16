@@ -77,6 +77,21 @@ export const LobsterFarmConfigSchema = z.object({
           pilot_channels: z.array(z.string()).default([]),
         })
         .optional(),
+      /**
+       * What the plugin-liveness probe does when a session stays idle after an
+       * inbound message it should have received ("deaf").
+       *
+       * - `redeliver_then_recycle` (default): type the missed message(s) into
+       *   the session once; recycle only if it is still silent a full probe
+       *   window later. Never recycles while the pane shows a blocking state
+       *   (permission prompt, usage-limit modal, startup dialog).
+       * - `alert_only`: alert, never recycle.
+       * - `recycle`: release + fresh assign on the first verdict — the
+       *   behaviour before this option existed; kept as an escape hatch.
+       */
+      deaf_policy: z
+        .enum(["recycle", "redeliver_then_recycle", "alert_only"])
+        .default("redeliver_then_recycle"),
     })
     .optional(),
 
