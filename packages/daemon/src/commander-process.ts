@@ -16,6 +16,7 @@ import {
   evaluate_plugin_liveness,
   is_tmux_session_idle,
 } from "./plugin-liveness.js";
+import { session_jsonl_exists_anywhere } from "./pool.js";
 import * as sentry from "./sentry.js";
 import { sq } from "./shell.js";
 import { answer_startup_dialogs } from "./startup-dialogs.js";
@@ -211,6 +212,40 @@ export class CommanderProcess extends EventEmitter {
     await writeFile(this.session_state_path(), JSON.stringify({ session_id }, null, 2), "utf-8");
   }
 
+  /** Whether the CLI has a transcript on disk for this session id. Searches
+   * every project slug rather than deriving the commander's own: a false
+   * negative here discards a real conversation, so it must not hinge on the
+   * slug encoding matching the CLI's. Protected so tests can answer without
+   * touching `~/.claude/projects`. */
+  protected session_transcript_exists(session_id: string): Promise<boolean> {
+    return session_jsonl_exists_anywhere(session_id);
+  }
+
+  /**
+   * Decide which session the next spawn uses: resume the persisted one
+   * (`--resume`, conversation restored) or establish a new id (`--session-id`).
+   *
+   * A persisted id is only resumable once the CLI has written its transcript,
+   * which happens on the session's first turn — not at spawn. `--resume` on an
+   * id with no transcript exits immediately, so a commander that was restarted
+   * before it ever took a turn could never come back: every retry resumed the
+   * same phantom until the restart budget ran out (#146). Starting fresh loses
+   * nothing — there is no conversation behind that id.
+   *
+   * Protected so tests can drive it without spawning tmux.
+   */
+  protected async resolve_session(): Promise<{ session_id: string; is_resume: boolean }> {
+    const persisted = await this.read_session_id();
+    if (persisted === null) return { session_id: randomUUID(), is_resume: false };
+    if (await this.session_transcript_exists(persisted)) {
+      return { session_id: persisted, is_resume: true };
+    }
+    console.log(
+      `[commander] Persisted session ${persisted.slice(0, 8)} has no transcript — nothing to resume, starting fresh`,
+    );
+    return { session_id: randomUUID(), is_resume: false };
+  }
+
   /** Clear persisted session state so the next startup begins fresh. */
   private async clear_session_id(): Promise<void> {
     try {
@@ -378,12 +413,7 @@ export class CommanderProcess extends EventEmitter {
     const agent_name = this.config.agents.commander.name.toLowerCase();
     const working_dir = lobsterfarm_dir(this.config.paths);
 
-    // Resolve session ID for resume support. If we have a persisted session_id
-    // from a previous run, use --resume to restore conversation context.
-    // Otherwise generate a fresh ID and use --session-id to establish it.
-    const existing_session_id = await this.read_session_id();
-    const is_resume = existing_session_id !== null;
-    const session_id = existing_session_id ?? randomUUID();
+    const { session_id, is_resume } = await this.resolve_session();
 
     const claude_args = [
       sq(claude_bin),
@@ -584,6 +614,24 @@ export class CommanderProcess extends EventEmitter {
     const inbound = this.last_inbound_at;
     if (!inbound) return; // nothing delivered — skip the tmux pane read entirely
 
+    // A marker stamped before this session started was delivered to — or
+    // dropped on the floor in front of — a session that no longer exists. It
+    // says nothing about THIS session's plugin, and Discord does not replay the
+    // message, so the fresh session will sit idle no matter how healthy it is.
+    // Judging it deaf on that evidence killed a working commander minutes after
+    // it came back (#146). Drop the marker and tell the operator the message
+    // needs resending: that is the only thing that recovers it.
+    if (this.last_started_at && inbound.getTime() < this.last_started_at.getTime()) {
+      this.last_inbound_at = null;
+      console.warn(
+        "[commander] Dropping an inbound marker that predates this session — the message was sent while the commander was down or restarting",
+      );
+      await this.post_alert(
+        "🟠 A #command-center message arrived while the commander (Pat) was down or restarting and was not delivered. The commander is back — please resend it.",
+      );
+      return;
+    }
+
     // Warm-up gate (#111) — the same gate the pool's two call sites got in
     // #108, closing the last asymmetry between the two probes that share
     // `evaluate_plugin_liveness` precisely so their decisions stay provably
@@ -608,20 +656,9 @@ export class CommanderProcess extends EventEmitter {
     // and the only cost is clearing a healthy marker up to 90s late — never a
     // false deaf.
     //
-    // The one verdict the gate can delay is a `deaf` call derived from a marker
-    // stamped BEFORE this session started — a crash respawn does not null
-    // `last_inbound_at`, only `recover_deaf_commander` does. Judging a fresh
-    // session deaf for a message delivered to its predecessor is a false
-    // positive, which the 90s wait DEFERS rather than suppresses: nothing
-    // inside the window can clear the marker (this gate returns before the
-    // switch, and unlike the pool the commander has no Stop-hook
-    // `mark_processed` to clear it either), so unless a new inbound arrives to
-    // re-stamp it, the first post-warm-up pass still returns `deaf` and the
-    // respawn gets its "went DEAF" alert and a second recovery restart about a
-    // cycle and a half later. `commander-plugin-liveness.test.ts` pins both
-    // halves of that. Detection is deferred, never lost — if you are here
-    // debugging a double-restart-after-crash, this gate delays it, it does not
-    // prevent it.
+    // A marker stamped BEFORE this session started never reaches this gate —
+    // the predecessor check above drops it (#146). Every marker judged from
+    // here on was stamped against the session being probed.
     if (this.last_started_at && Date.now() - this.last_started_at.getTime() < LIVENESS_WARMUP_MS) {
       return;
     }
