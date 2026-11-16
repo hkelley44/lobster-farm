@@ -391,4 +391,39 @@ describe("commander plugin-liveness probe (issue #77)", () => {
     expect(commander.start_calls).toBe(1);
     expect((commander as unknown as { recovering_plugin: boolean }).recovering_plugin).toBe(false);
   });
+
+  // #146 — a fresh, healthy commander was killed for a message sent to the
+  // session it replaced.
+  it("does not judge a fresh session deaf for an inbound that predates it (#146)", async () => {
+    const started = new Date(Date.now() - PLUGIN_DEAF_THRESHOLD_MS - 5_000);
+    commander.set_started_at(started);
+    commander.set_inbound(new Date(started.getTime() - 60_000)); // sent to the predecessor
+    commander.set_processing(null);
+    idle_mock.mockReturnValue(true);
+
+    await commander.run_probe();
+
+    expect(commander.start_calls).toBe(0);
+    expect(commander.get_inbound()).toBeNull();
+    expect(alert_mock).toHaveBeenCalledTimes(1);
+    expect(String(alert_mock.mock.calls[0]?.[0])).toContain("please resend");
+    expect(String(alert_mock.mock.calls[0]?.[0])).not.toContain("DEAF");
+
+    // The marker is consumed: the next pass is silent.
+    await commander.run_probe();
+    expect(alert_mock).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a predecessor's marker even inside the warm-up window, without reading the pane (#146)", async () => {
+    const started = new Date();
+    commander.set_started_at(started);
+    commander.set_inbound(new Date(started.getTime() - 1_000));
+    idle_mock.mockClear();
+
+    await commander.run_probe();
+
+    expect(commander.get_inbound()).toBeNull();
+    expect(idle_mock).not.toHaveBeenCalled();
+    expect(commander.start_calls).toBe(0);
+  });
 });
