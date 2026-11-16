@@ -19,6 +19,8 @@ export const BROKER_QUEUE_FILE = "broker-queue.json";
 export const ACTIVE_INCIDENTS_FILE = "active-incidents.json";
 /** `sentry-triage.ts`. */
 export const SENTRY_TRIAGES_FILE = "sentry-triages.json";
+/** `pending-inbound.ts`. */
+export const PENDING_INBOUND_FILE = "pending-inbound.json";
 
 /**
  * Every basename `write_json_atomic` can create a temp sibling for — i.e. every
@@ -32,7 +34,7 @@ export const SENTRY_TRIAGES_FILE = "sentry-triages.json";
  * What makes that checkable rather than a hope: `write_json_atomic` is the only
  * thing in the repo that produces a `<name>.<8 hex>.tmp` filename, so the list
  * is exhaustive exactly when every one of its call sites writes a basename that
- * appears here. Seven call sites, seven entries, verified by grep. (Other
+ * appears here. Eight call sites, eight entries, verified by grep. (Other
  * `.tmp` writers exist — `discord.ts`'s room archives — but they use a fixed
  * `.tmp` suffix and write outside `state/`, so they neither match this pattern
  * nor need to. `state/avatar-urls.json` is a plain non-atomic `writeFile` and
@@ -46,6 +48,7 @@ const ATOMIC_STATE_FILES = [
   BROKER_QUEUE_FILE,
   ACTIVE_INCIDENTS_FILE,
   SENTRY_TRIAGES_FILE,
+  PENDING_INBOUND_FILE,
 ] as const;
 
 function state_dir(config: LobsterFarmConfig): string {
@@ -119,8 +122,8 @@ const STATE_TEMP_PATTERN = new RegExp(
  * behind. `sweep_stale_state_temps` is what covers that case.
  *
  * This is the only place the pattern should be written for `state/` files: all
- * seven state writers route here (the four savers below, plus `alert-router.ts`,
- * `sentry-triage.ts` and `broker/queue.ts`). Two more implementations of the
+ * eight state writers route here (the four savers below, plus `alert-router.ts`,
+ * `sentry-triage.ts`, `broker/queue.ts` and `pending-inbound.ts`). Two more implementations of the
  * same idea exist for files *outside* `state/` — `pool.ts`'s and
  * `commander-process.ts`'s access.json writers — and they use a
  * `.tmp.<uuid>` suffix that `STATE_TEMP_PATTERN` deliberately does not match.
