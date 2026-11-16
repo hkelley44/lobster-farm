@@ -18,6 +18,7 @@ import {
 } from "./plugin-liveness.js";
 import * as sentry from "./sentry.js";
 import { sq } from "./shell.js";
+import { answer_startup_dialogs } from "./startup-dialogs.js";
 
 export interface CommanderHealth {
   state: "stopped" | "starting" | "running" | "crashed";
@@ -455,17 +456,12 @@ export class CommanderProcess extends EventEmitter {
 
       // tmux new-session exits immediately (detached). Check the session exists.
       if (this.is_tmux_alive()) {
-        // Claude Code shows a workspace trust dialog in interactive mode.
-        // Auto-accept it after a brief delay for the UI to render.
-        setTimeout(() => {
-          try {
-            execFileSync("tmux", ["send-keys", "-t", PAT_TMUX_SESSION, "Enter"], {
-              stdio: "ignore",
-            });
-          } catch {
-            /* ignore — dialog may not appear if already trusted */
-          }
-        }, 3000);
+        // The CLI can stop at the workspace-trust dialog before it reaches the
+        // prompt. Answer it by reading the pane, never with a timed Enter: the
+        // dialog's preselected option is "No, exit" as of CLI 2.1.325, so the
+        // blind Enter that used to live here made the commander quit itself on
+        // every start (#144).
+        this.watch_startup_dialogs();
 
         this.state = "running";
         this.last_started_at = new Date();
@@ -505,6 +501,35 @@ export class CommanderProcess extends EventEmitter {
       });
       this.emit("error", err);
       this.schedule_restart();
+    });
+  }
+
+  /**
+   * Run the pane-matched startup-dialog responder for the just-spawned session.
+   * Fire-and-forget and fail-open, like the pool's: a dialog still open at the
+   * timeout is alerted and left for a human — the session is never killed for
+   * it. Protected so tests can stub it.
+   */
+  protected watch_startup_dialogs(): void {
+    void answer_startup_dialogs(PAT_TMUX_SESSION, {
+      on_stuck: (dialog) => {
+        console.error(
+          `[commander] still ${describe_blocking_state(dialog)} after startup — #command-center is dark until it is answered`,
+        );
+        sentry.captureMessage("Commander stuck at a startup dialog", "warning", {
+          tags: { module: "commander", dialog },
+        });
+        void this.post_alert(
+          `🟠 Commander (Pat) is ${describe_blocking_state(dialog)} and the daemon could not get past it. #command-center is dark until someone attaches to tmux session \`${PAT_TMUX_SESSION}\` and answers it.`,
+        );
+      },
+      on_no_prompt: () => {
+        console.warn(
+          `[commander] did not reach the prompt within the startup window and showed no recognised dialog — if #command-center is dark, check tmux session ${PAT_TMUX_SESSION} for a reworded startup dialog`,
+        );
+      },
+    }).catch((err: unknown) => {
+      console.warn(`[commander] Startup-dialog watcher failed: ${String(err)}`);
     });
   }
 
