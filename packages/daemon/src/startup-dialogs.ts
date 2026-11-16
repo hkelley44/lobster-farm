@@ -10,7 +10,14 @@
  *
  * The daemon used to press Enter at fixed 3s and 6s delays. A slow boot left
  * the dialog open; a fast one sent a stray Enter into the prompt. This polls
- * the pane and presses Enter exactly once per dialog it actually sees.
+ * the pane and confirms exactly once per dialog it actually sees.
+ *
+ * It also reads WHICH option the cursor is on before confirming (#144). CLI
+ * 2.1.325 started rendering the trust dialog with "No, exit" preselected, so a
+ * bare Enter told the CLI to quit: every session the daemon spawned in an
+ * untrusted directory exited within seconds and the commander crash-looped.
+ * Enter is now only ever sent while the cursor is observed on the accept
+ * option; otherwise one arrow key is sent and the next poll re-reads the pane.
  *
  * Fail-open: never throws, never kills the session. A dialog still open at the
  * timeout is reported through `on_stuck` and left for a human.
@@ -19,6 +26,8 @@
 import { execFileSync } from "node:child_process";
 import {
   type BlockingPaneState,
+  DEV_CHANNELS_DIALOG_MARKERS,
+  TRUST_DIALOG_MARKERS,
   capture_tmux_pane_text,
   classify_blocking_pane,
   pane_shows_input_prompt,
@@ -46,7 +55,8 @@ export interface StartupDialogOptions {
 
 export interface StartupDialogDeps {
   capture?: (tmux_session: string) => string | null;
-  send_enter?: (tmux_session: string) => void;
+  /** Send one named tmux key ("Enter", "Up", "Down") to the session. */
+  send_key?: (tmux_session: string, key: StartupDialogKey) => void;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 }
@@ -68,11 +78,77 @@ const MAX_CAPTURE_FAILURES = 6;
  * leak the extra Enters into whatever comes next. */
 const REPRESS_AFTER_MS = 3_000;
 
-function default_send_enter(tmux_session: string): void {
-  execFileSync("tmux", ["send-keys", "-t", tmux_session, "Enter"], {
+/** Minimum gap between arrow keys. Arrows cannot dismiss a dialog, so they need
+ * no guard against leaking into the prompt — but a second arrow sent before the
+ * first has been drawn can wrap the cursor back onto the decline option and
+ * thrash. One redraw is far shorter than this. */
+const ARROW_REPRESS_AFTER_MS = 1_500;
+
+export type StartupDialogKey = "Enter" | "Up" | "Down";
+
+function default_send_key(tmux_session: string, key: StartupDialogKey): void {
+  execFileSync("tmux", ["send-keys", "-t", tmux_session, key], {
     stdio: "ignore",
     timeout: 5000,
   });
+}
+
+/** The option that lets startup continue, per dialog. Index 1 of each marker
+ * pair is that option's label (index 0 is the dialog's title line). */
+const ACCEPT_OPTION: Record<StartupDialog, string> = {
+  trust_dialog: TRUST_DIALOG_MARKERS[1],
+  dev_channels_dialog: DEV_CHANNELS_DIALOG_MARKERS[1],
+};
+
+/** Every dialog option the CLI is known to render, accept or decline. The
+ * cursor is only trusted when it sits on one of these — a `❯` anywhere else in
+ * the tail (scrollback, a quoted prompt) is not the selection cursor. */
+const DECLINE_OPTIONS: Record<StartupDialog, readonly string[]> = {
+  trust_dialog: ["No, exit"],
+  dev_channels_dialog: ["Exit"],
+};
+
+/** `Array.prototype.findLastIndex`, which the daemon's ES target predates. */
+function last_index_where(lines: string[], test: (line: string) => boolean): number {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (test(lines[i] ?? "")) return i;
+  }
+  return -1;
+}
+
+/**
+ * The single key that moves a startup dialog one step closer to accepted, or
+ * null when the pane does not show enough to decide.
+ *
+ * "Enter" only when the selection cursor (❯) is on the accept option. When it
+ * is on a decline option, the arrow key that moves it toward the accept option.
+ * Null when the accept option or the cursor cannot be located: pressing a key
+ * we cannot justify is how #144 happened, so the caller presses nothing and
+ * the dialog surfaces through `on_stuck` instead.
+ *
+ * Which option is preselected, and the order they are listed in, are CLI UI
+ * details that have already changed once — neither is assumed here.
+ *
+ * Pure: no I/O.
+ */
+export function next_key_for_dialog(dialog: StartupDialog, pane: string): StartupDialogKey | null {
+  const lines = pane_tail(pane, 14);
+  const accept = ACCEPT_OPTION[dialog];
+  // The cursor on any accept row is conclusive. Checked across every match
+  // rather than the first, so the label echoed higher up (scrollback, a
+  // wrapped line) cannot hide the live row.
+  if (lines.some((line) => line.includes(accept) && line.includes("❯"))) return "Enter";
+  // Otherwise navigate relative to the LAST match: an open dialog owns the
+  // bottom of the pane, so the lowest occurrence is its option row.
+  const accept_index = last_index_where(lines, (line) => line.includes(accept));
+  if (accept_index === -1) return null;
+
+  const cursor_index = last_index_where(
+    lines,
+    (line) => line.includes("❯") && DECLINE_OPTIONS[dialog].some((opt) => line.includes(opt)),
+  );
+  if (cursor_index === -1) return null;
+  return cursor_index < accept_index ? "Down" : "Up";
 }
 
 function as_startup_dialog(pane: string): StartupDialog | null {
@@ -97,7 +173,7 @@ export async function answer_startup_dialogs(
   const timeout_ms = opts.timeout_ms ?? 45_000;
   const poll_ms = opts.poll_ms ?? 500;
   const capture = deps.capture ?? capture_tmux_pane_text;
-  const send_enter = deps.send_enter ?? default_send_enter;
+  const send_key = deps.send_key ?? default_send_key;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = deps.now ?? Date.now;
 
@@ -106,6 +182,7 @@ export async function answer_startup_dialogs(
   let capture_failures = 0;
   let last_dialog: StartupDialog | null = null;
   let last_pressed: { dialog: StartupDialog; at: number } | null = null;
+  let last_arrow_at: number | null = null;
   let prompt_seen = false;
 
   while (now() - started < timeout_ms) {
@@ -133,10 +210,27 @@ export async function answer_startup_dialogs(
       if (same_as_pressed && now() - (last_pressed?.at ?? 0) < REPRESS_AFTER_MS) {
         continue; // already answered this one; give the CLI time to redraw
       }
+      const key = next_key_for_dialog(dialog, pane);
+      if (key === null) continue; // cannot tell where the cursor is — do not guess
+      if (
+        key !== "Enter" &&
+        last_arrow_at !== null &&
+        now() - last_arrow_at < ARROW_REPRESS_AFTER_MS
+      ) {
+        continue; // the previous arrow may not have been drawn yet
+      }
       try {
-        send_enter(tmux_session);
+        send_key(tmux_session, key);
       } catch {
         continue; // session may be mid-teardown; the next poll decides
+      }
+      // An arrow key only moves the cursor. The next poll re-reads the pane and
+      // confirms only if the cursor really landed on the accept option, so a
+      // dropped or doubled keypress corrects itself instead of confirming the
+      // wrong choice.
+      if (key !== "Enter") {
+        last_arrow_at = now();
+        continue;
       }
       if (!same_as_pressed) answered.push(dialog);
       last_pressed = { dialog, at: now() };
