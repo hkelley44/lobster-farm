@@ -21,6 +21,7 @@ import {
   type BlockingPaneState,
   capture_tmux_pane_text,
   classify_blocking_pane,
+  pane_shows_input_prompt,
   pane_tail,
 } from "./plugin-liveness.js";
 
@@ -37,6 +38,10 @@ export interface StartupDialogOptions {
   expect_dev_channels?: boolean;
   /** Called once if a dialog is still on screen at the timeout. */
   on_stuck?: (dialog: StartupDialog) => void;
+  /** Called once if the timeout passes with no dialog recognised AND no prompt
+   * ever seen. That is what a reworded dialog looks like from here: the old
+   * blind keypress would have got past it, this cannot. */
+  on_no_prompt?: () => void;
 }
 
 export interface StartupDialogDeps {
@@ -78,7 +83,10 @@ function as_startup_dialog(pane: string): StartupDialog | null {
 /** The CLI is past its startup dialogs: the input prompt (or the status bar
  * that accompanies it) is on screen. */
 function shows_prompt(pane: string): boolean {
-  return pane_tail(pane).some((line) => line.includes("❯") || line.includes("bypass permissions"));
+  return (
+    pane_shows_input_prompt(pane) ||
+    pane_tail(pane).some((line) => line.includes("bypass permissions"))
+  );
 }
 
 export async function answer_startup_dialogs(
@@ -98,6 +106,7 @@ export async function answer_startup_dialogs(
   let capture_failures = 0;
   let last_dialog: StartupDialog | null = null;
   let last_pressed: { dialog: StartupDialog; at: number } | null = null;
+  let prompt_seen = false;
 
   while (now() - started < timeout_ms) {
     await sleep(poll_ms);
@@ -135,6 +144,7 @@ export async function answer_startup_dialogs(
     }
 
     if (shows_prompt(pane)) {
+      prompt_seen = true;
       // Prompt is up with no dialog on screen. A broker session that has not
       // shown its dev-channels confirmation yet may still do so — the trust
       // dialog comes first and the prompt can flash between them — so keep
@@ -151,7 +161,15 @@ export async function answer_startup_dialogs(
       /* reporting must not throw into the caller */
     }
   }
+  if (!last_dialog && !prompt_seen) {
+    try {
+      opts.on_no_prompt?.();
+    } catch {
+      /* reporting must not throw into the caller */
+    }
+  }
   // A broker session whose confirmation never appeared (already accepted, or
-  // the CLI no longer shows it) ends here with nothing stuck — that is fine.
+  // the CLI no longer shows it) ends here with the prompt seen and nothing
+  // stuck — that is fine.
   return { answered, ended: "timeout", stuck: last_dialog };
 }

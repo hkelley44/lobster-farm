@@ -2816,7 +2816,7 @@ export class DiscordBot extends EventEmitter {
   /**
    * Hold an inbound message in the pool's durable pending queue. Returns the
    * queue position, or null when the message could not be queued (no store
-   * wired, or the pool threw) — the caller then falls back to its previous
+   * wired, a broker channel — the pool refuses those — or the pool threw) — the caller then falls back to its previous
    * behaviour. Never throws into the message handler.
    */
   private try_queue_inbound(
@@ -2824,9 +2824,10 @@ export class DiscordBot extends EventEmitter {
     pending: PendingMessage,
     entity_id: string,
     reason: PendingInboundReason,
+    opts?: { front?: boolean },
   ): { position: number; depth: number } | null {
     try {
-      const queued = this._pool?.queue_inbound(pending, entity_id, reason) ?? null;
+      const queued = this._pool?.queue_inbound(pending, entity_id, reason, opts) ?? null;
       if (queued) {
         log_inbound_outcome(message.channelId, message.id, `queued_${reason}` as InboundOutcome);
       }
@@ -3013,6 +3014,7 @@ export class DiscordBot extends EventEmitter {
         // already gone; treat it like "no slot" so the message is queued and
         // the pool retries it (bounded — see start_session_for_pending).
         let result: Awaited<ReturnType<BotPool["assign"]>> = null;
+        let assign_threw = false;
         try {
           result = await this._pool.assign(
             message.channelId,
@@ -3024,6 +3026,7 @@ export class DiscordBot extends EventEmitter {
             pending,
           );
         } catch (err) {
+          assign_threw = true;
           console.error(
             `[discord] assign() threw for channel ${message.channelId}: ${
               err instanceof Error ? err.message : String(err)
@@ -3079,9 +3082,16 @@ export class DiscordBot extends EventEmitter {
             // the durable pending queue — the pool starts a session for this
             // channel, with this message as its first turn, as soon as a slot
             // opens. ⏳ stays on the message until then.
-            const queued = this.try_queue_inbound(message, pending, entry.entity_id, "busy");
+            //
+            // `front`: this message arrived before anything that was parked
+            // behind its own in-flight assign(), so it goes ahead of those.
+            const queued = this.try_queue_inbound(message, pending, entry.entity_id, "busy", {
+              front: true,
+            });
             const notice = queued
-              ? `All bots are busy. Queued (position ${String(queued.position)}) — I'll start a session for this channel as soon as a bot frees up.`
+              ? assign_threw
+                ? "I couldn't start a session for this channel just now. Your message is queued and I'll keep retrying."
+                : `All bots are busy. Queued (position ${String(queued.position)}) — I'll start a session for this channel as soon as a bot frees up.`
               : "All bots are busy right now and I couldn't queue your message — please send it again in a few minutes.";
             if (!queued) {
               try {

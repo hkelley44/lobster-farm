@@ -123,4 +123,32 @@ describe("answer_startup_dialogs", () => {
     );
     expect(result).toMatchObject({ ended: "timeout", stuck: "trust_dialog", answered: [] });
   });
+
+  it("reports a boot that shows neither a known dialog nor the prompt (reworded dialog)", async () => {
+    const reworded = " Before we begin: do you trust this workspace?\n ❯ 1. Trust it\n   2. Leave";
+    const { deps, send_enter } = harness([reworded]);
+    const on_no_prompt = vi.fn();
+    const on_stuck = vi.fn();
+    const result = await answer_startup_dialogs(
+      "pool-1",
+      { timeout_ms: 5_000, on_no_prompt, on_stuck },
+      deps,
+    );
+    expect(send_enter).not.toHaveBeenCalled();
+    expect(result.ended).toBe("timeout");
+    expect(on_stuck).not.toHaveBeenCalled();
+    expect(on_no_prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report no-prompt for a broker session that reached the prompt and saw no dev dialog", async () => {
+    const { deps } = harness([PROMPT]);
+    const on_no_prompt = vi.fn();
+    const result = await answer_startup_dialogs(
+      "pool-1",
+      { timeout_ms: 5_000, expect_dev_channels: true, on_no_prompt },
+      deps,
+    );
+    expect(result).toMatchObject({ ended: "timeout", stuck: null });
+    expect(on_no_prompt).not.toHaveBeenCalled();
+  });
 });

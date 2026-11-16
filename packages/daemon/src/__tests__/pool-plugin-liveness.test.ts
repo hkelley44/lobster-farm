@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PendingInboundStore } from "../pending-inbound.js";
 import { PLUGIN_DEAF_THRESHOLD_MS } from "../pool.js";
 import type { PoolBot } from "../pool.js";
 import type { EntityRegistry } from "../registry.js";
@@ -127,8 +128,8 @@ class TestBotPool extends BotPoolTestBase {
     return this.panes.get(tmux_session) ?? null;
   }
 
-  protected override async transcript_has_message(_bot: PoolBot, id: string): Promise<boolean> {
-    return this.transcript.has(id);
+  protected override async read_transcript(): Promise<string | null> {
+    return [...this.transcript].join("\n");
   }
 
   // Expose the protected probe for direct invocation.
@@ -606,6 +607,7 @@ describe("check_plugin_liveness (issue #73)", () => {
   });
 });
 
+const LIVENESS_WARMUP = 90_000;
 const IDLE_PROMPT = ["● Done.", "╭────╮", "│ ❯  │", "╰────╯", "  ⏵⏵ bypass permissions on"].join(
   "\n",
 );
@@ -860,11 +862,107 @@ describe("deaf_policy (redeliver before recycle)", () => {
     await pool.run_probe(bot);
 
     expect(bot.state).toBe("free");
-    expect(start_tmux).not.toHaveBeenCalled(); // no blind reassign into the same wall
+    // No store is wired in this suite, so nothing drives a reassign: the
+    // channel resumes on the next human message. (With a store, the parked
+    // messages drive one restart — see the next test.)
+    expect(start_tmux).not.toHaveBeenCalled();
     expect(alerts().some((m) => m.includes("not logged in"))).toBe(true);
     expect(alerts().some((m) => m.includes("went DEAF"))).toBe(false);
     const history = (pool as unknown as { session_history: Map<string, string> }).session_history;
     expect(history.get("healthydogs:chan-foods")).toBe("sess-live");
+  });
+
+  it("login_required with the queue wired: one restart carrying the missed message, then a manual-/login alert — never a loop", async () => {
+    setup("redeliver_then_recycle");
+    const store = new PendingInboundStore({
+      path: join(temp_dir, "state", "pending-inbound.json"),
+    });
+    pool.set_pending_inbound(store);
+    pool.set_channel_resolver(() => ({
+      entity_id: "healthydogs",
+      archetype: "planner",
+      channel_type: "general",
+      channel_name: "foods",
+    }));
+    const bot = deaf_bot(["m1"]);
+    pool.panes.set("pool-3", LOGIN_REQUIRED);
+
+    await pool.run_probe(bot);
+    expect(store.peek_channel("chan-foods").map((e) => e.message_id)).toEqual(["m1"]);
+    await pool.drain_pending_inbound(); // restart, driven by the parked message
+    expect(start_tmux).toHaveBeenCalledTimes(1);
+    expect(store.depth("chan-foods")).toBe(0);
+
+    // The replacement is not logged in either. Probe it repeatedly.
+    for (let i = 0; i < 5; i++) {
+      const current = pool.get_assignment("chan-foods")!;
+      expect(current).toBeDefined();
+      current.assigned_at = new Date(Date.now() - 60 * 60_000);
+      pool.panes.set(current.tmux_session, LOGIN_REQUIRED);
+      pool.mark_inbound("chan-foods", human_message(`again-${String(i)}`));
+      make_deaf_eligible(current);
+      await pool.run_probe(current);
+      await pool.drain_pending_inbound();
+    }
+
+    expect(start_tmux).toHaveBeenCalledTimes(1); // no second restart
+    expect(pool.get_assignment("chan-foods")).toBeDefined(); // session left alone
+    expect(alerts().filter((m) => m.includes("manual `/login`"))).toHaveLength(1);
+    await store.flush();
+  });
+
+  it("a session whose listener is dead is recycled once redelivery has had to bridge it twice", async () => {
+    setup("redeliver_then_recycle");
+    const store = new PendingInboundStore({
+      path: join(temp_dir, "state", "pending-inbound.json"),
+    });
+    pool.set_pending_inbound(store);
+    const bot = deaf_bot([]);
+    bot.last_inbound_at = null;
+
+    // It answers whatever is typed into it, so every redelivery is followed by
+    // a healthy verdict — and then it goes silent on the next Discord message.
+    async function silence_then_redelivery(id: string): Promise<void> {
+      pool.set_bot_idle_state(3, true);
+      pool.mark_inbound("chan-foods", human_message(id));
+      make_deaf_eligible(bot);
+      await pool.run_probe(bot); // deaf → redeliver
+      pool.transcript.add(id); // the typed text is now in its transcript
+      pool.set_bot_idle_state(3, false);
+      await pool.run_probe(bot); // healthy_working (it took the typed text)
+      // ...and that turn finished some time before the next Discord message.
+      bot.last_processing_at = new Date(Date.now() - 10 * 60_000);
+    }
+    await silence_then_redelivery("m1");
+    await silence_then_redelivery("m2");
+    expect(pool.sent).toHaveLength(2);
+    expect(start_tmux).not.toHaveBeenCalled();
+
+    // Third silence: no more bridging.
+    pool.set_bot_idle_state(3, true);
+    await new Promise((r) => setTimeout(r, 5));
+    pool.mark_inbound("chan-foods", human_message("m3"));
+    make_deaf_eligible(bot);
+    await pool.run_probe(bot);
+
+    expect(pool.sent).toHaveLength(2);
+    expect(start_tmux).toHaveBeenCalledTimes(1);
+    expect(alerts().some((m) => m.includes("went DEAF"))).toBe(true);
+    // The unanswered message is waiting for the replacement session.
+    expect(store.peek_channel("chan-foods").map((e) => e.message_id)).toEqual(["m3"]);
+    await store.flush();
+  });
+
+  it("still re-sends the actual message after a crash restart refreshed assigned_at", async () => {
+    setup("redeliver_then_recycle");
+    const bot = deaf_bot(["before-crash"]);
+    bot.assigned_at = new Date(Date.now() - LIVENESS_WARMUP - 1_000); // restarted after the message
+    await new Promise((r) => setTimeout(r, 2));
+
+    await pool.run_probe(bot);
+
+    expect(pool.sent).toHaveLength(1);
+    expect(pool.sent[0]!.text).toContain("message_id before-crash");
   });
 
   it("alert_only: alerts once and never recycles or types anything", async () => {

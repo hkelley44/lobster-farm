@@ -129,7 +129,11 @@ export function classify_blocking_pane(pane_text: string): BlockingPaneState | n
     return "rate_limit_modal";
   }
 
-  if (has(PERMISSION_PROMPT_MARKERS)) return "permission_prompt";
+  // The question alone is ordinary English an agent might end a turn with;
+  // a real prompt also renders its numbered options beneath it.
+  if (has(PERMISSION_PROMPT_MARKERS) && /^\s*(?:❯\s*)?1\.\s/m.test(tail)) {
+    return "permission_prompt";
+  }
   if (LOGIN_REQUIRED_MARKERS.some((m) => pane_text.includes(m))) return "login_required";
   return null;
 }
@@ -154,7 +158,7 @@ export function describe_blocking_state(state: BlockingPaneState): string {
  * Can text typed into this pane right now be expected to start a turn?
  *
  * True when the input prompt (❯) is visible in the pane tail, nothing is
- * running, and no dialog owns the keyboard. The dialog check matters because
+ * running, and no dialog owns the keyboard. The dialog checks matter because
  * selection menus render their cursor as ❯ too — "is ❯ on screen" alone would
  * type a queued message into a trust dialog.
  *
@@ -163,7 +167,21 @@ export function describe_blocking_state(state: BlockingPaneState): string {
 export function pane_ready_for_input(pane_text: string): boolean {
   if (pane_shows_working(pane_text)) return false;
   if (classify_blocking_pane(pane_text) !== null) return false;
-  return pane_tail(pane_text).some((line) => line.includes("❯"));
+  return pane_shows_input_prompt(pane_text);
+}
+
+/**
+ * Is the CLI's text-input prompt (❯) in the pane tail?
+ *
+ * A ❯ followed by a numbered option ("❯ 1. Yes") is a selection menu's cursor,
+ * not the input prompt. Excluding it here means a dialog this module does not
+ * recognise by its wording — a reworded one, or a new one — is still not
+ * mistaken for a prompt that text can be typed into.
+ *
+ * Pure: no I/O.
+ */
+export function pane_shows_input_prompt(pane_text: string): boolean {
+  return pane_tail(pane_text).some((line) => line.includes("❯") && !/❯\s*\d+\./.test(line));
 }
 
 /**

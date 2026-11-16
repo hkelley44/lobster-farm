@@ -196,6 +196,7 @@ describe("handle_message — pending-inbound queue", () => {
       expect.objectContaining({ message_id: "m2" }),
       "acme",
       "assigning",
+      undefined,
     );
     expect(message.reply).not.toHaveBeenCalled();
     expect(message.react).toHaveBeenCalledWith("⏳");
@@ -209,7 +210,7 @@ describe("handle_message — pending-inbound queue", () => {
     await bot.invoke(fake_message("m3"));
 
     expect(pool.assign).not.toHaveBeenCalled();
-    expect(pool.queue_inbound).toHaveBeenCalledWith(expect.anything(), "acme", "busy");
+    expect(pool.queue_inbound).toHaveBeenCalledWith(expect.anything(), "acme", "busy", undefined);
   });
 
   it("broker channels keep their own cold-start buffer", async () => {
@@ -238,9 +239,17 @@ describe("handle_message — pending-inbound queue", () => {
     });
     use_pool(pool);
 
-    await expect(bot.invoke(fake_message("m1"))).resolves.toBeUndefined();
+    const message = fake_message("m1");
+    await expect(bot.invoke(message)).resolves.toBeUndefined();
 
-    expect(pool.queue_inbound).toHaveBeenCalledWith(expect.anything(), "acme", "busy");
+    // Queued at the FRONT: it arrived before anything parked behind its assign.
+    expect(pool.queue_inbound).toHaveBeenCalledWith(expect.anything(), "acme", "busy", {
+      front: true,
+    });
+    // And the user is not told the pool is full when it was a bring-up failure.
+    const reply = String(message.reply.mock.calls[0]?.[0]);
+    expect(reply).toContain("couldn't start a session");
+    expect(reply).not.toContain("All bots are busy");
     error_spy.mockRestore();
   });
 
@@ -278,6 +287,7 @@ describe("handle_message — pending-inbound queue", () => {
         expect.objectContaining({ message_id: "m1" }),
         "acme",
         "not_ready",
+        undefined,
       );
       // Not handed to the plugin, so the deaf probe must not be armed for it.
       expect(pool.mark_inbound).not.toHaveBeenCalled();

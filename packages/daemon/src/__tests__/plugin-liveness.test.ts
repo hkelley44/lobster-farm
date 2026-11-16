@@ -307,6 +307,18 @@ describe("classify_blocking_pane", () => {
     expect(classify_blocking_pane(idle)).toBeNull();
   });
 
+  it("does not mistake an agent ending its turn with the same question for a prompt", () => {
+    const pane = [
+      "● I can drop the old table and re-run the migration.",
+      "  Do you want to proceed?",
+      "",
+      "│ ❯ │",
+      "  ⏵⏵ bypass permissions on",
+    ].join("\n");
+    expect(classify_blocking_pane(pane)).toBeNull();
+    expect(pane_ready_for_input(pane)).toBe(true);
+  });
+
   it("ignores dialog wording that has scrolled into history", () => {
     const pane = [
       "The CLI asked: Do you want to proceed? — I answered yes.",

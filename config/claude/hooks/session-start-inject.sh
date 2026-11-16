@@ -52,7 +52,6 @@ fi
 USER_NAME="$(printf '%s' "$RAW" | jq -r '.user // "a user"' 2>/dev/null)" || USER_NAME="a user"
 CONTENT="$(printf '%s' "$RAW" | jq -r '.content // ""' 2>/dev/null)" || CONTENT=""
 CHANNEL_ID="$(printf '%s' "$RAW" | jq -r '.channel_id // ""' 2>/dev/null)" || CHANNEL_ID=""
-MESSAGE_ID="$(printf '%s' "$RAW" | jq -r '.message_id // ""' 2>/dev/null)" || MESSAGE_ID=""
 TS="$(printf '%s' "$RAW" | jq -r '.ts // ""' 2>/dev/null)" || TS=""
 
 if [ -z "$CONTENT" ]; then
@@ -65,12 +64,6 @@ fi
 CTX_HEADER="A user just messaged you in Discord. Respond to them via the Discord reply tool (the channel plugin is already loaded)."
 if [ -n "$CHANNEL_ID" ]; then
   CTX_HEADER="$CTX_HEADER Channel: $CHANNEL_ID."
-fi
-# The message id lets the agent reply-to the message, and puts the id in the
-# session transcript — which is how the daemon later recognises that this
-# message was delivered and must not be re-sent.
-if [ -n "$MESSAGE_ID" ]; then
-  CTX_HEADER="$CTX_HEADER Message ID: $MESSAGE_ID."
 fi
 if [ -n "$TS" ]; then
   CTX_HEADER="$CTX_HEADER Sent at: $TS."

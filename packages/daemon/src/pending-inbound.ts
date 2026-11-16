@@ -23,8 +23,8 @@
  * handed over, was provably delivered by the plugin after all (its message id
  * is in the session transcript), or expires — and expiry raises an alert.
  *
- * Broker channels never come here: the broker has its own durable queue with a
- * real ack (`broker/queue.ts`).
+ * Broker channels never come here — `BotPool.queue_inbound` refuses them: the
+ * broker has its own durable queue with a real ack (`broker/queue.ts`).
  *
  * Everything here is fail-open. A persist failure is logged and swallowed, a
  * corrupt file loads as empty — the store must never throw into the Discord
@@ -208,6 +208,7 @@ export class PendingInboundStore {
     message: PendingMessage,
     entity_id: string,
     reason: PendingInboundReason,
+    opts?: { front?: boolean },
   ): PendingInboundEntry | null {
     if (!message.message_id) return null;
     if (this.entries.some((e) => e.message_id === message.message_id)) return null;
@@ -222,7 +223,14 @@ export class PendingInboundStore {
       attempts: 0,
       reason,
     };
-    this.entries.push(entry);
+    // `front`: ahead of the channel's other queued messages. Used for a
+    // message that arrived first but only failed over to the queue after later
+    // ones were already parked behind its in-flight assign.
+    const first_of_channel = opts?.front
+      ? this.entries.findIndex((e) => e.channel_id === message.channel_id)
+      : -1;
+    if (first_of_channel >= 0) this.entries.splice(first_of_channel, 0, entry);
+    else this.entries.push(entry);
     this.schedule_persist();
     return entry;
   }

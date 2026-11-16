@@ -1,11 +1,11 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LobsterFarmConfigSchema } from "@lobster-farm/shared";
 import type { EntityConfig, LobsterFarmConfig } from "@lobster-farm/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PendingInboundStore } from "../pending-inbound.js";
-import { PENDING_INJECT_MIN_AGE_MS } from "../pool.js";
+import { PENDING_INJECT_MIN_AGE_MS, PENDING_STUCK_AFTER_MS } from "../pool.js";
 import type { ChannelTarget, InboundDeliveredEvent, PendingMessage, PoolBot } from "../pool.js";
 import type { EntityRegistry } from "../registry.js";
 import { BotPoolTestBase } from "./helpers/test-bot-pool-base.js";
@@ -84,8 +84,8 @@ class TestBotPool extends BotPoolTestBase {
   protected override read_pane(tmux_session: string): string | null {
     return this.panes.get(tmux_session) ?? null;
   }
-  protected override async transcript_has_message(_bot: PoolBot, id: string): Promise<boolean> {
-    return this.transcript.has(id);
+  protected override async read_transcript(): Promise<string | null> {
+    return [...this.transcript].join("\n");
   }
   // Every bot counts as busy so eviction never frees a slot behind the test's back.
   override is_bot_idle(): boolean {
@@ -272,7 +272,7 @@ describe("BotPool pending-inbound drain", () => {
     await vi.advanceTimersByTimeAsync(1_500);
     // The scheduled drain does real file I/O (the pending-message file) that
     // fake timers cannot advance — give the event loop a few real turns.
-    for (let i = 0; i < 50 && !pool.get_assignment("ch-1"); i++) {
+    for (let i = 0; i < 2_000 && !pool.get_assignment("ch-1"); i++) {
       await new Promise((r) => setImmediate(r));
     }
 
@@ -513,15 +513,12 @@ describe("BotPool pending-inbound drain", () => {
     pool.queue_inbound(msg("b1", "ch-2"), "acme", "not_ready");
     age();
     const error_spy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const original = (
-      pool as unknown as { transcript_has_message: (b: PoolBot, id: string) => Promise<boolean> }
-    ).transcript_has_message.bind(pool);
     vi.spyOn(
       pool as unknown as Record<string, unknown>,
-      "transcript_has_message" as never,
-    ).mockImplementation((async (bot: PoolBot, id: string) => {
-      if (bot.id === 1) throw new Error("boom");
-      return original(bot, id);
+      "channel_name" as never,
+    ).mockImplementation(((channel_id: string) => {
+      if (channel_id === "ch-1") throw new Error("boom");
+      return "general";
     }) as never);
 
     await expect(pool.drain_pending_inbound()).resolves.toBeUndefined();
@@ -552,5 +549,157 @@ describe("BotPool pending-inbound drain", () => {
     });
     await reloaded.load();
     expect(reloaded.peek_channel("ch-1").map((e) => e.message_id)).toEqual(["a1"]);
+  });
+
+  it("refuses broker channels — they have their own queue and ack", () => {
+    vi.spyOn(pool as unknown as Record<string, unknown>, "uses_broker" as never).mockImplementation(
+      ((channel_id: string) => channel_id === "ch-1") as never,
+    );
+    expect(pool.queue_inbound(msg("m1", "ch-1"), "acme", "busy")).toBeNull();
+    expect(store.total()).toBe(0);
+    expect(pool.queue_inbound(msg("m2", "ch-2"), "acme", "busy")).not.toBeNull();
+  });
+
+  it("a message whose own assign failed goes in ahead of those parked behind it", async () => {
+    pool.inject_bots([make_bot({ id: 1 })]);
+    pool.queue_inbound(msg("m2"), "acme", "assigning"); // parked during m1's assign
+    pool.queue_inbound(msg("m1"), "acme", "busy", { front: true }); // m1's assign then failed
+
+    await pool.drain_pending_inbound();
+
+    expect(delivered[0]).toMatchObject({ message_ids: ["m1"], how: "first_turn" });
+    expect(store.peek_channel("ch-1").map((e) => e.message_id)).toEqual(["m2"]);
+  });
+
+  it("a steady trickle of new messages cannot starve the ones that are ready", async () => {
+    pool.inject_bots([live_bot(1, "ch-1")]);
+    pool.queue_inbound(msg("old"), "acme", "not_ready");
+    age();
+    pool.queue_inbound(msg("young"), "acme", "not_ready"); // arrived a moment ago
+
+    await pool.drain_pending_inbound();
+
+    expect(pool.sent).toHaveLength(1);
+    expect(pool.sent[0]!.text).toContain("message_id old");
+    expect(pool.sent[0]!.text).not.toContain("message_id young");
+    expect(store.peek_channel("ch-1").map((e) => e.message_id)).toEqual(["young"]);
+  });
+
+  describe("a queue stuck behind a session that is not at the prompt", () => {
+    const PERMISSION = [" Do you want to proceed?", " ❯ 1. Yes", "   2. No"].join("\n");
+    const NO_GLYPH = ["● Done.", "> ", "  ? for shortcuts"].join("\n"); // idle, unknown prompt
+
+    function stuck_bot(pane: string | null): PoolBot {
+      const bot = live_bot(1, "ch-1");
+      pool.inject_bots([bot]);
+      pool.panes.set(bot.tmux_session, pane);
+      pool.queue_inbound(msg("m1"), "acme", "not_ready");
+      return bot;
+    }
+
+    it("waits quietly at first", async () => {
+      stuck_bot(PERMISSION);
+      age();
+      await pool.drain_pending_inbound();
+      expect(notify_mock).not.toHaveBeenCalled();
+      expect(pool.sent).toHaveLength(0);
+    });
+
+    it("alerts once when it is parked on a blocking state, and never types into it", async () => {
+      stuck_bot(PERMISSION);
+      age(PENDING_STUCK_AFTER_MS + 1_000);
+
+      await pool.drain_pending_inbound();
+      await pool.drain_pending_inbound();
+
+      expect(pool.sent).toHaveLength(0);
+      expect(store.depth("ch-1")).toBe(1);
+      expect(notify_mock).toHaveBeenCalledTimes(1);
+      expect(String(notify_mock.mock.calls[0]?.[1])).toContain("permission prompt");
+    });
+
+    it("leaves a long-running turn alone however old the queue is", async () => {
+      stuck_bot(WORKING);
+      age(60 * 60_000);
+      await pool.drain_pending_inbound();
+      expect(notify_mock).not.toHaveBeenCalled();
+      expect(pool.sent).toHaveLength(0);
+      expect(store.depth("ch-1")).toBe(1);
+    });
+
+    it("types anyway when the session is idle with no prompt glyph we recognise", async () => {
+      stuck_bot(NO_GLYPH);
+      age(PENDING_STUCK_AFTER_MS + 1_000);
+
+      await pool.drain_pending_inbound();
+
+      expect(pool.sent).toHaveLength(1);
+      expect(store.depth("ch-1")).toBe(0);
+    });
+
+    it("recycles the session after repeated failed attempts, keeping the queue for its replacement", async () => {
+      stuck_bot(NO_GLYPH);
+      age(PENDING_STUCK_AFTER_MS + 1_000);
+      pool.send_ok = false;
+      const recover = vi
+        .spyOn(pool as unknown as Record<string, unknown>, "recover_deaf_bot" as never)
+        .mockResolvedValue(undefined as never);
+      const error_spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await pool.drain_pending_inbound();
+      await pool.drain_pending_inbound();
+      expect(recover).not.toHaveBeenCalled();
+      await pool.drain_pending_inbound();
+
+      expect(recover).toHaveBeenCalledTimes(1);
+      expect(store.depth("ch-1")).toBe(1);
+      error_spy.mockRestore();
+    });
+  });
+
+  it("a drain requested while one is running is not dropped", async () => {
+    pool.inject_bots([make_bot({ id: 1 })]);
+    pool.queue_inbound(msg("a1"), "acme", "busy");
+
+    const first = pool.drain_pending_inbound();
+    const second = pool.drain_pending_inbound(); // returns at once, asks for a re-run
+    await Promise.all([first, second]);
+
+    const timer = (pool as unknown as { pending_drain_timer: unknown }).pending_drain_timer;
+    expect(timer).not.toBeNull();
+  });
+
+  it("a request to look sooner replaces a later scheduled drain", () => {
+    const due = () => (pool as unknown as { pending_drain_due: number }).pending_drain_due;
+    pool.schedule_pending_drain(9_000);
+    const later = due();
+    pool.schedule_pending_drain(1_000);
+    expect(due()).toBeLessThan(later);
+    const sooner = due();
+    pool.schedule_pending_drain(30_000); // a later request does not push it back
+    expect(due()).toBe(sooner);
+  });
+
+  it("reads the transcript from the entity's own CLAUDE_CONFIG_DIR, and fails open", async () => {
+    const real = new (class extends BotPoolTestBase {
+      read(bot: PoolBot): Promise<string | null> {
+        return this.read_transcript(bot);
+      }
+    })(make_config());
+    const config_dir = join(temp_dir, "claude-acme");
+    (real as unknown as { registry: EntityRegistry }).registry = {
+      get: (id: string) =>
+        id === "acme" ? { entity: { subscription: { claude_config_dir: config_dir } } } : undefined,
+    } as unknown as EntityRegistry;
+    const session_id = `sess-${String(Date.now())}-not-in-home`;
+    const bot = make_bot({ id: 9, state: "assigned", entity_id: "acme", session_id });
+
+    // Nowhere on disk yet → null (callers then deliver rather than skip).
+    expect(await real.read(bot)).toBeNull();
+
+    const project = join(config_dir, "projects", "-some-project");
+    await mkdir(project, { recursive: true });
+    await writeFile(join(project, `${session_id}.jsonl`), '{"message_id":"777"}\n', "utf-8");
+    expect(await real.read(bot)).toContain("777");
   });
 });

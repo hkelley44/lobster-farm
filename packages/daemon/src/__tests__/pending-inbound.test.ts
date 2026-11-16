@@ -65,6 +65,21 @@ describe("PendingInboundStore", () => {
     expect(store.position("ch-none")).toBe(0);
   });
 
+  it("front: goes ahead of its own channel's queue without disturbing other channels", () => {
+    const store = make_store();
+    store.enqueue(msg("x1", "ch-2"), "acme", "busy");
+    store.enqueue(msg("m2"), "acme", "assigning");
+    store.enqueue(msg("m3"), "acme", "assigning");
+    store.enqueue(msg("m1"), "acme", "busy", { front: true });
+
+    expect(store.peek_channel("ch-1").map((e) => e.message_id)).toEqual(["m1", "m2", "m3"]);
+    expect(store.channels_waiting()).toEqual(["ch-2", "ch-1"]);
+
+    // With nothing queued for the channel, front is just an append.
+    store.enqueue(msg("y1", "ch-3"), "acme", "busy", { front: true });
+    expect(store.channels_waiting()).toEqual(["ch-2", "ch-1", "ch-3"]);
+  });
+
   it("dedupes by message id — one Discord message is never two turns", () => {
     const store = make_store();
     expect(store.enqueue(msg("m1"), "acme", "busy")).not.toBeNull();
