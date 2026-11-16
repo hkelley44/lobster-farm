@@ -10,8 +10,11 @@ vi.mock("node:child_process", async () => {
 import { execFileSync } from "node:child_process";
 import {
   PLUGIN_DEAF_THRESHOLD_MS,
+  classify_blocking_pane,
   evaluate_plugin_liveness,
   is_tmux_session_idle,
+  pane_ready_for_input,
+  pane_shows_working,
 } from "../plugin-liveness.js";
 
 function set_pane_content(content: string): void {
@@ -189,5 +192,156 @@ describe("is_tmux_session_idle pane-text heuristic", () => {
       throw new Error("no such session");
     });
     expect(is_tmux_session_idle("pool-gone")).toBe(true);
+  });
+});
+
+/**
+ * The last line of a Claude Code pane is whatever the CLI renders last — a
+ * hint, a notice, an MCP footer. The working markers routinely sit above it,
+ * and a last-line-only read turned real work into an "idle" reading that the
+ * deaf probe then acted on.
+ */
+describe("idle reading scans the pane tail, not only the last line", () => {
+  const working_pane = [
+    "● Running the migration now.",
+    "",
+    "✻ Thinking… (42s · ↓ 1.2k tokens · esc to interrupt)",
+    "",
+    "╭──────────────────────────────────────────────╮",
+    "│ ❯                                            │",
+    "╰──────────────────────────────────────────────╯",
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+  ].join("\n");
+
+  it("finds 'esc to interrupt' several lines above the status bar", () => {
+    expect(pane_shows_working(working_pane)).toBe(true);
+    set_pane_content(working_pane);
+    expect(is_tmux_session_idle("pool-3")).toBe(false);
+  });
+
+  it("finds a background-agent marker above the last line", () => {
+    const pane = ["❯ ", "  2 local agents running", "  ⏵⏵ bypass permissions on"].join("\n");
+    expect(pane_shows_working(pane)).toBe(true);
+  });
+
+  it("ignores blank padding below the status area", () => {
+    expect(pane_shows_working(`${working_pane}\n\n\n\n\n\n\n\n\n\n`)).toBe(true);
+  });
+
+  it("does not treat a marker far up in scrollback as current work", () => {
+    const pane = [
+      "press esc to interrupt a running turn", // old output, long scrolled past
+      ...Array.from({ length: 12 }, (_, i) => `line ${String(i)}`),
+      "❯ ",
+    ].join("\n");
+    expect(pane_shows_working(pane)).toBe(false);
+  });
+});
+
+describe("classify_blocking_pane", () => {
+  // Dialog copy as rendered by Claude Code v2.1.325.
+  const trust_dialog = [
+    " Accessing workspace:",
+    " /Users/farm/.lobsterfarm/entities/acme",
+    "",
+    " Quick safety check: Is this a project you created or one you trust? (Like your own code, a",
+    " well-known open source project, or work from your team). If not, take a moment to review what's",
+    " in this folder first.",
+    "",
+    " ❯ 1. Yes, I trust this folder",
+    "   2. No, exit",
+    "",
+    " Enter to confirm · Esc to cancel",
+  ].join("\n");
+
+  const dev_channels_dialog = [
+    " WARNING: Loading development channels",
+    "",
+    " --dangerously-load-development-channels is for local channel development only.",
+    " Channels: server:lf-discord",
+    "",
+    " ❯ 1. I am using this for local development",
+    "   2. Exit",
+  ].join("\n");
+
+  const permission_prompt = [
+    "● Bash(rm -rf build)",
+    "",
+    " Bash command",
+    "   rm -rf build",
+    "",
+    " Do you want to proceed?",
+    " ❯ 1. Yes",
+    "   2. Yes, and don't ask again for rm commands in this project",
+    "   3. No, and tell Claude what to do differently (esc)",
+  ].join("\n");
+
+  const rate_limit_modal = [
+    " You've exceeded your usage limit.",
+    " ❯ 1. Switch to extra usage",
+    "   2. Wait for the limit to reset",
+    " Enter to confirm · Esc to cancel",
+  ].join("\n");
+
+  const login_required = [
+    "> hello",
+    "  ⎿  Not logged in · Please run /login",
+    "",
+    "╭───────────────╮",
+    "│ ❯             │",
+    "╰───────────────╯",
+  ].join("\n");
+
+  it.each([
+    ["trust_dialog", trust_dialog],
+    ["dev_channels_dialog", dev_channels_dialog],
+    ["permission_prompt", permission_prompt],
+    ["rate_limit_modal", rate_limit_modal],
+    ["login_required", login_required],
+  ] as const)("recognises %s", (state, pane) => {
+    expect(classify_blocking_pane(pane)).toBe(state);
+  });
+
+  it("returns null for an ordinary idle prompt", () => {
+    const idle = ["● Done.", "", "│ ❯ │", "  ⏵⏵ bypass permissions on"].join("\n");
+    expect(classify_blocking_pane(idle)).toBeNull();
+  });
+
+  it("ignores dialog wording that has scrolled into history", () => {
+    const pane = [
+      "The CLI asked: Do you want to proceed? — I answered yes.",
+      ...Array.from({ length: 20 }, (_, i) => `output ${String(i)}`),
+      "│ ❯ │",
+    ].join("\n");
+    expect(classify_blocking_pane(pane)).toBeNull();
+  });
+
+  it("a session on any blocking state reads idle — which is why callers must classify first", () => {
+    for (const pane of [trust_dialog, permission_prompt, rate_limit_modal]) {
+      expect(pane_shows_working(pane)).toBe(false);
+    }
+  });
+
+  describe("pane_ready_for_input", () => {
+    it("is true at an idle prompt", () => {
+      expect(
+        pane_ready_for_input(["● Done.", "│ ❯ │", "  ⏵⏵ bypass permissions on"].join("\n")),
+      ).toBe(true);
+    });
+
+    it("is false while a turn is running", () => {
+      expect(pane_ready_for_input(["✻ Working… (esc to interrupt)", "│ ❯ │"].join("\n"))).toBe(
+        false,
+      );
+    });
+
+    it("is false on a dialog even though its cursor is a ❯", () => {
+      expect(pane_ready_for_input(trust_dialog)).toBe(false);
+      expect(pane_ready_for_input(permission_prompt)).toBe(false);
+    });
+
+    it("is false with no prompt on screen (boot banner)", () => {
+      expect(pane_ready_for_input("Welcome to Claude Code\nLoading MCP servers…")).toBe(false);
+    });
   });
 });

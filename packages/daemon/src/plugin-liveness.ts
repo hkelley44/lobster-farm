@@ -28,14 +28,152 @@
 
 import { execFileSync } from "node:child_process";
 
+/** How many trailing non-empty pane lines the idle/blocking readers scan. */
+export const PANE_TAIL_LINES = 8;
+
+/** The last `count` non-empty lines of a pane capture, in order. */
+export function pane_tail(pane_text: string, count: number = PANE_TAIL_LINES): string[] {
+  return pane_text
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .slice(-count);
+}
+
+/**
+ * Does this pane capture show an explicit "working" marker?
+ *
+ * Scans the last PANE_TAIL_LINES non-empty lines rather than only the final
+ * one. The final line of a Claude Code pane is whatever the CLI happens to
+ * render last — a status-bar hint, a notice, an MCP footer — and the working
+ * markers routinely sit one or two rows above it. Reading only the last line
+ * therefore mis-read real work as idle, and the deaf probe turns a single such
+ * mis-read into a recycled session.
+ *
+ * Markers:
+ * 1. "esc to interrupt" → actively generating
+ * 2. "local agent"      → background subagent(s) running
+ *
+ * Pure: no I/O.
+ */
+export function pane_shows_working(pane_text: string): boolean {
+  return pane_tail(pane_text).some(
+    (line) => line.includes("esc to interrupt") || line.includes("local agent"),
+  );
+}
+
+/**
+ * A pane state in which the session is alive and its plugin may be perfectly
+ * healthy, but nothing can happen until a human (or a targeted remedy) acts.
+ * Recycling such a session cures nothing — the replacement walks into the same
+ * wall — and throws away the context that explains why it stopped.
+ */
+export type BlockingPaneState =
+  | "permission_prompt"
+  | "rate_limit_modal"
+  | "trust_dialog"
+  | "dev_channels_dialog"
+  | "login_required";
+
+/*
+ * Dialog strings, taken from the Claude Code CLI bundle (v2.1.325). They are
+ * UI copy, not an API: when the CLI rewords a dialog the matching state simply
+ * stops being recognised and the callers fall back to their pre-existing
+ * behaviour. Keep them as narrow as the copy allows — a false match here
+ * suppresses a recycle that may have been warranted.
+ */
+/** Workspace-trust dialog: its title line and its accept option. */
+export const TRUST_DIALOG_MARKERS = ["Quick safety check", "Yes, I trust this folder"] as const;
+/** `--dangerously-load-development-channels` confirmation (#114). */
+export const DEV_CHANNELS_DIALOG_MARKERS = [
+  "WARNING: Loading development channels",
+  "I am using this for local development",
+] as const;
+/** Tool/network permission prompts. */
+export const PERMISSION_PROMPT_MARKERS = [
+  "Do you want to proceed?",
+  "Do you want to allow this connection?",
+] as const;
+/** Expired/absent auth. The first is what `is_pane_stale_oauth` matches. */
+export const LOGIN_REQUIRED_MARKERS = [
+  "Not logged in · Please run /login",
+  "Not logged in · Run /login",
+  "Authentication required · Sign in again",
+] as const;
+
+/**
+ * Classify a pane capture as one of the known blocking states, or null.
+ *
+ * Dialogs are matched against the tail of the pane (a dialog owns the bottom of
+ * the screen while it is open; the same words further up are scrollback — e.g.
+ * an agent quoting a prompt it saw). Login failure is matched against the whole
+ * pane, mirroring `is_pane_stale_oauth`: the CLI prints it as a turn result and
+ * then returns to an ordinary-looking prompt beneath it.
+ *
+ * Rate-limit detection mirrors `detect_rate_limit_modal` (rate-limit-recovery.ts)
+ * rather than importing it, so this module stays free of pool imports.
+ *
+ * Pure: no I/O.
+ */
+export function classify_blocking_pane(pane_text: string): BlockingPaneState | null {
+  const tail = pane_tail(pane_text, 14).join("\n");
+  const has = (markers: readonly string[]) => markers.some((m) => tail.includes(m));
+
+  if (has(DEV_CHANNELS_DIALOG_MARKERS)) return "dev_channels_dialog";
+  if (has(TRUST_DIALOG_MARKERS)) return "trust_dialog";
+
+  const lower = tail.toLowerCase();
+  if (
+    lower.includes("switch to extra usage") ||
+    (lower.includes("exceeded") && lower.includes("esc to cancel"))
+  ) {
+    return "rate_limit_modal";
+  }
+
+  if (has(PERMISSION_PROMPT_MARKERS)) return "permission_prompt";
+  if (LOGIN_REQUIRED_MARKERS.some((m) => pane_text.includes(m))) return "login_required";
+  return null;
+}
+
+/** Operator-facing description of a blocking state, for #alerts. */
+export function describe_blocking_state(state: BlockingPaneState): string {
+  switch (state) {
+    case "permission_prompt":
+      return "waiting on a permission prompt";
+    case "rate_limit_modal":
+      return "stopped at the usage-limit modal";
+    case "trust_dialog":
+      return "stopped at the workspace-trust dialog";
+    case "dev_channels_dialog":
+      return "stopped at the development-channels confirmation";
+    case "login_required":
+      return "not logged in (the CLI's auth has expired)";
+  }
+}
+
+/**
+ * Can text typed into this pane right now be expected to start a turn?
+ *
+ * True when the input prompt (❯) is visible in the pane tail, nothing is
+ * running, and no dialog owns the keyboard. The dialog check matters because
+ * selection menus render their cursor as ❯ too — "is ❯ on screen" alone would
+ * type a queued message into a trust dialog.
+ *
+ * Pure: no I/O.
+ */
+export function pane_ready_for_input(pane_text: string): boolean {
+  if (pane_shows_working(pane_text)) return false;
+  if (classify_blocking_pane(pane_text) !== null) return false;
+  return pane_tail(pane_text).some((line) => line.includes("❯"));
+}
+
 /**
  * Check whether a tmux session is idle (showing a prompt, not actively processing).
- * Reads the last line of the tmux pane and looks for explicit working indicators.
+ * Captures the pane and looks for explicit working indicators in its last
+ * PANE_TAIL_LINES non-empty lines (see `pane_shows_working`).
  *
- * Classification (in order):
- * 1. "esc to interrupt" → actively generating → NOT idle
- * 2. "local agent" → background subagent running → NOT idle
- * 3. Anything else → idle. This covers the explicit prompt indicators ("❯",
+ * Classification:
+ * 1. A working marker ("esc to interrupt" / "local agent") in the tail → NOT idle.
+ * 2. Anything else → idle. This covers the explicit prompt indicators ("❯",
  *    "bypass permissions" in the status bar) AND every unrecognized state:
  *    startup banners, MCP-init lines, dialogs, partial redraws. "Not idle" is
  *    reserved for explicitly-recognized working markers only — Claude Code's
@@ -44,6 +182,10 @@ import { execFileSync } from "node:child_process";
  *    no marker at all. Treating unknown text as "working" was how a freshly
  *    spawned session's banner could read as `healthy_working` and falsely
  *    clear the deaf-probe's armed inbound marker (#106 review blocker).
+ *
+ * "Idle" is therefore NOT "ready for a message": a session parked on a
+ * permission prompt reads idle. Callers that are about to act destructively on
+ * an idle reading must consult `classify_blocking_pane` first.
  *
  * Fails open (returns true) when the pane can't be read — symmetric with the
  * unknown-text rule, and the safe default for eviction and typing-loop
@@ -54,26 +196,23 @@ import { execFileSync } from "node:child_process";
  * commander probes consume it. Re-exported from pool.ts for existing importers.
  */
 export function is_tmux_session_idle(tmux_session: string): boolean {
+  const pane = capture_tmux_pane_text(tmux_session);
+  if (pane === null) return true; // Can't check — assume idle (fail-open)
+  return !pane_shows_working(pane);
+}
+
+/**
+ * Visible content of a tmux pane, or null when it can't be read (dead session,
+ * timeout). Null is "indeterminate" — never treat it as an empty pane.
+ */
+export function capture_tmux_pane_text(tmux_session: string): string | null {
   try {
-    const output = execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
+    return execFileSync("tmux", ["capture-pane", "-t", tmux_session, "-p"], {
       encoding: "utf-8",
       timeout: 2000,
     });
-    const lines = output.trim().split("\n");
-    const last_line = lines[lines.length - 1] ?? "";
-
-    // Claude Code's status bar shows "esc to interrupt" only during active generation.
-    if (last_line.includes("esc to interrupt")) return false;
-
-    // Background subagents: status bar shows "N local agent(s)" when subagents are running.
-    // The parent is at the prompt but work is still happening — NOT idle.
-    if (last_line.includes("local agent")) return false;
-
-    // No explicit working marker → idle (prompt, dialog, startup banner, or
-    // any unrecognized transient — see the classification note above).
-    return true;
   } catch {
-    return true; // Can't check — assume idle (fail-open)
+    return null;
   }
 }
 
